@@ -76,7 +76,29 @@ fn pack5_word_from_bytes(bytes: &[u8], n_trits: usize) -> i64 {
     word as i64
 }
 
-/// Returns `true` if `module` is a hot numeric, ternary, or `@PACK5` path eligible for direct AOT execution.
+fn validate_func_pack5_ops(
+    func: &BinFunction,
+    reg_pack5: &BTreeMap<u16, (Vec<u8>, usize, bool)>,
+) -> Result<(), String> {
+    let check_reg = |r: u16| -> Result<(), String> {
+        if let Some((bytes, _, _)) = reg_pack5.get(&r) {
+            if bytes.iter().any(|&b| b > PACK5_MAX_VALID) {
+                return Err(String::from("PACK5_SENTINEL_OR_CORRUPT_BYTE"));
+            }
+        }
+        Ok(())
+    };
+    for ins in &func.instructions {
+        if matches!(ins.op_tok, 0x7F30 | 0x7F31 | 0x7F34 | 0x7F35 | 0x7F3F) {
+            for op in &ins.operands {
+                if let BinOperand::Reg(r) = *op {
+                    check_reg(r)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
 pub fn is_module_aot_hot_path(module: &BinModule) -> bool {
     if module.functions.len() != 1 {
         return false;
@@ -238,19 +260,22 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
     };
 
     let reg_pack5 = collect_func_pack5_map(func);
+    validate_func_pack5_ops(func, &reg_pack5)?;
     let emit_extract_pack5_trit_x86 = |c: &mut Vec<u8>, op: &BinOperand, trit_idx: usize, into_rcx: bool| {
+        let mut direct_byte = false;
         if let BinOperand::Reg(r) = *op {
-            if let Some((bytes, n, _)) = reg_pack5.get(&r) {
-                emit_load_op(c, &BinOperand::ImmInt(pack5_word_from_bytes(bytes, *n)), false);
-            } else {
-                emit_load_op(c, op, false);
+            if let Some((bytes, _, _)) = reg_pack5.get(&r) {
+                let b_val = bytes.get(trit_idx / 5).copied().unwrap_or(121) as i64;
+                emit_load_op(c, &BinOperand::ImmInt(b_val), false);
+                direct_byte = true;
             }
-        } else {
-            emit_load_op(c, op, false);
         }
-        let shift: u8 = (((trit_idx / 5) + 1) * 8) as u8;
-        c.extend_from_slice(&[0x48, 0xC1, 0xE8, shift]); // shr rax, shift
-        c.extend_from_slice(&[0x0F, 0xB6, 0xC0]);       // movzx eax, al
+        if !direct_byte {
+            emit_load_op(c, op, false);
+            let shift: u8 = (((trit_idx / 5) + 1) * 8) as u8;
+            c.extend_from_slice(&[0x48, 0xC1, 0xE8, shift]); // shr rax, shift
+            c.extend_from_slice(&[0x0F, 0xB6, 0xC0]);       // movzx eax, al
+        }
         c.extend_from_slice(&[0x31, 0xD2]);             // xor edx, edx
         let pow3: u8 = [1u8, 3, 9, 27, 81][trit_idx % 5];
         if pow3 > 1 {
@@ -278,17 +303,38 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
                 if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
             }
             0x7F0E => {
-                if let (Some(BinOperand::Reg(r_arr)), Some(BinOperand::ImmInt(idx))) =
+                if let (Some(BinOperand::Reg(r_arr)), Some(idx_op)) =
                     (ins.operands.first(), ins.operands.get(1))
                 {
-                    if *idx >= 0 {
-                        if let Some((bytes, _, is_tv)) = reg_pack5.get(r_arr) {
-                            if *is_tv {
-                                emit_extract_pack5_trit_x86(&mut code, &ins.operands[0], *idx as usize, false);
-                            } else {
-                                let b_val = bytes.get(*idx as usize).copied().unwrap_or(0) as i64;
-                                emit_load_op(&mut code, &BinOperand::ImmInt(b_val), false);
+                    if let Some((bytes, n_len, is_tv)) = reg_pack5.get(r_arr) {
+                        if let BinOperand::ImmInt(idx) = idx_op {
+                            if *idx >= 0 {
+                                if *is_tv {
+                                    emit_extract_pack5_trit_x86(&mut code, &ins.operands[0], *idx as usize, false);
+                                } else {
+                                    let b_val = bytes.get(*idx as usize).copied().unwrap_or(0) as i64;
+                                    emit_load_op(&mut code, &BinOperand::ImmInt(b_val), false);
+                                }
+                                if let Some(d) = ins.dest_reg {
+                                    emit_store_rax(&mut code, d);
+                                }
+                                continue;
                             }
+                        } else {
+                            code.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d (acc = 0)
+                            for k in 0..*n_len {
+                                if *is_tv {
+                                    emit_extract_pack5_trit_x86(&mut code, &ins.operands[0], k, true);
+                                } else {
+                                    let b_val = bytes.get(k).copied().unwrap_or(0) as i64;
+                                    emit_load_op(&mut code, &BinOperand::ImmInt(b_val), true);
+                                }
+                                emit_load_op(&mut code, idx_op, false); // rax = dynamic index
+                                code.extend_from_slice(&[0x48, 0x3D]);  // cmp rax, imm32(k)
+                                code.extend_from_slice(&(k as i32).to_le_bytes());
+                                code.extend_from_slice(&[0x4C, 0x0F, 0x44, 0xC1]); // cmove r8, rcx
+                            }
+                            code.extend_from_slice(&[0x4C, 0x89, 0xC0]); // mov rax, r8
                             if let Some(d) = ins.dest_reg {
                                 emit_store_rax(&mut code, d);
                             }
@@ -341,7 +387,7 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
                     (Some(BinOperand::Reg(ra)), Some(BinOperand::Reg(rb))) => {
                         let na = reg_pack5.get(ra).map(|(_, n, _)| *n).unwrap_or(0);
                         let nb = reg_pack5.get(rb).map(|(_, n, _)| *n).unwrap_or(0);
-                        na.min(nb).min(35)
+                        na.min(nb)
                     }
                     _ => 0,
                 };
@@ -357,7 +403,7 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
             }
             0x7F35 | 0x7F3F => {
                 let pack5_len = match ins.operands.first() {
-                    Some(BinOperand::Reg(r)) => reg_pack5.get(r).map(|(_, n, _)| (*n).min(35)),
+                    Some(BinOperand::Reg(r)) => reg_pack5.get(r).map(|(_, n, _)| *n),
                     _ => None,
                 };
                 if let Some(n_trits) = pack5_len {
@@ -735,24 +781,27 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
     };
 
     let reg_pack5 = collect_func_pack5_map(func);
+    validate_func_pack5_ops(func, &reg_pack5)?;
     let emit_extract_pack5_trit_wasm = |b: &mut Vec<u8>, op: &BinOperand, trit_idx: usize| {
+        let mut direct_byte = false;
         if let BinOperand::Reg(r) = *op {
-            if let Some((bytes, n, _)) = reg_pack5.get(&r) {
+            if let Some((bytes, _, _)) = reg_pack5.get(&r) {
+                let b_val = bytes.get(trit_idx / 5).copied().unwrap_or(121) as i64;
                 b.push(0x42);
-                b.extend(encode_sleb128(pack5_word_from_bytes(bytes, *n)));
-            } else {
-                emit_wasm_op(b, op);
+                b.extend(encode_sleb128(b_val));
+                direct_byte = true;
             }
-        } else {
-            emit_wasm_op(b, op);
         }
-        let shift: i64 = (((trit_idx / 5) + 1) * 8) as i64;
-        b.push(0x42);
-        b.extend(encode_sleb128(shift));
-        b.push(0x87); // i64.shr_s
-        b.push(0x42);
-        b.extend(encode_sleb128(255));
-        b.push(0x83); // i64.and
+        if !direct_byte {
+            emit_wasm_op(b, op);
+            let shift: i64 = (((trit_idx / 5) + 1) * 8) as i64;
+            b.push(0x42);
+            b.extend(encode_sleb128(shift));
+            b.push(0x87); // i64.shr_s
+            b.push(0x42);
+            b.extend(encode_sleb128(255));
+            b.push(0x83); // i64.and
+        }
         let pow3: i64 = [1i64, 3, 9, 27, 81][trit_idx % 5];
         if pow3 > 1 {
             b.push(0x42);
@@ -783,7 +832,7 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
                     (Some(BinOperand::Reg(ra)), Some(BinOperand::Reg(rb))) => {
                         let na = reg_pack5.get(ra).map(|(_, n, _)| *n).unwrap_or(0);
                         let nb = reg_pack5.get(rb).map(|(_, n, _)| *n).unwrap_or(0);
-                        na.min(nb).min(35)
+                        na.min(nb)
                     }
                     _ => 0,
                 };
@@ -797,7 +846,7 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
             }
             0x7F35 | 0x7F3F => {
                 let pack5_len = match ins.operands.first() {
-                    Some(BinOperand::Reg(r)) => reg_pack5.get(r).map(|(_, n, _)| (*n).min(35)),
+                    Some(BinOperand::Reg(r)) => reg_pack5.get(r).map(|(_, n, _)| *n),
                     _ => None,
                 };
                 if let Some(n_trits) = pack5_len {
@@ -826,17 +875,37 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
             }
             0x7F0E => {
                 let mut handled = false;
-                if let (Some(BinOperand::Reg(r_arr)), Some(BinOperand::ImmInt(idx))) =
+                if let (Some(BinOperand::Reg(r_arr)), Some(idx_op)) =
                     (ins.operands.first(), ins.operands.get(1))
                 {
-                    if *idx >= 0 {
-                        if let Some((bytes, _, is_tv)) = reg_pack5.get(r_arr) {
-                            if *is_tv {
-                                emit_extract_pack5_trit_wasm(b, &ins.operands[0], *idx as usize);
-                            } else {
-                                let b_val = bytes.get(*idx as usize).copied().unwrap_or(0) as i64;
+                    if let Some((bytes, n_len, is_tv)) = reg_pack5.get(r_arr) {
+                        if let BinOperand::ImmInt(idx) = idx_op {
+                            if *idx >= 0 {
+                                if *is_tv {
+                                    emit_extract_pack5_trit_wasm(b, &ins.operands[0], *idx as usize);
+                                } else {
+                                    let b_val = bytes.get(*idx as usize).copied().unwrap_or(0) as i64;
+                                    b.push(0x42);
+                                    b.extend(encode_sleb128(b_val));
+                                }
+                                emit_wasm_set_dest(b, ins.dest_reg);
+                                handled = true;
+                            }
+                        } else {
+                            // Dynamic index IGET on @PACK5 TritVec or Bytes in Wasm AOT:
+                            b.extend_from_slice(&[0x42, 0x00]); // acc = 0
+                            for k in 0..*n_len {
+                                if *is_tv {
+                                    emit_extract_pack5_trit_wasm(b, &ins.operands[0], k);
+                                } else {
+                                    let b_val = bytes.get(k).copied().unwrap_or(0) as i64;
+                                    b.push(0x42);
+                                    b.extend(encode_sleb128(b_val));
+                                }
+                                emit_wasm_op(b, idx_op);
                                 b.push(0x42);
-                                b.extend(encode_sleb128(b_val));
+                                b.extend(encode_sleb128(k as i64));
+                                b.extend_from_slice(&[0x51, 0xAD, 0x7E, 0x7C]); // i64.eq, i64.extend_i32_u, i64.mul, i64.add
                             }
                             emit_wasm_set_dest(b, ins.dest_reg);
                             handled = true;

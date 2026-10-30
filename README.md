@@ -4,8 +4,8 @@ Zero-dependency Rust implementation of the **Omni** 16-bit binary token ISA (`0x
 
 ## Repository Layout
 
-- [`omni_rust_bootstrap.rs`](./omni_rust_bootstrap.rs) — Standalone single-file reference monolith (`193` self-test checks).
-- [`omni-workspace/omni-workspace/`](./omni-workspace/omni-workspace/) — 8-crate Cargo workspace (`154` monolith-vs-workspace differential checks):
+- [`omni_rust_bootstrap.rs`](./omni_rust_bootstrap.rs) — Standalone single-file reference monolith (`196` self-test checks).
+- [`omni-workspace/omni-workspace/`](./omni-workspace/omni-workspace/) — 8-crate Cargo workspace (`157` monolith-vs-workspace differential checks):
   - `crates/omni-isa` — 128-opcode table (`0x7F00..=0x7F7F`), token ranges, zero-allocation `@PACK5` (`5 trits/byte`) codec & direct ops, FNV-1a64 hashing.
   - `crates/omni-ir` — Binary token stream decoder (`decode_omni_token_stream`) and IR types.
   - `crates/omni-verifier` — Static capability bitmask, linear ownership/borrow/arena state machine, SSA, and `@UNTRUSTED` taint verifier (`verify_binary_function`, `verify_u16_stream`).

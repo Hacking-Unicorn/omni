@@ -919,11 +919,19 @@ struct SurfaceLowerCtx {
     next_lbl: u16,
     defined_labels: Vec<u16>,
     used_labels: Vec<(u16, usize, usize)>,
+    ret_ty_tok: u16,
+    emit_asm: bool,
     lines: Vec<String>,
+    packets: Vec<Vec<u16>>,
 }
 
 impl SurfaceLowerCtx {
-    fn new(params: &[SurfaceParam], fn_sigs: BTreeMap<String, (u16, usize, String)>) -> Self {
+    fn new(
+        params: &[SurfaceParam],
+        fn_sigs: BTreeMap<String, (u16, usize, String)>,
+        ret_ty_tok: u16,
+        emit_asm: bool,
+    ) -> Self {
         let mut var_map = BTreeMap::new();
         for (idx, p) in params.iter().enumerate() {
             var_map.insert(p.name.clone(), format!("${}", idx));
@@ -935,8 +943,21 @@ impl SurfaceLowerCtx {
             next_lbl: 1,
             defined_labels: Vec::new(),
             used_labels: Vec::new(),
+            ret_ty_tok,
+            emit_asm,
             lines: Vec::new(),
+            packets: Vec::new(),
         }
+    }
+
+    fn emit(&mut self, line: String) -> Result<(), String> {
+        if self.emit_asm {
+            self.lines.push(line);
+        } else {
+            let pkt = encode_asm_ins_packet_u16(&line, self.ret_ty_tok)?;
+            self.packets.push(pkt);
+        }
+        Ok(())
     }
 
     fn alloc_reg(&mut self, line: usize, col: usize) -> Result<String, String> {
@@ -987,10 +1008,10 @@ impl SurfaceLowerCtx {
         } else {
             self.alloc_reg(line, col)?
         };
-        self.lines.push(format!("{} = ANEW 0", r_bytes));
+        self.emit(format!("{} = ANEW 0", r_bytes))?;
         for chunk in packed_bytes.chunks(24) {
             let byte_strs: Vec<String> = chunk.iter().map(|b| b.to_string()).collect();
-            self.lines.push(format!("{} = ISET {} {}", r_bytes, r_bytes, byte_strs.join(" ")));
+            self.emit(format!("{} = ISET {} {}", r_bytes, r_bytes, byte_strs.join(" ")))?;
         }
         if !unpack_to_tvec {
             return Ok(r_bytes);
@@ -999,7 +1020,7 @@ impl SurfaceLowerCtx {
             Some(r) => String::from(r),
             None => self.alloc_reg(line, col)?,
         };
-        self.lines.push(format!("{} = UNPACK5 {} {}", dst, r_bytes, trits.len()));
+        self.emit(format!("{} = UNPACK5 {} {}", dst, r_bytes, trits.len()))?;
         Ok(dst)
     }
 
@@ -1197,7 +1218,7 @@ impl SurfaceLowerCtx {
                     Some(r) => String::from(r),
                     None => self.alloc_reg(*line, *col)?,
                 };
-                self.lines.push(format!("{} = CINT {}", dst, v));
+                self.emit(format!("{} = CINT {}", dst, v))?;
                 Ok(dst)
             }
             SurfaceExpr::Trit(s, _, line, col) => {
@@ -1205,7 +1226,7 @@ impl SurfaceLowerCtx {
                     Some(r) => String::from(r),
                     None => self.alloc_reg(*line, *col)?,
                 };
-                self.lines.push(format!("{} = CTRIT {}", dst, s));
+                self.emit(format!("{} = CTRIT {}", dst, s))?;
                 Ok(dst)
             }
             SurfaceExpr::TritVecLit(trits, line, col) => {
@@ -1220,7 +1241,7 @@ impl SurfaceLowerCtx {
                 for &b in s.as_bytes() {
                     hex_str.push_str(&format!("{:02x}", b));
                 }
-                self.lines.push(format!("{} = CSTR@UNTRUSTED @str:{}", dst, hex_str));
+                self.emit(format!("{} = CSTR@UNTRUSTED @str:{}", dst, hex_str))?;
                 Ok(dst)
             }
             SurfaceExpr::Var(v, line, col) => {
@@ -1233,7 +1254,7 @@ impl SurfaceLowerCtx {
                     Some(r) => String::from(r),
                     None => self.alloc_reg(*line, *col)?,
                 };
-                self.lines.push(format!("{} = CINT {}", dst, src));
+                self.emit(format!("{} = CINT {}", dst, src))?;
                 Ok(dst)
             }
             SurfaceExpr::UnOp(mnem, sub, line, col) => {
@@ -1242,7 +1263,7 @@ impl SurfaceLowerCtx {
                     Some(r) => String::from(r),
                     None => self.alloc_reg(*line, *col)?,
                 };
-                self.lines.push(format!("{} = {} {}", dst, mnem, op_s));
+                self.emit(format!("{} = {} {}", dst, mnem, op_s))?;
                 Ok(dst)
             }
             SurfaceExpr::BinOp(mnem, lhs, rhs, line, col) => {
@@ -1252,7 +1273,7 @@ impl SurfaceLowerCtx {
                     Some(r) => String::from(r),
                     None => self.alloc_reg(*line, *col)?,
                 };
-                self.lines.push(format!("{} = {} {} {}", dst, mnem, l_op, r_op));
+                self.emit(format!("{} = {} {} {}", dst, mnem, l_op, r_op))?;
                 Ok(dst)
             }
             SurfaceExpr::Call(name, args, line, col) => {
@@ -1277,7 +1298,7 @@ impl SurfaceLowerCtx {
                     Some(r) => String::from(r),
                     None => self.alloc_reg(*line, *col)?,
                 };
-                self.lines.push(format!("{} = {}", dst, rhs));
+                self.emit(format!("{} = {}", dst, rhs))?;
                 Ok(dst)
             }
             SurfaceExpr::IfBranch(br_mnem, cond_expr, then_blk, else_blk, line, col) => {
@@ -1287,24 +1308,36 @@ impl SurfaceLowerCtx {
                     None => self.alloc_reg(*line, *col)?,
                 };
                 let l_then = self.alloc_lbl(*line, *col)?;
-                self.lines.push(format!("{} {} {}", br_mnem, cond_op, l_then));
+                self.emit(format!("{} {} {}", br_mnem, cond_op, l_then))?;
                 let saved_vars = self.var_map.clone();
                 self.lower_block_into_target(else_blk, &dst, false, *line, *col)?;
                 self.var_map = saved_vars.clone();
-                let jmp_placeholder_idx = self.lines.len();
-                self.lines.push(String::from("JMP __JOIN__"));
-                self.lines.push(format!("LABEL {}", l_then));
+                let jmp_placeholder_idx = if self.emit_asm { self.lines.len() } else { self.packets.len() };
+                if self.emit_asm {
+                    self.lines.push(String::from("JMP __JOIN__"));
+                } else {
+                    self.packets.push(vec![0x7F41, 0xFFFF, TOK_INS_END]);
+                }
+                self.emit(format!("LABEL {}", l_then))?;
                 self.lower_block_into_target(then_blk, &dst, true, *line, *col)?;
                 self.var_map = saved_vars;
                 if !has_shared_join {
                     let l_join = self.alloc_lbl(*line, *col)?;
-                    let join_str = l_join.to_string();
-                    for l_str in &mut self.lines[jmp_placeholder_idx..] {
-                        if l_str.contains("__JOIN__") {
-                            *l_str = l_str.replace("__JOIN__", &join_str);
+                    if self.emit_asm {
+                        let join_str = l_join.to_string();
+                        for l_str in &mut self.lines[jmp_placeholder_idx..] {
+                            if l_str.contains("__JOIN__") {
+                                *l_str = l_str.replace("__JOIN__", &join_str);
+                            }
+                        }
+                    } else {
+                        for pkt in &mut self.packets[jmp_placeholder_idx..] {
+                            if pkt.len() >= 2 && pkt[0] == 0x7F41 && pkt[1] == 0xFFFF {
+                                pkt[1] = LBL_BASE + l_join;
+                            }
                         }
                     }
-                    self.lines.push(format!("LABEL {}", l_join));
+                    self.emit(format!("LABEL {}", l_join))?;
                 }
                 Ok(dst)
             }
@@ -1318,20 +1351,20 @@ impl SurfaceLowerCtx {
                 let l_zero = self.alloc_lbl(*line, *col)?;
                 let l_pos = self.alloc_lbl(*line, *col)?;
                 let l_join = self.alloc_lbl(*line, *col)?;
-                self.lines.push(format!("BR_TRIT {} {} {} {}", cond_op, l_neg, l_zero, l_pos));
+                self.emit(format!("BR_TRIT {} {} {} {}", cond_op, l_neg, l_zero, l_pos))?;
                 let saved_vars = self.var_map.clone();
-                self.lines.push(format!("LABEL {}", l_neg));
+                self.emit(format!("LABEL {}", l_neg))?;
                 self.lower_block_into_target(neg_blk, &dst, false, *line, *col)?;
                 self.var_map = saved_vars.clone();
-                self.lines.push(format!("JMP {}", l_join));
-                self.lines.push(format!("LABEL {}", l_zero));
+                self.emit(format!("JMP {}", l_join))?;
+                self.emit(format!("LABEL {}", l_zero))?;
                 self.lower_block_into_target(zero_blk, &dst, false, *line, *col)?;
                 self.var_map = saved_vars.clone();
-                self.lines.push(format!("JMP {}", l_join));
-                self.lines.push(format!("LABEL {}", l_pos));
+                self.emit(format!("JMP {}", l_join))?;
+                self.emit(format!("LABEL {}", l_pos))?;
                 self.lower_block_into_target(pos_blk, &dst, false, *line, *col)?;
                 self.var_map = saved_vars;
-                self.lines.push(format!("LABEL {}", l_join));
+                self.emit(format!("LABEL {}", l_join))?;
                 Ok(dst)
             }
         }
@@ -1361,12 +1394,12 @@ impl SurfaceLowerCtx {
                     return Err(format!("line {}, col {}: Empty do_while loop body", line, col));
                 }
                 let l_top = self.alloc_lbl(*line, *col)?;
-                self.lines.push(format!("LABEL {}", l_top));
+                self.emit(format!("LABEL {}", l_top))?;
                 for s in body {
                     self.lower_stmt(s)?;
                 }
                 let cond_op = self.eval_to_operand(cond_expr)?;
-                self.lines.push(format!("BR_POS {} {}", cond_op, l_top));
+                self.emit(format!("BR_POS {} {}", cond_op, l_top))?;
                 Ok(())
             }
             SurfaceStmt::While(cond_expr, body, line, col) => {
@@ -1376,31 +1409,31 @@ impl SurfaceLowerCtx {
                 let l_top = self.alloc_lbl(*line, *col)?;
                 let l_body = self.alloc_lbl(*line, *col)?;
                 let l_exit = self.alloc_lbl(*line, *col)?;
-                self.lines.push(format!("LABEL {}", l_top));
+                self.emit(format!("LABEL {}", l_top))?;
                 let cond_op = self.eval_to_operand(cond_expr)?;
-                self.lines.push(format!("BR_POS {} {}", cond_op, l_body));
-                self.lines.push(format!("JMP {}", l_exit));
-                self.lines.push(format!("LABEL {}", l_body));
+                self.emit(format!("BR_POS {} {}", cond_op, l_body))?;
+                self.emit(format!("JMP {}", l_exit))?;
+                self.emit(format!("LABEL {}", l_body))?;
                 for s in body {
                     self.lower_stmt(s)?;
                 }
-                self.lines.push(format!("JMP {}", l_top));
-                self.lines.push(format!("LABEL {}", l_exit));
+                self.emit(format!("JMP {}", l_top))?;
+                self.emit(format!("LABEL {}", l_exit))?;
                 Ok(())
             }
             SurfaceStmt::Label(lid, _line, _col) => {
                 self.defined_labels.push(*lid);
-                self.lines.push(format!("LABEL {}", lid));
+                self.emit(format!("LABEL {}", lid))?;
                 Ok(())
             }
             SurfaceStmt::Goto(lid, line, col) => {
                 self.used_labels.push((*lid, *line, *col));
-                self.lines.push(format!("JMP {}", lid));
+                self.emit(format!("JMP {}", lid))?;
                 Ok(())
             }
             SurfaceStmt::Ret(expr, _line, _col) => {
                 let op = self.eval_to_operand(expr)?;
-                self.lines.push(format!("RET {}", op));
+                self.emit(format!("RET {}", op))?;
                 Ok(())
             }
             SurfaceStmt::Expr(expr, line, col) => {
@@ -1416,7 +1449,7 @@ impl SurfaceLowerCtx {
                                 return Err(format!("line {}, col {}: Branch label {} out of range 0..=15", ll, lc, lid));
                             }
                             self.used_labels.push((lid as u16, ll, lc));
-                            self.lines.push(format!("{} {} {}", low.to_ascii_uppercase(), c_op, lid));
+                            self.emit(format!("{} {} {}", low.to_ascii_uppercase(), c_op, lid))?;
                             return Ok(());
                         } else {
                             return Err(format!("line {}, col {}: '{}' target must be an integer label id", cl, cc, cname));
@@ -1438,14 +1471,14 @@ impl SurfaceLowerCtx {
                                 return Err(format!("line {}, col {}: 'br_trit' targets must be integer label ids", cl, cc));
                             }
                         }
-                        self.lines.push(format!("BR_TRIT {} {}", c_op, lids.join(" ")));
+                        self.emit(format!("BR_TRIT {} {}", c_op, lids.join(" ")))?;
                         return Ok(());
                     } else if low == "drop" {
                         let mut ops = Vec::with_capacity(args.len());
                         for a in args {
                             ops.push(self.eval_to_operand(a)?);
                         }
-                        self.lines.push(format!("DROP {}", ops.join(" ")));
+                        self.emit(format!("DROP {}", ops.join(" ")))?;
                         return Ok(());
                     }
                 }
@@ -1577,9 +1610,11 @@ pub fn compile_omni_surface_to_asm(src: &str) -> Result<String, String> {
             let taint_str = if p.untrusted { "UNTRUSTED" } else { "SAFE" };
             out.push(format!("PARAM ${} {} {}", p_idx, ty_str, taint_str));
         }
-        out.push(format!("RET_TY {}", map_omni_surface_type(&f.ret_ty, f.ret_line, f.ret_col)?));
+        let ret_ty_str = map_omni_surface_type(&f.ret_ty, f.ret_line, f.ret_col)?;
+        let ret_ty_tok = parse_asm_ty_tok(ret_ty_str);
+        out.push(format!("RET_TY {}", ret_ty_str));
 
-        let mut ctx = SurfaceLowerCtx::new(&f.params, fn_sigs.clone());
+        let mut ctx = SurfaceLowerCtx::new(&f.params, fn_sigs.clone(), ret_ty_tok, true);
         for stmt in &f.body {
             ctx.lower_stmt(stmt)?;
         }
@@ -1639,16 +1674,12 @@ pub fn compile_omni_surface_to_u16(src: &str) -> Result<Vec<u16>, String> {
         let ret_ty_str = map_omni_surface_type(&f.ret_ty, f.ret_line, f.ret_col)?;
         let ret_ty_tok = parse_asm_ty_tok(ret_ty_str);
 
-        let mut ctx = SurfaceLowerCtx::new(&f.params, fn_sigs.clone());
+        let mut ctx = SurfaceLowerCtx::new(&f.params, fn_sigs.clone(), ret_ty_tok, false);
         for stmt in &f.body {
             ctx.lower_stmt(stmt)?;
         }
         ctx.check_unresolved_labels()?;
-        let mut ins_packets = Vec::with_capacity(ctx.lines.len());
-        for pkt in &ctx.lines {
-            ins_packets.push(encode_asm_ins_packet_u16(pkt, ret_ty_tok)?);
-        }
-        completed_fns.push((fid, params, ret_ty_tok, f.cap_mask, ins_packets));
+        completed_fns.push((fid, params, ret_ty_tok, f.cap_mask, ctx.packets));
     }
 
     if completed_fns.len() == 1 {
@@ -1683,9 +1714,14 @@ pub fn extract_omni_surface_budgets(src: &str) -> (Option<u64>, Option<usize>) {
         return (None, None);
     };
     let mut parser = SurfaceParser::new(tokens);
-    let Ok((_includes, fns)) = parser.parse_module() else {
+    let Ok((includes, fns)) = parser.parse_module() else {
         return (None, None);
     };
+    if !includes.is_empty() {
+        if let Ok(expanded) = resolve_omni_surface_includes(src, None, None) {
+            return extract_omni_surface_budgets(&expanded);
+        }
+    }
     let mut step_b: Option<u64> = None;
     let mut mem_b: Option<usize> = None;
     for f in fns {
@@ -1868,7 +1904,11 @@ pub fn execute_omni_surface_program_with_budgets(
         (None, None) => None,
     };
     let u16_stream = compile_omni_surface_to_u16(&wrapped)?;
-    let _ = verify_u16_stream(&u16_stream)?;
+    for rep in verify_u16_stream(&u16_stream)? {
+        if !rep.passed {
+            return Err(format!("Static verification failed on fn #{}: {:?}", rep.fn_idx, rep.errors));
+        }
+    }
     let module = decode_omni_token_stream(&u16_stream)?;
     let entry_fn_idx = if module.functions.iter().any(|f| f.fn_idx == 0) {
         0
@@ -1897,7 +1937,11 @@ pub fn execute_omni_surface_aot_first(
     let wrapped = wrap_omni_surface_snippet(src);
     let (attr_steps, attr_mem) = extract_omni_surface_budgets(&wrapped);
     let u16_stream = compile_omni_surface_to_u16(&wrapped)?;
-    let _ = verify_u16_stream(&u16_stream)?;
+    for rep in verify_u16_stream(&u16_stream)? {
+        if !rep.passed {
+            return Err(format!("Static verification failed on fn #{}: {:?}", rep.fn_idx, rep.errors));
+        }
+    }
     let module = decode_omni_token_stream(&u16_stream)?;
     for func in &module.functions {
         let rep = verify_binary_function(func);
@@ -1986,7 +2030,20 @@ pub fn compile_omni_surface_via_stage1_to_elf(
 ) -> Result<Vec<u8>, String> {
     let wrapped = wrap_omni_surface_snippet(src);
     let u16_stream = compile_omni_surface_to_u16(&wrapped)?;
-    let _ = verify_u16_stream(&u16_stream)?;
+    for rep in verify_u16_stream(&u16_stream)? {
+        if !rep.passed {
+            return Err(format!("Static verification failed on fn #{}: {:?}", rep.fn_idx, rep.errors));
+        }
+    }
+    let module = decode_omni_token_stream(&u16_stream)?;
+    if module.functions.len() != 1 {
+        return Err(String::from("Stage-1 ELF64 emitter requires a single-function module"));
+    }
+    for ins in &module.functions[0].instructions {
+        if !is_x86_64_aot_supported_opcode(ins.op_tok) {
+            return Err(format!("Unsupported opcode 0x{:04X} in Stage-1 ELF64 emitter", ins.op_tok));
+        }
+    }
     let s1_stream = build_step7_stage1_compiler_stream();
     let s1_mod = decode_omni_token_stream(&s1_stream)?;
     let mut vm = OmniBinaryVm::new();
@@ -2029,13 +2086,30 @@ pub fn compile_omni_surface_to_wasm(src: &str) -> Result<Vec<u8>, String> {
 pub fn execute_omni_surface_wasm_i64(src: &str, args: &[i64]) -> Result<i64, String> {
     let wrapped = wrap_omni_surface_snippet(src);
     let (attr_steps, attr_mem) = extract_omni_surface_budgets(&wrapped);
-    let wasm = compile_omni_surface_to_wasm(&wrapped)?;
-    execute_wasm_module_i64_with_budgets(
-        &wasm,
-        args,
-        attr_steps.unwrap_or(DEFAULT_WASM_STEP_LIMIT),
-        attr_mem.unwrap_or(DEFAULT_WASM_MEMORY_BUDGET_BYTES),
-    )
+    let step_b = attr_steps.unwrap_or(DEFAULT_WASM_STEP_LIMIT);
+    let mem_b = attr_mem.unwrap_or(DEFAULT_WASM_MEMORY_BUDGET_BYTES);
+    let u16_stream = compile_omni_surface_to_u16(&wrapped)?;
+    let module = decode_omni_token_stream(&u16_stream)?;
+    let mut static_alloc_bytes = 0usize;
+    for func in &module.functions {
+        for ins in &func.instructions {
+            if ins.op_tok == 0x7F01 {
+                if let Some(BinOperand::ImmInt(cap)) = ins.operands.first() {
+                    if *cap > 0 {
+                        static_alloc_bytes = static_alloc_bytes.saturating_add(*cap as usize);
+                    }
+                }
+            }
+        }
+    }
+    if static_alloc_bytes > mem_b {
+        return Err(format!(
+            "AOT memory budget exceeded ({} > {} bytes)",
+            static_alloc_bytes, mem_b
+        ));
+    }
+    let wasm = compile_pure_u16_to_wasm(&u16_stream)?;
+    execute_wasm_module_i64_with_budgets(&wasm, args, step_b, mem_b)
 }
 
 

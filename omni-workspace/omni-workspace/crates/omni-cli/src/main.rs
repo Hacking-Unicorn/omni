@@ -796,6 +796,70 @@ pub fn run_workspace_selftest() -> Result<usize, String> {
     }
     checks += 1;
 
+    // 6p. Deep Audit Regressions: 50-Trit (>35) @PACK5 + Dynamic Loop IGET in AOT, Sentinel 243..=255 Rejection, & Uncalled Helper Verification
+    let surf_pack5_50 = "
+        #[cap(AI)]
+        fn pack5_50_dynamic_golden(limit: i64) -> i64 {
+            let v = [
+                +1t, -1t, 0t, +1t, +1t, -1t, 0t, -1t, +1t, +1t,
+                +1t, -1t, 0t, +1t, +1t, -1t, 0t, -1t, +1t, +1t,
+                +1t, -1t, 0t, +1t, +1t, -1t, 0t, -1t, +1t, +1t,
+                +1t, -1t, 0t, +1t, +1t, -1t, 0t, -1t, +1t, +1t,
+                +1t, -1t, 0t, +1t, +1t, -1t, 0t, -1t, +1t, +1t
+            ];
+            let dot = tdot(v, v);
+            let gate = egate(v);
+            let acc = 0;
+            let idx = 0;
+            while idx < limit {
+                acc += iget(v, idx);
+                idx += 1;
+            }
+            return dot * 100 + acc * 10 + gate;
+        }
+    ";
+    let (v_50, b_50) = execute_omni_surface_aot_first(surf_pack5_50, vec![OmniValue::Int(50)])?;
+    let vm_50 = execute_omni_surface_program_with_budgets(surf_pack5_50, vec![OmniValue::Int(50)], None, None)?;
+    let m_elf_50 = monolith::compile_omni_surface_to_x86_64_elf(surf_pack5_50, 50, 0, 0)?;
+    let w_elf_50 = compile_omni_surface_to_x86_64_elf(surf_pack5_50, 50, 0, 0)?;
+    if b_50 != "aot" || v_50 != OmniValue::Int(4101) || vm_50 != OmniValue::Int(4101) || m_elf_50 != w_elf_50 {
+        return Err("50-trit (>35) @PACK5 + dynamic loop IGET AOT/VM differential mismatch".into());
+    }
+
+    let corrupt_pack5_asm = "
+        CAP_MASK 1
+        RET_TY I64
+        %0 = ANEW 0
+        %0 = ISET %0 250
+        %1 = UNPACK5 %0 5
+        %2 = EGATE %1
+        RET %2
+    ";
+    let corrupt_u16 = assemble_omni_text_to_u16(corrupt_pack5_asm)?;
+    let corrupt_mod = decode_omni_token_stream(&corrupt_u16)?;
+    let mut c_vm = OmniBinaryVm::new();
+    if compile_pure_u16_to_wasm(&corrupt_u16).is_ok()
+        || compile_pure_u16_to_x86_64_elf_with_args(&corrupt_u16, 0, 0, 0).is_ok()
+        || c_vm.execute_function(&corrupt_mod, 0, vec![]).is_ok()
+    {
+        return Err("Corrupt @PACK5 sentinel byte (250 > 242) was not rejected across AOT and VM".into());
+    }
+
+    let uncalled_tainted_helper = "
+        fn bad_helper(u: i64 @untrusted) -> i64 {
+            return u;
+        }
+        fn main(x: i64) -> i64 {
+            return x + 1;
+        }
+    ";
+    if execute_omni_surface_program_with_budgets(uncalled_tainted_helper, vec![OmniValue::Int(5)], None, None).is_ok()
+        || execute_omni_surface_program(uncalled_tainted_helper, vec![OmniValue::Int(5)]).is_ok()
+    {
+        return Err("Uncalled helper function with taint violation was not rejected before execution".into());
+    }
+    checks += 3;
+
     // 7. Stage-1 == Stage-2 Self-Compilation Fixed Point
     #[cfg(all(unix, target_arch = "x86_64"))]
     {
@@ -892,16 +956,6 @@ fn main() {
             }
             "run-wasm" if args.len() >= 3 => {
                 let path = &args[2];
-                let wasm_bytes = if path.ends_with(".wasm") {
-                    fs::read(path).expect("Failed to read .wasm")
-                } else if path.ends_with(".omni") {
-                    let u16s = compile_omni_surface_file_to_u16(path).expect("Surface compilation failed");
-                    compile_pure_u16_to_wasm(&u16s).expect("WebAssembly AOT compilation failed")
-                } else {
-                    let raw = fs::read(path).expect("Failed to read .omni_bc");
-                    let u16s = decode_bytes_to_u16_stream(&raw);
-                    compile_pure_u16_to_wasm(&u16s).expect("WebAssembly AOT compilation failed")
-                };
                 let i64_args: Vec<i64> = args[3..]
                     .iter()
                     .map(|s| match parse_cli_omni_value(s) {
@@ -910,6 +964,22 @@ fn main() {
                         _ => 0,
                     })
                     .collect();
+                if path.ends_with(".omni") {
+                    let raw_src = fs::read_to_string(path).expect("Failed to read .omni surface file");
+                    let parent_dir = std::path::Path::new(path).parent();
+                    let merged = resolve_omni_surface_includes(&raw_src, parent_dir, None)
+                        .expect("Failed to resolve .omni surface file");
+                    let res = execute_omni_surface_wasm_i64(&merged, &i64_args).expect("Wasm execution failed");
+                    println!("{}", res);
+                    return;
+                }
+                let wasm_bytes = if path.ends_with(".wasm") {
+                    fs::read(path).expect("Failed to read .wasm")
+                } else {
+                    let raw = fs::read(path).expect("Failed to read .omni_bc");
+                    let u16s = decode_bytes_to_u16_stream(&raw);
+                    compile_pure_u16_to_wasm(&u16s).expect("WebAssembly AOT compilation failed")
+                };
                 let res = execute_wasm_module_i64(&wasm_bytes, &i64_args).expect("Wasm execution failed");
                 println!("{}", res);
                 return;

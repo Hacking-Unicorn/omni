@@ -269,7 +269,7 @@ impl OmniBinaryVm {
                         }
                         (OmniValue::TritVec(tv), OmniValue::Int(i)) if i >= 0 && (i as usize) < tv.len() => {
                             let packed = pack5_encode(&tv);
-                            OmniValue::Int(pack5_get_trit(&packed, i as usize).unwrap_or(0) as i64)
+                            OmniValue::Int(pack5_get_trit(&packed, i as usize).map_err(String::from)? as i64)
                         }
                         _ => OmniValue::Int(0),
                     }
@@ -369,7 +369,7 @@ impl OmniBinaryVm {
                     if let (OmniValue::Bytes(b), Some(len)) = (Self::eval_op(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) {
                         let n = len.max(0) as usize;
                         self.charge_memory(pack5_byte_len(n))?;
-                        OmniValue::TritVec(pack5_decode(&b, n).unwrap_or_default())
+                        OmniValue::TritVec(pack5_decode(&b, n).map_err(String::from)?)
                     } else { OmniValue::TritVec(Vec::new()) }
                 }
                 0x7F34 => {
@@ -381,13 +381,23 @@ impl OmniBinaryVm {
                                 .and_then(|op| Self::eval_as_i64(op, &regs))
                                 .map(|n| n.max(0) as usize)
                                 .unwrap_or(pa.len().min(pb.len()) * 5);
-                            OmniValue::Int(pack5_tdot_direct(&pa, &pb, n_trits).unwrap_or(0))
+                            OmniValue::Int(pack5_tdot_direct(&pa, &pb, n_trits).map_err(String::from)?)
                         }
                         (OmniValue::TritVec(a), OmniValue::TritVec(b)) => {
                             let pa = pack5_encode(&a);
                             let pb = pack5_encode(&b);
                             let n_trits = a.len().min(b.len());
-                            OmniValue::Int(pack5_tdot_direct(&pa, &pb, n_trits).unwrap_or(0))
+                            OmniValue::Int(pack5_tdot_direct(&pa, &pb, n_trits).map_err(String::from)?)
+                        }
+                        (OmniValue::Bytes(pa), OmniValue::TritVec(b)) => {
+                            let pb = pack5_encode(&b);
+                            let n_trits = (pa.len() * 5).min(b.len());
+                            OmniValue::Int(pack5_tdot_direct(&pa, &pb, n_trits).map_err(String::from)?)
+                        }
+                        (OmniValue::TritVec(a), OmniValue::Bytes(pb)) => {
+                            let pa = pack5_encode(&a);
+                            let n_trits = a.len().min(pb.len() * 5);
+                            OmniValue::Int(pack5_tdot_direct(&pa, &pb, n_trits).map_err(String::from)?)
                         }
                         _ => OmniValue::Int(0),
                     }
@@ -396,7 +406,7 @@ impl OmniBinaryVm {
                     let sum_i64: i64 = match Self::eval_op(&ins.operands[0], &regs) {
                         OmniValue::TritVec(tv) => {
                             let packed = pack5_encode(&tv);
-                            pack5_sum_direct(&packed, tv.len()).unwrap_or(0)
+                            pack5_sum_direct(&packed, tv.len()).map_err(String::from)?
                         }
                         OmniValue::Bytes(b) => {
                             let n_trits = ins
@@ -405,7 +415,7 @@ impl OmniBinaryVm {
                                 .and_then(|op| Self::eval_as_i64(op, &regs))
                                 .map(|n| n.max(0) as usize)
                                 .unwrap_or(b.len() * 5);
-                            pack5_sum_direct(&b, n_trits).unwrap_or(0)
+                            pack5_sum_direct(&b, n_trits).map_err(String::from)?
                         }
                         OmniValue::Int(v) => v,
                         OmniValue::Trit(t) => t as i64,

@@ -33,7 +33,7 @@ Reproducible command:
 rustc -O omni_rust_bootstrap.rs -o omni && ./omni selftest
 ```
 
-Verified coverage (`193` non-vacuous checks = `148` core bootstrap checks + `45` `omni-lang` surface language & Phase 5 checks, `0` compiler warnings):
+Verified coverage (`196` non-vacuous checks = `148` core bootstrap checks + `48` `omni-lang` surface language, Phase 5 & deep-audit checks, `0` compiler warnings):
 - **Full Golden Differential (`OmniBinaryVm` == `Stage-1` == `x86-64` ELF == `execute_wasm_module_i64`)**: `compile_pure_u16_to_wasm` and `execute_wasm_module_i64` lower `LABEL (0x7F40)`, `JMP (0x7F41)`, `BR_TRIT (0x7F42)`, `BR_POS (0x7F43)`, `BR_NEG (0x7F44)`, `ANEW (0x7F0D)`, `IGET (0x7F0E)`, `ISET (0x7F0F)`, `SLEN (0x7F50)`, `ARENA (0x7F01)`, `DROP (0x7F05)`, `PACK5 (0x7F30)`, `UNPACK5 (0x7F31)`, `TDOT (0x7F34)`, `EGATE (0x7F35)`, and `TLOGIC (0x7F3F)` in addition to all numeric/bitwise/ternary opcodes. Every golden covered by the `x86-64` path is verified through `execute_wasm_module_i64` and `OmniBinaryVm` on both Windows and Linux.
 - **Explicit Standalone AOT Rejection (Check 6)**: Both `compile_pure_u16_to_x86_64_elf` and `compile_pure_u16_to_wasm` reject high-level VM-only runtime seeds (`1, 2, 3, 5, 7`) with `Err(...)`.
 
@@ -57,8 +57,8 @@ CARGO_INCREMENTAL=0 cargo build --workspace
 cargo run -p omni-cli -- selftest
 ```
 
-Verified workspace build & differential results (`154` checks on Windows, `155` checks on Linux `x86-64`, `0` compiler warnings):
-- **8-Crate Workspace (`omni-isa`, `omni-ir`, `omni-verifier`, `omni-vm`, `omni-assembler`, `omni-lang`, `omni-aot`, `omni-cli`)**: Compiles cleanly with zero external dependencies and runs `assert_verifier_clone_eq`, `assert_golden_monolith_vs_workspace`, all 64 corpus samples, and all 47 surface-language & Phase 5 differential checks against `mod monolith`.
+Verified workspace build & differential results (`157` checks on Windows, `158` checks on Linux `x86-64`, `0` compiler warnings):
+- **8-Crate Workspace (`omni-isa`, `omni-ir`, `omni-verifier`, `omni-vm`, `omni-assembler`, `omni-lang`, `omni-aot`, `omni-cli`)**: Compiles cleanly with zero external dependencies and runs `assert_verifier_clone_eq`, `assert_golden_monolith_vs_workspace`, all 64 corpus samples, and all 50 surface-language, Phase 5 & deep-audit differential checks against `mod monolith`.
 
 ## 4. Usable Omni Surface Language (`omni-lang`) — Properties & Goldens
 
@@ -81,7 +81,7 @@ cargo run -p omni-cli -- compile-wasm program.omni program.wasm
 cargo run -p omni-cli -- run-wasm program.omni 30 15
 ```
 
-Verified surface language properties & usability checks (`45` checks in Section `13` / `47` checks in `omni-cli`, `0` new opcodes):
+Verified surface language properties & usability checks (`48` checks in Section `13` / `50` checks in `omni-cli`, `0` new opcodes):
 
 | Surface Property / Feature | Lowering Mechanism (Existing Opcodes Only) | Verified Golden / Rejection Proof |
 |----------------------------|--------------------------------------------|-----------------------------------|
@@ -99,4 +99,5 @@ Verified surface language properties & usability checks (`45` checks in Section 
 | **12. Direct `@PACK5` Operations & `@PACK5` / `EGATE` AOT (`x86-64` ELF64 + Wasm)** | `pack5_tdot_direct`, `pack5_sum_direct`, `pack5_gate_direct`, `pack5_get_trit`, `pack5_set_trit`; AOT lowering of `0x7F30..=0x7F3F` | `pack5_direct_aot` (`2422`) and `pack5_direct_golden` (`281`) execute identically across `x86-64` ELF64 AOT, 64-bit WebAssembly AOT, and `OmniBinaryVm` |
 | **13. AOT-First Hot Numeric Dispatcher & Stage-1 `.omni` -> ELF64** | `execute_omni_surface_aot_first` (`is_module_aot_hot_path`) + `compile_omni_surface_via_stage1_to_elf` (`compile-stage1`) | Dispatches hot numeric/ternary/`@PACK5`/arena paths to AOT (`backend == "aot"`); Stage-1 ELF matches direct `x86-64` ELF64 bit-for-bit (`0` byte diff) |
 | **14. Explicit Step & Memory Budgets (`#[step_budget(N)]`, `#[mem_budget(N)]`)** | `OmniBinaryVm::charge_memory` across all allocating opcodes + `execute_wasm_module_i64_with_budgets` | Deterministically halts runaway loops (`#[step_budget(40)]` / `#[step_budget(150)]`) and oversized allocations (`#[mem_budget(16)]` / `#[mem_budget(256)]` / `#[mem_budget(512)]`) in both AOT and VM |
-| **15. Zero Long-Lived Intermediate IR (`compile_omni_surface_to_u16`)** | Direct AST -> `encode_asm_ins_packet_u16` -> `pack_fn_module` + direct `verify_u16_stream(&[u16])` | Emits `Vec<u16>` with zero intermediate `.omni_asm` string construction; 100% bit-identical to `assemble_omni_text_to_u16` across all 15 goldens and multi-function modules |
+| **15. Zero Long-Lived Intermediate IR (`compile_omni_surface_to_u16`)** | Direct AST -> `SurfaceLowerCtx.packets: Vec<Vec<u16>>` -> `pack_fn_module` + direct `verify_u16_stream(&[u16])` | Emits `Vec<u16>` packets on the fly with zero intermediate `.omni_asm` string retention; 100% bit-identical to `assemble_omni_text_to_u16` across all 15 goldens and multi-function modules |
+| **16. Unbounded `@PACK5` Vectors (`> 35` Trits), Dynamic `IGET` & Corrupt Sentinel (`243..=255`) Rejection** | Direct byte-lane `@PACK5` extraction + branchless dynamic `IGET` in AOT (`x86-64` & Wasm) + `validate_func_pack5_ops` | `pack5_50_dynamic_golden(50) == 4101` (50 trits = 10 packed bytes + dynamic loop `iget(v, idx)`) matches across `x86-64` ELF64 AOT, 64-bit WebAssembly AOT, and `OmniBinaryVm`; corrupt byte `250 > 242` and uncalled tainted helpers are deterministically rejected across AOT and VM |

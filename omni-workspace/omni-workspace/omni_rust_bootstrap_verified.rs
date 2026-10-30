@@ -1284,7 +1284,7 @@ impl OmniBinaryVm {
                         }
                         (OmniValue::TritVec(tv), OmniValue::Int(i)) if i >= 0 && (i as usize) < tv.len() => {
                             let packed = pack5_encode(&tv);
-                            OmniValue::Int(pack5_get_trit(&packed, i as usize).unwrap_or(0) as i64)
+                            OmniValue::Int(pack5_get_trit(&packed, i as usize).map_err(String::from)? as i64)
                         }
                         _ => OmniValue::Int(0),
                     }
@@ -1391,26 +1391,26 @@ impl OmniBinaryVm {
                     if let (OmniValue::Bytes(b), Some(len)) = (Self::eval_op(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) {
                         let n_trits = len.max(0) as usize;
                         self.charge_memory(pack5_byte_len(n_trits))?;
-                        OmniValue::TritVec(pack5_decode(&b, n_trits).unwrap_or_default())
+                        OmniValue::TritVec(pack5_decode(&b, n_trits).map_err(String::from)?)
                     } else { OmniValue::TritVec(Vec::new()) }
                 }
                 0x7F34 => match (Self::eval_op(&ins.operands[0], &regs), Self::eval_op(&ins.operands[1], &regs)) {
                     (OmniValue::Bytes(ba), OmniValue::Bytes(bb)) => {
                         let max_trits = ba.len().min(bb.len()) * 5;
-                        OmniValue::Int(pack5_tdot_direct(&ba, &bb, max_trits).unwrap_or(0))
+                        OmniValue::Int(pack5_tdot_direct(&ba, &bb, max_trits).map_err(String::from)?)
                     }
                     (OmniValue::TritVec(a), OmniValue::TritVec(b)) => {
                         let pa = pack5_encode(&a);
                         let pb = pack5_encode(&b);
-                        OmniValue::Int(pack5_tdot_direct(&pa, &pb, a.len().min(b.len())).unwrap_or(0))
+                        OmniValue::Int(pack5_tdot_direct(&pa, &pb, a.len().min(b.len())).map_err(String::from)?)
                     }
                     (OmniValue::Bytes(ba), OmniValue::TritVec(b)) => {
                         let pb = pack5_encode(&b);
-                        OmniValue::Int(pack5_tdot_direct(&ba, &pb, b.len()).unwrap_or(0))
+                        OmniValue::Int(pack5_tdot_direct(&ba, &pb, b.len()).map_err(String::from)?)
                     }
                     (OmniValue::TritVec(a), OmniValue::Bytes(bb)) => {
                         let pa = pack5_encode(&a);
-                        OmniValue::Int(pack5_tdot_direct(&pa, &bb, a.len()).unwrap_or(0))
+                        OmniValue::Int(pack5_tdot_direct(&pa, &bb, a.len()).map_err(String::from)?)
                     }
                     _ => OmniValue::Int(0),
                 },
@@ -1418,7 +1418,7 @@ impl OmniBinaryVm {
                     let sum_i64: i64 = match Self::eval_op(&ins.operands[0], &regs) {
                         OmniValue::TritVec(tv) => {
                             let packed = pack5_encode(&tv);
-                            pack5_sum_direct(&packed, tv.len()).unwrap_or(0)
+                            pack5_sum_direct(&packed, tv.len()).map_err(String::from)?
                         }
                         OmniValue::Bytes(b) => {
                             let n_trits = ins
@@ -1427,7 +1427,7 @@ impl OmniBinaryVm {
                                 .and_then(|op| Self::eval_as_i64(op, &regs))
                                 .map(|n| n.max(0) as usize)
                                 .unwrap_or(b.len() * 5);
-                            pack5_sum_direct(&b, n_trits).unwrap_or(0)
+                            pack5_sum_direct(&b, n_trits).map_err(String::from)?
                         }
                         OmniValue::Int(v) => v,
                         OmniValue::Trit(t) => t as i64,
@@ -2781,11 +2781,19 @@ struct SurfaceLowerCtx {
     next_lbl: u16,
     defined_labels: Vec<u16>,
     used_labels: Vec<(u16, usize, usize)>,
+    ret_ty_tok: u16,
+    emit_asm: bool,
     lines: Vec<String>,
+    packets: Vec<Vec<u16>>,
 }
 
 impl SurfaceLowerCtx {
-    fn new(params: &[SurfaceParam], fn_sigs: BTreeMap<String, (u16, usize, String)>) -> Self {
+    fn new(
+        params: &[SurfaceParam],
+        fn_sigs: BTreeMap<String, (u16, usize, String)>,
+        ret_ty_tok: u16,
+        emit_asm: bool,
+    ) -> Self {
         let mut var_map = BTreeMap::new();
         for (idx, p) in params.iter().enumerate() {
             var_map.insert(p.name.clone(), format!("${}", idx));
@@ -2797,8 +2805,21 @@ impl SurfaceLowerCtx {
             next_lbl: 1,
             defined_labels: Vec::new(),
             used_labels: Vec::new(),
+            ret_ty_tok,
+            emit_asm,
             lines: Vec::new(),
+            packets: Vec::new(),
         }
+    }
+
+    fn emit(&mut self, line: String) -> Result<(), String> {
+        if self.emit_asm {
+            self.lines.push(line);
+        } else {
+            let pkt = encode_asm_ins_packet_u16(&line, self.ret_ty_tok)?;
+            self.packets.push(pkt);
+        }
+        Ok(())
     }
 
     fn alloc_reg(&mut self, line: usize, col: usize) -> Result<String, String> {
@@ -2849,10 +2870,10 @@ impl SurfaceLowerCtx {
         } else {
             self.alloc_reg(line, col)?
         };
-        self.lines.push(format!("{} = ANEW 0", r_bytes));
+        self.emit(format!("{} = ANEW 0", r_bytes))?;
         for chunk in packed_bytes.chunks(24) {
             let byte_strs: Vec<String> = chunk.iter().map(|b| b.to_string()).collect();
-            self.lines.push(format!("{} = ISET {} {}", r_bytes, r_bytes, byte_strs.join(" ")));
+            self.emit(format!("{} = ISET {} {}", r_bytes, r_bytes, byte_strs.join(" ")))?;
         }
         if !unpack_to_tvec {
             return Ok(r_bytes);
@@ -2861,7 +2882,7 @@ impl SurfaceLowerCtx {
             Some(r) => String::from(r),
             None => self.alloc_reg(line, col)?,
         };
-        self.lines.push(format!("{} = UNPACK5 {} {}", dst, r_bytes, trits.len()));
+        self.emit(format!("{} = UNPACK5 {} {}", dst, r_bytes, trits.len()))?;
         Ok(dst)
     }
 
@@ -3059,7 +3080,7 @@ impl SurfaceLowerCtx {
                     Some(r) => String::from(r),
                     None => self.alloc_reg(*line, *col)?,
                 };
-                self.lines.push(format!("{} = CINT {}", dst, v));
+                self.emit(format!("{} = CINT {}", dst, v))?;
                 Ok(dst)
             }
             SurfaceExpr::Trit(s, _, line, col) => {
@@ -3067,7 +3088,7 @@ impl SurfaceLowerCtx {
                     Some(r) => String::from(r),
                     None => self.alloc_reg(*line, *col)?,
                 };
-                self.lines.push(format!("{} = CTRIT {}", dst, s));
+                self.emit(format!("{} = CTRIT {}", dst, s))?;
                 Ok(dst)
             }
             SurfaceExpr::TritVecLit(trits, line, col) => {
@@ -3082,7 +3103,7 @@ impl SurfaceLowerCtx {
                 for &b in s.as_bytes() {
                     hex_str.push_str(&format!("{:02x}", b));
                 }
-                self.lines.push(format!("{} = CSTR@UNTRUSTED @str:{}", dst, hex_str));
+                self.emit(format!("{} = CSTR@UNTRUSTED @str:{}", dst, hex_str))?;
                 Ok(dst)
             }
             SurfaceExpr::Var(v, line, col) => {
@@ -3095,7 +3116,7 @@ impl SurfaceLowerCtx {
                     Some(r) => String::from(r),
                     None => self.alloc_reg(*line, *col)?,
                 };
-                self.lines.push(format!("{} = CINT {}", dst, src));
+                self.emit(format!("{} = CINT {}", dst, src))?;
                 Ok(dst)
             }
             SurfaceExpr::UnOp(mnem, sub, line, col) => {
@@ -3104,7 +3125,7 @@ impl SurfaceLowerCtx {
                     Some(r) => String::from(r),
                     None => self.alloc_reg(*line, *col)?,
                 };
-                self.lines.push(format!("{} = {} {}", dst, mnem, op_s));
+                self.emit(format!("{} = {} {}", dst, mnem, op_s))?;
                 Ok(dst)
             }
             SurfaceExpr::BinOp(mnem, lhs, rhs, line, col) => {
@@ -3114,7 +3135,7 @@ impl SurfaceLowerCtx {
                     Some(r) => String::from(r),
                     None => self.alloc_reg(*line, *col)?,
                 };
-                self.lines.push(format!("{} = {} {} {}", dst, mnem, l_op, r_op));
+                self.emit(format!("{} = {} {} {}", dst, mnem, l_op, r_op))?;
                 Ok(dst)
             }
             SurfaceExpr::Call(name, args, line, col) => {
@@ -3139,7 +3160,7 @@ impl SurfaceLowerCtx {
                     Some(r) => String::from(r),
                     None => self.alloc_reg(*line, *col)?,
                 };
-                self.lines.push(format!("{} = {}", dst, rhs));
+                self.emit(format!("{} = {}", dst, rhs))?;
                 Ok(dst)
             }
             SurfaceExpr::IfBranch(br_mnem, cond_expr, then_blk, else_blk, line, col) => {
@@ -3149,24 +3170,36 @@ impl SurfaceLowerCtx {
                     None => self.alloc_reg(*line, *col)?,
                 };
                 let l_then = self.alloc_lbl(*line, *col)?;
-                self.lines.push(format!("{} {} {}", br_mnem, cond_op, l_then));
+                self.emit(format!("{} {} {}", br_mnem, cond_op, l_then))?;
                 let saved_vars = self.var_map.clone();
                 self.lower_block_into_target(else_blk, &dst, false, *line, *col)?;
                 self.var_map = saved_vars.clone();
-                let jmp_placeholder_idx = self.lines.len();
-                self.lines.push(String::from("JMP __JOIN__"));
-                self.lines.push(format!("LABEL {}", l_then));
+                let jmp_placeholder_idx = if self.emit_asm { self.lines.len() } else { self.packets.len() };
+                if self.emit_asm {
+                    self.lines.push(String::from("JMP __JOIN__"));
+                } else {
+                    self.packets.push(vec![0x7F41, 0xFFFF, TOK_INS_END]);
+                }
+                self.emit(format!("LABEL {}", l_then))?;
                 self.lower_block_into_target(then_blk, &dst, true, *line, *col)?;
                 self.var_map = saved_vars;
                 if !has_shared_join {
                     let l_join = self.alloc_lbl(*line, *col)?;
-                    let join_str = l_join.to_string();
-                    for l_str in &mut self.lines[jmp_placeholder_idx..] {
-                        if l_str.contains("__JOIN__") {
-                            *l_str = l_str.replace("__JOIN__", &join_str);
+                    if self.emit_asm {
+                        let join_str = l_join.to_string();
+                        for l_str in &mut self.lines[jmp_placeholder_idx..] {
+                            if l_str.contains("__JOIN__") {
+                                *l_str = l_str.replace("__JOIN__", &join_str);
+                            }
+                        }
+                    } else {
+                        for pkt in &mut self.packets[jmp_placeholder_idx..] {
+                            if pkt.len() >= 2 && pkt[0] == 0x7F41 && pkt[1] == 0xFFFF {
+                                pkt[1] = LBL_BASE + l_join;
+                            }
                         }
                     }
-                    self.lines.push(format!("LABEL {}", l_join));
+                    self.emit(format!("LABEL {}", l_join))?;
                 }
                 Ok(dst)
             }
@@ -3180,20 +3213,20 @@ impl SurfaceLowerCtx {
                 let l_zero = self.alloc_lbl(*line, *col)?;
                 let l_pos = self.alloc_lbl(*line, *col)?;
                 let l_join = self.alloc_lbl(*line, *col)?;
-                self.lines.push(format!("BR_TRIT {} {} {} {}", cond_op, l_neg, l_zero, l_pos));
+                self.emit(format!("BR_TRIT {} {} {} {}", cond_op, l_neg, l_zero, l_pos))?;
                 let saved_vars = self.var_map.clone();
-                self.lines.push(format!("LABEL {}", l_neg));
+                self.emit(format!("LABEL {}", l_neg))?;
                 self.lower_block_into_target(neg_blk, &dst, false, *line, *col)?;
                 self.var_map = saved_vars.clone();
-                self.lines.push(format!("JMP {}", l_join));
-                self.lines.push(format!("LABEL {}", l_zero));
+                self.emit(format!("JMP {}", l_join))?;
+                self.emit(format!("LABEL {}", l_zero))?;
                 self.lower_block_into_target(zero_blk, &dst, false, *line, *col)?;
                 self.var_map = saved_vars.clone();
-                self.lines.push(format!("JMP {}", l_join));
-                self.lines.push(format!("LABEL {}", l_pos));
+                self.emit(format!("JMP {}", l_join))?;
+                self.emit(format!("LABEL {}", l_pos))?;
                 self.lower_block_into_target(pos_blk, &dst, false, *line, *col)?;
                 self.var_map = saved_vars;
-                self.lines.push(format!("LABEL {}", l_join));
+                self.emit(format!("LABEL {}", l_join))?;
                 Ok(dst)
             }
         }
@@ -3223,12 +3256,12 @@ impl SurfaceLowerCtx {
                     return Err(format!("line {}, col {}: Empty do_while loop body", line, col));
                 }
                 let l_top = self.alloc_lbl(*line, *col)?;
-                self.lines.push(format!("LABEL {}", l_top));
+                self.emit(format!("LABEL {}", l_top))?;
                 for s in body {
                     self.lower_stmt(s)?;
                 }
                 let cond_op = self.eval_to_operand(cond_expr)?;
-                self.lines.push(format!("BR_POS {} {}", cond_op, l_top));
+                self.emit(format!("BR_POS {} {}", cond_op, l_top))?;
                 Ok(())
             }
             SurfaceStmt::While(cond_expr, body, line, col) => {
@@ -3238,31 +3271,31 @@ impl SurfaceLowerCtx {
                 let l_top = self.alloc_lbl(*line, *col)?;
                 let l_body = self.alloc_lbl(*line, *col)?;
                 let l_exit = self.alloc_lbl(*line, *col)?;
-                self.lines.push(format!("LABEL {}", l_top));
+                self.emit(format!("LABEL {}", l_top))?;
                 let cond_op = self.eval_to_operand(cond_expr)?;
-                self.lines.push(format!("BR_POS {} {}", cond_op, l_body));
-                self.lines.push(format!("JMP {}", l_exit));
-                self.lines.push(format!("LABEL {}", l_body));
+                self.emit(format!("BR_POS {} {}", cond_op, l_body))?;
+                self.emit(format!("JMP {}", l_exit))?;
+                self.emit(format!("LABEL {}", l_body))?;
                 for s in body {
                     self.lower_stmt(s)?;
                 }
-                self.lines.push(format!("JMP {}", l_top));
-                self.lines.push(format!("LABEL {}", l_exit));
+                self.emit(format!("JMP {}", l_top))?;
+                self.emit(format!("LABEL {}", l_exit))?;
                 Ok(())
             }
             SurfaceStmt::Label(lid, _line, _col) => {
                 self.defined_labels.push(*lid);
-                self.lines.push(format!("LABEL {}", lid));
+                self.emit(format!("LABEL {}", lid))?;
                 Ok(())
             }
             SurfaceStmt::Goto(lid, line, col) => {
                 self.used_labels.push((*lid, *line, *col));
-                self.lines.push(format!("JMP {}", lid));
+                self.emit(format!("JMP {}", lid))?;
                 Ok(())
             }
             SurfaceStmt::Ret(expr, _line, _col) => {
                 let op = self.eval_to_operand(expr)?;
-                self.lines.push(format!("RET {}", op));
+                self.emit(format!("RET {}", op))?;
                 Ok(())
             }
             SurfaceStmt::Expr(expr, line, col) => {
@@ -3278,7 +3311,7 @@ impl SurfaceLowerCtx {
                                 return Err(format!("line {}, col {}: Branch label {} out of range 0..=15", ll, lc, lid));
                             }
                             self.used_labels.push((lid as u16, ll, lc));
-                            self.lines.push(format!("{} {} {}", low.to_ascii_uppercase(), c_op, lid));
+                            self.emit(format!("{} {} {}", low.to_ascii_uppercase(), c_op, lid))?;
                             return Ok(());
                         } else {
                             return Err(format!("line {}, col {}: '{}' target must be an integer label id", cl, cc, cname));
@@ -3300,14 +3333,14 @@ impl SurfaceLowerCtx {
                                 return Err(format!("line {}, col {}: 'br_trit' targets must be integer label ids", cl, cc));
                             }
                         }
-                        self.lines.push(format!("BR_TRIT {} {}", c_op, lids.join(" ")));
+                        self.emit(format!("BR_TRIT {} {}", c_op, lids.join(" ")))?;
                         return Ok(());
                     } else if low == "drop" {
                         let mut ops = Vec::with_capacity(args.len());
                         for a in args {
                             ops.push(self.eval_to_operand(a)?);
                         }
-                        self.lines.push(format!("DROP {}", ops.join(" ")));
+                        self.emit(format!("DROP {}", ops.join(" ")))?;
                         return Ok(());
                     }
                 }
@@ -3439,9 +3472,11 @@ pub fn compile_omni_surface_to_asm(src: &str) -> Result<String, String> {
             let taint_str = if p.untrusted { "UNTRUSTED" } else { "SAFE" };
             out.push(format!("PARAM ${} {} {}", p_idx, ty_str, taint_str));
         }
-        out.push(format!("RET_TY {}", map_omni_surface_type(&f.ret_ty, f.ret_line, f.ret_col)?));
+        let ret_ty_str = map_omni_surface_type(&f.ret_ty, f.ret_line, f.ret_col)?;
+        let ret_ty_tok = parse_asm_ty_tok(ret_ty_str);
+        out.push(format!("RET_TY {}", ret_ty_str));
 
-        let mut ctx = SurfaceLowerCtx::new(&f.params, fn_sigs.clone());
+        let mut ctx = SurfaceLowerCtx::new(&f.params, fn_sigs.clone(), ret_ty_tok, true);
         for stmt in &f.body {
             ctx.lower_stmt(stmt)?;
         }
@@ -3500,17 +3535,13 @@ pub fn compile_omni_surface_to_u16(src: &str) -> Result<Vec<u16>, String> {
         }
         let ret_ty_tok = parse_asm_ty_tok(map_omni_surface_type(&f.ret_ty, f.ret_line, f.ret_col)?);
 
-        let mut ctx = SurfaceLowerCtx::new(&f.params, fn_sigs.clone());
+        let mut ctx = SurfaceLowerCtx::new(&f.params, fn_sigs.clone(), ret_ty_tok, false);
         for stmt in &f.body {
             ctx.lower_stmt(stmt)?;
         }
         ctx.check_unresolved_labels()?;
 
-        let mut ins_packets: Vec<Vec<u16>> = Vec::with_capacity(ctx.lines.len());
-        for ins_line in &ctx.lines {
-            ins_packets.push(encode_asm_ins_packet_u16(ins_line, ret_ty_tok)?);
-        }
-        completed_fns.push((fid, params, ret_ty_tok, f.cap_mask, ins_packets));
+        completed_fns.push((fid, params, ret_ty_tok, f.cap_mask, ctx.packets));
     }
 
     if completed_fns.len() == 1 {
@@ -3546,9 +3577,14 @@ pub fn extract_omni_surface_budgets(src: &str) -> (Option<u64>, Option<usize>) {
         return (None, None);
     };
     let mut parser = SurfaceParser::new(tokens);
-    let Ok((_includes, fns)) = parser.parse_module() else {
+    let Ok((includes, fns)) = parser.parse_module() else {
         return (None, None);
     };
+    if !includes.is_empty() {
+        if let Ok(expanded) = resolve_omni_surface_includes(&wrapped, None, None) {
+            return extract_omni_surface_budgets(&expanded);
+        }
+    }
     let mut step_b: Option<u64> = None;
     let mut mem_b: Option<usize> = None;
     for f in fns {
@@ -3732,7 +3768,11 @@ pub fn execute_omni_surface_program_with_budgets(
         (None, None) => None,
     };
     let u16_stream = compile_omni_surface_to_u16(&wrapped)?;
-    let _ = verify_u16_stream(&u16_stream)?;
+    for rep in verify_u16_stream(&u16_stream)? {
+        if !rep.passed {
+            return Err(format!("Static verification failed on fn #{}: {:?}", rep.fn_idx, rep.errors));
+        }
+    }
     let module = decode_omni_token_stream(&u16_stream)?;
     let entry_fn_idx = if module.functions.iter().any(|f| f.fn_idx == 0) {
         0
@@ -3761,7 +3801,11 @@ pub fn execute_omni_surface_aot_first(
     let wrapped = wrap_omni_surface_snippet(src);
     let (attr_steps, attr_mem) = extract_omni_surface_budgets(&wrapped);
     let u16_stream = compile_omni_surface_to_u16(&wrapped)?;
-    let _ = verify_u16_stream(&u16_stream)?;
+    for rep in verify_u16_stream(&u16_stream)? {
+        if !rep.passed {
+            return Err(format!("Static verification failed on fn #{}: {:?}", rep.fn_idx, rep.errors));
+        }
+    }
     let module = decode_omni_token_stream(&u16_stream)?;
     for func in &module.functions {
         let rep = verify_binary_function(func);
@@ -3850,7 +3894,20 @@ pub fn compile_omni_surface_via_stage1_to_elf(
 ) -> Result<Vec<u8>, String> {
     let wrapped = wrap_omni_surface_snippet(src);
     let u16_stream = compile_omni_surface_to_u16(&wrapped)?;
-    let _ = verify_u16_stream(&u16_stream)?;
+    for rep in verify_u16_stream(&u16_stream)? {
+        if !rep.passed {
+            return Err(format!("Static verification failed on fn #{}: {:?}", rep.fn_idx, rep.errors));
+        }
+    }
+    let module = decode_omni_token_stream(&u16_stream)?;
+    if module.functions.len() != 1 {
+        return Err(String::from("Stage-1 ELF64 emitter requires a single-function module"));
+    }
+    for ins in &module.functions[0].instructions {
+        if !is_x86_64_aot_supported_opcode(ins.op_tok) {
+            return Err(format!("Unsupported opcode 0x{:04X} in Stage-1 ELF64 emitter", ins.op_tok));
+        }
+    }
     let s1_u16 = build_step7_stage1_compiler_stream();
     let s1_mod = decode_omni_token_stream(&s1_u16)?;
     let mut vm = OmniBinaryVm::new();
@@ -3893,13 +3950,30 @@ pub fn compile_omni_surface_to_wasm(src: &str) -> Result<Vec<u8>, String> {
 pub fn execute_omni_surface_wasm_i64(src: &str, args: &[i64]) -> Result<i64, String> {
     let wrapped = wrap_omni_surface_snippet(src);
     let (step_b, mem_b) = extract_omni_surface_budgets(&wrapped);
-    let wasm = compile_omni_surface_to_wasm(&wrapped)?;
-    execute_wasm_module_i64_with_budgets(
-        &wasm,
-        args,
-        step_b.unwrap_or(DEFAULT_WASM_STEP_LIMIT),
-        mem_b.unwrap_or(DEFAULT_WASM_MEMORY_BUDGET_BYTES),
-    )
+    let eff_step = step_b.unwrap_or(DEFAULT_WASM_STEP_LIMIT);
+    let eff_mem = mem_b.unwrap_or(DEFAULT_WASM_MEMORY_BUDGET_BYTES);
+    let u16_stream = compile_omni_surface_to_u16(&wrapped)?;
+    let module = decode_omni_token_stream(&u16_stream)?;
+    let mut static_alloc_bytes = 0usize;
+    for func in &module.functions {
+        for ins in &func.instructions {
+            if ins.op_tok == 0x7F01 {
+                if let Some(BinOperand::ImmInt(cap)) = ins.operands.first() {
+                    if *cap > 0 {
+                        static_alloc_bytes = static_alloc_bytes.saturating_add(*cap as usize);
+                    }
+                }
+            }
+        }
+    }
+    if static_alloc_bytes > eff_mem {
+        return Err(format!(
+            "AOT memory budget exceeded ({} > {} bytes)",
+            static_alloc_bytes, eff_mem
+        ));
+    }
+    let wasm = compile_pure_u16_to_wasm(&u16_stream)?;
+    execute_wasm_module_i64_with_budgets(&wasm, args, eff_step, eff_mem)
 }
 
 pub fn build_step1_pure_token_stream() -> Vec<u16> {
@@ -4869,6 +4943,42 @@ fn pack5_word_from_bytes(bytes: &[u8], n_trits: usize) -> i64 {
     word as i64
 }
 
+fn validate_func_pack5_ops(
+    func: &BinFunction,
+    reg_pack5: &BTreeMap<u16, (Vec<u8>, usize, bool)>,
+) -> Result<(), String> {
+    for ins in &func.instructions {
+        let check_reg = |r: u16| -> Result<(), String> {
+            if let Some((bytes, _, _)) = reg_pack5.get(&r) {
+                for &b in bytes {
+                    if b > PACK5_MAX_VALID {
+                        return Err(String::from("PACK5_SENTINEL_OR_CORRUPT_BYTE"));
+                    }
+                }
+            }
+            Ok(())
+        };
+        match ins.op_tok {
+            0x7F31 | 0x7F34 | 0x7F35 | 0x7F3F => {
+                for op in &ins.operands {
+                    if let BinOperand::Reg(r) = *op {
+                        check_reg(r)?;
+                    }
+                }
+            }
+            0x7F0E => {
+                if let Some(BinOperand::Reg(r)) = ins.operands.first() {
+                    if reg_pack5.get(r).map(|(_, _, is_tv)| *is_tv).unwrap_or(false) {
+                        check_reg(*r)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Returns `true` if `module` is a hot numeric, ternary, or `@PACK5` path eligible for direct AOT execution.
 pub fn is_module_aot_hot_path(module: &BinModule) -> bool {
     if module.functions.len() != 1 {
@@ -5031,19 +5141,22 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
     };
 
     let reg_pack5 = collect_func_pack5_map(func);
+    validate_func_pack5_ops(func, &reg_pack5)?;
     let emit_extract_pack5_trit_x86 = |c: &mut Vec<u8>, op: &BinOperand, trit_idx: usize, into_rcx: bool| {
+        let mut direct_byte = false;
         if let BinOperand::Reg(r) = *op {
-            if let Some((bytes, n, _)) = reg_pack5.get(&r) {
-                emit_load_op(c, &BinOperand::ImmInt(pack5_word_from_bytes(bytes, *n)), false);
-            } else {
-                emit_load_op(c, op, false);
+            if let Some((bytes, _, _)) = reg_pack5.get(&r) {
+                let b_val = bytes.get(trit_idx / 5).copied().unwrap_or(121) as i64;
+                emit_load_op(c, &BinOperand::ImmInt(b_val), false);
+                direct_byte = true;
             }
-        } else {
-            emit_load_op(c, op, false);
         }
-        let shift: u8 = (((trit_idx / 5) + 1) * 8) as u8;
-        c.extend_from_slice(&[0x48, 0xC1, 0xE8, shift]); // shr rax, shift
-        c.extend_from_slice(&[0x0F, 0xB6, 0xC0]);       // movzx eax, al
+        if !direct_byte {
+            emit_load_op(c, op, false);
+            let shift: u8 = (((trit_idx / 5) + 1) * 8) as u8;
+            c.extend_from_slice(&[0x48, 0xC1, 0xE8, shift]); // shr rax, shift
+            c.extend_from_slice(&[0x0F, 0xB6, 0xC0]);       // movzx eax, al
+        }
         c.extend_from_slice(&[0x31, 0xD2]);             // xor edx, edx
         let pow3: u8 = [1u8, 3, 9, 27, 81][trit_idx % 5];
         if pow3 > 1 {
@@ -5071,17 +5184,38 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
                 if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
             }
             0x7F0E => {
-                if let (Some(BinOperand::Reg(r_arr)), Some(BinOperand::ImmInt(idx))) =
+                if let (Some(BinOperand::Reg(r_arr)), Some(idx_op)) =
                     (ins.operands.first(), ins.operands.get(1))
                 {
-                    if *idx >= 0 {
-                        if let Some((bytes, _, is_tv)) = reg_pack5.get(r_arr) {
-                            if *is_tv {
-                                emit_extract_pack5_trit_x86(&mut code, &ins.operands[0], *idx as usize, false);
-                            } else {
-                                let b_val = bytes.get(*idx as usize).copied().unwrap_or(0) as i64;
-                                emit_load_op(&mut code, &BinOperand::ImmInt(b_val), false);
+                    if let Some((bytes, n_len, is_tv)) = reg_pack5.get(r_arr) {
+                        if let BinOperand::ImmInt(idx) = idx_op {
+                            if *idx >= 0 {
+                                if *is_tv {
+                                    emit_extract_pack5_trit_x86(&mut code, &ins.operands[0], *idx as usize, false);
+                                } else {
+                                    let b_val = bytes.get(*idx as usize).copied().unwrap_or(0) as i64;
+                                    emit_load_op(&mut code, &BinOperand::ImmInt(b_val), false);
+                                }
+                                if let Some(d) = ins.dest_reg {
+                                    emit_store_rax(&mut code, d);
+                                }
+                                continue;
                             }
+                        } else {
+                            code.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d (acc = 0)
+                            for k in 0..*n_len {
+                                if *is_tv {
+                                    emit_extract_pack5_trit_x86(&mut code, &ins.operands[0], k, true);
+                                } else {
+                                    let b_val = bytes.get(k).copied().unwrap_or(0) as i64;
+                                    emit_load_op(&mut code, &BinOperand::ImmInt(b_val), true);
+                                }
+                                emit_load_op(&mut code, idx_op, false); // rax = dynamic index
+                                code.extend_from_slice(&[0x48, 0x3D]);  // cmp rax, imm32(k)
+                                code.extend_from_slice(&(k as i32).to_le_bytes());
+                                code.extend_from_slice(&[0x4C, 0x0F, 0x44, 0xC1]); // cmove r8, rcx
+                            }
+                            code.extend_from_slice(&[0x4C, 0x89, 0xC0]); // mov rax, r8
                             if let Some(d) = ins.dest_reg {
                                 emit_store_rax(&mut code, d);
                             }
@@ -5134,7 +5268,7 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
                     (Some(BinOperand::Reg(ra)), Some(BinOperand::Reg(rb))) => {
                         let na = reg_pack5.get(ra).map(|(_, n, _)| *n).unwrap_or(0);
                         let nb = reg_pack5.get(rb).map(|(_, n, _)| *n).unwrap_or(0);
-                        na.min(nb).min(35)
+                        na.min(nb)
                     }
                     _ => 0,
                 };
@@ -5150,7 +5284,7 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
             }
             0x7F35 | 0x7F3F => {
                 let pack5_len = match ins.operands.first() {
-                    Some(BinOperand::Reg(r)) => reg_pack5.get(r).map(|(_, n, _)| (*n).min(35)),
+                    Some(BinOperand::Reg(r)) => reg_pack5.get(r).map(|(_, n, _)| *n),
                     _ => None,
                 };
                 if let Some(n_trits) = pack5_len {
@@ -5528,24 +5662,27 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
     };
 
     let reg_pack5 = collect_func_pack5_map(func);
+    validate_func_pack5_ops(func, &reg_pack5)?;
     let emit_extract_pack5_trit_wasm = |b: &mut Vec<u8>, op: &BinOperand, trit_idx: usize| {
+        let mut direct_byte = false;
         if let BinOperand::Reg(r) = *op {
-            if let Some((bytes, n, _)) = reg_pack5.get(&r) {
+            if let Some((bytes, _, _)) = reg_pack5.get(&r) {
+                let b_val = bytes.get(trit_idx / 5).copied().unwrap_or(121) as i64;
                 b.push(0x42);
-                b.extend(encode_sleb128(pack5_word_from_bytes(bytes, *n)));
-            } else {
-                emit_wasm_op(b, op);
+                b.extend(encode_sleb128(b_val));
+                direct_byte = true;
             }
-        } else {
-            emit_wasm_op(b, op);
         }
-        let shift: i64 = (((trit_idx / 5) + 1) * 8) as i64;
-        b.push(0x42);
-        b.extend(encode_sleb128(shift));
-        b.push(0x87); // i64.shr_s
-        b.push(0x42);
-        b.extend(encode_sleb128(255));
-        b.push(0x83); // i64.and
+        if !direct_byte {
+            emit_wasm_op(b, op);
+            let shift: i64 = (((trit_idx / 5) + 1) * 8) as i64;
+            b.push(0x42);
+            b.extend(encode_sleb128(shift));
+            b.push(0x87); // i64.shr_s
+            b.push(0x42);
+            b.extend(encode_sleb128(255));
+            b.push(0x83); // i64.and
+        }
         let pow3: i64 = [1i64, 3, 9, 27, 81][trit_idx % 5];
         if pow3 > 1 {
             b.push(0x42);
@@ -5576,7 +5713,7 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
                     (Some(BinOperand::Reg(ra)), Some(BinOperand::Reg(rb))) => {
                         let na = reg_pack5.get(ra).map(|(_, n, _)| *n).unwrap_or(0);
                         let nb = reg_pack5.get(rb).map(|(_, n, _)| *n).unwrap_or(0);
-                        na.min(nb).min(35)
+                        na.min(nb)
                     }
                     _ => 0,
                 };
@@ -5590,7 +5727,7 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
             }
             0x7F35 | 0x7F3F => {
                 let pack5_len = match ins.operands.first() {
-                    Some(BinOperand::Reg(r)) => reg_pack5.get(r).map(|(_, n, _)| (*n).min(35)),
+                    Some(BinOperand::Reg(r)) => reg_pack5.get(r).map(|(_, n, _)| *n),
                     _ => None,
                 };
                 if let Some(n_trits) = pack5_len {
@@ -5619,17 +5756,37 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
             }
             0x7F0E => {
                 let mut handled = false;
-                if let (Some(BinOperand::Reg(r_arr)), Some(BinOperand::ImmInt(idx))) =
+                if let (Some(BinOperand::Reg(r_arr)), Some(idx_op)) =
                     (ins.operands.first(), ins.operands.get(1))
                 {
-                    if *idx >= 0 {
-                        if let Some((bytes, _, is_tv)) = reg_pack5.get(r_arr) {
-                            if *is_tv {
-                                emit_extract_pack5_trit_wasm(b, &ins.operands[0], *idx as usize);
-                            } else {
-                                let b_val = bytes.get(*idx as usize).copied().unwrap_or(0) as i64;
+                    if let Some((bytes, n_len, is_tv)) = reg_pack5.get(r_arr) {
+                        if let BinOperand::ImmInt(idx) = idx_op {
+                            if *idx >= 0 {
+                                if *is_tv {
+                                    emit_extract_pack5_trit_wasm(b, &ins.operands[0], *idx as usize);
+                                } else {
+                                    let b_val = bytes.get(*idx as usize).copied().unwrap_or(0) as i64;
+                                    b.push(0x42);
+                                    b.extend(encode_sleb128(b_val));
+                                }
+                                emit_wasm_set_dest(b, ins.dest_reg);
+                                handled = true;
+                            }
+                        } else {
+                            // Dynamic index IGET on @PACK5 TritVec or Bytes in Wasm AOT:
+                            b.extend_from_slice(&[0x42, 0x00]); // acc = 0
+                            for k in 0..*n_len {
+                                if *is_tv {
+                                    emit_extract_pack5_trit_wasm(b, &ins.operands[0], k);
+                                } else {
+                                    let b_val = bytes.get(k).copied().unwrap_or(0) as i64;
+                                    b.push(0x42);
+                                    b.extend(encode_sleb128(b_val));
+                                }
+                                emit_wasm_op(b, idx_op);
                                 b.push(0x42);
-                                b.extend(encode_sleb128(b_val));
+                                b.extend(encode_sleb128(k as i64));
+                                b.extend_from_slice(&[0x51, 0xAD, 0x7E, 0x7C]); // i64.eq, i64.extend_i32_u, i64.mul, i64.add
                             }
                             emit_wasm_set_dest(b, ins.dest_reg);
                             handled = true;
@@ -8748,6 +8905,71 @@ fn main(a: i64) -> i64 {
             }
             checks_passed += 1;
         }
+
+        // 13o. Deep Audit Regressions: 50-Trit (>35) @PACK5 + Dynamic Loop IGET in AOT, Sentinel 243..=255 Rejection, & Uncalled Helper Verification
+        {
+            let surf_pack5_50 = "
+                #[cap(AI)]
+                fn pack5_50_dynamic_golden(limit: i64) -> i64 {
+                    let v = [
+                        +1t, -1t, 0t, +1t, +1t, -1t, 0t, -1t, +1t, +1t,
+                        +1t, -1t, 0t, +1t, +1t, -1t, 0t, -1t, +1t, +1t,
+                        +1t, -1t, 0t, +1t, +1t, -1t, 0t, -1t, +1t, +1t,
+                        +1t, -1t, 0t, +1t, +1t, -1t, 0t, -1t, +1t, +1t,
+                        +1t, -1t, 0t, +1t, +1t, -1t, 0t, -1t, +1t, +1t
+                    ];
+                    let dot = tdot(v, v);
+                    let gate = egate(v);
+                    let acc = 0;
+                    let idx = 0;
+                    while idx < limit {
+                        acc += iget(v, idx);
+                        idx += 1;
+                    }
+                    return dot * 100 + acc * 10 + gate;
+                }
+            ";
+            let (v_50, b_50) = execute_omni_surface_aot_first(surf_pack5_50, vec![OmniValue::Int(50)])?;
+            let vm_50 = execute_omni_surface_program_with_budgets(surf_pack5_50, vec![OmniValue::Int(50)], None, None)?;
+            let elf_50 = compile_omni_surface_to_x86_64_elf(surf_pack5_50, 50, 0, 0)?;
+            if b_50 != "aot" || v_50 != OmniValue::Int(4101) || vm_50 != OmniValue::Int(4101) || elf_50.len() < 120 {
+                return Err(String::from("50-trit (>35) @PACK5 + dynamic loop IGET AOT/VM mismatch"));
+            }
+
+            let corrupt_pack5_asm = "
+                CAP_MASK 1
+                RET_TY I64
+                %0 = ANEW 0
+                %0 = ISET %0 250
+                %1 = UNPACK5 %0 5
+                %2 = EGATE %1
+                RET %2
+            ";
+            let corrupt_u16 = assemble_omni_text_to_u16(corrupt_pack5_asm)?;
+            let corrupt_mod = decode_omni_token_stream(&corrupt_u16)?;
+            let mut c_vm = OmniBinaryVm::new();
+            if compile_pure_u16_to_wasm(&corrupt_u16).is_ok()
+                || compile_pure_u16_to_x86_64_elf_with_args(&corrupt_u16, 0, 0, 0).is_ok()
+                || c_vm.execute_function(&corrupt_mod, 0, vec![]).is_ok()
+            {
+                return Err(String::from("Corrupt @PACK5 sentinel byte (250 > 242) was not rejected across AOT and VM"));
+            }
+
+            let uncalled_tainted_helper = "
+                fn bad_helper(u: i64 @untrusted) -> i64 {
+                    return u;
+                }
+                fn main(x: i64) -> i64 {
+                    return x + 1;
+                }
+            ";
+            if execute_omni_surface_program_with_budgets(uncalled_tainted_helper, vec![OmniValue::Int(5)], None, None).is_ok()
+                || execute_omni_surface_program(uncalled_tainted_helper, vec![OmniValue::Int(5)]).is_ok()
+            {
+                return Err(String::from("Uncalled helper function with taint violation was not rejected before execution"));
+            }
+            checks_passed += 3;
+        }
     }
 
     Ok(checks_passed)
@@ -8891,16 +9113,6 @@ fn main() {
             }
             "run-wasm" if cli_args.len() >= 3 => {
                 let path = &cli_args[2];
-                let wasm_bytes = if path.ends_with(".wasm") {
-                    fs::read(path).expect("Failed to read .wasm")
-                } else if path.ends_with(".omni") {
-                    let u16_stream = compile_omni_surface_file_to_u16(path).expect("Surface compilation failed");
-                    compile_pure_u16_to_wasm(&u16_stream).expect("WebAssembly AOT compilation failed")
-                } else {
-                    let raw = fs::read(path).expect("Failed to read .omni_bc");
-                    let u16_stream = decode_bytes_to_u16_stream(&raw);
-                    compile_pure_u16_to_wasm(&u16_stream).expect("WebAssembly AOT compilation failed")
-                };
                 let i64_args: Vec<i64> = cli_args[3..]
                     .iter()
                     .map(|s| match parse_cli_omni_value(s) {
@@ -8909,6 +9121,22 @@ fn main() {
                         _ => 0,
                     })
                     .collect();
+                if path.ends_with(".omni") {
+                    let raw_src = fs::read_to_string(path).expect("Failed to read .omni surface file");
+                    let parent_dir = std::path::Path::new(path).parent();
+                    let expanded = resolve_omni_surface_includes(&raw_src, parent_dir, None)
+                        .expect("Include resolution failed");
+                    let res = execute_omni_surface_wasm_i64(&expanded, &i64_args).expect("Wasm execution failed");
+                    println!("{}", res);
+                    return;
+                }
+                let wasm_bytes = if path.ends_with(".wasm") {
+                    fs::read(path).expect("Failed to read .wasm")
+                } else {
+                    let raw = fs::read(path).expect("Failed to read .omni_bc");
+                    let u16_stream = decode_bytes_to_u16_stream(&raw);
+                    compile_pure_u16_to_wasm(&u16_stream).expect("WebAssembly AOT compilation failed")
+                };
                 let res = execute_wasm_module_i64(&wasm_bytes, &i64_args).expect("Wasm execution failed");
                 println!("{}", res);
                 return;
