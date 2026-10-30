@@ -25,6 +25,7 @@ pub enum OmniValue {
 
 pub const DEFAULT_VM_STEP_LIMIT: u64 = 50_000_000;
 pub const DEFAULT_VM_MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+pub const MAX_VM_CALL_DEPTH: usize = 64;
 
 pub struct OmniBinaryVm {
     pub tables: HashMap<u16, Vec<BTreeMap<u16, OmniValue>>>,
@@ -32,6 +33,7 @@ pub struct OmniBinaryVm {
     pub steps_executed: u64,
     pub memory_budget_bytes: usize,
     pub allocated_bytes: usize,
+    pub call_depth: usize,
 }
 
 impl OmniBinaryVm {
@@ -42,6 +44,7 @@ impl OmniBinaryVm {
             steps_executed: 0,
             memory_budget_bytes: DEFAULT_VM_MEMORY_BUDGET_BYTES,
             allocated_bytes: 0,
+            call_depth: 0,
         }
     }
 
@@ -52,6 +55,7 @@ impl OmniBinaryVm {
             steps_executed: 0,
             memory_budget_bytes,
             allocated_bytes: 0,
+            call_depth: 0,
         }
     }
 
@@ -59,6 +63,20 @@ impl OmniBinaryVm {
         self.tables.clear();
         self.steps_executed = 0;
         self.allocated_bytes = 0;
+        self.call_depth = 0;
+    }
+
+    #[inline]
+    fn charge_memory(&mut self, bytes: usize) -> Result<(), String> {
+        let next_alloc = self.allocated_bytes.saturating_add(bytes);
+        if next_alloc > self.memory_budget_bytes {
+            return Err(format!(
+                "VM memory budget exceeded ({} > {} bytes)",
+                next_alloc, self.memory_budget_bytes
+            ));
+        }
+        self.allocated_bytes = next_alloc;
+        Ok(())
     }
 
     fn eval_op(op: &BinOperand, regs: &[OmniValue; 224]) -> OmniValue {
@@ -219,11 +237,7 @@ impl OmniBinaryVm {
                 0x7F01 => {
                     if let OmniValue::Int(cap) = Self::eval_op(&ins.operands[0], &regs) {
                         let req = if cap > 0 { cap as usize } else { 0 };
-                        let next_alloc = self.allocated_bytes.saturating_add(req);
-                        if next_alloc > self.memory_budget_bytes {
-                            return Err(format!("VM memory budget exceeded ({} > {} bytes)", next_alloc, self.memory_budget_bytes));
-                        }
-                        self.allocated_bytes = next_alloc;
+                        self.charge_memory(req)?;
                         OmniValue::Arena { capacity: req, active: true }
                     } else { OmniValue::Void }
                 }
@@ -231,8 +245,18 @@ impl OmniBinaryVm {
                     OmniValue::Arena { .. } => OmniValue::Arena { capacity: 0, active: true },
                     other => other,
                 },
-                0x7F04 | 0x7F06 | 0x7F08 | 0x7F09 => Self::eval_op(&ins.operands[0], &regs),
-                0x7F0D => OmniValue::Bytes(Vec::with_capacity(512)),
+                0x7F04 | 0x7F06 | 0x7F09 => Self::eval_op(&ins.operands[0], &regs),
+                0x7F08 => {
+                    let v = Self::eval_op(&ins.operands[0], &regs);
+                    if let OmniValue::Str(ref s) = v {
+                        self.charge_memory(s.len().max(1))?;
+                    }
+                    v
+                }
+                0x7F0D => {
+                    self.charge_memory(64)?;
+                    OmniValue::Bytes(Vec::with_capacity(64))
+                }
                 0x7F0E => {
                     let arr_val = Self::eval_op(&ins.operands[0], &regs);
                     let idx_val = Self::eval_op(&ins.operands[1], &regs);
@@ -244,7 +268,8 @@ impl OmniBinaryVm {
                             OmniValue::Int(buf[i as usize] as i64)
                         }
                         (OmniValue::TritVec(tv), OmniValue::Int(i)) if i >= 0 && (i as usize) < tv.len() => {
-                            OmniValue::Int(tv[i as usize] as i64)
+                            let packed = pack5_encode(&tv);
+                            OmniValue::Int(pack5_get_trit(&packed, i as usize).unwrap_or(0) as i64)
                         }
                         _ => OmniValue::Int(0),
                     }
@@ -255,10 +280,12 @@ impl OmniBinaryVm {
                         _ => Vec::new(),
                     };
                     if ins.operands.len() == 3 && ins.operands[1] == BinOperand::ImmInt(-4) {
+                        self.charge_memory(4)?;
                         if let Some(v) = Self::eval_as_i64(&ins.operands[2], &regs) {
                             buf.extend_from_slice(&(v as i32).to_le_bytes());
                         }
                     } else if ins.operands.len() == 3 && ins.operands[1] == BinOperand::ImmInt(-8) {
+                        self.charge_memory(8)?;
                         if let Some(v) = Self::eval_as_i64(&ins.operands[2], &regs) {
                             buf.extend_from_slice(&v.to_le_bytes());
                         }
@@ -273,6 +300,7 @@ impl OmniBinaryVm {
                             }
                         }
                     } else {
+                        self.charge_memory(ins.operands.len().saturating_sub(1))?;
                         for op_b in &ins.operands[1..] {
                             let b_val = Self::eval_as_i64(op_b, &regs).unwrap_or(0);
                             buf.push((b_val & 0xFF) as u8);
@@ -304,6 +332,7 @@ impl OmniBinaryVm {
                 },
                 0x7F51 => {
                     if let (OmniValue::Str(a), OmniValue::Str(b)) = (Self::eval_op(&ins.operands[0], &regs), Self::eval_op(&ins.operands[1], &regs)) {
+                        self.charge_memory(a.len().saturating_add(b.len()).max(1))?;
                         OmniValue::Str(format!("{}{}", a, b))
                     } else { OmniValue::Str(String::new()) }
                 }
@@ -314,7 +343,9 @@ impl OmniBinaryVm {
                 }
                 0x7F56 => {
                     if let Some(v) = Self::eval_as_i64(&ins.operands[0], &regs) {
-                        OmniValue::Str(v.to_string())
+                        let s = v.to_string();
+                        self.charge_memory(s.len().max(1))?;
+                        OmniValue::Str(s)
                     } else { OmniValue::Str(String::new()) }
                 }
                 0x7F24 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Trit(if a == b { 1 } else { -1 }) } else { OmniValue::Trit(-1) },
@@ -329,23 +360,44 @@ impl OmniBinaryVm {
                 0x7F2D => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Trit(if a < b { -1 } else if a > b { 1 } else { 0 }) } else { OmniValue::Trit(0) },
                 0x7F30 => {
                     if let OmniValue::TritVec(tv) = Self::eval_op(&ins.operands[0], &regs) {
-                        OmniValue::Bytes(pack5_encode(&tv))
+                        let packed = pack5_encode(&tv);
+                        self.charge_memory(packed.len())?;
+                        OmniValue::Bytes(packed)
                     } else { OmniValue::Bytes(Vec::new()) }
                 }
                 0x7F31 => {
                     if let (OmniValue::Bytes(b), Some(len)) = (Self::eval_op(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) {
-                        OmniValue::TritVec(pack5_decode(&b, len as usize).unwrap_or_default())
+                        let n = len.max(0) as usize;
+                        self.charge_memory(pack5_byte_len(n))?;
+                        OmniValue::TritVec(pack5_decode(&b, n).unwrap_or_default())
                     } else { OmniValue::TritVec(Vec::new()) }
                 }
                 0x7F34 => {
-                    if let (OmniValue::TritVec(a), OmniValue::TritVec(b)) = (Self::eval_op(&ins.operands[0], &regs), Self::eval_op(&ins.operands[1], &regs)) {
-                        let dot: i64 = a.iter().zip(b.iter()).map(|(&x, &y)| (x as i64) * (y as i64)).sum();
-                        OmniValue::Int(dot)
-                    } else { OmniValue::Int(0) }
+                    match (Self::eval_op(&ins.operands[0], &regs), Self::eval_op(&ins.operands[1], &regs)) {
+                        (OmniValue::Bytes(pa), OmniValue::Bytes(pb)) => {
+                            let n_trits = ins
+                                .operands
+                                .get(2)
+                                .and_then(|op| Self::eval_as_i64(op, &regs))
+                                .map(|n| n.max(0) as usize)
+                                .unwrap_or(pa.len().min(pb.len()) * 5);
+                            OmniValue::Int(pack5_tdot_direct(&pa, &pb, n_trits).unwrap_or(0))
+                        }
+                        (OmniValue::TritVec(a), OmniValue::TritVec(b)) => {
+                            let pa = pack5_encode(&a);
+                            let pb = pack5_encode(&b);
+                            let n_trits = a.len().min(b.len());
+                            OmniValue::Int(pack5_tdot_direct(&pa, &pb, n_trits).unwrap_or(0))
+                        }
+                        _ => OmniValue::Int(0),
+                    }
                 }
                 0x7F35 | 0x7F3F => {
                     let sum_i64: i64 = match Self::eval_op(&ins.operands[0], &regs) {
-                        OmniValue::TritVec(tv) => tv.iter().map(|&t| t.clamp(-1, 1) as i64).sum(),
+                        OmniValue::TritVec(tv) => {
+                            let packed = pack5_encode(&tv);
+                            pack5_sum_direct(&packed, tv.len()).unwrap_or(0)
+                        }
                         OmniValue::Bytes(b) => {
                             let n_trits = ins
                                 .operands
@@ -353,8 +405,7 @@ impl OmniBinaryVm {
                                 .and_then(|op| Self::eval_as_i64(op, &regs))
                                 .map(|n| n.max(0) as usize)
                                 .unwrap_or(b.len() * 5);
-                            let tv = pack5_decode(&b, n_trits).unwrap_or_default();
-                            tv.iter().map(|&t| t as i64).sum()
+                            pack5_sum_direct(&b, n_trits).unwrap_or(0)
                         }
                         OmniValue::Int(v) => v,
                         OmniValue::Trit(t) => t as i64,
@@ -381,8 +432,14 @@ impl OmniBinaryVm {
                 }
                 0x7F48 => {
                     if let BinOperand::FnRef(callee_idx) = ins.operands[0] {
+                        if self.call_depth >= MAX_VM_CALL_DEPTH {
+                            return Err(format!("VM call depth budget exceeded ({} >= {})", self.call_depth, MAX_VM_CALL_DEPTH));
+                        }
                         let call_args: Vec<OmniValue> = ins.operands[1..].iter().map(|op| Self::eval_op(op, &regs)).collect();
-                        self.execute_function(module, callee_idx, call_args)?
+                        self.call_depth += 1;
+                        let call_res = self.execute_function(module, callee_idx, call_args);
+                        self.call_depth = self.call_depth.saturating_sub(1);
+                        call_res?
                     } else { OmniValue::Void }
                 }
                 0x7F57 => if let OmniValue::Str(s) = Self::eval_op(&ins.operands[0], &regs) { OmniValue::Str(s.replace('\'', "''").replace(';', "")) } else { OmniValue::Str(String::new()) },
@@ -397,6 +454,7 @@ impl OmniBinaryVm {
                 }
                 0x7F63 => {
                     if let BinOperand::SchemaRef(s_idx) = ins.operands[0] {
+                        self.charge_memory(64 * ins.operands.len())?;
                         let mut row = BTreeMap::new();
                         for op in &ins.operands[1..] {
                             if let BinOperand::FieldKV(f_id, inner) = op {
@@ -409,13 +467,15 @@ impl OmniBinaryVm {
                 }
                 0x7F6A => {
                     if let (BinOperand::SchemaRef(s_idx), OmniValue::TritVec(q_vec)) = (&ins.operands[0], Self::eval_op(&ins.operands[1], &regs)) {
+                        let q_packed = pack5_encode(&q_vec);
                         let mut best = OmniValue::Void;
                         let mut best_score = i64::MIN;
                         if let Some(rows) = self.tables.get(s_idx) {
                             for row in rows {
                                 for val in row.values() {
                                     if let OmniValue::TritVec(r_vec) = val {
-                                        let score: i64 = q_vec.iter().zip(r_vec.iter()).map(|(&a, &b)| (a as i64) * (b as i64)).sum();
+                                        let r_packed = pack5_encode(r_vec);
+                                        let score: i64 = pack5_tdot_direct(&q_packed, &r_packed, q_vec.len().min(r_vec.len())).unwrap_or(0);
                                         if score > best_score { best_score = score; best = OmniValue::Struct(row.clone()); }
                                     }
                                 }
@@ -433,6 +493,7 @@ impl OmniBinaryVm {
                 }
                 0x7F7D => {
                     if let OmniValue::Str(s) = Self::eval_op(&ins.operands[0], &regs) {
+                        self.charge_memory(pack5_byte_len(64))?;
                         let mut trits = vec![0i8; 64];
                         let mut h: u32 = 2166136261;
                         for (idx, b) in s.bytes().enumerate() {
@@ -444,7 +505,10 @@ impl OmniBinaryVm {
                 }
                 0x7F7E => if let BinOperand::SkillRef(sk_id) = ins.operands[0] { OmniValue::SkillModel { skill_id: sk_id, active: true } } else { OmniValue::Void },
                 0x7F7F => if let (OmniValue::SkillModel { skill_id, .. }, OmniValue::Str(prompt)) = (Self::eval_op(&ins.operands[0], &regs), Self::eval_op(&ins.operands[1], &regs)) { OmniValue::Str(format!("[Skill#{}->'{}']", skill_id, prompt)) } else { OmniValue::Void },
-                0x7F76 => if let BinOperand::ImmInt(tag_id) = ins.operands[0] { OmniValue::DomNode { tag_id: tag_id as u16, children: ins.operands[1..].iter().map(|op| Self::eval_op(op, &regs)).collect() } } else { OmniValue::Void },
+                0x7F76 => if let BinOperand::ImmInt(tag_id) = ins.operands[0] {
+                    self.charge_memory(32 * ins.operands.len())?;
+                    OmniValue::DomNode { tag_id: tag_id as u16, children: ins.operands[1..].iter().map(|op| Self::eval_op(op, &regs)).collect() }
+                } else { OmniValue::Void },
                 _ => OmniValue::Void,
             };
 

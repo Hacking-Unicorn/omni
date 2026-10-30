@@ -21,10 +21,12 @@ use omni_ir::{
 use omni_isa::*;
 use omni_lang::{
     compile_omni_surface_file_to_u16, compile_omni_surface_to_asm, compile_omni_surface_to_u16,
-    compile_omni_surface_to_wasm, compile_omni_surface_to_x86_64_elf, execute_omni_surface_program,
+    compile_omni_surface_to_wasm, compile_omni_surface_to_x86_64_elf,
+    compile_omni_surface_via_stage1_to_elf, execute_omni_surface_aot_first,
+    execute_omni_surface_program, execute_omni_surface_program_with_budgets,
     execute_omni_surface_wasm_i64, parse_cli_omni_value, resolve_omni_surface_includes,
 };
-use omni_verifier::{format_debug_lens, verify_binary_function};
+use omni_verifier::{format_debug_lens, verify_binary_function, verify_u16_stream};
 use omni_vm::{OmniBinaryVm, OmniValue};
 
 fn to_ws_val(v: &monolith::OmniValue) -> OmniValue {
@@ -683,6 +685,117 @@ pub fn run_workspace_selftest() -> Result<usize, String> {
     }
     checks += 1;
 
+    // 6l. Phase 5: Direct @PACK5 Trit Operations & Pack5/EGATE AOT (x86-64 ELF64 + 64-bit Wasm) Differential
+    let p5_a = pack5_encode(&[1, -1, 0, 1, 1, -1, 0, -1, 1, 1]);
+    let p5_b = pack5_encode(&[1, 1, 0, -1, 1, -1, 0, 1, 1, -1]);
+    let direct_dot = pack5_tdot_direct(&p5_a, &p5_b, 10).map_err(|e| e.to_string())?;
+    let m_direct_dot = monolith::pack5_tdot_direct(&p5_a, &p5_b, 10).map_err(|e| e.to_string())?;
+    let direct_sum = pack5_sum_direct(&p5_a, 10).map_err(|e| e.to_string())?;
+    let m_direct_sum = monolith::pack5_sum_direct(&p5_a, 10).map_err(|e| e.to_string())?;
+    if direct_dot != m_direct_dot || direct_dot != 0 || direct_sum != m_direct_sum || direct_sum != 2 {
+        return Err("Direct @PACK5 tdot/sum mismatch between monolith and workspace".into());
+    }
+    let m_p5_elf = monolith::compile_omni_surface_to_x86_64_elf(surf_pack5, 0, 0, 0)?;
+    let w_p5_elf = compile_omni_surface_to_x86_64_elf(surf_pack5, 0, 0, 0)?;
+    let m_p5_wasm_val = monolith::execute_omni_surface_wasm_i64(surf_pack5, &[])?;
+    let w_p5_wasm_val = execute_omni_surface_wasm_i64(surf_pack5, &[])?;
+    let w_dec_wasm_val = execute_omni_surface_wasm_i64(surf_decision_hook, &[30, 10])?;
+    if m_p5_elf != w_p5_elf || m_p5_wasm_val != 2455 || w_p5_wasm_val != 2455 || w_dec_wasm_val != 1 {
+        return Err("Phase 5 @PACK5 / EGATE AOT (ELF64 + Wasm) differential mismatch".into());
+    }
+    let surf_pack5_direct = "
+        #[cap(AI)]
+        fn pack5_direct_golden() -> i64 {
+            let p = pack5_bytes([+1t, -1t, 0t, +1t, +1t, -1t, 0t, -1t, +1t, +1t]);
+            let dot = pack5_tdot(p, p);
+            let gate = pack5_gate(p);
+            let len = pack5_len(p);
+            return len * 100 + dot * 10 + gate;
+        }
+    ";
+    if execute_omni_surface_wasm_i64(surf_pack5_direct, &[])? != 281
+        || execute_omni_surface_program(surf_pack5_direct, vec![])? != OmniValue::Int(281)
+    {
+        return Err("Phase 5 pack5_bytes direct AOT execution mismatch".into());
+    }
+    checks += 3;
+
+    // 6m. Phase 5: AOT-First Hot-Path Dispatcher & Stage-1 Surface-to-ELF Differential
+    let (aot_v1, backend1) = execute_omni_surface_aot_first(surf_pack5, vec![])?;
+    let (aot_v2, backend2) = execute_omni_surface_aot_first(surf_decision_hook, vec![OmniValue::Int(5), OmniValue::Int(20)])?;
+    let (aot_v3, backend3) = execute_omni_surface_aot_first(arena_ok_surf, vec![OmniValue::Int(8)])?;
+    if backend1 != "aot" || aot_v1 != OmniValue::Int(2455)
+        || backend2 != "aot" || aot_v2 != OmniValue::Trit(-1)
+        || backend3 != "aot" || aot_v3 != OmniValue::Int(50)
+    {
+        return Err("execute_omni_surface_aot_first failed to dispatch hot numeric/@PACK5/arena paths to AOT".into());
+    }
+    let s1_seed0_elf = compile_omni_surface_via_stage1_to_elf(surface_goldens[0].1, 30, 15, 0)?;
+    let aot_seed0_elf = compile_omni_surface_to_x86_64_elf(surface_goldens[0].1, 30, 15, 0)?;
+    if s1_seed0_elf != aot_seed0_elf {
+        return Err("compile_omni_surface_via_stage1_to_elf mismatch against direct x86-64 AOT".into());
+    }
+    checks += 2;
+
+    // 6n. Phase 5: Explicit Step & Memory Budgets (`#[step_budget(N)]`, `#[mem_budget(N)]`) across AOT & VM
+    let inf_surface = "
+        #[step_budget(150)]
+        fn runaway_loop(x: i64) -> i64 {
+            let acc = x;
+            while +1t {
+                acc += 1;
+            }
+            return acc;
+        }
+    ";
+    if execute_omni_surface_program(inf_surface, vec![OmniValue::Int(1)]).is_ok()
+        || execute_omni_surface_program_with_budgets(inf_surface, vec![OmniValue::Int(1)], Some(150), None).is_ok()
+        || monolith::execute_omni_surface_program(inf_surface, vec![monolith::OmniValue::Int(1)]).is_ok()
+    {
+        return Err("Step budget failed to halt runaway surface loop in AOT/VM".into());
+    }
+    let mem_blowup_surface = "
+        #[mem_budget(512)]
+        fn runaway_alloc(x: i64) -> i64 {
+            let a = arena(4096);
+            drop(a);
+            return x;
+        }
+    ";
+    if execute_omni_surface_program(mem_blowup_surface, vec![OmniValue::Int(1)]).is_ok()
+        || execute_omni_surface_program_with_budgets(mem_blowup_surface, vec![OmniValue::Int(1)], None, Some(512)).is_ok()
+        || monolith::execute_omni_surface_program(mem_blowup_surface, vec![monolith::OmniValue::Int(1)]).is_ok()
+    {
+        return Err("Memory budget failed to reject oversized arena in AOT/VM".into());
+    }
+    let vm_buf_blowup_surface = "
+        #[mem_budget(256)]
+        fn runaway_buf() -> i64 {
+            let b = anew(0);
+            let i = 0;
+            while i < 100 {
+                b = iset_i64(b, i);
+                i += 1;
+            }
+            return slen(b);
+        }
+    ";
+    if execute_omni_surface_program_with_budgets(vm_buf_blowup_surface, vec![], None, None).is_ok() {
+        return Err("VM memory budget failed to reject runaway byte-buffer growth in ISET".into());
+    }
+    checks += 3;
+
+    // 6o. Phase 5: Zero Long-Lived Intermediate IR Direct Emission & Direct `verify_u16_stream`
+    for &(g_name, surf_src, ref expected_u16) in surface_goldens {
+        let direct_u16 = compile_omni_surface_to_u16(surf_src)?;
+        let via_asm_u16 = assemble_omni_text_to_u16(&compile_omni_surface_to_asm(surf_src)?)?;
+        let reps = verify_u16_stream(&direct_u16)?;
+        if direct_u16 != via_asm_u16 || &direct_u16 != expected_u16 || reps.len() != 1 || !reps[0].passed {
+            return Err(format!("Zero-IR direct u16 emission or verify_u16_stream mismatch on '{}'", g_name));
+        }
+    }
+    checks += 1;
+
     // 7. Stage-1 == Stage-2 Self-Compilation Fixed Point
     #[cfg(all(unix, target_arch = "x86_64"))]
     {
@@ -809,24 +922,52 @@ fn main() {
                 print!("{}", asm);
                 return;
             }
+            "compile-stage1" if args.len() >= 4 => {
+                let raw_src = fs::read_to_string(&args[2]).expect("Failed to read .omni surface file");
+                let parent_dir = std::path::Path::new(&args[2]).parent();
+                let merged = resolve_omni_surface_includes(&raw_src, parent_dir, None)
+                    .expect("Failed to resolve .omni surface file");
+                let a0 = args.get(4).and_then(|s| s.parse::<i64>().ok()).unwrap_or(45);
+                let a1 = args.get(5).and_then(|s| s.parse::<i64>().ok()).unwrap_or(40);
+                let a2 = args.get(6).and_then(|s| s.parse::<i64>().ok()).unwrap_or(90);
+                let elf = compile_omni_surface_via_stage1_to_elf(&merged, a0, a1, a2)
+                    .expect("Stage-1 ELF compilation failed");
+                fs::write(&args[3], &elf).expect("Write failed");
+                println!(
+                    "[OMNIC STAGE-1 ELF] Wrote {} bytes to '{}' (FNV-1a64=0x{:016X})",
+                    elf.len(),
+                    args[3],
+                    fnv1a_64_hash(&elf)
+                );
+                return;
+            }
             "run" | "run-surface" if args.len() >= 3 => {
                 let path = &args[2];
                 let mut vm_args = Vec::new();
                 for a in &args[3..] {
                     vm_args.push(parse_cli_omni_value(a));
                 }
-                let u16s = if path.ends_with(".omni") || args[1] == "run-surface" {
-                    match compile_omni_surface_file_to_u16(path) {
+                if path.ends_with(".omni") || args[1] == "run-surface" {
+                    let raw_src = fs::read_to_string(path).expect("Failed to read .omni surface file");
+                    let parent_dir = std::path::Path::new(path).parent();
+                    let merged = match resolve_omni_surface_includes(&raw_src, parent_dir, None) {
                         Ok(s) => s,
                         Err(e) => {
-                            eprintln!("[OMNIC COMPILE ERROR] {}", e);
+                            eprintln!("[OMNIC INCLUDE ERROR] {}", e);
+                            std::process::exit(1);
+                        }
+                    };
+                    match execute_omni_surface_program(&merged, vm_args) {
+                        Ok(res) => println!("{:?}", res),
+                        Err(e) => {
+                            eprintln!("[OMNIC EXECUTION ERROR] {}", e);
                             std::process::exit(1);
                         }
                     }
-                } else {
-                    let raw = fs::read(path).expect("Failed to read .omni_bc");
-                    decode_bytes_to_u16_stream(&raw)
-                };
+                    return;
+                }
+                let raw = fs::read(path).expect("Failed to read .omni_bc");
+                let u16s = decode_bytes_to_u16_stream(&raw);
                 let m = decode_omni_token_stream(&u16s).expect("Decode failed");
                 for func in &m.functions {
                     let rep = verify_binary_function(func);

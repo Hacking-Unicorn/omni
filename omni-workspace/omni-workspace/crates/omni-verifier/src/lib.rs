@@ -269,6 +269,12 @@ pub fn verify_binary_function(func: &BinFunction) -> BinVerificationReport {
     }
 }
 
+/// Verifies a raw `&[u16]` binary token stream directly in a single ephemeral pass without retaining intermediate IR.
+pub fn verify_u16_stream(stream: &[u16]) -> Result<Vec<BinVerificationReport>, String> {
+    let module = decode_omni_token_stream(stream)?;
+    Ok(module.functions.iter().map(verify_binary_function).collect())
+}
+
 
 /// Pretty-prints a pure `u16` stream using the `OMNI_ISA_TABLE` opcode labels for human debugging (`--debug-lens`, Roadmap 3.3).
 pub fn format_debug_lens(stream: &[u16]) -> Result<String, String> {

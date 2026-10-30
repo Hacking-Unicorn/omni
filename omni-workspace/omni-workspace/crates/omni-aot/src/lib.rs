@@ -1,6 +1,7 @@
 //! Omni AOT — standalone two-pass x86-64 ELF64 compiler (64-bit stdout channel),
 //! trap-free WebAssembly v1 compiler & 64-bit stack-machine evaluator, and Two-Pass Stage-1 compiler stream.
 
+use std::collections::BTreeMap;
 use omni_isa::*;
 use omni_ir::*;
 use omni_verifier::verify_binary_function;
@@ -12,6 +13,84 @@ use omni_verifier::verify_binary_function;
 struct RelocPatch {
     patch_offset: usize,
     target_label: u16,
+}
+
+fn collect_func_pack5_map(func: &BinFunction) -> BTreeMap<u16, (Vec<u8>, usize, bool)> {
+    let mut reg_pack5: BTreeMap<u16, (Vec<u8>, usize, bool)> = BTreeMap::new();
+    for ins in &func.instructions {
+        match ins.op_tok {
+            0x7F0D => {
+                if let Some(d) = ins.dest_reg {
+                    reg_pack5.insert(d, (Vec::new(), 0, false));
+                }
+            }
+            0x7F0F => {
+                let is_typed_write = (ins.operands.len() == 3
+                    && (ins.operands[1] == BinOperand::ImmInt(-4) || ins.operands[1] == BinOperand::ImmInt(-8)))
+                    || (ins.operands.len() == 4 && ins.operands[1] == BinOperand::ImmInt(-9));
+                if !is_typed_write {
+                    let mut bytes = match ins.operands.first() {
+                        Some(BinOperand::Reg(s)) => reg_pack5.get(s).map(|(b, _, _)| b.clone()).unwrap_or_default(),
+                        _ => Vec::new(),
+                    };
+                    for op_b in &ins.operands[1..] {
+                        if let BinOperand::ImmInt(v) = *op_b {
+                            bytes.push((v & 0xFF) as u8);
+                        }
+                    }
+                    let n_trits = bytes.len() * 5;
+                    if let Some(d) = ins.dest_reg {
+                        reg_pack5.insert(d, (bytes, n_trits, false));
+                    }
+                }
+            }
+            0x7F31 => {
+                if let (Some(d), Some(BinOperand::Reg(s))) = (ins.dest_reg, ins.operands.first()) {
+                    let bytes = reg_pack5.get(s).map(|(b, _, _)| b.clone()).unwrap_or_default();
+                    let n_trits = match ins.operands.get(1) {
+                        Some(BinOperand::ImmInt(n)) => (*n).max(0) as usize,
+                        _ => bytes.len() * 5,
+                    };
+                    reg_pack5.insert(d, (bytes, n_trits, true));
+                }
+            }
+            0x7F30 => {
+                if let (Some(d), Some(BinOperand::Reg(s))) = (ins.dest_reg, ins.operands.first()) {
+                    if let Some((bytes, n_trits, _)) = reg_pack5.get(s).cloned() {
+                        reg_pack5.insert(d, (bytes, n_trits, false));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    reg_pack5
+}
+
+#[inline]
+fn pack5_word_from_bytes(bytes: &[u8], n_trits: usize) -> i64 {
+    let mut word: u64 = (n_trits & 0xFF) as u64;
+    for (idx, &b) in bytes.iter().take(7).enumerate() {
+        word |= (b as u64) << ((idx + 1) * 8);
+    }
+    word as i64
+}
+
+/// Returns `true` if `module` is a hot numeric, ternary, or `@PACK5` path eligible for direct AOT execution.
+pub fn is_module_aot_hot_path(module: &BinModule) -> bool {
+    if module.functions.len() != 1 {
+        return false;
+    }
+    let func = &module.functions[0];
+    if !matches!(func.ret_ty_tok, TY_I64 | TY_TRIT) {
+        return false;
+    }
+    if !func.params.iter().all(|&(_, ty, _)| matches!(ty, TY_I64 | TY_TRIT | TY_ARENA)) {
+        return false;
+    }
+    func.instructions
+        .iter()
+        .all(|ins| is_wasm_aot_supported_opcode(ins.op_tok) && is_x86_64_aot_supported_opcode(ins.op_tok))
 }
 
 /// Emits a 65-byte x86-64 CLI decimal integer parser supporting optional leading `'-'` (`0x2D`)
@@ -158,10 +237,39 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
         c.extend_from_slice(&disp.to_le_bytes());
     };
 
+    let reg_pack5 = collect_func_pack5_map(func);
+    let emit_extract_pack5_trit_x86 = |c: &mut Vec<u8>, op: &BinOperand, trit_idx: usize, into_rcx: bool| {
+        if let BinOperand::Reg(r) = *op {
+            if let Some((bytes, n, _)) = reg_pack5.get(&r) {
+                emit_load_op(c, &BinOperand::ImmInt(pack5_word_from_bytes(bytes, *n)), false);
+            } else {
+                emit_load_op(c, op, false);
+            }
+        } else {
+            emit_load_op(c, op, false);
+        }
+        let shift: u8 = (((trit_idx / 5) + 1) * 8) as u8;
+        c.extend_from_slice(&[0x48, 0xC1, 0xE8, shift]); // shr rax, shift
+        c.extend_from_slice(&[0x0F, 0xB6, 0xC0]);       // movzx eax, al
+        c.extend_from_slice(&[0x31, 0xD2]);             // xor edx, edx
+        let pow3: u8 = [1u8, 3, 9, 27, 81][trit_idx % 5];
+        if pow3 > 1 {
+            c.extend_from_slice(&[0xBE, pow3, 0, 0, 0]); // mov esi, pow3
+            c.extend_from_slice(&[0x48, 0xF7, 0xF6]);    // div rsi
+            c.extend_from_slice(&[0x31, 0xD2]);          // xor edx, edx
+        }
+        c.extend_from_slice(&[0xBE, 3, 0, 0, 0]);       // mov esi, 3
+        c.extend_from_slice(&[0x48, 0xF7, 0xF6]);       // div rsi (rdx = byte / 3^k % 3)
+        c.extend_from_slice(&[0x48, 0x8D, 0x42, 0xFF]); // lea rax, [rdx - 1]
+        if into_rcx {
+            c.extend_from_slice(&[0x48, 0x89, 0xC1]);   // mov rcx, rax
+        }
+    };
+
     for ins in &func.instructions {
         match ins.op_tok {
-            0x7F00 => {}
-            0x7F02 | 0x7F03 | 0x7F04 | 0x7F06 | 0x7F09 | 0x7F57 | 0x7F58 | 0x7F59 => {
+            0x7F00 | 0x7F05 => {}
+            0x7F01 | 0x7F02 | 0x7F03 | 0x7F04 | 0x7F06 | 0x7F09 | 0x7F57 | 0x7F58 | 0x7F59 => {
                 emit_load_op(&mut code, &ins.operands[0], false);
                 if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
             }
@@ -170,6 +278,24 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
                 if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
             }
             0x7F0E => {
+                if let (Some(BinOperand::Reg(r_arr)), Some(BinOperand::ImmInt(idx))) =
+                    (ins.operands.first(), ins.operands.get(1))
+                {
+                    if *idx >= 0 {
+                        if let Some((bytes, _, is_tv)) = reg_pack5.get(r_arr) {
+                            if *is_tv {
+                                emit_extract_pack5_trit_x86(&mut code, &ins.operands[0], *idx as usize, false);
+                            } else {
+                                let b_val = bytes.get(*idx as usize).copied().unwrap_or(0) as i64;
+                                emit_load_op(&mut code, &BinOperand::ImmInt(b_val), false);
+                            }
+                            if let Some(d) = ins.dest_reg {
+                                emit_store_rax(&mut code, d);
+                            }
+                            continue;
+                        }
+                    }
+                }
                 emit_load_op(&mut code, &ins.operands[1], false);
                 code.extend_from_slice(&[0x0F, 0xB7, 0x84, 0x45, 0x00, 0x20, 0xFD, 0xFF]);
                 if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
@@ -198,6 +324,60 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
             }
             0x7F50 => {
                 code.extend_from_slice(&[0x4C, 0x89, 0xD8]);
+                if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+            }
+            0x7F30 | 0x7F31 => {
+                if let Some(d) = ins.dest_reg {
+                    let word = reg_pack5
+                        .get(&d)
+                        .map(|(b, n, _)| pack5_word_from_bytes(b, *n))
+                        .unwrap_or(0);
+                    emit_load_op(&mut code, &BinOperand::ImmInt(word), false);
+                    emit_store_rax(&mut code, d);
+                }
+            }
+            0x7F34 => {
+                let n_trits = match (ins.operands.first(), ins.operands.get(1)) {
+                    (Some(BinOperand::Reg(ra)), Some(BinOperand::Reg(rb))) => {
+                        let na = reg_pack5.get(ra).map(|(_, n, _)| *n).unwrap_or(0);
+                        let nb = reg_pack5.get(rb).map(|(_, n, _)| *n).unwrap_or(0);
+                        na.min(nb).min(35)
+                    }
+                    _ => 0,
+                };
+                code.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d
+                for idx in 0..n_trits {
+                    emit_extract_pack5_trit_x86(&mut code, &ins.operands[0], idx, true);
+                    emit_extract_pack5_trit_x86(&mut code, &ins.operands[1], idx, false);
+                    code.extend_from_slice(&[0x48, 0x0F, 0xAF, 0xC1]); // imul rax, rcx
+                    code.extend_from_slice(&[0x49, 0x01, 0xC0]);       // add r8, rax
+                }
+                code.extend_from_slice(&[0x4C, 0x89, 0xC0]); // mov rax, r8
+                if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+            }
+            0x7F35 | 0x7F3F => {
+                let pack5_len = match ins.operands.first() {
+                    Some(BinOperand::Reg(r)) => reg_pack5.get(r).map(|(_, n, _)| (*n).min(35)),
+                    _ => None,
+                };
+                if let Some(n_trits) = pack5_len {
+                    code.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d
+                    for idx in 0..n_trits {
+                        emit_extract_pack5_trit_x86(&mut code, &ins.operands[0], idx, false);
+                        code.extend_from_slice(&[0x49, 0x01, 0xC0]); // add r8, rax
+                    }
+                    code.extend_from_slice(&[0x4C, 0x89, 0xC0]); // mov rax, r8
+                } else {
+                    emit_load_op(&mut code, &ins.operands[0], false);
+                }
+                code.extend_from_slice(&[
+                    0x48, 0x83, 0xF8, 0x00, // cmp rax, 0
+                    0x0F, 0x9F, 0xC0,       // setg al
+                    0x0F, 0x9C, 0xC2,       // setl dl
+                    0x0F, 0xB6, 0xC0,       // movzx eax, al
+                    0x0F, 0xB6, 0xD2,       // movzx edx, dl
+                    0x48, 0x29, 0xD0,       // sub rax, rdx
+                ]);
                 if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
             }
             0x7F10 | 0x7F11 | 0x7F12 | 0x7F1E | 0x7F1F | 0x7F20 => {
@@ -554,11 +734,85 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
         }
     };
 
+    let reg_pack5 = collect_func_pack5_map(func);
+    let emit_extract_pack5_trit_wasm = |b: &mut Vec<u8>, op: &BinOperand, trit_idx: usize| {
+        if let BinOperand::Reg(r) = *op {
+            if let Some((bytes, n, _)) = reg_pack5.get(&r) {
+                b.push(0x42);
+                b.extend(encode_sleb128(pack5_word_from_bytes(bytes, *n)));
+            } else {
+                emit_wasm_op(b, op);
+            }
+        } else {
+            emit_wasm_op(b, op);
+        }
+        let shift: i64 = (((trit_idx / 5) + 1) * 8) as i64;
+        b.push(0x42);
+        b.extend(encode_sleb128(shift));
+        b.push(0x87); // i64.shr_s
+        b.push(0x42);
+        b.extend(encode_sleb128(255));
+        b.push(0x83); // i64.and
+        let pow3: i64 = [1i64, 3, 9, 27, 81][trit_idx % 5];
+        if pow3 > 1 {
+            b.push(0x42);
+            b.extend(encode_sleb128(pow3));
+            b.push(0x7F); // i64.div_s
+        }
+        b.extend_from_slice(&[0x42, 0x03, 0x81, 0x42, 0x01, 0x7D]); // % 3 - 1
+    };
+
     let emit_straight_ins = |b: &mut Vec<u8>, ins: &BinInstruction| {
         match ins.op_tok {
-            0x7F00 => {}
-            0x7F02 | 0x7F03 | 0x7F04 | 0x7F06 | 0x7F09 | 0x7F57 | 0x7F58 | 0x7F59 => {
+            0x7F00 | 0x7F05 => {}
+            0x7F01 | 0x7F02 | 0x7F03 | 0x7F04 | 0x7F06 | 0x7F09 | 0x7F57 | 0x7F58 | 0x7F59 => {
                 emit_wasm_op(b, &ins.operands[0]);
+                emit_wasm_set_dest(b, ins.dest_reg);
+            }
+            0x7F30 | 0x7F31 => {
+                let word = ins
+                    .dest_reg
+                    .and_then(|d| reg_pack5.get(&d).map(|(bytes, n, _)| pack5_word_from_bytes(bytes, *n)))
+                    .unwrap_or(0);
+                b.push(0x42);
+                b.extend(encode_sleb128(word));
+                emit_wasm_set_dest(b, ins.dest_reg);
+            }
+            0x7F34 => {
+                let n_trits = match (ins.operands.first(), ins.operands.get(1)) {
+                    (Some(BinOperand::Reg(ra)), Some(BinOperand::Reg(rb))) => {
+                        let na = reg_pack5.get(ra).map(|(_, n, _)| *n).unwrap_or(0);
+                        let nb = reg_pack5.get(rb).map(|(_, n, _)| *n).unwrap_or(0);
+                        na.min(nb).min(35)
+                    }
+                    _ => 0,
+                };
+                b.extend_from_slice(&[0x42, 0x00]); // acc = 0
+                for idx in 0..n_trits {
+                    emit_extract_pack5_trit_wasm(b, &ins.operands[0], idx);
+                    emit_extract_pack5_trit_wasm(b, &ins.operands[1], idx);
+                    b.extend_from_slice(&[0x7E, 0x7C]); // i64.mul, i64.add
+                }
+                emit_wasm_set_dest(b, ins.dest_reg);
+            }
+            0x7F35 | 0x7F3F => {
+                let pack5_len = match ins.operands.first() {
+                    Some(BinOperand::Reg(r)) => reg_pack5.get(r).map(|(_, n, _)| (*n).min(35)),
+                    _ => None,
+                };
+                if let Some(n_trits) = pack5_len {
+                    b.extend_from_slice(&[0x42, 0x00]); // sum = 0
+                    for idx in 0..n_trits {
+                        emit_extract_pack5_trit_wasm(b, &ins.operands[0], idx);
+                        b.push(0x7C); // i64.add
+                    }
+                } else {
+                    emit_wasm_op(b, &ins.operands[0]);
+                }
+                b.push(0x22); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x55, 0xAD]);
+                b.push(0x20); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x53, 0xAD, 0x7D]);
                 emit_wasm_set_dest(b, ins.dest_reg);
             }
             0x7F0D => {
@@ -571,8 +825,28 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
                 }
             }
             0x7F0E => {
-                b.extend_from_slice(&[0x42, 0x00]);
-                emit_wasm_set_dest(b, ins.dest_reg);
+                let mut handled = false;
+                if let (Some(BinOperand::Reg(r_arr)), Some(BinOperand::ImmInt(idx))) =
+                    (ins.operands.first(), ins.operands.get(1))
+                {
+                    if *idx >= 0 {
+                        if let Some((bytes, _, is_tv)) = reg_pack5.get(r_arr) {
+                            if *is_tv {
+                                emit_extract_pack5_trit_wasm(b, &ins.operands[0], *idx as usize);
+                            } else {
+                                let b_val = bytes.get(*idx as usize).copied().unwrap_or(0) as i64;
+                                b.push(0x42);
+                                b.extend(encode_sleb128(b_val));
+                            }
+                            emit_wasm_set_dest(b, ins.dest_reg);
+                            handled = true;
+                        }
+                    }
+                }
+                if !handled {
+                    b.extend_from_slice(&[0x42, 0x00]);
+                    emit_wasm_set_dest(b, ins.dest_reg);
+                }
             }
             0x7F0F => {
                 let delta: i64 = if ins.operands.len() == 3 && ins.operands[1] == BinOperand::ImmInt(-4) {
@@ -926,9 +1200,27 @@ fn skip_wasm_to_matching_end(body: &[u8], mut pos: usize) -> Result<usize, Strin
     Err(String::from("Unclosed Wasm block while skipping to end"))
 }
 
+pub const DEFAULT_WASM_STEP_LIMIT: u64 = 50_000_000;
+pub const DEFAULT_WASM_MEMORY_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
 /// Self-contained 64-bit WebAssembly v1 binary validator and stack-machine evaluator for
 /// differential verification of `compile_pure_u16_to_wasm` against `OmniBinaryVm` and x86-64 ELF.
 pub fn execute_wasm_module_i64(wasm: &[u8], args: &[i64]) -> Result<i64, String> {
+    execute_wasm_module_i64_with_budgets(
+        wasm,
+        args,
+        DEFAULT_WASM_STEP_LIMIT,
+        DEFAULT_WASM_MEMORY_BUDGET_BYTES,
+    )
+}
+
+/// Executes a 64-bit WebAssembly v1 binary under explicit `step_limit` and `memory_budget_bytes` caps.
+pub fn execute_wasm_module_i64_with_budgets(
+    wasm: &[u8],
+    args: &[i64],
+    step_limit: u64,
+    memory_budget_bytes: usize,
+) -> Result<i64, String> {
     if wasm.len() < 8 || &wasm[0..8] != &[0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00] {
         return Err(String::from("Invalid WebAssembly '\0asm' v1 header"));
     }
@@ -980,6 +1272,14 @@ pub fn execute_wasm_module_i64(wasm: &[u8], args: &[i64]) -> Result<i64, String>
         total_locals += cnt;
     }
 
+    let frame_bytes = wasm.len().saturating_add(total_locals.max(args.len()).saturating_mul(8));
+    if frame_bytes > memory_budget_bytes {
+        return Err(format!(
+            "Wasm AOT memory budget exceeded ({} > {} bytes)",
+            frame_bytes, memory_budget_bytes
+        ));
+    }
+
     let mut locals = vec![0i64; total_locals.max(args.len())];
     for (i, &v) in args.iter().enumerate() {
         if i < locals.len() {
@@ -988,8 +1288,23 @@ pub fn execute_wasm_module_i64(wasm: &[u8], args: &[i64]) -> Result<i64, String>
     }
     let mut stack: Vec<i64> = Vec::with_capacity(32);
     let mut ctrl_stack: Vec<(u8, usize)> = Vec::with_capacity(8);
+    let mut steps_executed: u64 = 0;
 
     while bpos < body.len() {
+        steps_executed = steps_executed.saturating_add(1);
+        if steps_executed > step_limit {
+            return Err(format!(
+                "Wasm AOT step budget exceeded ({} > {})",
+                steps_executed, step_limit
+            ));
+        }
+        let runtime_bytes = frame_bytes.saturating_add(stack.len().saturating_add(ctrl_stack.len()).saturating_mul(8));
+        if runtime_bytes > memory_budget_bytes {
+            return Err(format!(
+                "Wasm AOT memory budget exceeded ({} > {} bytes)",
+                runtime_bytes, memory_budget_bytes
+            ));
+        }
         let op = body[bpos];
         bpos += 1;
         match op {

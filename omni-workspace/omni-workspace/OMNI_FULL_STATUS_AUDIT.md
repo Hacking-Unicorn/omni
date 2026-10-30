@@ -33,8 +33,8 @@ Reproducible command:
 rustc -O omni_rust_bootstrap.rs -o omni && ./omni selftest
 ```
 
-Verified coverage (`186` non-vacuous checks = `148` core bootstrap checks + `38` `omni-lang` surface language checks, `0` compiler warnings):
-- **Full Golden Differential (`OmniBinaryVm` == `Stage-1` == `x86-64` ELF == `execute_wasm_module_i64`)**: `compile_pure_u16_to_wasm` and `execute_wasm_module_i64` lower `LABEL (0x7F40)`, `JMP (0x7F41)`, `BR_TRIT (0x7F42)`, `BR_POS (0x7F43)`, `BR_NEG (0x7F44)`, `ANEW (0x7F0D)`, `ISET (0x7F0F)`, and `SLEN (0x7F50)` in addition to all numeric/bitwise/ternary opcodes. Every golden covered by the `x86-64` path is verified through `execute_wasm_module_i64` and `OmniBinaryVm` on both Windows and Linux.
+Verified coverage (`193` non-vacuous checks = `148` core bootstrap checks + `45` `omni-lang` surface language & Phase 5 checks, `0` compiler warnings):
+- **Full Golden Differential (`OmniBinaryVm` == `Stage-1` == `x86-64` ELF == `execute_wasm_module_i64`)**: `compile_pure_u16_to_wasm` and `execute_wasm_module_i64` lower `LABEL (0x7F40)`, `JMP (0x7F41)`, `BR_TRIT (0x7F42)`, `BR_POS (0x7F43)`, `BR_NEG (0x7F44)`, `ANEW (0x7F0D)`, `IGET (0x7F0E)`, `ISET (0x7F0F)`, `SLEN (0x7F50)`, `ARENA (0x7F01)`, `DROP (0x7F05)`, `PACK5 (0x7F30)`, `UNPACK5 (0x7F31)`, `TDOT (0x7F34)`, `EGATE (0x7F35)`, and `TLOGIC (0x7F3F)` in addition to all numeric/bitwise/ternary opcodes. Every golden covered by the `x86-64` path is verified through `execute_wasm_module_i64` and `OmniBinaryVm` on both Windows and Linux.
 - **Explicit Standalone AOT Rejection (Check 6)**: Both `compile_pure_u16_to_x86_64_elf` and `compile_pure_u16_to_wasm` reject high-level VM-only runtime seeds (`1, 2, 3, 5, 7`) with `Err(...)`.
 
 ## 3. Multi-Crate Workspace Build & In-Process Monolith Differential (Items 2, 3 & 4)
@@ -57,30 +57,31 @@ CARGO_INCREMENTAL=0 cargo build --workspace
 cargo run -p omni-cli -- selftest
 ```
 
-Verified workspace build & differential results (`145` checks on Windows, `146` checks on Linux `x86-64`, `0` compiler warnings):
-- **8-Crate Workspace (`omni-isa`, `omni-ir`, `omni-verifier`, `omni-vm`, `omni-assembler`, `omni-lang`, `omni-aot`, `omni-cli`)**: Compiles cleanly with zero external dependencies and runs `assert_verifier_clone_eq`, `assert_golden_monolith_vs_workspace`, all 64 corpus samples, and all 38 surface-language differential checks against `mod monolith`.
+Verified workspace build & differential results (`154` checks on Windows, `155` checks on Linux `x86-64`, `0` compiler warnings):
+- **8-Crate Workspace (`omni-isa`, `omni-ir`, `omni-verifier`, `omni-vm`, `omni-assembler`, `omni-lang`, `omni-aot`, `omni-cli`)**: Compiles cleanly with zero external dependencies and runs `assert_verifier_clone_eq`, `assert_golden_monolith_vs_workspace`, all 64 corpus samples, and all 47 surface-language & Phase 5 differential checks against `mod monolith`.
 
 ## 4. Usable Omni Surface Language (`omni-lang`) — Properties & Goldens
 
-Reproducible CLI commands (single-file runner, evaluator, REPL, and AOT compiler):
+Reproducible CLI commands (single-file runner, evaluator, REPL, and AOT/Stage-1 compiler):
 
 ```bash
-# Single-step compile + verify + run a .omni file (with automatic relative include resolution):
+# Single-step compile + verify + AOT-first run of a .omni file:
 cargo run -p omni-cli -- run program.omni 30 15
-# Evaluate an inline .omni program or bare expression directly:
+# Evaluate an inline .omni program or bare expression directly (AOT-first):
 cargo run -p omni-cli -- eval "#[cap(AI)] fn main(a: i64, b: i64) -> trit { let g = egate(a - b); return g; }" 30 10
 cargo run -p omni-cli -- eval "egate(30 - 10)"
 # Interactive REPL:
 cargo run -p omni-cli -- repl
-# Inspect lowered .omni_asm or emit binary .omni_bc / .elf / .wasm:
+# Inspect lowered .omni_asm or emit binary .omni_bc / .elf / Stage-1 .elf / .wasm:
 cargo run -p omni-cli -- surface-to-asm program.omni
 cargo run -p omni-cli -- compile-surface program.omni program.omni_bc
 cargo run -p omni-cli -- compile-elf program.omni program.elf
+cargo run -p omni-cli -- compile-stage1 program.omni program_stage1.elf
 cargo run -p omni-cli -- compile-wasm program.omni program.wasm
 cargo run -p omni-cli -- run-wasm program.omni 30 15
 ```
 
-Verified surface language properties & usability checks (`38` checks in Section `13` / `omni-cli`, `0` new opcodes):
+Verified surface language properties & usability checks (`45` checks in Section `13` / `47` checks in `omni-cli`, `0` new opcodes):
 
 | Surface Property / Feature | Lowering Mechanism (Existing Opcodes Only) | Verified Golden / Rejection Proof |
 |----------------------------|--------------------------------------------|-----------------------------------|
@@ -90,8 +91,12 @@ Verified surface language properties & usability checks (`38` checks in Section 
 | **4. Line & Column Error Messages** | 1-based `(line, col)` spans on all tokens, AST nodes, and label references | Reports `line 2, col 13: Undefined variable 'missing_y'`, `line 1, col 11: Unknown surface type 'float128'`, `line 2, col 5: Cannot reassign immutable function parameter 'x'`, `line 2, col 10: Unresolved branch target label 9`, and `line 2, col 13: match_trit missing 'pos' arm` |
 | **5. Multi-Function `.omni` Programs** | Multiple `fn` definitions -> `FN_DEF <id>` blocks; inter-function calls -> `0x7F48 (OP_7F48_CALL)` (`TOK_SYM_FN`) | `weighted_term(x, w)` + `main(10, 20)` -> verifies both functions and returns `Int(80)` |
 | **6. Module / File `include` Linker** | `include "helper.omni";` / `mod "helper.omni";` preprocessor + circular-include detector | Links `trit_helper.omni` (`score_to_trit`) into `main(75)` -> returns `Int(30)`; rejects circular `include "loop.omni";` with `line/col` error |
-| **7. Single-File Runner, Eval & REPL** | `omni run file.omni args...`, `omni eval "..." args...`, `omni repl` (`wrap_omni_surface_snippet`) | Compiles `.omni` -> `Vec<u16>`, verifies all functions via `verify_binary_function`, and executes in `OmniBinaryVm` without manual intermediate steps |
+| **7. Single-File Runner, Eval & REPL** | `omni run file.omni args...`, `omni eval "..." args...`, `omni repl` (`wrap_omni_surface_snippet`) | Compiles `.omni` -> `Vec<u16>`, verifies all functions via `verify_binary_function`, and executes via AOT-first dispatcher without manual intermediate steps |
 | **8. All 15 Original Surface Goldens** | `seed0_risk` through `byte_buf_golden` | 100% bit-exact `Vec<u16>` match (`0` byte diff) against `assemble_omni_text_to_u16` |
 | **9. Pre-Conditioned `while` + `<=`/`>=` + `+=`/`-=`/`*=` + Direct Surface-to-AOT** | `<=` -> `TNOT(CGT)`, `>=` -> `TNOT(CLT)`, `+=` -> `IADD`; `compile_omni_surface_to_x86_64_elf` & `compile_omni_surface_to_wasm` | `while_sum_even_golden(10) == 30` verified across `OmniBinaryVm`, Stage-1 Self-Compiler, `x86-64` ELF AOT (`0` byte diff), and 64-bit WebAssembly |
 | **10. Surface Linear Memory Arena & Borrow Checker** | `arena(cap)` (`0x7F01`), `borrow_r(a)` (`0x7F02`), `borrow_w(a)` (`0x7F03`), `move_val(a)` (`0x7F04`), `drop(a)` (`0x7F05`) | `arena_lifecycle_golden(8) == 50` passes; `bad_surface_arena_leak` (`Linear memory leak`) and `bad_surface_borrow_conflict` (`active readers`) rejected by `verify_binary_function` |
 | **11. Surface String Literals (`@ENG` Taint), Sanitizers & String Ops** | `"..."` -> `CSTR@UNTRUSTED @str:<hex>` (`0x7F08` + `0x7EEA`); `scat` (`0x7F51`), `s2i` (`0x7F55`), `i2s` (`0x7F56`), `fnv1a` (`0x7F5D`) | `bad_unsanitized_str_lit` rejected (`Taint violation on RET`); `str_pipeline_golden(45) == 130` passes verification and executes in `OmniBinaryVm` |
+| **12. Direct `@PACK5` Operations & `@PACK5` / `EGATE` AOT (`x86-64` ELF64 + Wasm)** | `pack5_tdot_direct`, `pack5_sum_direct`, `pack5_gate_direct`, `pack5_get_trit`, `pack5_set_trit`; AOT lowering of `0x7F30..=0x7F3F` | `pack5_direct_aot` (`2422`) and `pack5_direct_golden` (`281`) execute identically across `x86-64` ELF64 AOT, 64-bit WebAssembly AOT, and `OmniBinaryVm` |
+| **13. AOT-First Hot Numeric Dispatcher & Stage-1 `.omni` -> ELF64** | `execute_omni_surface_aot_first` (`is_module_aot_hot_path`) + `compile_omni_surface_via_stage1_to_elf` (`compile-stage1`) | Dispatches hot numeric/ternary/`@PACK5`/arena paths to AOT (`backend == "aot"`); Stage-1 ELF matches direct `x86-64` ELF64 bit-for-bit (`0` byte diff) |
+| **14. Explicit Step & Memory Budgets (`#[step_budget(N)]`, `#[mem_budget(N)]`)** | `OmniBinaryVm::charge_memory` across all allocating opcodes + `execute_wasm_module_i64_with_budgets` | Deterministically halts runaway loops (`#[step_budget(40)]` / `#[step_budget(150)]`) and oversized allocations (`#[mem_budget(16)]` / `#[mem_budget(256)]` / `#[mem_budget(512)]`) in both AOT and VM |
+| **15. Zero Long-Lived Intermediate IR (`compile_omni_surface_to_u16`)** | Direct AST -> `encode_asm_ins_packet_u16` -> `pack_fn_module` + direct `verify_u16_stream(&[u16])` | Emits `Vec<u16>` with zero intermediate `.omni_asm` string construction; 100% bit-identical to `assemble_omni_text_to_u16` across all 15 goldens and multi-function modules |

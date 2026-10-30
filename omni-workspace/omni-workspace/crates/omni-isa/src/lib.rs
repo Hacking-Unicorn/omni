@@ -244,12 +244,13 @@ pub fn is_x86_64_aot_supported_opcode(op_tok: u16) -> bool {
     matches!(
         op_tok,
         0x7F00
-            | 0x7F02..=0x7F04
-            | 0x7F06
+            | 0x7F01..=0x7F06
             | 0x7F09
             | 0x7F0D..=0x7F18
             | 0x7F1E..=0x7F2D
-            | 0x7F40..=0x7F45
+            | 0x7F30..=0x7F31
+            | 0x7F34..=0x7F35
+            | 0x7F3F..=0x7F45
             | 0x7F4A
             | 0x7F50
             | 0x7F57..=0x7F59
@@ -261,12 +262,13 @@ pub fn is_wasm_aot_supported_opcode(op_tok: u16) -> bool {
     matches!(
         op_tok,
         0x7F00
-            | 0x7F02..=0x7F04
-            | 0x7F06
+            | 0x7F01..=0x7F06
             | 0x7F09
             | 0x7F0D..=0x7F18
             | 0x7F1E..=0x7F2D
-            | 0x7F40..=0x7F45
+            | 0x7F30..=0x7F31
+            | 0x7F34..=0x7F35
+            | 0x7F3F..=0x7F45
             | 0x7F4A
             | 0x7F50
             | 0x7F57..=0x7F59
@@ -311,6 +313,11 @@ pub const LUT_UNPACK5: [[i8; 5]; 243] = {
 };
 
 #[inline]
+pub fn pack5_byte_len(n_trits: usize) -> usize {
+    (n_trits + 4) / 5
+}
+
+#[inline]
 pub fn pack5_encode(trits: &[i8]) -> Vec<u8> {
     let mut out = Vec::with_capacity((trits.len() + 4) / 5);
     for chunk in trits.chunks(5) {
@@ -344,6 +351,97 @@ pub fn pack5_decode(bytes: &[u8], expected_trits: usize) -> Result<Vec<i8>, &'st
         }
     }
     Ok(out)
+}
+
+/// Reads a single trit (`-1, 0, +1`) directly from a `@PACK5` byte slice at `trit_idx` with zero heap allocation.
+#[inline]
+pub fn pack5_get_trit(packed: &[u8], trit_idx: usize) -> Result<i8, &'static str> {
+    let byte_idx = trit_idx / 5;
+    if byte_idx >= packed.len() {
+        return Err("PACK5_INDEX_OUT_OF_BOUNDS");
+    }
+    let b = packed[byte_idx];
+    if b > PACK5_MAX_VALID {
+        return Err("PACK5_SENTINEL_OR_CORRUPT_BYTE");
+    }
+    Ok(LUT_UNPACK5[b as usize][trit_idx % 5])
+}
+
+/// Updates a single trit (`-1, 0, +1`) in-place inside a `@PACK5` byte slice at `trit_idx` with zero heap allocation.
+#[inline]
+pub fn pack5_set_trit(packed: &mut [u8], trit_idx: usize, val: i8) -> Result<(), &'static str> {
+    let byte_idx = trit_idx / 5;
+    if byte_idx >= packed.len() {
+        return Err("PACK5_INDEX_OUT_OF_BOUNDS");
+    }
+    let b = packed[byte_idx];
+    if b > PACK5_MAX_VALID {
+        return Err("PACK5_SENTINEL_OR_CORRUPT_BYTE");
+    }
+    let mut trits = LUT_UNPACK5[b as usize];
+    trits[trit_idx % 5] = val.clamp(-1, 1);
+    let mut acc: u8 = 0;
+    let mut pow3: u8 = 1;
+    for i in 0..5 {
+        acc += ((trits[i] + 1) as u8) * pow3;
+        if i < 4 {
+            pow3 *= 3;
+        }
+    }
+    packed[byte_idx] = acc;
+    Ok(())
+}
+
+/// Computes the ternary dot product directly over two `@PACK5` byte slices (`5 trits per byte`) without unpacking to `Vec<i8>` or `i64`.
+#[inline]
+pub fn pack5_tdot_direct(a_packed: &[u8], b_packed: &[u8], n_trits: usize) -> Result<i64, &'static str> {
+    let mut dot: i64 = 0;
+    let mut rem_trits = n_trits;
+    for (&ba, &bb) in a_packed.iter().zip(b_packed.iter()) {
+        if rem_trits == 0 {
+            break;
+        }
+        if ba > PACK5_MAX_VALID || bb > PACK5_MAX_VALID {
+            return Err("PACK5_SENTINEL_OR_CORRUPT_BYTE");
+        }
+        let ua = LUT_UNPACK5[ba as usize];
+        let ub = LUT_UNPACK5[bb as usize];
+        let take = rem_trits.min(5);
+        for k in 0..take {
+            dot += (ua[k] as i64) * (ub[k] as i64);
+        }
+        rem_trits -= take;
+    }
+    Ok(dot)
+}
+
+/// Sums `n_trits` directly over a `@PACK5` byte slice (`5 trits per byte`) with zero heap allocation.
+#[inline]
+pub fn pack5_sum_direct(packed: &[u8], n_trits: usize) -> Result<i64, &'static str> {
+    let mut sum: i64 = 0;
+    let mut rem_trits = n_trits;
+    for &b in packed {
+        if rem_trits == 0 {
+            break;
+        }
+        if b > PACK5_MAX_VALID {
+            return Err("PACK5_SENTINEL_OR_CORRUPT_BYTE");
+        }
+        let u = LUT_UNPACK5[b as usize];
+        let take = rem_trits.min(5);
+        for k in 0..take {
+            sum += u[k] as i64;
+        }
+        rem_trits -= take;
+    }
+    Ok(sum)
+}
+
+/// Evaluates the ternary decision gate (`signum(sum)`) directly over a `@PACK5` byte slice with zero heap allocation.
+#[inline]
+pub fn pack5_gate_direct(packed: &[u8], n_trits: usize) -> Result<i8, &'static str> {
+    let s = pack5_sum_direct(packed, n_trits)?;
+    Ok(if s > 0 { 1 } else if s < 0 { -1 } else { 0 })
 }
 
 // ==============================================================================

@@ -6,35 +6,26 @@
 use omni_isa::*;
 use omni_ir::pack_fn_module;
 
-/// Minimal human-readable mnemonic assembler that emits a verified pure `u16` token stream (Roadmap 3.5).
-/// Supports single-function and multi-function (`FN_DEF <id>`) modules, `CAP_MASK <u16>`, `@fn<id>` call targets,
-/// `@PACK5` vector opcodes (`PACK5`, `UNPACK5`, `TDOT`), and decision hooks (`EGATE`, `TLOGIC`, `LOOKAHEAD`).
-pub fn assemble_omni_text_to_u16(src: &str) -> Result<Vec<u16>, String> {
+/// Maps an upper-case type name (`"I64"`, `"TRIT"`, `"BYTES"`, `"TRIT_VEC"`, etc.) to its canonical `TY_*` token.
+pub fn parse_asm_ty_tok(s: &str) -> u16 {
+    match s {
+        "I64" => TY_I64,
+        "TRIT" => TY_TRIT,
+        "STR" => TY_STR,
+        "UUID" => TY_UUID,
+        "BYTES" => TY_BYTES,
+        "ARRAY" => TY_ARRAY,
+        "TRIT_VEC" => TY_TRIT_VEC,
+        "ARENA" => TY_ARENA,
+        "DOM" => TY_DOM,
+        "STRUCT" => TY_STRUCT,
+        _ => TY_I64,
+    }
+}
+
+/// Encodes a single instruction packet directly into binary `u16` tokens (`[dest?, op_tok, ..., TOK_INS_END]`).
+pub fn encode_asm_ins_packet_u16(line: &str, ret_ty: u16) -> Result<Vec<u16>, String> {
     let tc_safe = pack_tc(false, CAP_ID_PURE);
-    let mut fn_id: u16 = 0x0000;
-    let mut cap_mask: CapMask = 0x0000;
-    let mut params: Vec<(u16, u16, u16)> = Vec::new();
-    let mut ret_ty: u16 = TY_I64;
-    let mut ins_packets: Vec<Vec<u16>> = Vec::new();
-    let mut completed_fns: Vec<(u16, Vec<(u16, u16, u16)>, u16, CapMask, Vec<Vec<u16>>)> = Vec::new();
-    let mut started_fn_def = false;
-
-    let parse_ty = |s: &str| -> u16 {
-        match s {
-            "I64" => TY_I64,
-            "TRIT" => TY_TRIT,
-            "STR" => TY_STR,
-            "UUID" => TY_UUID,
-            "BYTES" => TY_BYTES,
-            "ARRAY" => TY_ARRAY,
-            "TRIT_VEC" => TY_TRIT_VEC,
-            "ARENA" => TY_ARENA,
-            "DOM" => TY_DOM,
-            "STRUCT" => TY_STRUCT,
-            _ => TY_I64,
-        }
-    };
-
     let parse_op_mnemonic = |m: &str, current_ret_ty: u16| -> Result<(u16, u16), String> {
         match m {
             "CINT"     | "MOV"        => Ok((0x7F06, TY_I64)),
@@ -139,6 +130,88 @@ pub fn assemble_omni_text_to_u16(src: &str) -> Result<Vec<u16>, String> {
         Ok(())
     };
 
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.is_empty() {
+        return Err("Empty instruction packet".into());
+    }
+    if parts[0] == "NOP" {
+        Ok(vec![0x7F00, TOK_INS_END])
+    } else if parts[0] == "DROP" && parts.len() >= 2 {
+        let mut pkt = vec![0x7F05];
+        push_operand_tok(&mut pkt, parts[1])?;
+        pkt.push(TOK_INS_END);
+        Ok(pkt)
+    } else if parts[0] == "RET" && parts.len() >= 2 {
+        let mut pkt = vec![0x7F4A];
+        push_operand_tok(&mut pkt, parts[1])?;
+        pkt.push(TOK_INS_END);
+        Ok(pkt)
+    } else if parts[0] == "LABEL" && parts.len() >= 2 {
+        let lid = parts[1].parse::<u16>().map_err(|e| e.to_string())?;
+        if lid > 15 { return Err("Label id > 15".into()); }
+        Ok(vec![0x7F40, LBL_BASE + lid, TOK_INS_END])
+    } else if parts[0] == "JMP" && parts.len() >= 2 {
+        let lid = parts[1].parse::<u16>().map_err(|e| e.to_string())?;
+        if lid > 15 { return Err("Label id > 15".into()); }
+        Ok(vec![0x7F41, LBL_BASE + lid, TOK_INS_END])
+    } else if parts[0] == "BR_POS" && parts.len() >= 3 {
+        let mut pkt = vec![0x7F43];
+        push_operand_tok(&mut pkt, parts[1])?;
+        let lid = parts[2].parse::<u16>().map_err(|e| e.to_string())?;
+        if lid > 15 { return Err("Label id > 15".into()); }
+        pkt.push(LBL_BASE + lid);
+        pkt.push(TOK_INS_END);
+        Ok(pkt)
+    } else if parts[0] == "BR_NEG" && parts.len() >= 3 {
+        let mut pkt = vec![0x7F44];
+        push_operand_tok(&mut pkt, parts[1])?;
+        let lid = parts[2].parse::<u16>().map_err(|e| e.to_string())?;
+        if lid > 15 { return Err("Label id > 15".into()); }
+        pkt.push(LBL_BASE + lid);
+        pkt.push(TOK_INS_END);
+        Ok(pkt)
+    } else if parts[0] == "BR_TRIT" && parts.len() >= 5 {
+        let mut pkt = vec![0x7F42];
+        push_operand_tok(&mut pkt, parts[1])?;
+        for j in 2..=4 {
+            let lid = parts[j].parse::<u16>().map_err(|e| e.to_string())?;
+            if lid > 15 { return Err("Label id > 15".into()); }
+            pkt.push(LBL_BASE + lid);
+        }
+        pkt.push(TOK_INS_END);
+        Ok(pkt)
+    } else if parts.len() >= 4 && parts[1] == "=" {
+        let d_idx = parts[0].strip_prefix('%').ok_or("Expected %N destination")?.parse::<u16>().map_err(|e| e.to_string())?;
+        let (op_mnem, untr_suffix) = if let Some(base) = parts[2].strip_suffix("@UNTRUSTED") {
+            (base, true)
+        } else {
+            (parts[2], false)
+        };
+        let (op_tok, ty_tok) = parse_op_mnemonic(op_mnem, ret_ty)?;
+        let ins_tc = if untr_suffix { pack_tc(true, CAP_ID_PURE) } else { tc_safe };
+        let mut pkt = vec![REG_BASE + d_idx, op_tok, ty_tok, ins_tc];
+        for &op_s in &parts[3..] {
+            push_operand_tok(&mut pkt, op_s)?;
+        }
+        pkt.push(TOK_INS_END);
+        Ok(pkt)
+    } else {
+        Err(format!("Cannot parse assembler line: '{}'", line))
+    }
+}
+
+/// Minimal human-readable mnemonic assembler that emits a verified pure `u16` token stream (Roadmap 3.5).
+/// Supports single-function and multi-function (`FN_DEF <id>`) modules, `CAP_MASK <u16>`, `@fn<id>` call targets,
+/// `@PACK5` vector opcodes (`PACK5`, `UNPACK5`, `TDOT`), and decision hooks (`EGATE`, `TLOGIC`, `LOOKAHEAD`).
+pub fn assemble_omni_text_to_u16(src: &str) -> Result<Vec<u16>, String> {
+    let mut fn_id: u16 = 0x0000;
+    let mut cap_mask: CapMask = 0x0000;
+    let mut params: Vec<(u16, u16, u16)> = Vec::new();
+    let mut ret_ty: u16 = TY_I64;
+    let mut ins_packets: Vec<Vec<u16>> = Vec::new();
+    let mut completed_fns: Vec<(u16, Vec<(u16, u16, u16)>, u16, CapMask, Vec<Vec<u16>>)> = Vec::new();
+    let mut started_fn_def = false;
+
     for raw_line in src.lines() {
         let line = raw_line.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
@@ -165,76 +238,13 @@ pub fn assemble_omni_text_to_u16(src: &str) -> Result<Vec<u16>, String> {
             cap_mask = parts[1].parse::<u16>().map_err(|e| e.to_string())?;
         } else if parts[0] == "PARAM" && parts.len() >= 3 {
             let p_idx = parts[1].strip_prefix('$').ok_or("Expected $N in PARAM")?.parse::<u16>().map_err(|e| e.to_string())?;
-            let ty = parse_ty(parts[2]);
+            let ty = parse_asm_ty_tok(parts[2]);
             let untr = parts.get(3).copied() == Some("UNTRUSTED");
             params.push((PAR_BASE + p_idx, ty, pack_tc(untr, CAP_ID_PURE)));
         } else if parts[0] == "RET_TY" && parts.len() >= 2 {
-            ret_ty = parse_ty(parts[1]);
-        } else if parts[0] == "NOP" {
-            ins_packets.push(vec![0x7F00, TOK_INS_END]);
-        } else if parts[0] == "DROP" && parts.len() >= 2 {
-            let mut pkt = vec![0x7F05];
-            push_operand_tok(&mut pkt, parts[1])?;
-            pkt.push(TOK_INS_END);
-            ins_packets.push(pkt);
-        } else if parts[0] == "RET" && parts.len() >= 2 {
-            let mut pkt = vec![0x7F4A];
-            push_operand_tok(&mut pkt, parts[1])?;
-            pkt.push(TOK_INS_END);
-            ins_packets.push(pkt);
-        } else if parts[0] == "LABEL" && parts.len() >= 2 {
-            let lid = parts[1].parse::<u16>().map_err(|e| e.to_string())?;
-            if lid > 15 { return Err("Label id > 15".into()); }
-            let pkt = vec![0x7F40, LBL_BASE + lid, TOK_INS_END];
-            ins_packets.push(pkt);
-        } else if parts[0] == "JMP" && parts.len() >= 2 {
-            let lid = parts[1].parse::<u16>().map_err(|e| e.to_string())?;
-            if lid > 15 { return Err("Label id > 15".into()); }
-            let pkt = vec![0x7F41, LBL_BASE + lid, TOK_INS_END];
-            ins_packets.push(pkt);
-        } else if parts[0] == "BR_POS" && parts.len() >= 3 {
-            let mut pkt = vec![0x7F43];
-            push_operand_tok(&mut pkt, parts[1])?;
-            let lid = parts[2].parse::<u16>().map_err(|e| e.to_string())?;
-            if lid > 15 { return Err("Label id > 15".into()); }
-            pkt.push(LBL_BASE + lid);
-            pkt.push(TOK_INS_END);
-            ins_packets.push(pkt);
-        } else if parts[0] == "BR_NEG" && parts.len() >= 3 {
-            let mut pkt = vec![0x7F44];
-            push_operand_tok(&mut pkt, parts[1])?;
-            let lid = parts[2].parse::<u16>().map_err(|e| e.to_string())?;
-            if lid > 15 { return Err("Label id > 15".into()); }
-            pkt.push(LBL_BASE + lid);
-            pkt.push(TOK_INS_END);
-            ins_packets.push(pkt);
-        } else if parts[0] == "BR_TRIT" && parts.len() >= 5 {
-            let mut pkt = vec![0x7F42];
-            push_operand_tok(&mut pkt, parts[1])?;
-            for j in 2..=4 {
-                let lid = parts[j].parse::<u16>().map_err(|e| e.to_string())?;
-                if lid > 15 { return Err("Label id > 15".into()); }
-                pkt.push(LBL_BASE + lid);
-            }
-            pkt.push(TOK_INS_END);
-            ins_packets.push(pkt);
-        } else if parts.len() >= 4 && parts[1] == "=" {
-            let d_idx = parts[0].strip_prefix('%').ok_or("Expected %N destination")?.parse::<u16>().map_err(|e| e.to_string())?;
-            let (op_mnem, untr_suffix) = if let Some(base) = parts[2].strip_suffix("@UNTRUSTED") {
-                (base, true)
-            } else {
-                (parts[2], false)
-            };
-            let (op_tok, ty_tok) = parse_op_mnemonic(op_mnem, ret_ty)?;
-            let ins_tc = if untr_suffix { pack_tc(true, CAP_ID_PURE) } else { tc_safe };
-            let mut pkt = vec![REG_BASE + d_idx, op_tok, ty_tok, ins_tc];
-            for &op_s in &parts[3..] {
-                push_operand_tok(&mut pkt, op_s)?;
-            }
-            pkt.push(TOK_INS_END);
-            ins_packets.push(pkt);
+            ret_ty = parse_asm_ty_tok(parts[1]);
         } else {
-            return Err(format!("Cannot parse assembler line: '{}'", line));
+            ins_packets.push(encode_asm_ins_packet_u16(line, ret_ty)?);
         }
     }
 

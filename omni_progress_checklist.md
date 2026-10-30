@@ -63,3 +63,16 @@
   - Unified `wrap_omni_surface_snippet` in `omni-lang` so multi-statement snippets and bare expressions work seamlessly in `eval` and `repl`.
 - [x] **5. Direct `.omni` Surface-to-AOT (`x86-64` ELF64 & WebAssembly) Pipeline**:
   - Added `compile_omni_surface_to_x86_64_elf`, `compile_omni_surface_to_wasm`, and `execute_omni_surface_wasm_i64` in `omni-lang` and the monolith, plus `compile-elf`, `compile-wasm`, and `run-wasm` CLI subcommands (`186` monolith checks / `145` workspace differential checks passing).
+
+## Phase 5: Direct `@PACK5` Operations, AOT-First Hot Paths, Explicit Budgets & Zero Long-Lived IR (Complete)
+- [x] **1. `@PACK5` for Trit Data Instead of 64-Bit Integers (`5 trits per byte`)**:
+  - Added zero-allocation `@PACK5` byte primitives (`pack5_byte_len`, `pack5_get_trit`, `pack5_set_trit`, `pack5_tdot_direct`, `pack5_sum_direct`, `pack5_gate_direct`) in `omni-isa` and wired `OmniBinaryVm` (`IGET`, `TDOT`, `EGATE`, `TLOGIC`, `TV_SRCH`) directly to `@PACK5` bytes.
+  - Lowered `0x7F01 (ARENA)`, `0x7F05 (DROP)`, `0x7F30 (PACK5)`, `0x7F31 (UNPACK5)`, `0x7F34 (TDOT)`, `0x7F35 (EGATE)`, `0x7F3F (TLOGIC)`, and `@PACK5` `0x7F0E (IGET)` in both `compile_pure_u16_to_x86_64_elf_with_args` and `compile_pure_u16_to_wasm`, plus surface intrinsics `pack5_tdot`, `pack5_gate`, `pack5_get`, and `pack5_len`.
+- [x] **2. AOT / Stage-1 for Hot Numeric Paths Instead of the Interpreter**:
+  - Added `is_module_aot_hot_path` and `execute_omni_surface_aot_first` so `execute_omni_surface_program` (`run`, `eval`, `repl`) automatically dispatches hot numeric, ternary, `@PACK5`, control-flow, and arena functions through the 64-bit AOT path (`backend == "aot"`).
+  - Added `compile_omni_surface_via_stage1_to_elf` and the `compile-stage1` CLI subcommand to lower `.omni` programs through `omni_self_compiler.omni_bc` into bit-exact `x86-64` ELF64 binaries without host codegen.
+- [x] **3. Explicit Step & Memory Budgets (`#[step_budget(N)]` / `#[mem_budget(N)]`)**:
+  - Enforced `OmniBinaryVm::charge_memory` across all allocating opcodes (`ARENA`, `CSTR`, `ANEW`, `ISET`, `PACK5`, `UNPACK5`, `SCONC`, `I2S`, `DB_INS`, `DOM_NODE`, `EMBED`), call-depth cap `MAX_VM_CALL_DEPTH = 64`, and `execute_wasm_module_i64_with_budgets` in AOT.
+  - Added `#[step_budget(N)]` / `#[fuel(N)]` and `#[mem_budget(N)]` / `#[memory_budget(N)]` surface function attributes and `execute_omni_surface_program_with_budgets`.
+- [x] **4. No Long-Lived Intermediate IR**:
+  - Refactored `compile_omni_surface_to_u16` to emit binary `u16` instruction packets directly from `SurfaceFnDef` via `encode_asm_ins_packet_u16` and `pack_fn_module` without building or re-parsing an `.omni_asm` string, and added direct `verify_u16_stream(&[u16])` (`193` monolith checks / `154` workspace differential checks passing with `0` warnings).

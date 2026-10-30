@@ -6,12 +6,14 @@
 use std::collections::BTreeMap;
 use std::fs;
 use omni_isa::*;
-use omni_ir::decode_omni_token_stream;
-use omni_verifier::verify_binary_function;
+use omni_ir::{decode_omni_token_stream, pack_fn_module, BinOperand};
+use omni_verifier::{verify_binary_function, verify_u16_stream};
 use omni_vm::{OmniBinaryVm, OmniValue};
-use omni_assembler::assemble_omni_text_to_u16;
+use omni_assembler::{encode_asm_ins_packet_u16, parse_asm_ty_tok};
 use omni_aot::{
-    compile_pure_u16_to_wasm, compile_pure_u16_to_x86_64_elf_with_args, execute_wasm_module_i64,
+    build_step7_stage1_compiler_stream, compile_pure_u16_to_wasm,
+    compile_pure_u16_to_x86_64_elf_with_args, execute_wasm_module_i64_with_budgets,
+    is_module_aot_hot_path, DEFAULT_WASM_MEMORY_BUDGET_BYTES, DEFAULT_WASM_STEP_LIMIT,
 };
 
 // 7B. OMNI SURFACE LANGUAGE (`omni-lang`) -> `.omni_asm` -> `Vec<u16>`
@@ -49,6 +51,8 @@ struct SurfaceParam {
 struct SurfaceFnDef {
     fn_id_attr: Option<u16>,
     cap_mask: CapMask,
+    step_budget_attr: Option<u64>,
+    mem_budget_attr: Option<usize>,
     name: String,
     params: Vec<SurfaceParam>,
     ret_ty: String,
@@ -398,6 +402,8 @@ impl SurfaceParser {
     fn parse_fn_def(&mut self) -> Result<SurfaceFnDef, String> {
         let mut fn_id_attr: Option<u16> = None;
         let mut cap_mask: CapMask = 0x0000;
+        let mut step_budget_attr: Option<u64> = None;
+        let mut mem_budget_attr: Option<usize> = None;
 
         while self.peek() == Some(&SurfaceTok::Hash) {
             let _ = self.next_spanned()?;
@@ -420,6 +426,22 @@ impl SurfaceParser {
                         let _ = self.next_spanned()?;
                     }
                 }
+                self.expect_sym(")")?;
+            } else if attr == "step_budget" || attr == "fuel" {
+                self.expect_sym("(")?;
+                let (b_val, bl, bc) = self.expect_int_spanned()?;
+                if b_val <= 0 {
+                    return Err(format!("line {}, col {}: step_budget must be > 0, got {}", bl, bc, b_val));
+                }
+                step_budget_attr = Some(b_val as u64);
+                self.expect_sym(")")?;
+            } else if attr == "mem_budget" || attr == "memory_budget" {
+                self.expect_sym("(")?;
+                let (m_val, ml, mc) = self.expect_int_spanned()?;
+                if m_val <= 0 {
+                    return Err(format!("line {}, col {}: mem_budget must be > 0, got {}", ml, mc, m_val));
+                }
+                mem_budget_attr = Some(m_val as usize);
                 self.expect_sym(")")?;
             } else {
                 return Err(format!("line {}, col {}: Unsupported surface attribute '{}'", al, ac, attr));
@@ -469,6 +491,8 @@ impl SurfaceParser {
         Ok(SurfaceFnDef {
             fn_id_attr,
             cap_mask,
+            step_budget_attr,
+            mem_budget_attr,
             name: fn_name,
             params,
             ret_ty,
@@ -1014,11 +1038,11 @@ impl SurfaceLowerCtx {
             "bnot" => Some("BNOT"),
             "tnot" => Some("TNOT"),
             "anew" => Some("ANEW"),
-            "slen" => Some("SLEN"),
+            "slen" | "pack5_len" => Some("SLEN"),
             "cint" | "mov" => Some("CINT"),
             "ctrit" => Some("CTRIT"),
             "pack5" | "tpack5" => Some("PACK5"),
-            "egate" | "decision_hook" => Some("EGATE"),
+            "egate" | "decision_hook" | "pack5_gate" => Some("EGATE"),
             "tlogic" | "decide_trit" => Some("TLOGIC"),
             "lookahead" => Some("LOOKAHEAD"),
             "san_sql" | "sanitize_sql" => Some("SAN_SQL"),
@@ -1063,9 +1087,9 @@ impl SurfaceLowerCtx {
             "tor" => Some("TOR"),
             "txor" => Some("TXOR"),
             "tcmp" => Some("TCMP"),
-            "iget" => Some("IGET"),
+            "iget" | "pack5_get" => Some("IGET"),
             "unpack5" | "tunpack5" => Some("UNPACK5"),
-            "tdot" => Some("TDOT"),
+            "tdot" | "pack5_tdot" => Some("TDOT"),
             "scat" | "sconc" => Some("SCAT"),
             _ => None,
         };
@@ -1568,10 +1592,111 @@ pub fn compile_omni_surface_to_asm(src: &str) -> Result<String, String> {
     Ok(joined)
 }
 
-/// Compiles an Omni surface language program directly into a `Vec<u16>` token stream.
+/// Compiles an Omni surface language program directly into a `Vec<u16>` token stream without
+/// materializing or re-parsing an intermediate `.omni_asm` text file.
 pub fn compile_omni_surface_to_u16(src: &str) -> Result<Vec<u16>, String> {
-    let asm = compile_omni_surface_to_asm(src)?;
-    assemble_omni_text_to_u16(&asm)
+    let tokens = tokenize_omni_surface(src)?;
+    let mut parser = SurfaceParser::new(tokens);
+    let (includes, fns) = parser.parse_module()?;
+    if !includes.is_empty() {
+        let expanded = resolve_omni_surface_includes(src, None, None)?;
+        return compile_omni_surface_to_u16(&expanded);
+    }
+
+    let multi_fn = fns.len() > 1;
+    let mut fn_sigs: BTreeMap<String, (u16, usize, String)> = BTreeMap::new();
+    let mut assigned_ids: Vec<u16> = Vec::with_capacity(fns.len());
+
+    for (idx, f) in fns.iter().enumerate() {
+        let fid = if let Some(id_attr) = f.fn_id_attr {
+            id_attr
+        } else if !multi_fn || idx + 1 == fns.len() {
+            0
+        } else {
+            (idx + 1) as u16
+        };
+        let ret_asm = String::from(map_omni_surface_type(&f.ret_ty, f.ret_line, f.ret_col)?);
+        for p in &f.params {
+            let _ = map_omni_surface_type(&p.ty, p.line, p.col)?;
+        }
+        if fn_sigs.contains_key(&f.name) {
+            return Err(format!("line {}, col {}: Duplicate function definition '{}'", f.ret_line, f.ret_col, f.name));
+        }
+        fn_sigs.insert(f.name.clone(), (fid, f.params.len(), ret_asm));
+        assigned_ids.push(fid);
+    }
+
+    let mut completed_fns: Vec<(u16, Vec<(u16, u16, u16)>, u16, CapMask, Vec<Vec<u16>>)> =
+        Vec::with_capacity(fns.len());
+    for (idx, f) in fns.iter().enumerate() {
+        let fid = assigned_ids[idx];
+        let mut params = Vec::with_capacity(f.params.len());
+        for (p_idx, p) in f.params.iter().enumerate() {
+            let ty_str = map_omni_surface_type(&p.ty, p.line, p.col)?;
+            let ty_tok = parse_asm_ty_tok(ty_str);
+            params.push((PAR_BASE + (p_idx as u16), ty_tok, pack_tc(p.untrusted, CAP_ID_PURE)));
+        }
+        let ret_ty_str = map_omni_surface_type(&f.ret_ty, f.ret_line, f.ret_col)?;
+        let ret_ty_tok = parse_asm_ty_tok(ret_ty_str);
+
+        let mut ctx = SurfaceLowerCtx::new(&f.params, fn_sigs.clone());
+        for stmt in &f.body {
+            ctx.lower_stmt(stmt)?;
+        }
+        ctx.check_unresolved_labels()?;
+        let mut ins_packets = Vec::with_capacity(ctx.lines.len());
+        for pkt in &ctx.lines {
+            ins_packets.push(encode_asm_ins_packet_u16(pkt, ret_ty_tok)?);
+        }
+        completed_fns.push((fid, params, ret_ty_tok, f.cap_mask, ins_packets));
+    }
+
+    if completed_fns.len() == 1 {
+        let (fn_id, params, ret_ty, cap_mask, ins_packets) = completed_fns.pop().unwrap();
+        Ok(pack_fn_module(&[], fn_id, &params, ret_ty, cap_mask, &ins_packets))
+    } else {
+        let mut stream = vec![TOK_MOD_BEGIN];
+        for (f_id, f_params, f_ret, f_cap, f_ins) in completed_fns {
+            stream.push(TOK_FN_DEF);
+            stream.push(f_id);
+            stream.push(f_params.len() as u16);
+            for (pt, pty, ptc) in f_params {
+                stream.push(pt);
+                stream.push(pty);
+                stream.push(ptc);
+            }
+            stream.push(f_ret);
+            stream.push(f_cap);
+            stream.push(f_ins.len() as u16);
+            for pkt in f_ins {
+                stream.extend_from_slice(&pkt);
+            }
+        }
+        stream.push(TOK_MOD_END);
+        Ok(stream)
+    }
+}
+
+/// Extracts any `#[step_budget(N)]` and `#[mem_budget(N)]` attributes declared on surface functions.
+pub fn extract_omni_surface_budgets(src: &str) -> (Option<u64>, Option<usize>) {
+    let Ok(tokens) = tokenize_omni_surface(src) else {
+        return (None, None);
+    };
+    let mut parser = SurfaceParser::new(tokens);
+    let Ok((_includes, fns)) = parser.parse_module() else {
+        return (None, None);
+    };
+    let mut step_b: Option<u64> = None;
+    let mut mem_b: Option<usize> = None;
+    for f in fns {
+        if let Some(sb) = f.step_budget_attr {
+            step_b = Some(step_b.map_or(sb, |cur| cur.min(sb)));
+        }
+        if let Some(mb) = f.mem_budget_attr {
+            mem_b = Some(mem_b.map_or(mb, |cur| cur.min(mb)));
+        }
+    }
+    (step_b, mem_b)
 }
 
 /// Compiles a `.omni` file from disk, resolving any relative `include "..."` directives.
@@ -1690,6 +1815,7 @@ pub fn wrap_omni_surface_snippet(snippet: &str) -> String {
             || e.contains(" > ")
             || e.starts_with("egate(")
             || e.starts_with("decision_hook(")
+            || e.starts_with("pack5_gate(")
             || e.starts_with("tlogic(")
             || e.starts_with("tmaj(")
             || e.starts_with("tand(")
@@ -1720,10 +1846,58 @@ pub fn wrap_omni_surface_snippet(snippet: &str) -> String {
     }
 }
 
-/// Compiles, statically verifies all functions in the module, and executes an Omni surface program in `OmniBinaryVm`.
-pub fn execute_omni_surface_program(src: &str, args: Vec<OmniValue>) -> Result<OmniValue, String> {
+/// Compiles, verifies, and executes an Omni surface program with explicit step and memory budgets.
+pub fn execute_omni_surface_program_with_budgets(
+    src: &str,
+    args: Vec<OmniValue>,
+    step_budget: Option<u64>,
+    mem_budget: Option<usize>,
+) -> Result<OmniValue, String> {
     let wrapped = wrap_omni_surface_snippet(src);
+    let (attr_steps, attr_mem) = extract_omni_surface_budgets(&wrapped);
+    let eff_steps = match (step_budget, attr_steps) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+    let eff_mem = match (mem_budget, attr_mem) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
     let u16_stream = compile_omni_surface_to_u16(&wrapped)?;
+    let _ = verify_u16_stream(&u16_stream)?;
+    let module = decode_omni_token_stream(&u16_stream)?;
+    let entry_fn_idx = if module.functions.iter().any(|f| f.fn_idx == 0) {
+        0
+    } else {
+        module.functions.last().map(|f| f.fn_idx).ok_or("No functions in module")?
+    };
+    let mut vm = OmniBinaryVm::new();
+    if let Some(sb) = eff_steps {
+        vm.step_limit = sb;
+    }
+    if let Some(mb) = eff_mem {
+        vm.memory_budget_bytes = mb;
+    }
+    vm.execute_function(&module, entry_fn_idx, args)
+}
+
+/// Executes an Omni surface program using the AOT hot path (`compile_pure_u16_to_wasm` ->
+/// `execute_wasm_module_i64_with_budgets`) whenever the module is an AOT-eligible numeric/ternary/
+/// `@PACK5` hot path returning `i64` or `trit`, falling back to `OmniBinaryVm` under explicit budgets
+/// only for high-level string, composite-return, or multi-function modules.
+/// Returns `(result_value, "aot" | "vm")`.
+pub fn execute_omni_surface_aot_first(
+    src: &str,
+    args: Vec<OmniValue>,
+) -> Result<(OmniValue, &'static str), String> {
+    let wrapped = wrap_omni_surface_snippet(src);
+    let (attr_steps, attr_mem) = extract_omni_surface_budgets(&wrapped);
+    let u16_stream = compile_omni_surface_to_u16(&wrapped)?;
+    let _ = verify_u16_stream(&u16_stream)?;
     let module = decode_omni_token_stream(&u16_stream)?;
     for func in &module.functions {
         let rep = verify_binary_function(func);
@@ -1736,8 +1910,100 @@ pub fn execute_omni_surface_program(src: &str, args: Vec<OmniValue>) -> Result<O
     } else {
         module.functions.last().map(|f| f.fn_idx).ok_or("No functions in module")?
     };
+    let entry_ret_ty_tok = module
+        .functions
+        .iter()
+        .find(|f| f.fn_idx == entry_fn_idx)
+        .map(|f| f.ret_ty_tok)
+        .unwrap_or(TY_I64);
+
+    let all_scalar_args = args.iter().all(|a| matches!(a, OmniValue::Int(_) | OmniValue::Trit(_)));
+    let scalar_ret = matches!(entry_ret_ty_tok, TY_I64 | TY_TRIT);
+
+    if is_module_aot_hot_path(&module) && all_scalar_args && scalar_ret {
+        let step_b = attr_steps.unwrap_or(DEFAULT_WASM_STEP_LIMIT);
+        let mem_b = attr_mem.unwrap_or(DEFAULT_WASM_MEMORY_BUDGET_BYTES);
+        let mut static_alloc_bytes = 0usize;
+        for func in &module.functions {
+            for ins in &func.instructions {
+                if ins.op_tok == 0x7F01 {
+                    if let Some(BinOperand::ImmInt(cap)) = ins.operands.first() {
+                        if *cap > 0 {
+                            static_alloc_bytes = static_alloc_bytes.saturating_add(*cap as usize);
+                        }
+                    }
+                }
+            }
+        }
+        if static_alloc_bytes > mem_b {
+            return Err(format!(
+                "AOT memory budget exceeded ({} > {} bytes)",
+                static_alloc_bytes, mem_b
+            ));
+        }
+        let i64_args: Vec<i64> = args
+            .iter()
+            .map(|a| match *a {
+                OmniValue::Int(n) => n,
+                OmniValue::Trit(t) => t as i64,
+                _ => 0,
+            })
+            .collect();
+        let wasm = compile_pure_u16_to_wasm(&u16_stream)?;
+        let raw_i64 = execute_wasm_module_i64_with_budgets(&wasm, &i64_args, step_b, mem_b)?;
+        let out_val = if entry_ret_ty_tok == TY_TRIT {
+            OmniValue::Trit(raw_i64.clamp(-1, 1) as i8)
+        } else {
+            OmniValue::Int(raw_i64)
+        };
+        return Ok((out_val, "aot"));
+    }
+
     let mut vm = OmniBinaryVm::new();
-    vm.execute_function(&module, entry_fn_idx, args)
+    if let Some(sb) = attr_steps {
+        vm.step_limit = sb;
+    }
+    if let Some(mb) = attr_mem {
+        vm.memory_budget_bytes = mb;
+    }
+    let val = vm.execute_function(&module, entry_fn_idx, args)?;
+    Ok((val, "vm"))
+}
+
+/// Compiles, statically verifies all functions in the module, and executes an Omni surface program
+/// (dispatching hot numeric/ternary/`@PACK5` paths through AOT first with explicit step and memory budgets).
+pub fn execute_omni_surface_program(src: &str, args: Vec<OmniValue>) -> Result<OmniValue, String> {
+    execute_omni_surface_aot_first(src, args).map(|(v, _)| v)
+}
+
+/// Compiles a surface `.omni` program via the Stage-1 self-hosting compiler (`omni_self_compiler.omni_bc`)
+/// into a standalone 64-bit Linux x86-64 ELF64 binary.
+pub fn compile_omni_surface_via_stage1_to_elf(
+    src: &str,
+    arg0: i64,
+    arg1: i64,
+    arg2: i64,
+) -> Result<Vec<u8>, String> {
+    let wrapped = wrap_omni_surface_snippet(src);
+    let u16_stream = compile_omni_surface_to_u16(&wrapped)?;
+    let _ = verify_u16_stream(&u16_stream)?;
+    let s1_stream = build_step7_stage1_compiler_stream();
+    let s1_mod = decode_omni_token_stream(&s1_stream)?;
+    let mut vm = OmniBinaryVm::new();
+    let res = vm.execute_function(
+        &s1_mod,
+        0,
+        vec![
+            OmniValue::U16Array(u16_stream),
+            OmniValue::Int(arg0),
+            OmniValue::Int(arg1),
+            OmniValue::Int(arg2),
+        ],
+    )?;
+    match res {
+        OmniValue::Bytes(elf) => Ok(elf),
+        other => Err(format!("Stage-1 self-compiler returned non-Bytes: {:?}", other)),
+    }
 }
 
 /// Compiles a surface `.omni` program directly to a standalone 64-bit Linux x86-64 ELF64 binary.
@@ -1761,8 +2027,15 @@ pub fn compile_omni_surface_to_wasm(src: &str) -> Result<Vec<u8>, String> {
 
 /// Compiles a surface `.omni` program to 64-bit WebAssembly and executes it in the pure-Rust 64-bit Wasm evaluator.
 pub fn execute_omni_surface_wasm_i64(src: &str, args: &[i64]) -> Result<i64, String> {
-    let wasm = compile_omni_surface_to_wasm(src)?;
-    execute_wasm_module_i64(&wasm, args)
+    let wrapped = wrap_omni_surface_snippet(src);
+    let (attr_steps, attr_mem) = extract_omni_surface_budgets(&wrapped);
+    let wasm = compile_omni_surface_to_wasm(&wrapped)?;
+    execute_wasm_module_i64_with_budgets(
+        &wasm,
+        args,
+        attr_steps.unwrap_or(DEFAULT_WASM_STEP_LIMIT),
+        attr_mem.unwrap_or(DEFAULT_WASM_MEMORY_BUDGET_BYTES),
+    )
 }
 
 
