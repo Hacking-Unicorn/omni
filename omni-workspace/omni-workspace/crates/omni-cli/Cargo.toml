@@ -1,0 +1,17 @@
+[package]
+name = "omni-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "omnic"
+path = "src/main.rs"
+
+[dependencies]
+omni-isa = { path = "../omni-isa" }
+omni-ir = { path = "../omni-ir" }
+omni-verifier = { path = "../omni-verifier" }
+omni-vm = { path = "../omni-vm" }
+omni-assembler = { path = "../omni-assembler" }
+omni-lang = { path = "../omni-lang" }
+omni-aot = { path = "../omni-aot" }

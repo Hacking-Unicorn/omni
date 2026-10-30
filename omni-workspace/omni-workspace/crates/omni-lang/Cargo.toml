@@ -1,0 +1,13 @@
+[package]
+name = "omni-lang"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+omni-isa = { path = "../omni-isa" }
+omni-ir = { path = "../omni-ir" }
+omni-verifier = { path = "../omni-verifier" }
+omni-vm = { path = "../omni-vm" }
+omni-assembler = { path = "../omni-assembler" }
+omni-aot = { path = "../omni-aot" }
+

@@ -1,0 +1,7 @@
+[package]
+name = "omni-ir"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+omni-isa = { path = "../omni-isa" }

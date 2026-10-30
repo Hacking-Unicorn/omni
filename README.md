@@ -1,0 +1,41 @@
+# Omni Language, ISA, Verifier, VM & AOT Compiler
+
+Zero-dependency Rust implementation of the **Omni** 16-bit binary token ISA (`0x7F00..=0x7F7F`), static linear/capability/taint verifier, deterministic ternary & numeric VM (`OmniBinaryVm`), self-hosting Stage-1/Stage-2 `x86-64` ELF64 and 64-bit WebAssembly AOT backends, and `.omni` surface language compiler (`omni-lang`).
+
+## Repository Layout
+
+- [`omni_rust_bootstrap.rs`](./omni_rust_bootstrap.rs) — Standalone single-file reference monolith (`186` self-test checks).
+- [`omni-workspace/omni-workspace/`](./omni-workspace/omni-workspace/) — 8-crate Cargo workspace (`145` monolith-vs-workspace differential checks):
+  - `crates/omni-isa` — 128-opcode table (`0x7F00..=0x7F7F`), token ranges, `@PACK5` codec, FNV-1a64 hashing.
+  - `crates/omni-ir` — Binary token stream decoder (`decode_omni_token_stream`) and IR types.
+  - `crates/omni-verifier` — Static capability bitmask, linear ownership/borrow/arena state machine, SSA, and `@UNTRUSTED` taint verifier (`verify_binary_function`).
+  - `crates/omni-vm` — Deterministic execution engine (`OmniBinaryVm`) with fuel and 256 MiB memory budgets.
+  - `crates/omni-assembler` — `.omni_asm` text assembler (`assemble_omni_text_to_u16`).
+  - `crates/omni-lang` — `.omni` surface language lexer, parser, multi-file `include` linker, and lowering pass.
+  - `crates/omni-aot` — Two-pass `x86-64` Linux ELF64 compiler, 64-bit WebAssembly (`\0asm`) compiler & evaluator, and Stage-1/Stage-2 self-compiler (`omni_self_compiler.omni_bc`).
+  - `crates/omni-cli` — CLI runner (`selftest`, `run`, `eval`, `repl`, `compile-surface`, `surface-to-asm`, `compile-elf`, `compile-wasm`, `run-wasm`).
+- [`spec.md`](./spec.md) — Normative specification (`SPEC.md`).
+- [`omni_full_status_audit.md`](./omni_full_status_audit.md) — Full architectural and verification status audit.
+- [`omni_progress_checklist.md`](./omni_progress_checklist.md) — Phase 1–4 progress checklist.
+
+## Quick Start
+
+### 1. Run the 8-Crate Workspace Selftest
+```powershell
+cd omni-workspace/omni-workspace
+$env:CARGO_INCREMENTAL=0; cargo build --workspace
+cargo run -p omni-cli -- selftest
+```
+
+### 2. Run the Standalone Monolith Selftest
+```powershell
+rustc -O omni_rust_bootstrap.rs -o omni.exe
+.\omni.exe selftest
+```
+
+### 3. Evaluate or Run `.omni` Surface Programs
+```powershell
+cargo run -p omni-cli -- eval "#[cap(AI)] fn main(a: i64, b: i64) -> trit { let g = egate(a - b); return g; }" 30 10
+cargo run -p omni-cli -- eval "let acc = 0; let i = 10; while i >= 1 { acc += i; i -= 1; } acc"
+cargo run -p omni-cli -- repl
+```

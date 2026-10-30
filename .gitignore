@@ -1,0 +1,20 @@
+# Rust / Cargo build outputs
+target/
+**/target/
+
+# Compiled binaries and artifacts
+*.exe
+*.dll
+*.pdb
+*.bin
+*.elf
+*.wasm
+*.omni_bc
+*.omni_holo
+*.tar.gz
+
+# Temporary files and generated checkpoints
+*.log
+grpo_policy_checkpoint.json
+omni_sft_corpus.jsonl
+tokenizer.json

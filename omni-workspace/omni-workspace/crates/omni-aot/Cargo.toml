@@ -1,0 +1,9 @@
+[package]
+name = "omni-aot"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+omni-isa = { path = "../omni-isa" }
+omni-ir = { path = "../omni-ir" }
+omni-verifier = { path = "../omni-verifier" }

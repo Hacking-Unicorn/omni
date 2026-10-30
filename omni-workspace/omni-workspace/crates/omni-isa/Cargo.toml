@@ -1,0 +1,4 @@
+[package]
+name = "omni-isa"
+version.workspace = true
+edition.workspace = true

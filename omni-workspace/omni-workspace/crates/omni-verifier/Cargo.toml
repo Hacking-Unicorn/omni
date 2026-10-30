@@ -1,0 +1,8 @@
+[package]
+name = "omni-verifier"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+omni-isa = { path = "../omni-isa" }
+omni-ir = { path = "../omni-ir" }
