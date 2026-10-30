@@ -1,0 +1,30 @@
+name: Omni CI (Monolith & 8-Crate Workspace Selftests)
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run standalone monolith selftest (186 checks + Stage-1/Stage-2 ELF64 fixed point)
+        run: |
+          rustc -O omni_rust_bootstrap.rs -o omni
+          ./omni selftest
+
+      - name: Build and run 8-crate Cargo workspace differential selftest (145 checks)
+        working-directory: omni-workspace/omni-workspace
+        env:
+          CARGO_INCREMENTAL: "0"
+        run: |
+          cargo build --workspace
+          cargo run -p omni-cli -- selftest
