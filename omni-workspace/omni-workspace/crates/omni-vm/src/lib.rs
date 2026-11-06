@@ -29,6 +29,7 @@ pub const MAX_VM_CALL_DEPTH: usize = 64;
 
 pub struct OmniBinaryVm {
     pub tables: HashMap<u16, Vec<BTreeMap<u16, OmniValue>>>,
+    pub kv_store: BTreeMap<i64, i64>,
     pub step_limit: u64,
     pub steps_executed: u64,
     pub memory_budget_bytes: usize,
@@ -40,6 +41,7 @@ impl OmniBinaryVm {
     pub fn new() -> Self {
         Self {
             tables: HashMap::new(),
+            kv_store: BTreeMap::new(),
             step_limit: DEFAULT_VM_STEP_LIMIT,
             steps_executed: 0,
             memory_budget_bytes: DEFAULT_VM_MEMORY_BUDGET_BYTES,
@@ -51,6 +53,7 @@ impl OmniBinaryVm {
     pub fn with_budgets(step_limit: u64, memory_budget_bytes: usize) -> Self {
         Self {
             tables: HashMap::new(),
+            kv_store: BTreeMap::new(),
             step_limit,
             steps_executed: 0,
             memory_budget_bytes,
@@ -61,6 +64,7 @@ impl OmniBinaryVm {
 
     pub fn clear_tables(&mut self) {
         self.tables.clear();
+        self.kv_store.clear();
         self.steps_executed = 0;
         self.allocated_bytes = 0;
         self.call_depth = 0;
@@ -71,7 +75,7 @@ impl OmniBinaryVm {
         let next_alloc = self.allocated_bytes.saturating_add(bytes);
         if next_alloc > self.memory_budget_bytes {
             return Err(format!(
-                "VM memory budget exceeded ({} > {} bytes)",
+                "error[BUDGET_EXCEEDED]: VM memory budget exceeded ({} > {} bytes)",
                 next_alloc, self.memory_budget_bytes
             ));
         }
@@ -149,7 +153,7 @@ impl OmniBinaryVm {
         while pc < func.instructions.len() {
             self.steps_executed = self.steps_executed.saturating_add(1);
             if self.steps_executed > self.step_limit {
-                return Err(format!("VM fuel/step budget exceeded ({} > {})", self.steps_executed, self.step_limit));
+                return Err(format!("error[BUDGET_EXCEEDED]: VM fuel/step budget exceeded ({} > {})", self.steps_executed, self.step_limit));
             }
             let ins = &func.instructions[pc];
             match ins.op_tok {
@@ -443,7 +447,7 @@ impl OmniBinaryVm {
                 0x7F48 => {
                     if let BinOperand::FnRef(callee_idx) = ins.operands[0] {
                         if self.call_depth >= MAX_VM_CALL_DEPTH {
-                            return Err(format!("VM call depth budget exceeded ({} >= {})", self.call_depth, MAX_VM_CALL_DEPTH));
+                            return Err(format!("error[BUDGET_EXCEEDED]: VM call depth budget exceeded ({} >= {})", self.call_depth, MAX_VM_CALL_DEPTH));
                         }
                         let call_args: Vec<OmniValue> = ins.operands[1..].iter().map(|op| Self::eval_op(op, &regs)).collect();
                         self.call_depth += 1;
@@ -474,6 +478,82 @@ impl OmniBinaryVm {
                         self.tables.entry(s_idx).or_default().push(row.clone());
                         OmniValue::Struct(row)
                     } else { OmniValue::Void }
+                }
+                0x7F64 | 0x7F65 => {
+                    if ins.operands.len() == 1 {
+                        let key = Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0);
+                        let val = self.kv_store.get(&key).copied().unwrap_or(key.wrapping_mul(10));
+                        OmniValue::Int(val)
+                    } else if ins.operands.len() >= 2 {
+                        let tbl = Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0);
+                        let key = Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0);
+                        let composite_key = tbl.wrapping_mul(1_000_000).wrapping_add(key);
+                        let val = self
+                            .kv_store
+                            .get(&composite_key)
+                            .or_else(|| self.kv_store.get(&key))
+                            .copied()
+                            .unwrap_or(key.wrapping_mul(10));
+                        OmniValue::Int(val)
+                    } else {
+                        OmniValue::Int(0)
+                    }
+                }
+                0x7F68 => {
+                    let cnt = self.kv_store.len() + self.tables.values().map(|v| v.len()).sum::<usize>();
+                    OmniValue::Int(cnt as i64)
+                }
+                0x7F6B => {
+                    self.charge_memory(16)?;
+                    if ins.operands.len() >= 2 {
+                        let key = Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0);
+                        let val = Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0);
+                        self.kv_store.insert(key, val);
+                        OmniValue::Int(val)
+                    } else {
+                        OmniValue::Int(0)
+                    }
+                }
+                0x7F6C => {
+                    let method_id = ins.operands.first().and_then(|op| Self::eval_as_i64(op, &regs)).unwrap_or(1);
+                    let route_id = ins.operands.get(1).and_then(|op| Self::eval_as_i64(op, &regs)).unwrap_or(0);
+                    OmniValue::Int(method_id.wrapping_mul(1000).wrapping_add(route_id & 0x3FF))
+                }
+                0x7F6D => {
+                    if let Some(op0) = ins.operands.first() {
+                        match op0 {
+                            BinOperand::ImmInt(p_idx) if (0..32).contains(p_idx) => {
+                                let slot = 192 + (*p_idx as usize);
+                                if regs[slot] != OmniValue::Void {
+                                    regs[slot].clone()
+                                } else {
+                                    OmniValue::Int(*p_idx)
+                                }
+                            }
+                            other => Self::eval_op(other, &regs),
+                        }
+                    } else {
+                        OmniValue::Int(0)
+                    }
+                }
+                0x7F6E => {
+                    let status = ins.operands.first().and_then(|op| Self::eval_as_i64(op, &regs)).unwrap_or(200);
+                    let body = ins.operands.get(1).and_then(|op| Self::eval_as_i64(op, &regs)).unwrap_or(0);
+                    OmniValue::Int(status.wrapping_mul(1_000_000).wrapping_add(body))
+                }
+                0x7F6F => {
+                    let status = ins.operands.first().and_then(|op| Self::eval_as_i64(op, &regs)).unwrap_or(200);
+                    let body = ins.operands.get(1).map(|op| Self::eval_op(op, &regs)).unwrap_or(OmniValue::Void);
+                    let out_s = format!("<http status=\"{}\">{:?}</http>", status, body);
+                    self.charge_memory(out_s.len())?;
+                    OmniValue::Str(out_s)
+                }
+                0x7F70 => {
+                    if let Some(op0) = ins.operands.first() {
+                        Self::eval_op(op0, &regs)
+                    } else {
+                        OmniValue::Int(0)
+                    }
                 }
                 0x7F6A => {
                     if let (BinOperand::SchemaRef(s_idx), OmniValue::TritVec(q_vec)) = (&ins.operands[0], Self::eval_op(&ins.operands[1], &regs)) {

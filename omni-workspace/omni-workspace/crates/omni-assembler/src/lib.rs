@@ -83,6 +83,15 @@ pub fn encode_asm_ins_packet_u16(line: &str, ret_ty: u16) -> Result<Vec<u16>, St
             "SAN_DOM"                 => Ok((0x7F58, TY_STR)),
             "SAN_PRM"                 => Ok((0x7F59, TY_STR)),
             "FNV1A"                   => Ok((0x7F5D, TY_I64)),
+            "DB_GET"   | "KV_GET"     => Ok((0x7F64, TY_I64)),
+            "DB_QRY"                  => Ok((0x7F65, TY_I64)),
+            "DB_CNT"                  => Ok((0x7F68, TY_I64)),
+            "KV_PUT"   | "DB_PUT"     => Ok((0x7F6B, TY_I64)),
+            "ROUTE"    | "HTTP_SRV"   => Ok((0x7F6C, TY_I64)),
+            "REQ_PAR"                 => Ok((0x7F6D, TY_I64)),
+            "RSP_JSON"                => Ok((0x7F6E, TY_I64)),
+            "RSP_HTML"                => Ok((0x7F6F, TY_STR)),
+            "AUTH_VER"                => Ok((0x7F70, TY_I64)),
             other => Err(format!("Unknown assembler mnemonic '{}'", other)),
         }
     };
@@ -184,6 +193,8 @@ pub fn encode_asm_ins_packet_u16(line: &str, ret_ty: u16) -> Result<Vec<u16>, St
         let d_idx = parts[0].strip_prefix('%').ok_or("Expected %N destination")?.parse::<u16>().map_err(|e| e.to_string())?;
         let (op_mnem, untr_suffix) = if let Some(base) = parts[2].strip_suffix("@UNTRUSTED") {
             (base, true)
+        } else if let Some(base) = parts[2].strip_suffix("@SAFE") {
+            (base, false)
         } else {
             (parts[2], false)
         };

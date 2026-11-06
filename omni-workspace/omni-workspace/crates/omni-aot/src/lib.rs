@@ -83,7 +83,7 @@ fn validate_func_pack5_ops(
     let check_reg = |r: u16| -> Result<(), String> {
         if let Some((bytes, _, _)) = reg_pack5.get(&r) {
             if bytes.iter().any(|&b| b > PACK5_MAX_VALID) {
-                return Err(String::from("PACK5_SENTINEL_OR_CORRUPT_BYTE"));
+                return Err(String::from("error[CORRUPT_PACK5]: PACK5_SENTINEL_OR_CORRUPT_BYTE"));
             }
         }
         Ok(())
@@ -1344,7 +1344,7 @@ pub fn execute_wasm_module_i64_with_budgets(
     let frame_bytes = wasm.len().saturating_add(total_locals.max(args.len()).saturating_mul(8));
     if frame_bytes > memory_budget_bytes {
         return Err(format!(
-            "Wasm AOT memory budget exceeded ({} > {} bytes)",
+            "error[BUDGET_EXCEEDED]: Wasm AOT memory budget exceeded ({} > {} bytes)",
             frame_bytes, memory_budget_bytes
         ));
     }
@@ -1363,14 +1363,14 @@ pub fn execute_wasm_module_i64_with_budgets(
         steps_executed = steps_executed.saturating_add(1);
         if steps_executed > step_limit {
             return Err(format!(
-                "Wasm AOT step budget exceeded ({} > {})",
+                "error[BUDGET_EXCEEDED]: Wasm AOT step budget exceeded ({} > {})",
                 steps_executed, step_limit
             ));
         }
         let runtime_bytes = frame_bytes.saturating_add(stack.len().saturating_add(ctrl_stack.len()).saturating_mul(8));
         if runtime_bytes > memory_budget_bytes {
             return Err(format!(
-                "Wasm AOT memory budget exceeded ({} > {} bytes)",
+                "error[BUDGET_EXCEEDED]: Wasm AOT memory budget exceeded ({} > {} bytes)",
                 runtime_bytes, memory_budget_bytes
             ));
         }

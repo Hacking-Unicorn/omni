@@ -33,7 +33,7 @@ Reproducible command:
 rustc -O omni_rust_bootstrap.rs -o omni && ./omni selftest
 ```
 
-Verified coverage (`196` non-vacuous checks = `148` core bootstrap checks + `48` `omni-lang` surface language, Phase 5 & deep-audit checks, `0` compiler warnings):
+Verified coverage (`237` non-vacuous checks = `148` core bootstrap checks + `89` `omni-lang` surface language, Phase 5, deep-audit & Phase 6 AI-first/harness checks, `0` compiler warnings):
 - **Full Golden Differential (`OmniBinaryVm` == `Stage-1` == `x86-64` ELF == `execute_wasm_module_i64`)**: `compile_pure_u16_to_wasm` and `execute_wasm_module_i64` lower `LABEL (0x7F40)`, `JMP (0x7F41)`, `BR_TRIT (0x7F42)`, `BR_POS (0x7F43)`, `BR_NEG (0x7F44)`, `ANEW (0x7F0D)`, `IGET (0x7F0E)`, `ISET (0x7F0F)`, `SLEN (0x7F50)`, `ARENA (0x7F01)`, `DROP (0x7F05)`, `PACK5 (0x7F30)`, `UNPACK5 (0x7F31)`, `TDOT (0x7F34)`, `EGATE (0x7F35)`, and `TLOGIC (0x7F3F)` in addition to all numeric/bitwise/ternary opcodes. Every golden covered by the `x86-64` path is verified through `execute_wasm_module_i64` and `OmniBinaryVm` on both Windows and Linux.
 - **Explicit Standalone AOT Rejection (Check 6)**: Both `compile_pure_u16_to_x86_64_elf` and `compile_pure_u16_to_wasm` reject high-level VM-only runtime seeds (`1, 2, 3, 5, 7`) with `Err(...)`.
 
@@ -57,8 +57,8 @@ CARGO_INCREMENTAL=0 cargo build --workspace
 cargo run -p omni-cli -- selftest
 ```
 
-Verified workspace build & differential results (`157` checks on Windows, `158` checks on Linux `x86-64`, `0` compiler warnings):
-- **8-Crate Workspace (`omni-isa`, `omni-ir`, `omni-verifier`, `omni-vm`, `omni-assembler`, `omni-lang`, `omni-aot`, `omni-cli`)**: Compiles cleanly with zero external dependencies and runs `assert_verifier_clone_eq`, `assert_golden_monolith_vs_workspace`, all 64 corpus samples, and all 50 surface-language, Phase 5 & deep-audit differential checks against `mod monolith`.
+Verified workspace build & differential results (`198` checks on Windows, `199` checks on Linux `x86-64`, `0` compiler warnings):
+- **8-Crate Workspace (`omni-isa`, `omni-ir`, `omni-verifier`, `omni-vm`, `omni-assembler`, `omni-lang`, `omni-aot`, `omni-cli`)**: Compiles cleanly with zero external dependencies and runs `assert_verifier_clone_eq`, `assert_golden_monolith_vs_workspace`, all 64 corpus samples, and all 91 surface-language, Phase 5, deep-audit & Phase 6 AI-first/harness differential checks against `mod monolith`.
 
 ## 4. Usable Omni Surface Language (`omni-lang`) — Properties & Goldens
 
@@ -81,7 +81,7 @@ cargo run -p omni-cli -- compile-wasm program.omni program.wasm
 cargo run -p omni-cli -- run-wasm program.omni 30 15
 ```
 
-Verified surface language properties & usability checks (`48` checks in Section `13` / `50` checks in `omni-cli`, `0` new opcodes):
+Verified surface language properties, full-stack host ABI & version-locked harness checks (`89` checks in Section `13` / `91` checks in `omni-cli`, `0` new opcodes):
 
 | Surface Property / Feature | Lowering Mechanism (Existing Opcodes Only) | Verified Golden / Rejection Proof |
 |----------------------------|--------------------------------------------|-----------------------------------|
@@ -101,3 +101,8 @@ Verified surface language properties & usability checks (`48` checks in Section 
 | **14. Explicit Step & Memory Budgets (`#[step_budget(N)]`, `#[mem_budget(N)]`)** | `OmniBinaryVm::charge_memory` across all allocating opcodes + `execute_wasm_module_i64_with_budgets` | Deterministically halts runaway loops (`#[step_budget(40)]` / `#[step_budget(150)]`) and oversized allocations (`#[mem_budget(16)]` / `#[mem_budget(256)]` / `#[mem_budget(512)]`) in both AOT and VM |
 | **15. Zero Long-Lived Intermediate IR (`compile_omni_surface_to_u16`)** | Direct AST -> `SurfaceLowerCtx.packets: Vec<Vec<u16>>` -> `pack_fn_module` + direct `verify_u16_stream(&[u16])` | Emits `Vec<u16>` packets on the fly with zero intermediate `.omni_asm` string retention; 100% bit-identical to `assemble_omni_text_to_u16` across all 15 goldens and multi-function modules |
 | **16. Unbounded `@PACK5` Vectors (`> 35` Trits), Dynamic `IGET` & Corrupt Sentinel (`243..=255`) Rejection** | Direct byte-lane `@PACK5` extraction + branchless dynamic `IGET` in AOT (`x86-64` & Wasm) + `validate_func_pack5_ops` | `pack5_50_dynamic_golden(50) == 4101` (50 trits = 10 packed bytes + dynamic loop `iget(v, idx)`) matches across `x86-64` ELF64 AOT, 64-bit WebAssembly AOT, and `OmniBinaryVm`; corrupt byte `250 > 242` and uncalled tainted helpers are deterministically rejected across AOT and VM |
+| **17. Golden Size Regression Gate (`13p` / `6q`)** | Asserts locked `u16` token counts `[53, 34, 34, 91, 40, 20, 22, 22, 49, 49, 51, 74, 69, 57, 86]` across all 15 `SPEC.md` goldens | Fails selftest if any golden grows by even `1` `u16` token; verifies zero-cost `: <ty>` on `let` (`0` extra tokens) |
+| **18. Stricter AI-First Single-Form Grammar (`#[strict]` / `--strict`, `13q` / `6r`)** | `compile_omni_surface_strict_to_u16` enforcing `: <ty>` on every `let`, canonical `+1t`/`0t`/`-1t`, `@untrusted`, and `include "..."` | Accepts canonical typed programs and `let v: trit_vec = [...]` (`@PACK5` `2` B vs `80` B for 10 trits, `10` B vs `400` B for 50 trits); rejects untyped `let` (`BAD_TYPE`), `TRIT_POS`, `untrusted_i64`, `int`, and `mod "..."` (`AMBIGUOUS_GRAMMAR`) |
+| **19. Machine-Readable Error Codes (`error[<CODE>]`, `13r` / `6s`)** | `parse_omni_structured_error` across lexer, parser, lowering, static verifier, `@PACK5`, and budgets | Verifies all 16 codes: `TAINT_ON_RET`, `TAINT_SINK`, `MISSING_CAP`, `LINEAR_LEAK`, `BORROW_CONFLICT`, `UNDEF_VAR` (line 2, col 13), `IMMUT_PARAM`, `BAD_TYPE`, `UNKNOWN_FN`, `ARITY_MISMATCH`, `UNRESOLVED_LABEL`, `CIRCULAR_INCLUDE`, `BUDGET_EXCEEDED`, `CORRUPT_PACK5`, `AMBIGUOUS_GRAMMAR`, `SYNTAX_ERROR` |
+| **20. Full-Stack `route` + `req.param` + DB/KV Host ABI (`13s` / `6t`)** | `route GET /users/:id` -> `0x7F6C ROUTE`, `req.param` -> `0x7F6D REQ_PAR`, `db_get`/`db_query` -> `0x7F64`/`0x7F65`, `kv_put` -> `0x7F6B`, `auth_verify` -> `0x7F70`, `respond` -> `0x7F6E` | `route GET /users/:id` with `kv_put`/`db_get` returns `Int(200_000_777)` and `db_query` returns `Int(200_000_420)`; missing `@cap(net)` / `@cap(db_r)` / `@cap(db_w)` rejected with `MISSING_CAP`; unsanitized `@untrusted` query parameter rejected with `TAINT_SINK` until sanitized via `auth_verify` |
+| **21. Version-Locked Model Harness (`omni-harness`, `13t` / `6u`)** | `OMNI_HARNESS_CONTRACT_VERSION = "omni-harness-v1.0.0"`, `run_omni_harness_json`, `omni_harness_spec_json`, and `omni-harness` binary | Single-line JSON output verified for `"ok":true` (`"backend":"aot"` and `"backend":"vm"`), `"ok":false` (`TAINT_ON_RET`, `MISSING_CAP`, `BUDGET_EXCEEDED`, `BAD_TYPE` with `line`/`col` and `--retry-hint`), and `--spec` |

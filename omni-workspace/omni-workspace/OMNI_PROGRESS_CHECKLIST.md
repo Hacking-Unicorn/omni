@@ -77,4 +77,18 @@
 - [x] **4. No Long-Lived Intermediate IR & Deep Audit Hardening**:
   - Refactored `compile_omni_surface_to_u16` (`SurfaceLowerCtx.packets`) to emit binary `u16` instruction packets directly from `SurfaceFnDef` and patch `IfBranch` join targets directly in binary without retaining `ctx.lines` or building an `.omni_asm` string, and added direct `verify_u16_stream(&[u16])`.
   - Removed the 35-trit AOT `@PACK5` limit so arbitrary-length `@PACK5` vectors (`> 35` trits, e.g., 50 trits) and dynamic-index `iget(v, i)` loops execute natively in both `x86-64` ELF64 AOT and 64-bit WebAssembly AOT (`pack5_50_dynamic_golden(50) == 4101`).
-  - Added strict `@PACK5` sentinel/corrupt byte (`243..=255`) rejection (`validate_func_pack5_ops` in AOT + `Err("PACK5_SENTINEL_OR_CORRUPT_BYTE")` propagation in `OmniBinaryVm`) and full multi-function verification across all execution entrypoints (`196` monolith checks / `157` workspace differential checks passing with `0` warnings).
+  - Added strict `@PACK5` sentinel/corrupt byte (`243..=255`) rejection (`validate_func_pack5_ops` in AOT + `Err("error[CORRUPT_PACK5]: PACK5_SENTINEL_OR_CORRUPT_BYTE")` propagation in `OmniBinaryVm`) and full multi-function verification across all execution entrypoints.
+
+## Phase 6: AI-First Surface Additions, Full-Stack Host ABI & Version-Locked Harness (Complete)
+- [x] **1. CI, Standalone Edition-Free Compilation & Workspace Path Sync (Section 1)**:
+  - Added `use std::convert::TryInto;` to `omni_rust_bootstrap.rs` so `rustc -O omni_rust_bootstrap.rs -o omni` compiles cleanly with `0` warnings without needing `--edition 2021`.
+  - Synchronized `.github/workflows/ci.yml`, `README.md`, `spec.md`, `omni_full_status_audit.md`, and `omni_progress_checklist.md` (`237` monolith checks / `198` Windows & `199` Linux workspace differential checks).
+- [x] **2. Golden Size Regression Gate & Stricter Single-Form Grammar (`#[strict]` / `--strict`, Section 2.1, 2.3, 2.4)**:
+  - Locked exact `u16` token counts `[53, 34, 34, 91, 40, 20, 22, 22, 49, 49, 51, 74, 69, 57, 86]` across all 15 `SPEC.md` goldens (`13p` / `6q`).
+  - Added zero-cost explicit `: <ty>` annotations on `let` (`let x: i64 = ...;`, `let v: trit_vec = [...]` traveling as `@PACK5` by default: `2` B vs `80` B for 10 trits, `10` B vs `400` B for 50 trits) and `compile_omni_surface_strict_to_u16` (`13q` / `6r`).
+- [x] **3. Machine-Readable Error Codes (`error[<CODE>]`, Section 2.2 & 2.5)**:
+  - Standardized all 16 error codes across lexer, parser, lowering, static verifier, `@PACK5`, and step/memory budgets (`TAINT_ON_RET`, `TAINT_SINK`, `MISSING_CAP`, `LINEAR_LEAK`, `BORROW_CONFLICT`, `UNDEF_VAR`, `IMMUT_PARAM`, `BAD_TYPE`, `UNKNOWN_FN`, `ARITY_MISMATCH`, `UNRESOLVED_LABEL`, `CIRCULAR_INCLUDE`, `BUDGET_EXCEEDED`, `CORRUPT_PACK5`, `AMBIGUOUS_GRAMMAR`, `SYNTAX_ERROR`, `13r` / `6s`).
+- [x] **4. Full-Stack `route` + `req.param` + DB/KV Host ABI (Zero New Opcodes, Section 3)**:
+  - Wired existing `OMNI_ISA_TABLE` opcodes `0x7F64..=0x7F70` (`DB_GET`, `DB_QRY`, `DB_CNT`, `KV_PUT`, `ROUTE`, `REQ_PAR`, `RSP_JSON`, `RSP_HTML`, `AUTH_VER`) through the assembler, `OmniBinaryVm`, and `omni-lang`, with capability (`MISSING_CAP`) and taint (`TAINT_SINK`) verification (`13s` / `6t`).
+- [x] **5. Version-Locked Model Harness (`omni-harness` / `omni-harness-v1.0.0`, Section 4)**:
+  - Added `OMNI_HARNESS_CONTRACT_VERSION = "omni-harness-v1.0.0"`, `run_omni_harness_json`, `omni_harness_spec_json`, `omni harness`, and the standalone `omni-harness` binary target (`13t` / `6u`, `237` monolith checks / `198` Windows & `199` Linux workspace differential checks passing with `0` warnings).

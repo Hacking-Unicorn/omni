@@ -2,10 +2,15 @@
 name = "omni-cli"
 version.workspace = true
 edition.workspace = true
+default-run = "omnic"
 
 [[bin]]
 name = "omnic"
 path = "src/main.rs"
+
+[[bin]]
+name = "omni-harness"
+path = "src/bin/omni-harness.rs"
 
 [dependencies]
 omni-isa = { path = "../omni-isa" }

@@ -6,6 +6,7 @@
 
 pub const VOCAB_SIZE: usize = 32_768;
 pub const ENGLISH_MAX_TOKEN: u16 = 0x7DFF;
+pub const OMNI_HARNESS_CONTRACT_VERSION: &str = "omni-harness-v1.0.0";
 
 pub const REG_BASE: u16 = 0x7E00; // 0x7E00 .. 0x7EBF (192 SSA registers)
 pub const REG_MAX: u16  = 0x7EBF;
@@ -341,7 +342,7 @@ pub fn pack5_decode(bytes: &[u8], expected_trits: usize) -> Result<Vec<i8>, &'st
     let mut out = Vec::with_capacity(expected_trits);
     for &b in bytes {
         if b > PACK5_MAX_VALID {
-            return Err("PACK5_SENTINEL_OR_CORRUPT_BYTE");
+            return Err("error[CORRUPT_PACK5]: PACK5_SENTINEL_OR_CORRUPT_BYTE");
         }
         let unpacked = LUT_UNPACK5[b as usize];
         for &v in &unpacked {
@@ -362,7 +363,7 @@ pub fn pack5_get_trit(packed: &[u8], trit_idx: usize) -> Result<i8, &'static str
     }
     let b = packed[byte_idx];
     if b > PACK5_MAX_VALID {
-        return Err("PACK5_SENTINEL_OR_CORRUPT_BYTE");
+        return Err("error[CORRUPT_PACK5]: PACK5_SENTINEL_OR_CORRUPT_BYTE");
     }
     Ok(LUT_UNPACK5[b as usize][trit_idx % 5])
 }
@@ -376,7 +377,7 @@ pub fn pack5_set_trit(packed: &mut [u8], trit_idx: usize, val: i8) -> Result<(),
     }
     let b = packed[byte_idx];
     if b > PACK5_MAX_VALID {
-        return Err("PACK5_SENTINEL_OR_CORRUPT_BYTE");
+        return Err("error[CORRUPT_PACK5]: PACK5_SENTINEL_OR_CORRUPT_BYTE");
     }
     let mut trits = LUT_UNPACK5[b as usize];
     trits[trit_idx % 5] = val.clamp(-1, 1);
@@ -402,7 +403,7 @@ pub fn pack5_tdot_direct(a_packed: &[u8], b_packed: &[u8], n_trits: usize) -> Re
             break;
         }
         if ba > PACK5_MAX_VALID || bb > PACK5_MAX_VALID {
-            return Err("PACK5_SENTINEL_OR_CORRUPT_BYTE");
+            return Err("error[CORRUPT_PACK5]: PACK5_SENTINEL_OR_CORRUPT_BYTE");
         }
         let ua = LUT_UNPACK5[ba as usize];
         let ub = LUT_UNPACK5[bb as usize];
@@ -425,7 +426,7 @@ pub fn pack5_sum_direct(packed: &[u8], n_trits: usize) -> Result<i64, &'static s
             break;
         }
         if b > PACK5_MAX_VALID {
-            return Err("PACK5_SENTINEL_OR_CORRUPT_BYTE");
+            return Err("error[CORRUPT_PACK5]: PACK5_SENTINEL_OR_CORRUPT_BYTE");
         }
         let u = LUT_UNPACK5[b as usize];
         let take = rem_trits.min(5);

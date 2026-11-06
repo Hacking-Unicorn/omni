@@ -112,10 +112,10 @@ pub fn verify_binary_function(func: &BinFunction) -> BinVerificationReport {
                 if let Some(slot) = token_to_slot(*r_tok) {
                     match regs[slot].state {
                         RegState::Moved | RegState::Dropped | RegState::Uninit => {
-                            errors.push(format!("Offset {}: Invalid DROP on 0x{:04X}", ins.offset, r_tok));
+                            errors.push(format!("Offset {}: error[BORROW_CONFLICT]: Invalid DROP on 0x{:04X}", ins.offset, r_tok));
                         }
                         RegState::BorrowedR(k) if k > 0 => {
-                            errors.push(format!("Offset {}: Cannot DROP 0x{:04X} with {} active readers", ins.offset, r_tok, k));
+                            errors.push(format!("Offset {}: error[BORROW_CONFLICT]: Cannot DROP 0x{:04X} with {} active readers", ins.offset, r_tok, k));
                         }
                         _ => {
                             if let Some(p) = regs[slot].parent_slot {
@@ -139,7 +139,7 @@ pub fn verify_binary_function(func: &BinFunction) -> BinVerificationReport {
                 for r_tok in ref_toks {
                     if let Some(slot) = token_to_slot(r_tok) {
                         if regs[slot].taint == Taint::Untrusted {
-                            errors.push(format!("Offset {}: Taint violation on RET 0x{:04X}", ins.offset, r_tok));
+                            errors.push(format!("Offset {}: error[TAINT_ON_RET]: Taint violation on RET 0x{:04X}", ins.offset, r_tok));
                         }
                         regs[slot].state = RegState::Moved;
                     }
@@ -147,7 +147,7 @@ pub fn verify_binary_function(func: &BinFunction) -> BinVerificationReport {
             }
             for idx in 0..192usize {
                 if regs[idx].is_heap_arena && !matches!(regs[idx].state, RegState::Moved | RegState::Dropped | RegState::Uninit) {
-                    errors.push(format!("Offset {}: Linear memory leak on 0x{:04X}", ins.offset, REG_BASE + (idx as u16)));
+                    errors.push(format!("Offset {}: error[LINEAR_LEAK]: Linear memory leak on 0x{:04X}", ins.offset, REG_BASE + (idx as u16)));
                 }
             }
             continue;
@@ -162,13 +162,13 @@ pub fn verify_binary_function(func: &BinFunction) -> BinVerificationReport {
                 &[]
             };
             if lbl_ops.is_empty() {
-                errors.push(format!("Offset {}: Missing branch target label on 0x{:04X}", ins.offset, ins.op_tok));
+                errors.push(format!("Offset {}: error[UNRESOLVED_LABEL]: Missing branch target label on 0x{:04X}", ins.offset, ins.op_tok));
             }
             for lop in lbl_ops {
                 match extract_label_id(lop) {
                     Some(lid) if defined_labels.contains(&lid) => {}
                     other => {
-                        errors.push(format!("Offset {}: Unresolved branch target label {:?}", ins.offset, other));
+                        errors.push(format!("Offset {}: error[UNRESOLVED_LABEL]: Unresolved branch target label {:?}", ins.offset, other));
                     }
                 }
             }
@@ -197,7 +197,7 @@ pub fn verify_binary_function(func: &BinFunction) -> BinVerificationReport {
 
             let (ins_untrusted, _, ins_cap_mask) = unpack_tc(ins.tc_tok);
             if (ins_cap_mask & !func.cap_mask) != 0 || (spec.req_cap_mask & !func.cap_mask) != 0 {
-                errors.push(format!("Offset {}: Capability violation on opcode 0x{:04X}", ins.offset, ins.op_tok));
+                errors.push(format!("Offset {}: error[MISSING_CAP]: Capability violation on opcode 0x{:04X}", ins.offset, ins.op_tok));
             }
 
             let mut any_untrusted = false;
@@ -214,7 +214,7 @@ pub fn verify_binary_function(func: &BinFunction) -> BinVerificationReport {
                 if let Some(slot) = token_to_slot(r_tok) {
                     let info = regs[slot];
                     if matches!(info.state, RegState::Moved | RegState::Dropped | RegState::Uninit | RegState::BorrowedW) {
-                        errors.push(format!("Offset {}: Invalid state {:?} on token 0x{:04X}", ins.offset, info.state, r_tok));
+                        errors.push(format!("Offset {}: error[BORROW_CONFLICT]: Invalid state {:?} on token 0x{:04X}", ins.offset, info.state, r_tok));
                     }
                     if info.taint == Taint::Untrusted {
                         any_untrusted = true;
@@ -233,11 +233,11 @@ pub fn verify_binary_function(func: &BinFunction) -> BinVerificationReport {
             }
 
             if spec.sink_requires_safe && any_untrusted {
-                errors.push(format!("Offset {}: Sink opcode 0x{:04X} received @UNTRUSTED operand", ins.offset, ins.op_tok));
+                errors.push(format!("Offset {}: error[TAINT_SINK]: Sink opcode 0x{:04X} received @UNTRUSTED operand", ins.offset, ins.op_tok));
             }
             let out_taint = if ins_untrusted { Taint::Untrusted } else { Taint::Safe };
             if !spec.is_sanitizer && any_untrusted && out_taint == Taint::Safe {
-                errors.push(format!("Offset {}: Illegal taint upgrade to @SAFE in opcode 0x{:04X}", ins.offset, ins.op_tok));
+                errors.push(format!("Offset {}: error[TAINT_SINK]: Illegal taint upgrade to @SAFE in opcode 0x{:04X}", ins.offset, ins.op_tok));
             }
 
             if let Some(d_slot) = token_to_slot(d_tok) {

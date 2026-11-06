@@ -1,7 +1,9 @@
 //! Omni Surface Language (`omni-lang`) — usable surface syntax with line/col diagnostics,
-//! surface taint/capability annotations (`@untrusted`, `#[cap(...)]`), decision hooks (`egate`/`tlogic`),
-//! compile-time `@PACK5` trit-vector lowering, multi-function calls (`CALL_*`), module/file `include`
-//! linking, and single-step execution (`execute_omni_surface_program`) with zero new opcodes.
+//! machine-readable error codes (`error[<CODE>]`), stricter single-form mode (`#[strict]`),
+//! surface taint/capability annotations (`@untrusted`, `#[cap(...)]`, `@cap(...)`),
+//! decision hooks (`egate`/`tlogic`), compile-time `@PACK5` trit-vector lowering,
+//! multi-function calls (`CALL_*`), module/file `include` linking, full-stack `route` + DB/KV
+//! host ABI lowering (zero new opcodes), and the version-locked `omni-harness` JSON contract.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -9,7 +11,7 @@ use omni_isa::*;
 use omni_ir::{decode_omni_token_stream, pack_fn_module, BinOperand};
 use omni_verifier::{verify_binary_function, verify_u16_stream};
 use omni_vm::{OmniBinaryVm, OmniValue};
-use omni_assembler::{encode_asm_ins_packet_u16, parse_asm_ty_tok};
+use omni_assembler::{assemble_omni_text_to_u16, encode_asm_ins_packet_u16, parse_asm_ty_tok};
 use omni_aot::{
     build_step7_stage1_compiler_stream, compile_pure_u16_to_wasm,
     compile_pure_u16_to_x86_64_elf_with_args, execute_wasm_module_i64_with_budgets,
@@ -53,6 +55,10 @@ struct SurfaceFnDef {
     cap_mask: CapMask,
     step_budget_attr: Option<u64>,
     mem_budget_attr: Option<usize>,
+    strict_attr: bool,
+    is_route: bool,
+    route_method: Option<String>,
+    route_path: Option<String>,
     name: String,
     params: Vec<SurfaceParam>,
     ret_ty: String,
@@ -94,7 +100,7 @@ impl SurfaceExpr {
 
 #[derive(Clone, Debug)]
 enum SurfaceStmt {
-    Let(String, SurfaceExpr, usize, usize),
+    Let(String, Option<(String, usize, usize)>, SurfaceExpr, usize, usize),
     Assign(String, SurfaceExpr, usize, usize),
     DoWhile(Vec<SurfaceStmt>, SurfaceExpr, usize, usize),
     While(SurfaceExpr, Vec<SurfaceStmt>, usize, usize),
@@ -104,7 +110,7 @@ enum SurfaceStmt {
     Expr(SurfaceExpr, usize, usize),
 }
 
-fn tokenize_omni_surface(src: &str) -> Result<Vec<SpannedSurfaceTok>, String> {
+fn tokenize_omni_surface_inner(src: &str, strict: bool) -> Result<Vec<SpannedSurfaceTok>, String> {
     let bytes = src.as_bytes();
     let n = bytes.len();
     let mut i = 0usize;
@@ -157,7 +163,10 @@ fn tokenize_omni_surface(src: &str) -> Result<Vec<SpannedSurfaceTok>, String> {
                 col += 1;
             }
             if i >= n || bytes[i] != b'"' {
-                return Err(format!("line {}, col {}: Unterminated string literal", start_line, start_col));
+                return Err(format!(
+                    "error[SYNTAX_ERROR] line {}, col {}: Unterminated string literal",
+                    start_line, start_col
+                ));
             }
             let s = String::from(&src[start..i]);
             i += 1;
@@ -179,7 +188,10 @@ fn tokenize_omni_surface(src: &str) -> Result<Vec<SpannedSurfaceTok>, String> {
                 col += 1;
             }
             if start == i {
-                return Err(format!("line {}, col {}: Expected annotation name after '@'", line, start_col));
+                return Err(format!(
+                    "error[SYNTAX_ERROR] line {}, col {}: Expected annotation name after '@'",
+                    line, start_col
+                ));
             }
             toks.push(SpannedSurfaceTok {
                 tok: SurfaceTok::AtIdent(String::from(&src[start..i])),
@@ -249,9 +261,12 @@ fn tokenize_omni_surface(src: &str) -> Result<Vec<SpannedSurfaceTok>, String> {
                 i += 1;
                 col += 1;
             }
-            let val = src[start..i]
-                .parse::<i64>()
-                .map_err(|e| format!("line {}, col {}: Invalid integer literal: {}", line, start_col, e))?;
+            let val = src[start..i].parse::<i64>().map_err(|e| {
+                format!(
+                    "error[SYNTAX_ERROR] line {}, col {}: Invalid integer literal: {}",
+                    line, start_col, e
+                )
+            })?;
             toks.push(SpannedSurfaceTok { tok: SurfaceTok::Int(val), line, col: start_col });
             continue;
         }
@@ -263,28 +278,43 @@ fn tokenize_omni_surface(src: &str) -> Result<Vec<SpannedSurfaceTok>, String> {
                 col += 1;
             }
             let ident = &src[start..i];
-            if ident == "TRIT_POS" {
-                toks.push(SpannedSurfaceTok { tok: SurfaceTok::Trit(String::from("+1"), 1), line, col: start_col });
-            } else if ident == "TRIT_ZERO" {
-                toks.push(SpannedSurfaceTok { tok: SurfaceTok::Trit(String::from("0t"), 0), line, col: start_col });
-            } else if ident == "TRIT_NEG" {
-                toks.push(SpannedSurfaceTok { tok: SurfaceTok::Trit(String::from("-1t"), -1), line, col: start_col });
+            if ident == "TRIT_POS" || ident == "TRIT_ZERO" || ident == "TRIT_NEG" {
+                if strict {
+                    return Err(format!(
+                        "error[AMBIGUOUS_GRAMMAR] line {}, col {}: Non-canonical trit literal '{}'; use '+1t', '0t', or '-1t' in strict mode",
+                        line, start_col, ident
+                    ));
+                }
+                if ident == "TRIT_POS" {
+                    toks.push(SpannedSurfaceTok { tok: SurfaceTok::Trit(String::from("+1"), 1), line, col: start_col });
+                } else if ident == "TRIT_ZERO" {
+                    toks.push(SpannedSurfaceTok { tok: SurfaceTok::Trit(String::from("0t"), 0), line, col: start_col });
+                } else {
+                    toks.push(SpannedSurfaceTok { tok: SurfaceTok::Trit(String::from("-1t"), -1), line, col: start_col });
+                }
             } else {
                 toks.push(SpannedSurfaceTok { tok: SurfaceTok::Ident(String::from(ident)), line, col: start_col });
             }
             continue;
         }
-        return Err(format!("line {}, col {}: Unexpected character '{}'", line, col, c));
+        return Err(format!(
+            "error[SYNTAX_ERROR] line {}, col {}: Unexpected character '{}'",
+            line, col, c
+        ));
     }
     Ok(toks)
+}
+
+fn tokenize_omni_surface(src: &str) -> Result<Vec<SpannedSurfaceTok>, String> {
+    tokenize_omni_surface_inner(src, false)
 }
 
 fn parse_surface_cap_name(name: &str, line: usize, col: usize) -> Result<CapMask, String> {
     match name.to_ascii_uppercase().as_str() {
         "PURE" => Ok(0),
-        "DB_R" => Ok(cap_bit(CAP_ID_DB_R)),
-        "DB_W" => Ok(cap_bit(CAP_ID_DB_W)),
-        "NET" => Ok(cap_bit(CAP_ID_NET)),
+        "DB_R" | "DB_READ" => Ok(cap_bit(CAP_ID_DB_R)),
+        "DB_W" | "DB_WRITE" | "KV_W" => Ok(cap_bit(CAP_ID_DB_W)),
+        "NET" | "HTTP" => Ok(cap_bit(CAP_ID_NET)),
         "DOM" => Ok(cap_bit(CAP_ID_DOM)),
         "AI" => Ok(cap_bit(CAP_ID_AI)),
         "VISION" | "SKILL" => Ok(cap_bit(CAP_ID_VISION)),
@@ -292,18 +322,32 @@ fn parse_surface_cap_name(name: &str, line: usize, col: usize) -> Result<CapMask
         "AUTH" => Ok(cap_bit(CAP_ID_AUTH)),
         "FS" | "FS_R" | "FS_W" => Ok(cap_bit(CAP_ID_FS)),
         "SYS" | "ENV" | "PROC" | "TIME" | "RAND" | "CRYPTO" => Ok(cap_bit(CAP_ID_SYS)),
-        other => Err(format!("line {}, col {}: Unknown capability '{}'", line, col, other)),
+        other => Err(format!(
+            "error[MISSING_CAP] line {}, col {}: Unknown capability '{}'",
+            line, col, other
+        )),
     }
 }
 
 struct SurfaceParser {
     tokens: Vec<SpannedSurfaceTok>,
     pos: usize,
+    strict_mode: bool,
+    extra_fn_caps: CapMask,
 }
 
 impl SurfaceParser {
     fn new(tokens: Vec<SpannedSurfaceTok>) -> Self {
-        Self { tokens, pos: 0 }
+        Self::new_with_strict(tokens, false)
+    }
+
+    fn new_with_strict(tokens: Vec<SpannedSurfaceTok>, strict_mode: bool) -> Self {
+        Self {
+            tokens,
+            pos: 0,
+            strict_mode,
+            extra_fn_caps: 0,
+        }
     }
 
     fn current_span(&self) -> (usize, usize) {
@@ -326,7 +370,10 @@ impl SurfaceParser {
             Ok(t)
         } else {
             let (l, c) = self.current_span();
-            Err(format!("line {}, col {}: Unexpected EOF in surface program", l, c))
+            Err(format!(
+                "error[SYNTAX_ERROR] line {}, col {}: Unexpected EOF in surface program",
+                l, c
+            ))
         }
     }
 
@@ -334,7 +381,10 @@ impl SurfaceParser {
         let st = self.next_spanned()?;
         match st.tok {
             SurfaceTok::Sym(ref s) if s == sym => Ok((st.line, st.col)),
-            other => Err(format!("line {}, col {}: Expected symbol '{}', got {:?}", st.line, st.col, sym, other)),
+            other => Err(format!(
+                "error[SYNTAX_ERROR] line {}, col {}: Expected symbol '{}', got {:?}",
+                st.line, st.col, sym, other
+            )),
         }
     }
 
@@ -342,7 +392,10 @@ impl SurfaceParser {
         let st = self.next_spanned()?;
         match st.tok {
             SurfaceTok::Ident(s) => Ok((s, st.line, st.col)),
-            other => Err(format!("line {}, col {}: Expected identifier, got {:?}", st.line, st.col, other)),
+            other => Err(format!(
+                "error[SYNTAX_ERROR] line {}, col {}: Expected identifier, got {:?}",
+                st.line, st.col, other
+            )),
         }
     }
 
@@ -350,7 +403,10 @@ impl SurfaceParser {
         let st = self.next_spanned()?;
         match st.tok {
             SurfaceTok::Ident(ref s) if s == kw => Ok((st.line, st.col)),
-            other => Err(format!("line {}, col {}: Expected keyword '{}', got {:?}", st.line, st.col, kw, other)),
+            other => Err(format!(
+                "error[SYNTAX_ERROR] line {}, col {}: Expected keyword '{}', got {:?}",
+                st.line, st.col, kw, other
+            )),
         }
     }
 
@@ -358,8 +414,73 @@ impl SurfaceParser {
         let st = self.next_spanned()?;
         match st.tok {
             SurfaceTok::Int(v) => Ok((v, st.line, st.col)),
-            other => Err(format!("line {}, col {}: Expected integer literal, got {:?}", st.line, st.col, other)),
+            other => Err(format!(
+                "error[SYNTAX_ERROR] line {}, col {}: Expected integer literal, got {:?}",
+                st.line, st.col, other
+            )),
         }
+    }
+
+    fn consume_at_annotations(&mut self) -> Result<CapMask, String> {
+        let mut mask: CapMask = 0;
+        while let Some(SurfaceTok::AtIdent(tag)) = self.peek().cloned() {
+            let low = tag.to_ascii_lowercase();
+            if low == "cap" {
+                let _ = self.next_spanned()?;
+                self.expect_sym("(")?;
+                while self.peek().is_some() && self.peek() != Some(&SurfaceTok::Sym(String::from(")"))) {
+                    let (cname, cl, cc) = self.expect_ident_spanned()?;
+                    mask |= parse_surface_cap_name(&cname, cl, cc)?;
+                    if self.peek() == Some(&SurfaceTok::Sym(String::from(","))) {
+                        let _ = self.next_spanned()?;
+                    }
+                }
+                self.expect_sym(")")?;
+            } else if low == "pack5" || low == "safe" {
+                let _ = self.next_spanned()?;
+            } else {
+                break;
+            }
+        }
+        self.extra_fn_caps |= mask;
+        Ok(mask)
+    }
+
+    fn parse_route_path(&mut self) -> Result<String, String> {
+        if let Some(SurfaceTok::StrLit(s)) = self.peek().cloned() {
+            let _ = self.next_spanned()?;
+            return Ok(s);
+        }
+        let mut path = String::new();
+        while let Some(tok) = self.peek().cloned() {
+            match tok {
+                SurfaceTok::Op(ref s) if s == "/" || s == "-" || s == "*" => {
+                    let _ = self.next_spanned()?;
+                    path.push_str(s);
+                }
+                SurfaceTok::Sym(ref s) if s == ":" || s == "." => {
+                    let _ = self.next_spanned()?;
+                    path.push_str(s);
+                }
+                SurfaceTok::Ident(ref s) => {
+                    let _ = self.next_spanned()?;
+                    path.push_str(s);
+                }
+                SurfaceTok::Int(v) => {
+                    let _ = self.next_spanned()?;
+                    path.push_str(&v.to_string());
+                }
+                _ => break,
+            }
+        }
+        if path.is_empty() {
+            let (l, c) = self.current_span();
+            return Err(format!(
+                "error[SYNTAX_ERROR] line {}, col {}: Expected route path (e.g. /users/:id or \"/users/:id\")",
+                l, c
+            ));
+        }
+        Ok(path)
     }
 
     fn parse_module(&mut self) -> Result<(Vec<(String, usize, usize)>, Vec<SurfaceFnDef>), String> {
@@ -371,15 +492,20 @@ impl SurfaceParser {
                 || self.peek() == Some(&SurfaceTok::Ident(String::from("mod")))
             {
                 let kw_st = self.next_spanned()?;
+                let kw_str = if let SurfaceTok::Ident(k) = kw_st.tok { k } else { String::from("include") };
+                if self.strict_mode && kw_str == "mod" {
+                    return Err(format!(
+                        "error[AMBIGUOUS_GRAMMAR] line {}, col {}: Non-canonical 'mod' directive; use 'include \"...\"' in strict mode",
+                        kw_st.line, kw_st.col
+                    ));
+                }
                 let path_st = self.next_spanned()?;
                 let inc_path = match path_st.tok {
                     SurfaceTok::StrLit(s) => s,
                     other => {
                         return Err(format!(
-                            "line {}, col {}: Expected string literal after '{}', got {:?}",
-                            path_st.line, path_st.col,
-                            if let SurfaceTok::Ident(k) = kw_st.tok { k } else { String::from("include") },
-                            other
+                            "error[SYNTAX_ERROR] line {}, col {}: Expected string literal after '{}', got {:?}",
+                            path_st.line, path_st.col, kw_str, other
                         ));
                     }
                 };
@@ -394,7 +520,10 @@ impl SurfaceParser {
 
         if fns.is_empty() {
             let (l, c) = self.current_span();
-            return Err(format!("line {}, col {}: Surface program contains no 'fn' declarations", l, c));
+            return Err(format!(
+                "error[SYNTAX_ERROR] line {}, col {}: Surface program contains no 'fn' or 'route' declarations",
+                l, c
+            ));
         }
         Ok((includes, fns))
     }
@@ -404,49 +533,170 @@ impl SurfaceParser {
         let mut cap_mask: CapMask = 0x0000;
         let mut step_budget_attr: Option<u64> = None;
         let mut mem_budget_attr: Option<usize> = None;
+        let mut fn_strict = self.strict_mode;
+        self.extra_fn_caps = 0;
 
-        while self.peek() == Some(&SurfaceTok::Hash) {
-            let _ = self.next_spanned()?;
-            self.expect_sym("[")?;
-            let (attr, al, ac) = self.expect_ident_spanned()?;
-            if attr == "fn_id" {
-                self.expect_sym("(")?;
-                let (id_val, il, ic) = self.expect_int_spanned()?;
-                if !(0..=15).contains(&id_val) {
-                    return Err(format!("line {}, col {}: fn_id {} out of range 0..=15", il, ic, id_val));
+        loop {
+            if self.peek() == Some(&SurfaceTok::Hash) {
+                let _ = self.next_spanned()?;
+                self.expect_sym("[")?;
+                let (attr, al, ac) = self.expect_ident_spanned()?;
+                if attr == "fn_id" {
+                    self.expect_sym("(")?;
+                    let (id_val, il, ic) = self.expect_int_spanned()?;
+                    if !(0..=15).contains(&id_val) {
+                        return Err(format!(
+                            "error[SYNTAX_ERROR] line {}, col {}: fn_id {} out of range 0..=15",
+                            il, ic, id_val
+                        ));
+                    }
+                    fn_id_attr = Some(id_val as u16);
+                    self.expect_sym(")")?;
+                } else if attr == "cap" {
+                    self.expect_sym("(")?;
+                    while self.peek().is_some() && self.peek() != Some(&SurfaceTok::Sym(String::from(")"))) {
+                        let (cname, cl, cc) = self.expect_ident_spanned()?;
+                        cap_mask |= parse_surface_cap_name(&cname, cl, cc)?;
+                        if self.peek() == Some(&SurfaceTok::Sym(String::from(","))) {
+                            let _ = self.next_spanned()?;
+                        }
+                    }
+                    self.expect_sym(")")?;
+                } else if attr == "step_budget" || attr == "fuel" {
+                    self.expect_sym("(")?;
+                    let (b_val, bl, bc) = self.expect_int_spanned()?;
+                    if b_val <= 0 {
+                        return Err(format!(
+                            "error[BUDGET_EXCEEDED] line {}, col {}: step_budget must be > 0, got {}",
+                            bl, bc, b_val
+                        ));
+                    }
+                    step_budget_attr = Some(b_val as u64);
+                    self.expect_sym(")")?;
+                } else if attr == "mem_budget" || attr == "memory_budget" {
+                    self.expect_sym("(")?;
+                    let (m_val, ml, mc) = self.expect_int_spanned()?;
+                    if m_val <= 0 {
+                        return Err(format!(
+                            "error[BUDGET_EXCEEDED] line {}, col {}: mem_budget must be > 0, got {}",
+                            ml, mc, m_val
+                        ));
+                    }
+                    mem_budget_attr = Some(m_val as usize);
+                    self.expect_sym(")")?;
+                } else if attr == "strict" {
+                    fn_strict = true;
+                } else {
+                    return Err(format!(
+                        "error[SYNTAX_ERROR] line {}, col {}: Unsupported surface attribute '{}'",
+                        al, ac, attr
+                    ));
                 }
-                fn_id_attr = Some(id_val as u16);
-                self.expect_sym(")")?;
-            } else if attr == "cap" {
-                self.expect_sym("(")?;
+                self.expect_sym("]")?;
+            } else if matches!(self.peek(), Some(SurfaceTok::AtIdent(_))) {
+                cap_mask |= self.consume_at_annotations()?;
+            } else {
+                break;
+            }
+        }
+
+        let prev_strict = self.strict_mode;
+        self.strict_mode = fn_strict;
+
+        if self.peek() == Some(&SurfaceTok::Ident(String::from("route"))) {
+            let route_st = self.next_spanned()?;
+            let (method, _ml, _mc) = self.expect_ident_spanned()?;
+            let path = self.parse_route_path()?;
+            let mut params = Vec::new();
+            if self.peek() == Some(&SurfaceTok::Sym(String::from("("))) {
+                let _ = self.next_spanned()?;
                 while self.peek().is_some() && self.peek() != Some(&SurfaceTok::Sym(String::from(")"))) {
-                    let (cname, cl, cc) = self.expect_ident_spanned()?;
-                    cap_mask |= parse_surface_cap_name(&cname, cl, cc)?;
+                    let (p_name, _pl, _pc) = self.expect_ident_spanned()?;
+                    self.expect_sym(":")?;
+                    let (raw_ty, tl, tc) = self.expect_ident_spanned()?;
+                    let mut untrusted = false;
+                    let clean_ty = if let Some(stripped) = raw_ty.strip_prefix("untrusted_") {
+                        if self.strict_mode {
+                            self.strict_mode = prev_strict;
+                            return Err(format!(
+                                "error[AMBIGUOUS_GRAMMAR] line {}, col {}: Non-canonical taint prefix '{}'; use '{}: {} @untrusted' in strict mode",
+                                tl, tc, raw_ty, p_name, stripped
+                            ));
+                        }
+                        untrusted = true;
+                        String::from(stripped)
+                    } else {
+                        raw_ty
+                    };
+                    if let Some(SurfaceTok::AtIdent(tag)) = self.peek().cloned() {
+                        let st = self.next_spanned()?;
+                        match tag.to_ascii_lowercase().as_str() {
+                            "untrusted" => untrusted = true,
+                            "safe" => untrusted = false,
+                            other => {
+                                self.strict_mode = prev_strict;
+                                return Err(format!(
+                                    "error[BAD_TYPE] line {}, col {}: Unknown taint annotation '@{}'",
+                                    st.line, st.col, other
+                                ));
+                            }
+                        }
+                    }
+                    params.push(SurfaceParam {
+                        name: p_name,
+                        ty: clean_ty,
+                        untrusted,
+                        line: tl,
+                        col: tc,
+                    });
                     if self.peek() == Some(&SurfaceTok::Sym(String::from(","))) {
                         let _ = self.next_spanned()?;
                     }
                 }
                 self.expect_sym(")")?;
-            } else if attr == "step_budget" || attr == "fuel" {
-                self.expect_sym("(")?;
-                let (b_val, bl, bc) = self.expect_int_spanned()?;
-                if b_val <= 0 {
-                    return Err(format!("line {}, col {}: step_budget must be > 0, got {}", bl, bc, b_val));
-                }
-                step_budget_attr = Some(b_val as u64);
-                self.expect_sym(")")?;
-            } else if attr == "mem_budget" || attr == "memory_budget" {
-                self.expect_sym("(")?;
-                let (m_val, ml, mc) = self.expect_int_spanned()?;
-                if m_val <= 0 {
-                    return Err(format!("line {}, col {}: mem_budget must be > 0, got {}", ml, mc, m_val));
-                }
-                mem_budget_attr = Some(m_val as usize);
-                self.expect_sym(")")?;
-            } else {
-                return Err(format!("line {}, col {}: Unsupported surface attribute '{}'", al, ac, attr));
             }
-            self.expect_sym("]")?;
+            if params.is_empty() {
+                params.push(SurfaceParam {
+                    name: String::from("req"),
+                    ty: String::from("i64"),
+                    untrusted: false,
+                    line: route_st.line,
+                    col: route_st.col,
+                });
+            }
+            cap_mask |= self.consume_at_annotations()?;
+            let (ret_ty, rl, rc) = if self.peek() == Some(&SurfaceTok::Sym(String::from("->"))) {
+                let _ = self.next_spanned()?;
+                self.expect_ident_spanned()?
+            } else {
+                (String::from("i64"), route_st.line, route_st.col)
+            };
+            cap_mask |= self.consume_at_annotations()?;
+            let body = self.parse_block()?;
+            cap_mask |= self.extra_fn_caps;
+            self.strict_mode = prev_strict;
+
+            let sanitized_path: String = path
+                .chars()
+                .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+                .collect();
+            let route_fn_name = format!("route_{}_{}", method.to_ascii_lowercase(), sanitized_path);
+            return Ok(SurfaceFnDef {
+                fn_id_attr,
+                cap_mask,
+                step_budget_attr,
+                mem_budget_attr,
+                strict_attr: fn_strict,
+                is_route: true,
+                route_method: Some(method.to_ascii_uppercase()),
+                route_path: Some(path),
+                name: route_fn_name,
+                params,
+                ret_ty,
+                ret_line: rl,
+                ret_col: rc,
+                body,
+            });
         }
 
         self.expect_ident_kw("fn")?;
@@ -459,6 +709,13 @@ impl SurfaceParser {
             let (raw_ty, tl, tc) = self.expect_ident_spanned()?;
             let mut untrusted = false;
             let clean_ty = if let Some(stripped) = raw_ty.strip_prefix("untrusted_") {
+                if self.strict_mode {
+                    self.strict_mode = prev_strict;
+                    return Err(format!(
+                        "error[AMBIGUOUS_GRAMMAR] line {}, col {}: Non-canonical taint prefix '{}'; use '{}: {} @untrusted' in strict mode",
+                        tl, tc, raw_ty, p_name, stripped
+                    ));
+                }
                 untrusted = true;
                 String::from(stripped)
             } else {
@@ -469,7 +726,13 @@ impl SurfaceParser {
                 match tag.to_ascii_lowercase().as_str() {
                     "untrusted" => untrusted = true,
                     "safe" => untrusted = false,
-                    other => return Err(format!("line {}, col {}: Unknown taint annotation '@{}'", st.line, st.col, other)),
+                    other => {
+                        self.strict_mode = prev_strict;
+                        return Err(format!(
+                            "error[BAD_TYPE] line {}, col {}: Unknown taint annotation '@{}'",
+                            st.line, st.col, other
+                        ));
+                    }
                 }
             }
             params.push(SurfaceParam {
@@ -484,15 +747,23 @@ impl SurfaceParser {
             }
         }
         self.expect_sym(")")?;
+        cap_mask |= self.consume_at_annotations()?;
         self.expect_sym("->")?;
         let (ret_ty, rl, rc) = self.expect_ident_spanned()?;
+        cap_mask |= self.consume_at_annotations()?;
         let body = self.parse_block()?;
+        cap_mask |= self.extra_fn_caps;
+        self.strict_mode = prev_strict;
 
         Ok(SurfaceFnDef {
             fn_id_attr,
             cap_mask,
             step_budget_attr,
             mem_budget_attr,
+            strict_attr: fn_strict,
+            is_route: false,
+            route_method: None,
+            route_path: None,
             name: fn_name,
             params,
             ret_ty,
@@ -513,26 +784,45 @@ impl SurfaceParser {
     }
 
     fn parse_stmt(&mut self) -> Result<SurfaceStmt, String> {
+        let _ = self.consume_at_annotations()?;
         let (line, col) = self.current_span();
         match self.peek().cloned() {
             Some(SurfaceTok::Ident(ref kw)) if kw == "let" => {
                 let _ = self.next_spanned()?;
                 let (name, nl, nc) = self.expect_ident_spanned()?;
+                let mut ty_opt: Option<(String, usize, usize)> = None;
                 if self.peek() == Some(&SurfaceTok::Sym(String::from(":"))) {
                     let _ = self.next_spanned()?;
                     let (ty_ann, tl, tc) = self.expect_ident_spanned()?;
-                    let _ = map_omni_surface_type(&ty_ann, tl, tc)?;
+                    let _ = map_omni_surface_type_inner(&ty_ann, tl, tc, self.strict_mode)?;
+                    let _ = self.consume_at_annotations()?;
+                    ty_opt = Some((ty_ann, tl, tc));
+                } else if self.strict_mode {
+                    return Err(format!(
+                        "error[BAD_TYPE] line {}, col {}: Missing explicit type annotation on 'let {}' (strict mode requires 'let {}: <ty> = ...;')",
+                        nl, nc, name, name
+                    ));
                 }
                 self.expect_sym("=")?;
                 let expr = self.parse_expr()?;
+                let _ = self.consume_at_annotations()?;
                 if self.peek() == Some(&SurfaceTok::Sym(String::from(";"))) {
                     let _ = self.next_spanned()?;
                 }
-                Ok(SurfaceStmt::Let(name, expr, nl, nc))
+                Ok(SurfaceStmt::Let(name, ty_opt, expr, nl, nc))
             }
-            Some(SurfaceTok::Ident(ref kw)) if kw == "return" => {
+            Some(SurfaceTok::Ident(ref kw)) if kw == "return" || kw == "respond" || kw == "respond_json" || kw == "respond_html" => {
+                if kw == "respond" || kw == "respond_json" || kw == "respond_html" {
+                    let expr = self.parse_expr()?;
+                    let _ = self.consume_at_annotations()?;
+                    if self.peek() == Some(&SurfaceTok::Sym(String::from(";"))) {
+                        let _ = self.next_spanned()?;
+                    }
+                    return Ok(SurfaceStmt::Ret(expr, line, col));
+                }
                 let _ = self.next_spanned()?;
                 let expr = self.parse_expr()?;
+                let _ = self.consume_at_annotations()?;
                 if self.peek() == Some(&SurfaceTok::Sym(String::from(";"))) {
                     let _ = self.next_spanned()?;
                 }
@@ -560,7 +850,10 @@ impl SurfaceParser {
                 let _ = self.next_spanned()?;
                 let (lid, ll, lc) = self.expect_int_spanned()?;
                 if !(0..=15).contains(&lid) {
-                    return Err(format!("line {}, col {}: Label id {} out of range 0..=15", ll, lc, lid));
+                    return Err(format!(
+                        "error[UNRESOLVED_LABEL] line {}, col {}: Label id {} out of range 0..=15",
+                        ll, lc, lid
+                    ));
                 }
                 if self.peek() == Some(&SurfaceTok::Sym(String::from(";"))) {
                     let _ = self.next_spanned()?;
@@ -571,7 +864,10 @@ impl SurfaceParser {
                 let _ = self.next_spanned()?;
                 let (lid, ll, lc) = self.expect_int_spanned()?;
                 if !(0..=15).contains(&lid) {
-                    return Err(format!("line {}, col {}: Goto label id {} out of range 0..=15", ll, lc, lid));
+                    return Err(format!(
+                        "error[UNRESOLVED_LABEL] line {}, col {}: Goto label id {} out of range 0..=15",
+                        ll, lc, lid
+                    ));
                 }
                 if self.peek() == Some(&SurfaceTok::Sym(String::from(";"))) {
                     let _ = self.next_spanned()?;
@@ -591,6 +887,7 @@ impl SurfaceParser {
                     _ => String::from("="),
                 };
                 let rhs = self.parse_expr()?;
+                let _ = self.consume_at_annotations()?;
                 if self.peek() == Some(&SurfaceTok::Sym(String::from(";"))) {
                     let _ = self.next_spanned()?;
                 }
@@ -622,6 +919,7 @@ impl SurfaceParser {
             }
             _ => {
                 let expr = self.parse_expr()?;
+                let _ = self.consume_at_annotations()?;
                 if self.peek() == Some(&SurfaceTok::Sym(String::from(";"))) {
                     let _ = self.next_spanned()?;
                 }
@@ -631,7 +929,9 @@ impl SurfaceParser {
     }
 
     fn parse_expr(&mut self) -> Result<SurfaceExpr, String> {
-        self.parse_cmp()
+        let e = self.parse_cmp()?;
+        let _ = self.consume_at_annotations()?;
+        Ok(e)
     }
 
     fn parse_cmp(&mut self) -> Result<SurfaceExpr, String> {
@@ -774,6 +1074,7 @@ impl SurfaceParser {
     }
 
     fn parse_primary(&mut self) -> Result<SurfaceExpr, String> {
+        let _ = self.consume_at_annotations()?;
         let (line, col) = self.current_span();
         match self.peek().cloned() {
             Some(SurfaceTok::Int(v)) => {
@@ -795,11 +1096,19 @@ impl SurfaceParser {
                     let elem = self.parse_expr()?;
                     match elem {
                         SurfaceExpr::Trit(_, tv, _, _) => trits.push(tv),
-                        SurfaceExpr::Int(v, _el, _ec) if (-1..=1).contains(&v) => trits.push(v as i8),
+                        SurfaceExpr::Int(v, el, ec) if (-1..=1).contains(&v) => {
+                            if self.strict_mode {
+                                return Err(format!(
+                                    "error[AMBIGUOUS_GRAMMAR] line {}, col {}: Trit vector literal elements must use canonical trit tokens (-1t, 0t, +1t) in strict mode",
+                                    el, ec
+                                ));
+                            }
+                            trits.push(v as i8);
+                        }
                         other => {
                             let (el, ec) = other.span();
                             return Err(format!(
-                                "line {}, col {}: Trit vector literal elements must be balanced trits (-1t, 0t, +1t)",
+                                "error[BAD_TYPE] line {}, col {}: Trit vector literal elements must be balanced trits (-1t, 0t, +1t)",
                                 el, ec
                             ));
                         }
@@ -810,7 +1119,10 @@ impl SurfaceParser {
                 }
                 self.expect_sym("]")?;
                 if trits.is_empty() {
-                    return Err(format!("line {}, col {}: Trit vector literal cannot be empty", st.line, st.col));
+                    return Err(format!(
+                        "error[BAD_TYPE] line {}, col {}: Trit vector literal cannot be empty",
+                        st.line, st.col
+                    ));
                 }
                 Ok(SurfaceExpr::TritVecLit(trits, st.line, st.col))
             }
@@ -862,20 +1174,64 @@ impl SurfaceParser {
                         "pos" => pos_arm = Some(arm_stmts),
                         other => {
                             return Err(format!(
-                                "line {}, col {}: Unknown match_trit arm '{}' (expected neg, zero, pos)",
+                                "error[SYNTAX_ERROR] line {}, col {}: Unknown match_trit arm '{}' (expected neg, zero, pos)",
                                 al, ac, other
                             ));
                         }
                     }
                 }
                 self.expect_sym("}")?;
-                let neg = neg_arm.ok_or_else(|| format!("line {}, col {}: match_trit missing 'neg' arm", st.line, st.col))?;
-                let zero = zero_arm.ok_or_else(|| format!("line {}, col {}: match_trit missing 'zero' arm", st.line, st.col))?;
-                let pos = pos_arm.ok_or_else(|| format!("line {}, col {}: match_trit missing 'pos' arm", st.line, st.col))?;
+                let neg = neg_arm.ok_or_else(|| {
+                    format!(
+                        "error[SYNTAX_ERROR] line {}, col {}: match_trit missing 'neg' arm",
+                        st.line, st.col
+                    )
+                })?;
+                let zero = zero_arm.ok_or_else(|| {
+                    format!(
+                        "error[SYNTAX_ERROR] line {}, col {}: match_trit missing 'zero' arm",
+                        st.line, st.col
+                    )
+                })?;
+                let pos = pos_arm.ok_or_else(|| {
+                    format!(
+                        "error[SYNTAX_ERROR] line {}, col {}: match_trit missing 'pos' arm",
+                        st.line, st.col
+                    )
+                })?;
                 Ok(SurfaceExpr::MatchTrit(Box::new(cond), neg, zero, pos, st.line, st.col))
             }
             Some(SurfaceTok::Ident(ident)) => {
                 let st = self.next_spanned()?;
+                if self.peek() == Some(&SurfaceTok::Sym(String::from("."))) {
+                    let _ = self.next_spanned()?;
+                    let (method_name, _ml, _mc) = self.expect_ident_spanned()?;
+                    self.expect_sym("(")?;
+                    let mut args = vec![SurfaceExpr::Var(ident.clone(), st.line, st.col)];
+                    while self.peek().is_some() && self.peek() != Some(&SurfaceTok::Sym(String::from(")"))) {
+                        args.push(self.parse_expr()?);
+                        if self.peek() == Some(&SurfaceTok::Sym(String::from(","))) {
+                            let _ = self.next_spanned()?;
+                        }
+                    }
+                    self.expect_sym(")")?;
+                    let _ = self.consume_at_annotations()?;
+                    let call_name = if ident == "req" && method_name == "param" {
+                        String::from("req_param")
+                    } else if (ident == "db" || ident == "kv") && method_name == "query" {
+                        String::from("db_query")
+                    } else if (ident == "db" || ident == "kv") && method_name == "get" {
+                        String::from("db_get")
+                    } else if (ident == "db" || ident == "kv") && method_name == "put" {
+                        String::from("kv_put")
+                    } else {
+                        format!("{}_{}", ident, method_name)
+                    };
+                    if call_name == "db_query" || call_name == "db_get" || call_name == "kv_put" {
+                        args.remove(0);
+                    }
+                    return Ok(SurfaceExpr::Call(call_name, args, st.line, st.col));
+                }
                 if self.peek() == Some(&SurfaceTok::Sym(String::from("("))) {
                     let _ = self.next_spanned()?;
                     let mut args = Vec::new();
@@ -886,18 +1242,29 @@ impl SurfaceParser {
                         }
                     }
                     self.expect_sym(")")?;
+                    let _ = self.consume_at_annotations()?;
                     Ok(SurfaceExpr::Call(ident, args, st.line, st.col))
                 } else {
                     Ok(SurfaceExpr::Var(ident, st.line, st.col))
                 }
             }
-            other => Err(format!("line {}, col {}: Unexpected token in surface expression: {:?}", line, col, other)),
+            other => Err(format!(
+                "error[SYNTAX_ERROR] line {}, col {}: Unexpected token in surface expression: {:?}",
+                line, col, other
+            )),
         }
     }
 }
 
-fn map_omni_surface_type(ty: &str, line: usize, col: usize) -> Result<&'static str, String> {
-    match ty.to_ascii_lowercase().as_str() {
+fn map_omni_surface_type_inner(ty: &str, line: usize, col: usize, strict: bool) -> Result<&'static str, String> {
+    let low = ty.to_ascii_lowercase();
+    if strict && matches!(low.as_str(), "int" | "byte_buf" | "u16_array" | "tvec") {
+        return Err(format!(
+            "error[AMBIGUOUS_GRAMMAR] line {}, col {}: Non-canonical type alias '{}'; use 'i64', 'trit', 'bytes', 'array', 'trit_vec', or 'str' in strict mode",
+            line, col, ty
+        ));
+    }
+    match low.as_str() {
         "i64" | "int" => Ok("I64"),
         "trit" => Ok("TRIT"),
         "bytes" | "byte_buf" | "pack5" => Ok("BYTES"),
@@ -908,8 +1275,20 @@ fn map_omni_surface_type(ty: &str, line: usize, col: usize) -> Result<&'static s
         "arena" => Ok("ARENA"),
         "dom" => Ok("DOM"),
         "struct" => Ok("STRUCT"),
-        _ => Err(format!("line {}, col {}: Unknown surface type '{}'", line, col, ty)),
+        _ => Err(format!(
+            "error[BAD_TYPE] line {}, col {}: Unknown surface type '{}'",
+            line, col, ty
+        )),
     }
+}
+
+fn fnv1a_32_positive(s: &str) -> i64 {
+    let mut h: u32 = 0x811c9dc5;
+    for &b in s.as_bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x01000193);
+    }
+    ((h & 0x3FFF_FFFF) as i64).max(1)
 }
 
 struct SurfaceLowerCtx {
@@ -962,7 +1341,10 @@ impl SurfaceLowerCtx {
 
     fn alloc_reg(&mut self, line: usize, col: usize) -> Result<String, String> {
         if self.next_reg >= 192 {
-            return Err(format!("line {}, col {}: Surface function exceeded 192 SSA registers", line, col));
+            return Err(format!(
+                "error[BUDGET_EXCEEDED] line {}, col {}: Surface function exceeded 192 SSA registers",
+                line, col
+            ));
         }
         let r = format!("%{}", self.next_reg);
         self.next_reg += 1;
@@ -971,7 +1353,10 @@ impl SurfaceLowerCtx {
 
     fn alloc_lbl(&mut self, line: usize, col: usize) -> Result<u16, String> {
         if self.next_lbl > 15 {
-            return Err(format!("line {}, col {}: Surface function exceeded 15 basic-block labels", line, col));
+            return Err(format!(
+                "error[BUDGET_EXCEEDED] line {}, col {}: Surface function exceeded 15 basic-block labels",
+                line, col
+            ));
         }
         let l = self.next_lbl;
         self.next_lbl += 1;
@@ -986,8 +1371,21 @@ impl SurfaceLowerCtx {
                 .var_map
                 .get(v)
                 .cloned()
-                .ok_or_else(|| format!("line {}, col {}: Undefined variable '{}'", line, col, v)),
+                .ok_or_else(|| format!("error[UNDEF_VAR] line {}, col {}: Undefined variable '{}'", line, col, v)),
             _ => self.lower_expr_into(expr, None, false),
+        }
+    }
+
+    fn eval_host_arg_to_operand(&mut self, expr: &SurfaceExpr) -> Result<String, String> {
+        match expr {
+            SurfaceExpr::StrLit(s, _, _) => {
+                if let Ok(n) = s.trim().parse::<i64>() {
+                    Ok(n.to_string())
+                } else {
+                    Ok(fnv1a_32_positive(s).to_string())
+                }
+            }
+            other => self.eval_to_operand(other),
         }
     }
 
@@ -1029,7 +1427,7 @@ impl SurfaceLowerCtx {
         if let Some((callee_id, expected_arity, callee_ret_ty)) = self.fn_sigs.get(name).cloned() {
             if args.len() != expected_arity {
                 return Err(format!(
-                    "line {}, col {}: Function '{}' expects {} arguments, got {}",
+                    "error[ARITY_MISMATCH] line {}, col {}: Function '{}' expects {} arguments, got {}",
                     line, col, name, expected_arity, args.len()
                 ));
             }
@@ -1049,6 +1447,104 @@ impl SurfaceLowerCtx {
         }
 
         let low = name.to_ascii_lowercase();
+
+        // 2. Host ABI opcodes (0x7F64..=0x7F70)
+        match low.as_str() {
+            "req_param" => {
+                if args.is_empty() || args.len() > 2 {
+                    return Err(format!(
+                        "error[ARITY_MISMATCH] line {}, col {}: Intrinsic 'req_param' expects 1 or 2 arguments, got {}",
+                        line, col, args.len()
+                    ));
+                }
+                let req_op = if args.len() == 2 {
+                    self.eval_host_arg_to_operand(&args[0])?
+                } else if self.var_map.contains_key("req") {
+                    self.var_map.get("req").cloned().unwrap()
+                } else {
+                    self.eval_host_arg_to_operand(&args[0])?
+                };
+                let key_op = if args.len() == 2 {
+                    self.eval_host_arg_to_operand(&args[1])?
+                } else {
+                    String::from("0")
+                };
+                return Ok(format!("REQ_PAR@SAFE {} {}", req_op, key_op));
+            }
+            "db_get" | "kv_get" => {
+                if args.is_empty() || args.len() > 2 {
+                    return Err(format!(
+                        "error[ARITY_MISMATCH] line {}, col {}: Intrinsic '{}' expects 1 or 2 arguments, got {}",
+                        line, col, name, args.len()
+                    ));
+                }
+                let key_op = self.eval_host_arg_to_operand(args.last().unwrap())?;
+                return Ok(format!("DB_GET {}", key_op));
+            }
+            "db_query" => {
+                if args.is_empty() || args.len() > 2 {
+                    return Err(format!(
+                        "error[ARITY_MISMATCH] line {}, col {}: Intrinsic 'db_query' expects 1 or 2 arguments, got {}",
+                        line, col, args.len()
+                    ));
+                }
+                let q_op = self.eval_host_arg_to_operand(&args[0])?;
+                let p_op = if args.len() == 2 {
+                    self.eval_host_arg_to_operand(&args[1])?
+                } else {
+                    String::from("0")
+                };
+                return Ok(format!("DB_QRY {} {}", q_op, p_op));
+            }
+            "db_count" | "kv_count" => {
+                let c_op = if let Some(first) = args.first() {
+                    self.eval_host_arg_to_operand(first)?
+                } else {
+                    String::from("0")
+                };
+                return Ok(format!("DB_CNT {}", c_op));
+            }
+            "kv_put" | "db_put" => {
+                if args.len() != 2 {
+                    return Err(format!(
+                        "error[ARITY_MISMATCH] line {}, col {}: Intrinsic '{}' expects 2 arguments (key, value), got {}",
+                        line, col, name, args.len()
+                    ));
+                }
+                let k_op = self.eval_host_arg_to_operand(&args[0])?;
+                let v_op = self.eval_host_arg_to_operand(&args[1])?;
+                return Ok(format!("KV_PUT {} {}", k_op, v_op));
+            }
+            "respond" | "respond_json" | "respond_html" => {
+                if args.is_empty() || args.len() > 2 {
+                    return Err(format!(
+                        "error[ARITY_MISMATCH] line {}, col {}: Intrinsic '{}' expects 1 or 2 arguments (status, body), got {}",
+                        line, col, name, args.len()
+                    ));
+                }
+                let mnem = if low == "respond_html" { "RSP_HTML" } else { "RSP_JSON" };
+                if args.len() == 2 {
+                    let st_op = self.eval_host_arg_to_operand(&args[0])?;
+                    let body_op = self.eval_host_arg_to_operand(&args[1])?;
+                    return Ok(format!("{} {} {}", mnem, st_op, body_op));
+                } else {
+                    let body_op = self.eval_host_arg_to_operand(&args[0])?;
+                    return Ok(format!("{} 200 {}", mnem, body_op));
+                }
+            }
+            "auth_verify" => {
+                if args.len() != 1 {
+                    return Err(format!(
+                        "error[ARITY_MISMATCH] line {}, col {}: Intrinsic 'auth_verify' expects 1 argument, got {}",
+                        line, col, args.len()
+                    ));
+                }
+                let tok_op = self.eval_host_arg_to_operand(&args[0])?;
+                return Ok(format!("AUTH_VER {}", tok_op));
+            }
+            _ => {}
+        }
+
         let mut op_args = Vec::with_capacity(args.len());
         for a in args {
             op_args.push(self.eval_to_operand(a)?);
@@ -1081,7 +1577,7 @@ impl SurfaceLowerCtx {
         if let Some(m) = unary_mnem {
             if op_args.len() != 1 {
                 return Err(format!(
-                    "line {}, col {}: Intrinsic '{}' expects 1 argument, got {}",
+                    "error[ARITY_MISMATCH] line {}, col {}: Intrinsic '{}' expects 1 argument, got {}",
                     line, col, name, op_args.len()
                 ));
             }
@@ -1117,7 +1613,7 @@ impl SurfaceLowerCtx {
         if let Some(m) = binary_mnem {
             if op_args.len() != 2 {
                 return Err(format!(
-                    "line {}, col {}: Intrinsic '{}' expects 2 arguments, got {}",
+                    "error[ARITY_MISMATCH] line {}, col {}: Intrinsic '{}' expects 2 arguments, got {}",
                     line, col, name, op_args.len()
                 ));
             }
@@ -1127,7 +1623,7 @@ impl SurfaceLowerCtx {
             "tmaj" => {
                 if op_args.len() != 3 {
                     return Err(format!(
-                        "line {}, col {}: Intrinsic 'tmaj' expects 3 arguments, got {}",
+                        "error[ARITY_MISMATCH] line {}, col {}: Intrinsic 'tmaj' expects 3 arguments, got {}",
                         line, col, op_args.len()
                     ));
                 }
@@ -1136,7 +1632,7 @@ impl SurfaceLowerCtx {
             "sel_trit" | "cmov" => {
                 if op_args.len() != 4 {
                     return Err(format!(
-                        "line {}, col {}: Intrinsic '{}' expects 4 arguments, got {}",
+                        "error[ARITY_MISMATCH] line {}, col {}: Intrinsic '{}' expects 4 arguments, got {}",
                         line, col, name, op_args.len()
                     ));
                 }
@@ -1146,7 +1642,7 @@ impl SurfaceLowerCtx {
             "iset_i32" => {
                 if op_args.len() != 2 {
                     return Err(format!(
-                        "line {}, col {}: Intrinsic 'iset_i32' expects 2 arguments, got {}",
+                        "error[ARITY_MISMATCH] line {}, col {}: Intrinsic 'iset_i32' expects 2 arguments, got {}",
                         line, col, op_args.len()
                     ));
                 }
@@ -1155,7 +1651,7 @@ impl SurfaceLowerCtx {
             "iset_i64" => {
                 if op_args.len() != 2 {
                     return Err(format!(
-                        "line {}, col {}: Intrinsic 'iset_i64' expects 2 arguments, got {}",
+                        "error[ARITY_MISMATCH] line {}, col {}: Intrinsic 'iset_i64' expects 2 arguments, got {}",
                         line, col, op_args.len()
                     ));
                 }
@@ -1164,7 +1660,7 @@ impl SurfaceLowerCtx {
             "iset_patch_i64" => {
                 if op_args.len() != 3 {
                     return Err(format!(
-                        "line {}, col {}: Intrinsic 'iset_patch_i64' expects 3 arguments, got {}",
+                        "error[ARITY_MISMATCH] line {}, col {}: Intrinsic 'iset_patch_i64' expects 3 arguments, got {}",
                         line, col, op_args.len()
                     ));
                 }
@@ -1173,13 +1669,16 @@ impl SurfaceLowerCtx {
             "iset" => {
                 if op_args.len() < 2 {
                     return Err(format!(
-                        "line {}, col {}: Intrinsic 'iset' expects at least 2 arguments",
+                        "error[ARITY_MISMATCH] line {}, col {}: Intrinsic 'iset' expects at least 2 arguments",
                         line, col
                     ));
                 }
                 Ok(format!("ISET {}", op_args.join(" ")))
             }
-            _ => Err(format!("line {}, col {}: Unknown surface intrinsic or function '{}'", line, col, name)),
+            _ => Err(format!(
+                "error[UNKNOWN_FN] line {}, col {}: Unknown surface intrinsic or function '{}'",
+                line, col, name
+            )),
         }
     }
 
@@ -1192,7 +1691,10 @@ impl SurfaceLowerCtx {
         col: usize,
     ) -> Result<(), String> {
         if stmts.is_empty() {
-            return Err(format!("line {}, col {}: Empty branch block in control-flow expression", line, col));
+            return Err(format!(
+                "error[SYNTAX_ERROR] line {}, col {}: Empty branch block in control-flow expression",
+                line, col
+            ));
         }
         for s in &stmts[..stmts.len() - 1] {
             self.lower_stmt(s)?;
@@ -1249,7 +1751,7 @@ impl SurfaceLowerCtx {
                     .var_map
                     .get(v)
                     .cloned()
-                    .ok_or_else(|| format!("line {}, col {}: Undefined variable '{}'", line, col, v))?;
+                    .ok_or_else(|| format!("error[UNDEF_VAR] line {}, col {}: Undefined variable '{}'", line, col, v))?;
                 let dst = match target_reg {
                     Some(r) => String::from(r),
                     None => self.alloc_reg(*line, *col)?,
@@ -1280,7 +1782,7 @@ impl SurfaceLowerCtx {
                 if name.eq_ignore_ascii_case("pack5_bytes") {
                     if args.len() != 1 {
                         return Err(format!(
-                            "line {}, col {}: Intrinsic 'pack5_bytes' expects 1 trit-vector literal argument",
+                            "error[ARITY_MISMATCH] line {}, col {}: Intrinsic 'pack5_bytes' expects 1 trit-vector literal argument",
                             line, col
                         ));
                     }
@@ -1288,7 +1790,7 @@ impl SurfaceLowerCtx {
                         return self.lower_trit_vec_pack5(trits, target_reg, false, l, c);
                     } else {
                         return Err(format!(
-                            "line {}, col {}: Intrinsic 'pack5_bytes' requires a '[+1t, -1t, ...]' literal",
+                            "error[BAD_TYPE] line {}, col {}: Intrinsic 'pack5_bytes' requires a '[+1t, -1t, ...]' literal",
                             line, col
                         ));
                     }
@@ -1372,7 +1874,7 @@ impl SurfaceLowerCtx {
 
     fn lower_stmt(&mut self, stmt: &SurfaceStmt) -> Result<(), String> {
         match stmt {
-            SurfaceStmt::Let(name, expr, _line, _col) => {
+            SurfaceStmt::Let(name, _ty_opt, expr, _line, _col) => {
                 let reg = self.lower_expr_into(expr, None, false)?;
                 self.var_map.insert(name.clone(), reg);
                 Ok(())
@@ -1382,16 +1884,27 @@ impl SurfaceLowerCtx {
                     .var_map
                     .get(name)
                     .cloned()
-                    .ok_or_else(|| format!("line {}, col {}: Cannot reassign undeclared variable '{}'", line, col, name))?;
+                    .ok_or_else(|| {
+                        format!(
+                            "error[UNDEF_VAR] line {}, col {}: Cannot reassign undeclared variable '{}'",
+                            line, col, name
+                        )
+                    })?;
                 if !reg.starts_with('%') {
-                    return Err(format!("line {}, col {}: Cannot reassign immutable function parameter '{}'", line, col, name));
+                    return Err(format!(
+                        "error[IMMUT_PARAM] line {}, col {}: Cannot reassign immutable function parameter '{}'",
+                        line, col, name
+                    ));
                 }
                 let _ = self.lower_expr_into(expr, Some(&reg), false)?;
                 Ok(())
             }
             SurfaceStmt::DoWhile(body, cond_expr, line, col) => {
                 if body.is_empty() {
-                    return Err(format!("line {}, col {}: Empty do_while loop body", line, col));
+                    return Err(format!(
+                        "error[SYNTAX_ERROR] line {}, col {}: Empty do_while loop body",
+                        line, col
+                    ));
                 }
                 let l_top = self.alloc_lbl(*line, *col)?;
                 self.emit(format!("LABEL {}", l_top))?;
@@ -1404,7 +1917,10 @@ impl SurfaceLowerCtx {
             }
             SurfaceStmt::While(cond_expr, body, line, col) => {
                 if body.is_empty() {
-                    return Err(format!("line {}, col {}: Empty while loop body", line, col));
+                    return Err(format!(
+                        "error[SYNTAX_ERROR] line {}, col {}: Empty while loop body",
+                        line, col
+                    ));
                 }
                 let l_top = self.alloc_lbl(*line, *col)?;
                 let l_body = self.alloc_lbl(*line, *col)?;
@@ -1441,34 +1957,52 @@ impl SurfaceLowerCtx {
                     let low = cname.to_ascii_lowercase();
                     if low == "br_pos" || low == "br_neg" {
                         if args.len() != 2 {
-                            return Err(format!("line {}, col {}: '{}' expects 2 arguments", cl, cc, cname));
+                            return Err(format!(
+                                "error[ARITY_MISMATCH] line {}, col {}: '{}' expects 2 arguments",
+                                cl, cc, cname
+                            ));
                         }
                         let c_op = self.eval_to_operand(&args[0])?;
                         if let SurfaceExpr::Int(lid, ll, lc) = args[1] {
                             if !(0..=15).contains(&lid) {
-                                return Err(format!("line {}, col {}: Branch label {} out of range 0..=15", ll, lc, lid));
+                                return Err(format!(
+                                    "error[UNRESOLVED_LABEL] line {}, col {}: Branch label {} out of range 0..=15",
+                                    ll, lc, lid
+                                ));
                             }
                             self.used_labels.push((lid as u16, ll, lc));
                             self.emit(format!("{} {} {}", low.to_ascii_uppercase(), c_op, lid))?;
                             return Ok(());
                         } else {
-                            return Err(format!("line {}, col {}: '{}' target must be an integer label id", cl, cc, cname));
+                            return Err(format!(
+                                "error[UNRESOLVED_LABEL] line {}, col {}: '{}' target must be an integer label id",
+                                cl, cc, cname
+                            ));
                         }
                     } else if low == "br_trit" {
                         if args.len() != 4 {
-                            return Err(format!("line {}, col {}: 'br_trit' expects 4 arguments", cl, cc));
+                            return Err(format!(
+                                "error[ARITY_MISMATCH] line {}, col {}: 'br_trit' expects 4 arguments",
+                                cl, cc
+                            ));
                         }
                         let c_op = self.eval_to_operand(&args[0])?;
                         let mut lids = Vec::new();
                         for a in &args[1..] {
                             if let SurfaceExpr::Int(lid, ll, lc) = *a {
                                 if !(0..=15).contains(&lid) {
-                                    return Err(format!("line {}, col {}: Branch label {} out of range 0..=15", ll, lc, lid));
+                                    return Err(format!(
+                                        "error[UNRESOLVED_LABEL] line {}, col {}: Branch label {} out of range 0..=15",
+                                        ll, lc, lid
+                                    ));
                                 }
                                 self.used_labels.push((lid as u16, ll, lc));
                                 lids.push(lid.to_string());
                             } else {
-                                return Err(format!("line {}, col {}: 'br_trit' targets must be integer label ids", cl, cc));
+                                return Err(format!(
+                                    "error[UNRESOLVED_LABEL] line {}, col {}: 'br_trit' targets must be integer label ids",
+                                    cl, cc
+                                ));
                             }
                         }
                         self.emit(format!("BR_TRIT {} {}", c_op, lids.join(" ")))?;
@@ -1479,6 +2013,10 @@ impl SurfaceLowerCtx {
                             ops.push(self.eval_to_operand(a)?);
                         }
                         self.emit(format!("DROP {}", ops.join(" ")))?;
+                        return Ok(());
+                    } else if low == "respond" || low == "respond_json" || low == "respond_html" {
+                        let op = self.lower_expr_into(expr, None, false)?;
+                        self.emit(format!("RET {}", op))?;
                         return Ok(());
                     }
                 }
@@ -1493,7 +2031,7 @@ impl SurfaceLowerCtx {
         for &(lid, line, col) in &self.used_labels {
             if !self.defined_labels.contains(&lid) {
                 return Err(format!(
-                    "line {}, col {}: Unresolved branch target label {}",
+                    "error[UNRESOLVED_LABEL] line {}, col {}: Unresolved branch target label {}",
                     line, col, lid
                 ));
             }
@@ -1514,6 +2052,9 @@ pub fn resolve_omni_surface_includes(
         vfs: Option<&BTreeMap<String, String>>,
         stack: &mut Vec<String>,
     ) -> Result<String, String> {
+        if !cur_src.contains("include") && !cur_src.contains("mod ") && !cur_src.contains("mod\"") {
+            return Ok(String::from(cur_src));
+        }
         let tokens = tokenize_omni_surface(cur_src)?;
         let mut parser = SurfaceParser::new(tokens);
         let (includes, _fns) = parser.parse_module()?;
@@ -1524,18 +2065,27 @@ pub fn resolve_omni_surface_includes(
         let mut combined = String::new();
         for (inc_path, line, col) in includes {
             if stack.contains(&inc_path) {
-                return Err(format!("line {}, col {}: Circular include detected for '{}'", line, col, inc_path));
+                return Err(format!(
+                    "error[CIRCULAR_INCLUDE] line {}, col {}: Circular include detected for '{}'",
+                    line, col, inc_path
+                ));
             }
             let inc_content = if let Some(map) = vfs.and_then(|m| m.get(&inc_path).map(|s| (m, s))) {
                 map.1.clone()
             } else if let Some(dir) = cur_dir {
                 let full_p = dir.join(&inc_path);
                 fs::read_to_string(&full_p).map_err(|e| {
-                    format!("line {}, col {}: Failed to read included file '{}': {}", line, col, full_p.display(), e)
+                    format!(
+                        "error[SYNTAX_ERROR] line {}, col {}: Failed to read included file '{}': {}",
+                        line, col, full_p.display(), e
+                    )
                 })?
             } else {
                 fs::read_to_string(&inc_path).map_err(|e| {
-                    format!("line {}, col {}: Failed to read included file '{}': {}", line, col, inc_path, e)
+                    format!(
+                        "error[SYNTAX_ERROR] line {}, col {}: Failed to read included file '{}': {}",
+                        line, col, inc_path, e
+                    )
                 })?
             };
             stack.push(inc_path.clone());
@@ -1545,7 +2095,6 @@ pub fn resolve_omni_surface_includes(
             combined.push('\n');
         }
 
-        // Strip top-level include/mod lines from cur_src before appending
         for raw_line in cur_src.lines() {
             let trimmed = raw_line.trim_start();
             if trimmed.starts_with("include ") || trimmed.starts_with("include\"") || trimmed.starts_with("mod ") {
@@ -1561,14 +2110,14 @@ pub fn resolve_omni_surface_includes(
     resolve_inner(src, base_dir, vfs, &mut stack)
 }
 
-/// Lowers an Omni surface language program (single-function or multi-function) to canonical `.omni_asm`.
-pub fn compile_omni_surface_to_asm(src: &str) -> Result<String, String> {
-    let tokens = tokenize_omni_surface(src)?;
-    let mut parser = SurfaceParser::new(tokens);
+fn compile_omni_surface_to_asm_inner(src: &str, strict: bool) -> Result<String, String> {
+    let effective_strict = strict || src.contains("#[strict]");
+    let tokens = tokenize_omni_surface_inner(src, effective_strict)?;
+    let mut parser = SurfaceParser::new_with_strict(tokens, effective_strict);
     let (includes, fns) = parser.parse_module()?;
     if !includes.is_empty() {
         let expanded = resolve_omni_surface_includes(src, None, None)?;
-        return compile_omni_surface_to_asm(&expanded);
+        return compile_omni_surface_to_asm_inner(&expanded, effective_strict);
     }
 
     let multi_fn = fns.len() > 1;
@@ -1583,12 +2132,16 @@ pub fn compile_omni_surface_to_asm(src: &str) -> Result<String, String> {
         } else {
             (idx + 1) as u16
         };
-        let ret_asm = String::from(map_omni_surface_type(&f.ret_ty, f.ret_line, f.ret_col)?);
+        let fn_strict = effective_strict || f.strict_attr;
+        let ret_asm = String::from(map_omni_surface_type_inner(&f.ret_ty, f.ret_line, f.ret_col, fn_strict)?);
         for p in &f.params {
-            let _ = map_omni_surface_type(&p.ty, p.line, p.col)?;
+            let _ = map_omni_surface_type_inner(&p.ty, p.line, p.col, fn_strict)?;
         }
         if fn_sigs.contains_key(&f.name) {
-            return Err(format!("line {}, col {}: Duplicate function definition '{}'", f.ret_line, f.ret_col, f.name));
+            return Err(format!(
+                "error[SYNTAX_ERROR] line {}, col {}: Duplicate function definition '{}'",
+                f.ret_line, f.ret_col, f.name
+            ));
         }
         fn_sigs.insert(f.name.clone(), (fid, f.params.len(), ret_asm));
         assigned_ids.push(fid);
@@ -1597,6 +2150,7 @@ pub fn compile_omni_surface_to_asm(src: &str) -> Result<String, String> {
     let mut out = Vec::new();
     for (idx, f) in fns.iter().enumerate() {
         let fid = assigned_ids[idx];
+        let fn_strict = effective_strict || f.strict_attr;
         if multi_fn {
             out.push(format!("FN_DEF {}", fid));
         } else if let Some(explicit_id) = f.fn_id_attr {
@@ -1606,15 +2160,27 @@ pub fn compile_omni_surface_to_asm(src: &str) -> Result<String, String> {
             out.push(format!("CAP_MASK {}", f.cap_mask));
         }
         for (p_idx, p) in f.params.iter().enumerate() {
-            let ty_str = map_omni_surface_type(&p.ty, p.line, p.col)?;
+            let ty_str = map_omni_surface_type_inner(&p.ty, p.line, p.col, fn_strict)?;
             let taint_str = if p.untrusted { "UNTRUSTED" } else { "SAFE" };
             out.push(format!("PARAM ${} {} {}", p_idx, ty_str, taint_str));
         }
-        let ret_ty_str = map_omni_surface_type(&f.ret_ty, f.ret_line, f.ret_col)?;
+        let ret_ty_str = map_omni_surface_type_inner(&f.ret_ty, f.ret_line, f.ret_col, fn_strict)?;
         let ret_ty_tok = parse_asm_ty_tok(ret_ty_str);
         out.push(format!("RET_TY {}", ret_ty_str));
 
         let mut ctx = SurfaceLowerCtx::new(&f.params, fn_sigs.clone(), ret_ty_tok, true);
+        if f.is_route {
+            let method_code = match f.route_method.as_deref() {
+                Some("GET") => 1,
+                Some("POST") => 2,
+                Some("PUT") => 3,
+                Some("DELETE") => 4,
+                _ => 0,
+            };
+            let path_hash = fnv1a_32_positive(f.route_path.as_deref().unwrap_or("/"));
+            let r_rt = ctx.alloc_reg(f.ret_line, f.ret_col)?;
+            ctx.emit(format!("{} = ROUTE {} {}", r_rt, method_code, path_hash))?;
+        }
         for stmt in &f.body {
             ctx.lower_stmt(stmt)?;
         }
@@ -1627,15 +2193,19 @@ pub fn compile_omni_surface_to_asm(src: &str) -> Result<String, String> {
     Ok(joined)
 }
 
-/// Compiles an Omni surface language program directly into a `Vec<u16>` token stream without
-/// materializing or re-parsing an intermediate `.omni_asm` text file.
-pub fn compile_omni_surface_to_u16(src: &str) -> Result<Vec<u16>, String> {
-    let tokens = tokenize_omni_surface(src)?;
-    let mut parser = SurfaceParser::new(tokens);
+/// Lowers an Omni surface language program (single-function, multi-function, or `route`) to canonical `.omni_asm`.
+pub fn compile_omni_surface_to_asm(src: &str) -> Result<String, String> {
+    compile_omni_surface_to_asm_inner(src, false)
+}
+
+fn compile_omni_surface_to_u16_inner(src: &str, strict: bool) -> Result<Vec<u16>, String> {
+    let effective_strict = strict || src.contains("#[strict]");
+    let tokens = tokenize_omni_surface_inner(src, effective_strict)?;
+    let mut parser = SurfaceParser::new_with_strict(tokens, effective_strict);
     let (includes, fns) = parser.parse_module()?;
     if !includes.is_empty() {
         let expanded = resolve_omni_surface_includes(src, None, None)?;
-        return compile_omni_surface_to_u16(&expanded);
+        return compile_omni_surface_to_u16_inner(&expanded, effective_strict);
     }
 
     let multi_fn = fns.len() > 1;
@@ -1650,12 +2220,16 @@ pub fn compile_omni_surface_to_u16(src: &str) -> Result<Vec<u16>, String> {
         } else {
             (idx + 1) as u16
         };
-        let ret_asm = String::from(map_omni_surface_type(&f.ret_ty, f.ret_line, f.ret_col)?);
+        let fn_strict = effective_strict || f.strict_attr;
+        let ret_asm = String::from(map_omni_surface_type_inner(&f.ret_ty, f.ret_line, f.ret_col, fn_strict)?);
         for p in &f.params {
-            let _ = map_omni_surface_type(&p.ty, p.line, p.col)?;
+            let _ = map_omni_surface_type_inner(&p.ty, p.line, p.col, fn_strict)?;
         }
         if fn_sigs.contains_key(&f.name) {
-            return Err(format!("line {}, col {}: Duplicate function definition '{}'", f.ret_line, f.ret_col, f.name));
+            return Err(format!(
+                "error[SYNTAX_ERROR] line {}, col {}: Duplicate function definition '{}'",
+                f.ret_line, f.ret_col, f.name
+            ));
         }
         fn_sigs.insert(f.name.clone(), (fid, f.params.len(), ret_asm));
         assigned_ids.push(fid);
@@ -1665,16 +2239,29 @@ pub fn compile_omni_surface_to_u16(src: &str) -> Result<Vec<u16>, String> {
         Vec::with_capacity(fns.len());
     for (idx, f) in fns.iter().enumerate() {
         let fid = assigned_ids[idx];
+        let fn_strict = effective_strict || f.strict_attr;
         let mut params = Vec::with_capacity(f.params.len());
         for (p_idx, p) in f.params.iter().enumerate() {
-            let ty_str = map_omni_surface_type(&p.ty, p.line, p.col)?;
+            let ty_str = map_omni_surface_type_inner(&p.ty, p.line, p.col, fn_strict)?;
             let ty_tok = parse_asm_ty_tok(ty_str);
             params.push((PAR_BASE + (p_idx as u16), ty_tok, pack_tc(p.untrusted, CAP_ID_PURE)));
         }
-        let ret_ty_str = map_omni_surface_type(&f.ret_ty, f.ret_line, f.ret_col)?;
+        let ret_ty_str = map_omni_surface_type_inner(&f.ret_ty, f.ret_line, f.ret_col, fn_strict)?;
         let ret_ty_tok = parse_asm_ty_tok(ret_ty_str);
 
         let mut ctx = SurfaceLowerCtx::new(&f.params, fn_sigs.clone(), ret_ty_tok, false);
+        if f.is_route {
+            let method_code = match f.route_method.as_deref() {
+                Some("GET") => 1,
+                Some("POST") => 2,
+                Some("PUT") => 3,
+                Some("DELETE") => 4,
+                _ => 0,
+            };
+            let path_hash = fnv1a_32_positive(f.route_path.as_deref().unwrap_or("/"));
+            let r_rt = ctx.alloc_reg(f.ret_line, f.ret_col)?;
+            ctx.emit(format!("{} = ROUTE {} {}", r_rt, method_code, path_hash))?;
+        }
         for stmt in &f.body {
             ctx.lower_stmt(stmt)?;
         }
@@ -1706,6 +2293,20 @@ pub fn compile_omni_surface_to_u16(src: &str) -> Result<Vec<u16>, String> {
         stream.push(TOK_MOD_END);
         Ok(stream)
     }
+}
+
+/// Compiles an Omni surface language program directly into a `Vec<u16>` token stream without
+/// materializing or re-parsing an intermediate `.omni_asm` text file.
+pub fn compile_omni_surface_to_u16(src: &str) -> Result<Vec<u16>, String> {
+    compile_omni_surface_to_u16_inner(src, false)
+}
+
+/// Compiles an Omni surface language program in strict AI-first single-form mode (`#[strict]`),
+/// requiring explicit type annotations on every `let` (`let x: <ty> = ...;`) and rejecting
+/// non-canonical trit aliases (`TRIT_POS`), type aliases (`int`/`tvec`), taint prefixes (`untrusted_i64`),
+/// and `mod "..."` directives with `error[BAD_TYPE]` or `error[AMBIGUOUS_GRAMMAR]`.
+pub fn compile_omni_surface_strict_to_u16(src: &str) -> Result<Vec<u16>, String> {
+    compile_omni_surface_to_u16_inner(src, true)
 }
 
 /// Extracts any `#[step_budget(N)]` and `#[mem_budget(N)]` attributes declared on surface functions.
@@ -1765,9 +2366,10 @@ pub fn parse_cli_omni_value(a_str: &str) -> OmniValue {
     }
 }
 
-/// Wraps a bare expression or multi-statement snippet in a full `#[cap(...)] fn main(...) -> <ty>` function if it does not already contain `fn `.
+/// Wraps a bare expression or multi-statement snippet in a full `#[cap(...)] fn main(...) -> <ty>` function if it does not already contain `fn ` or `route `.
 pub fn wrap_omni_surface_snippet(snippet: &str) -> String {
-    if snippet.contains("fn ") {
+    let t_check = snippet.trim_start();
+    if snippet.contains("fn ") || t_check.starts_with("route ") || snippet.contains("\nroute ") || snippet.contains(" route ") {
         return String::from(snippet);
     }
     let trimmed = snippet.trim().trim_end_matches(';').trim();
@@ -1906,7 +2508,8 @@ pub fn execute_omni_surface_program_with_budgets(
     let u16_stream = compile_omni_surface_to_u16(&wrapped)?;
     for rep in verify_u16_stream(&u16_stream)? {
         if !rep.passed {
-            return Err(format!("Static verification failed on fn #{}: {:?}", rep.fn_idx, rep.errors));
+            let first = rep.errors.first().cloned().unwrap_or_default();
+            return Err(format!("{} (fn #{}: {:?})", first, rep.fn_idx, rep.errors));
         }
     }
     let module = decode_omni_token_stream(&u16_stream)?;
@@ -1928,7 +2531,7 @@ pub fn execute_omni_surface_program_with_budgets(
 /// Executes an Omni surface program using the AOT hot path (`compile_pure_u16_to_wasm` ->
 /// `execute_wasm_module_i64_with_budgets`) whenever the module is an AOT-eligible numeric/ternary/
 /// `@PACK5` hot path returning `i64` or `trit`, falling back to `OmniBinaryVm` under explicit budgets
-/// only for high-level string, composite-return, or multi-function modules.
+/// only for high-level string, composite-return, host-ABI (`route`/DB/KV), or multi-function modules.
 /// Returns `(result_value, "aot" | "vm")`.
 pub fn execute_omni_surface_aot_first(
     src: &str,
@@ -1939,14 +2542,16 @@ pub fn execute_omni_surface_aot_first(
     let u16_stream = compile_omni_surface_to_u16(&wrapped)?;
     for rep in verify_u16_stream(&u16_stream)? {
         if !rep.passed {
-            return Err(format!("Static verification failed on fn #{}: {:?}", rep.fn_idx, rep.errors));
+            let first = rep.errors.first().cloned().unwrap_or_default();
+            return Err(format!("{} (fn #{}: {:?})", first, rep.fn_idx, rep.errors));
         }
     }
     let module = decode_omni_token_stream(&u16_stream)?;
     for func in &module.functions {
         let rep = verify_binary_function(func);
         if !rep.passed {
-            return Err(format!("Static verification failed on fn #{}: {:?}", func.fn_idx, rep.errors));
+            let first = rep.errors.first().cloned().unwrap_or_default();
+            return Err(format!("{} (fn #{}: {:?})", first, func.fn_idx, rep.errors));
         }
     }
     let entry_fn_idx = if module.functions.iter().any(|f| f.fn_idx == 0) {
@@ -1981,7 +2586,7 @@ pub fn execute_omni_surface_aot_first(
         }
         if static_alloc_bytes > mem_b {
             return Err(format!(
-                "AOT memory budget exceeded ({} > {} bytes)",
+                "error[BUDGET_EXCEEDED]: AOT memory budget exceeded ({} > {} bytes)",
                 static_alloc_bytes, mem_b
             ));
         }
@@ -2032,7 +2637,8 @@ pub fn compile_omni_surface_via_stage1_to_elf(
     let u16_stream = compile_omni_surface_to_u16(&wrapped)?;
     for rep in verify_u16_stream(&u16_stream)? {
         if !rep.passed {
-            return Err(format!("Static verification failed on fn #{}: {:?}", rep.fn_idx, rep.errors));
+            let first = rep.errors.first().cloned().unwrap_or_default();
+            return Err(format!("{} (fn #{}: {:?})", first, rep.fn_idx, rep.errors));
         }
     }
     let module = decode_omni_token_stream(&u16_stream)?;
@@ -2104,7 +2710,7 @@ pub fn execute_omni_surface_wasm_i64(src: &str, args: &[i64]) -> Result<i64, Str
     }
     if static_alloc_bytes > mem_b {
         return Err(format!(
-            "AOT memory budget exceeded ({} > {} bytes)",
+            "error[BUDGET_EXCEEDED]: AOT memory budget exceeded ({} > {} bytes)",
             static_alloc_bytes, mem_b
         ));
     }
@@ -2112,5 +2718,544 @@ pub fn execute_omni_surface_wasm_i64(src: &str, args: &[i64]) -> Result<i64, Str
     execute_wasm_module_i64_with_budgets(&wasm, args, step_b, mem_b)
 }
 
+// ==============================================================================
+// 7C. VERSION-LOCKED MODEL HARNESS (`omni-harness`) & STRUCTURED DIAGNOSTICS
+// ==============================================================================
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OmniStructuredError {
+    pub code: &'static str,
+    pub line: Option<usize>,
+    pub col: Option<usize>,
+    pub message: String,
+    pub retry_hint: &'static str,
+}
 
+fn map_error_code_str(tag: &str) -> Option<&'static str> {
+    match tag {
+        "TAINT_ON_RET" => Some("TAINT_ON_RET"),
+        "TAINT_SINK" => Some("TAINT_SINK"),
+        "MISSING_CAP" => Some("MISSING_CAP"),
+        "LINEAR_LEAK" => Some("LINEAR_LEAK"),
+        "BORROW_CONFLICT" => Some("BORROW_CONFLICT"),
+        "UNDEF_VAR" => Some("UNDEF_VAR"),
+        "IMMUT_PARAM" => Some("IMMUT_PARAM"),
+        "BAD_TYPE" => Some("BAD_TYPE"),
+        "UNKNOWN_FN" => Some("UNKNOWN_FN"),
+        "ARITY_MISMATCH" => Some("ARITY_MISMATCH"),
+        "UNRESOLVED_LABEL" => Some("UNRESOLVED_LABEL"),
+        "CIRCULAR_INCLUDE" => Some("CIRCULAR_INCLUDE"),
+        "BUDGET_EXCEEDED" => Some("BUDGET_EXCEEDED"),
+        "CORRUPT_PACK5" => Some("CORRUPT_PACK5"),
+        "AMBIGUOUS_GRAMMAR" => Some("AMBIGUOUS_GRAMMAR"),
+        "SYNTAX_ERROR" => Some("SYNTAX_ERROR"),
+        _ => None,
+    }
+}
+
+fn retry_hint_for_code(code: &str) -> &'static str {
+    match code {
+        "TAINT_ON_RET" => "Sanitize @untrusted data with san_sql(x), san_dom(x), san_prm(x), or auth_verify(x) before returning.",
+        "TAINT_SINK" => "Pass @untrusted values through san_sql(x), san_dom(x), san_prm(x), or auth_verify(x) before invoking a safe-sink opcode.",
+        "MISSING_CAP" => "Add the required capability to the function or route header, e.g. #[cap(AI, NET, DB_R, DB_W, AUTH)] or @cap(net, db_r).",
+        "LINEAR_LEAK" => "Ensure every allocated linear register or arena is consumed by drop(...) or returned before RET.",
+        "BORROW_CONFLICT" => "Release active borrows before taking a conflicting mutable borrow_w(...) or moving the register.",
+        "UNDEF_VAR" => "Declare the variable with 'let <name>: <ty> = <expr>;' before referencing or reassigning it.",
+        "IMMUT_PARAM" => "Copy the immutable parameter into a local variable ('let tmp: i64 = param;') before reassigning.",
+        "BAD_TYPE" => "Use a valid canonical type ('i64', 'trit', 'bytes', 'array', 'trit_vec', 'str', 'arena') and annotate every 'let' in #[strict] mode.",
+        "UNKNOWN_FN" => "Use a built-in intrinsic (e.g. iabs, imin, imax, tmaj, sel_trit, egate, tdot, db_query, req.param, respond) or define the helper fn.",
+        "ARITY_MISMATCH" => "Check the expected argument count of the intrinsic or user-defined function.",
+        "UNRESOLVED_LABEL" => "Ensure every 'goto N;' or 'br_pos(c, N);' has a matching 'label N;' (0..=15) in the same function.",
+        "CIRCULAR_INCLUDE" => "Remove the cyclic 'include \"...\";' reference between modules.",
+        "BUDGET_EXCEEDED" => "Reduce loop iterations or allocations, or raise #[step_budget(N)] / #[mem_budget(N)].",
+        "CORRUPT_PACK5" => "Ensure all @PACK5 bytes are in 0..=242 (valid 5-trit encodings) without sentinel bytes 243..=255.",
+        "AMBIGUOUS_GRAMMAR" => "In #[strict] mode, use canonical '+1t'/'0t'/'-1t' trits, ': <ty>' on every let, '@untrusted' suffix, and 'include \"...\"'.",
+        _ => "Check surface syntax, balanced braces, and function/route signatures.",
+    }
+}
+
+/// Parses any compiler, verifier, or runtime diagnostic into a structured machine-readable `OmniStructuredError`.
+pub fn parse_omni_structured_error(err: &str) -> OmniStructuredError {
+    let mut code: &'static str = "SYNTAX_ERROR";
+    if let Some(start) = err.find("error[") {
+        let rest = &err[start + 6..];
+        if let Some(end) = rest.find(']') {
+            if let Some(mapped) = map_error_code_str(&rest[..end]) {
+                code = mapped;
+            }
+        }
+    } else if err.contains("Taint violation on RET") {
+        code = "TAINT_ON_RET";
+    } else if err.contains("Sink opcode") && err.contains("@UNTRUSTED") {
+        code = "TAINT_SINK";
+    } else if err.contains("Capability violation") {
+        code = "MISSING_CAP";
+    } else if err.contains("Linear value leak") {
+        code = "LINEAR_LEAK";
+    } else if err.contains("Borrow violation") {
+        code = "BORROW_CONFLICT";
+    } else if err.contains("budget exceeded") {
+        code = "BUDGET_EXCEEDED";
+    } else if err.contains("PACK5_SENTINEL_OR_CORRUPT_BYTE") {
+        code = "CORRUPT_PACK5";
+    } else if err.contains("Undefined variable") || err.contains("undeclared variable") {
+        code = "UNDEF_VAR";
+    } else if err.contains("immutable function parameter") {
+        code = "IMMUT_PARAM";
+    } else if err.contains("Unknown surface type") {
+        code = "BAD_TYPE";
+    } else if err.contains("Unknown surface intrinsic") {
+        code = "UNKNOWN_FN";
+    } else if err.contains("Unresolved branch target label") || err.contains("Unresolved jump target") {
+        code = "UNRESOLVED_LABEL";
+    } else if err.contains("Circular include") {
+        code = "CIRCULAR_INCLUDE";
+    }
+
+    let mut line_num: Option<usize> = None;
+    let mut col_num: Option<usize> = None;
+    if let Some(l_idx) = err.find("line ") {
+        let after_l = &err[l_idx + 5..];
+        let digits: String = after_l.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(n) = digits.parse::<usize>() {
+            line_num = Some(n);
+        }
+        if let Some(c_idx) = after_l.find("col ") {
+            let after_c = &after_l[c_idx + 4..];
+            let c_digits: String = after_c.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(cn) = c_digits.parse::<usize>() {
+                col_num = Some(cn);
+            }
+        }
+    }
+
+    OmniStructuredError {
+        code,
+        line: line_num,
+        col: col_num,
+        message: String::from(err),
+        retry_hint: retry_hint_for_code(code),
+    }
+}
+
+fn json_escape_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn format_omni_value_compact(v: &OmniValue) -> String {
+    match v {
+        OmniValue::Int(n) => n.to_string(),
+        OmniValue::Trit(t) => {
+            if *t > 0 {
+                String::from("+1t")
+            } else if *t < 0 {
+                String::from("-1t")
+            } else {
+                String::from("0t")
+            }
+        }
+        OmniValue::Str(s) => s.clone(),
+        OmniValue::Bytes(b) => format!("bytes[{}]", b.len()),
+        OmniValue::TritVec(tv) => format!("trit_vec[{}]", tv.len()),
+        OmniValue::U16Array(a) => format!("u16[{}]", a.len()),
+        OmniValue::Struct(m) => {
+            if let (Some(OmniValue::Int(status)), Some(body)) = (m.get(&0), m.get(&1)) {
+                format!("HTTP {} {}", status, format_omni_value_compact(body))
+            } else {
+                format!("{:?}", m)
+            }
+        }
+        other => format!("{:?}", other),
+    }
+}
+
+/// Returns the version-locked JSON specification of the `omni-harness` grammar, capabilities, and error codes.
+pub fn omni_harness_spec_json() -> String {
+    format!(
+        "{{\"version\":\"{}\",\"isa_version\":\"0x{:04X}\",\"types\":[\"i64\",\"trit\",\"bytes\",\"array\",\"trit_vec\",\"str\",\"arena\"],\"capabilities\":[\"PURE\",\"DB_R\",\"DB_W\",\"NET\",\"DOM\",\"AI\",\"VISION\",\"AUDIO\",\"AUTH\",\"FS\",\"SYS\"],\"error_codes\":[\"TAINT_ON_RET\",\"TAINT_SINK\",\"MISSING_CAP\",\"LINEAR_LEAK\",\"BORROW_CONFLICT\",\"UNDEF_VAR\",\"IMMUT_PARAM\",\"BAD_TYPE\",\"UNKNOWN_FN\",\"ARITY_MISMATCH\",\"UNRESOLVED_LABEL\",\"CIRCULAR_INCLUDE\",\"BUDGET_EXCEEDED\",\"CORRUPT_PACK5\",\"AMBIGUOUS_GRAMMAR\",\"SYNTAX_ERROR\"],\"strict_rules\":[\"Explicit : <ty> on every let\",\"Canonical trit literals (+1t, 0t, -1t)\",\"Canonical @untrusted suffix\",\"Canonical include directive\"]}}",
+        OMNI_HARNESS_CONTRACT_VERSION, OP_BASE
+    )
+}
+
+/// Executes the version-locked `omni-harness` pipeline (compile -> static verify -> AOT/VM execute under budgets)
+/// and returns a deterministic single-line JSON response locked to `OMNI_HARNESS_CONTRACT_VERSION`.
+pub fn run_omni_harness_json(
+    src: &str,
+    args: Vec<OmniValue>,
+    strict: bool,
+    include_retry_hint: bool,
+) -> String {
+    let wrapped = if strict {
+        String::from(src)
+    } else {
+        wrap_omni_surface_snippet(src)
+    };
+    let u16_res = if strict {
+        compile_omni_surface_strict_to_u16(&wrapped)
+    } else {
+        compile_omni_surface_to_u16(&wrapped)
+    };
+    let u16_stream = match u16_res {
+        Ok(s) => s,
+        Err(e) => {
+            let st = parse_omni_structured_error(&e);
+            let line_json = st.line.map(|n| n.to_string()).unwrap_or_else(|| String::from("null"));
+            let col_json = st.col.map(|n| n.to_string()).unwrap_or_else(|| String::from("null"));
+            if include_retry_hint {
+                return format!(
+                    "{{\"ok\":false,\"version\":\"{}\",\"code\":\"{}\",\"line\":{},\"col\":{},\"message\":\"{}\",\"tokens\":null,\"retry_hint\":\"{}\"}}",
+                    OMNI_HARNESS_CONTRACT_VERSION,
+                    st.code,
+                    line_json,
+                    col_json,
+                    json_escape_str(&st.message),
+                    json_escape_str(st.retry_hint)
+                );
+            } else {
+                return format!(
+                    "{{\"ok\":false,\"version\":\"{}\",\"code\":\"{}\",\"line\":{},\"col\":{},\"message\":\"{}\",\"tokens\":null}}",
+                    OMNI_HARNESS_CONTRACT_VERSION,
+                    st.code,
+                    line_json,
+                    col_json,
+                    json_escape_str(&st.message)
+                );
+            }
+        }
+    };
+    let token_count = u16_stream.len();
+    match execute_omni_surface_aot_first(&wrapped, args) {
+        Ok((val, backend)) => {
+            format!(
+                "{{\"ok\":true,\"version\":\"{}\",\"result\":\"{}\",\"tokens\":{},\"backend\":\"{}\"}}",
+                OMNI_HARNESS_CONTRACT_VERSION,
+                json_escape_str(&format_omni_value_compact(&val)),
+                token_count,
+                backend
+            )
+        }
+        Err(e) => {
+            let st = parse_omni_structured_error(&e);
+            let line_json = st.line.map(|n| n.to_string()).unwrap_or_else(|| String::from("null"));
+            let col_json = st.col.map(|n| n.to_string()).unwrap_or_else(|| String::from("null"));
+            if include_retry_hint {
+                format!(
+                    "{{\"ok\":false,\"version\":\"{}\",\"code\":\"{}\",\"line\":{},\"col\":{},\"message\":\"{}\",\"tokens\":{},\"retry_hint\":\"{}\"}}",
+                    OMNI_HARNESS_CONTRACT_VERSION,
+                    st.code,
+                    line_json,
+                    col_json,
+                    json_escape_str(&st.message),
+                    token_count,
+                    json_escape_str(st.retry_hint)
+                )
+            } else {
+                format!(
+                    "{{\"ok\":false,\"version\":\"{}\",\"code\":\"{}\",\"line\":{},\"col\":{},\"message\":\"{}\",\"tokens\":{}}}",
+                    OMNI_HARNESS_CONTRACT_VERSION,
+                    st.code,
+                    line_json,
+                    col_json,
+                    json_escape_str(&st.message),
+                    token_count
+                )
+            }
+        }
+    }
+}
+
+/// Expects `res` to fail with a diagnostic whose machine-readable code equals `code`.
+fn expect_omni_error_code<T: std::fmt::Debug>(label: &str, res: Result<T, String>, code: &str) -> Result<OmniStructuredError, String> {
+    match res {
+        Ok(v) => Err(format!("Error-code case '{}' unexpectedly succeeded: {:?}", label, v)),
+        Err(e) => {
+            let st = parse_omni_structured_error(&e);
+            if st.code != code {
+                Err(format!("Error-code case '{}': got code {} (want {}) from '{}'", label, st.code, code, e))
+            } else {
+                Ok(st)
+            }
+        }
+    }
+}
+
+/// AI-first surface additions selftests (monolith 13p..13t / workspace 6q..6u):
+/// golden size regression gate, strict single-form grammar + default `@PACK5` trit vectors,
+/// machine-readable error codes, full-stack `route` + DB/KV host ABI goldens, and the
+/// version-locked `omni-harness` JSON contract.
+pub fn run_ai_first_surface_selftests() -> Result<usize, String> {
+    let mut checks = 0usize;
+
+    // 13p. Golden size regression gate: exact u16 token counts for all 15 SPEC.md goldens.
+    let size_gate: [(&str, &str, usize); 15] = [
+        ("seed0_risk", "fn seed0_risk(base: i64, delta: i64) -> trit { let scaled = base * 2; let score = scaled + delta; let cmp = score <=> 50; let pos = +1t; let res = tand(cmp, pos); return res; }", 53),
+        ("seed4_consensus", "#[fn_id(4)] fn seed4_consensus(s0: trit, s1: trit, s2: trit) -> trit { let m = tmaj(s0, s1, s2); let res = !m; return res; }", 34),
+        ("seed6_clamp", "#[fn_id(6)] fn seed6_clamp(x: i64, lo: i64, hi: i64) -> i64 { let lower = imax(x, lo); let clamped = imin(lower, hi); return clamped; }", 34),
+        ("custom_non_seed_alu", "fn custom_non_seed_alu(a: i64, b: i64, c: i64) -> i64 { let r0 = a * 4; let r1 = r0 - b; let r2 = c << 1; let r3 = r1 + r2; let r4 = r3 / 3; let r5 = r4 <=> 35; let r6 = !r5; let r7 = sel_trit(r6, 25, 50, 75); let r8 = r4 + r7; return r8; }", 91),
+        ("asm_roundtrip", "fn asm_roundtrip(a: i64, b: i64) -> trit { let res = (a * 3 - b) <=> 75; return res; }", 40),
+        ("iabs_golden", "fn iabs_golden(x: i64) -> i64 { let r = iabs(x); return r; }", 20),
+        ("idiv_zero", "fn idiv_zero(x: i64) -> i64 { let r = x / 0; return r; }", 22),
+        ("shl_65", "fn shl_65(x: i64) -> i64 { let r = x << 65; return r; }", 22),
+        ("sel_mix", "fn sel_mix(x: i64) -> i64 { let prod = x * 3; let cmp = prod <=> 20; let bonus = sel_trit(cmp, 5, 10, 15); let res = prod + bonus; return res; }", 49),
+        ("br_pos_golden", "fn br_pos_golden(x: i64) -> i64 { let c = x <=> 0; let r = if_pos c { 200 } else { 100 }; return r; }", 49),
+        ("br_neg_arith_golden", "fn br_neg_arith_golden(x: i64) -> i64 { let c = x <=> 0; let r = if_neg c { x - 50 } else { x + 100 }; return r; }", 51),
+        ("nested_branch_golden", "fn nested_branch_golden(x: i64) -> i64 { let c0 = x <=> 0; let r = if_pos c0 { let c1 = x <=> 5; if_pos c1 { 30 } else { 20 } } else { 10 }; return r; }", 74),
+        ("match_trit_golden", "fn match_trit_golden(x: i64) -> i64 { let c = x <=> 10; let r = match_trit c { neg => x - 5, zero => 100, pos => x + 50 }; return r; }", 69),
+        ("branch_loop_golden", "fn branch_loop_golden(n: i64) -> i64 { let acc = 0; let i = n; do_while { acc = acc + i; i = i - 1; } i <=> 0; return acc; }", 57),
+        ("byte_buf_golden", "fn byte_buf_golden(x: i64) -> i64 { let buf = anew(0); buf = iset(buf, 10, 20, 30); buf = iset_i32(buf, 100); buf = iset_i64(buf, 200); let len = slen(buf); let cmp = x <=> 5; let sel = cmov(cmp, 100, 200, 300); let total = len + sel; return total; }", 86),
+    ];
+    for &(g_name, g_src, locked) in size_gate.iter() {
+        let toks = compile_omni_surface_to_u16(g_src)
+            .map_err(|e| format!("Size gate '{}' failed to compile: {}", g_name, e))?
+            .len();
+        if toks > locked {
+            return Err(format!("Size regression gate: golden '{}' grew to {} u16 tokens (locked at {})", g_name, toks, locked));
+        }
+        if toks < locked {
+            return Err(format!("Size gate: golden '{}' shrank to {} u16 tokens (locked at {}); update the lock deliberately", g_name, toks, locked));
+        }
+    }
+    checks += 1;
+
+    // Typed `let` annotations are zero-cost: identical Vec<u16> in lax and strict mode.
+    let typed_seed0 = "fn seed0_risk(base: i64, delta: i64) -> trit { let scaled: i64 = base * 2; let score: i64 = scaled + delta; let cmp: trit = score <=> 50; let pos: trit = +1t; let res: trit = tand(cmp, pos); return res; }";
+    let untyped_u16 = compile_omni_surface_to_u16(size_gate[0].1)?;
+    if compile_omni_surface_to_u16(typed_seed0)? != untyped_u16 || compile_omni_surface_strict_to_u16(typed_seed0)? != untyped_u16 {
+        return Err(String::from("Typed let annotations changed the emitted Vec<u16> (must be zero-cost)"));
+    }
+    checks += 1;
+
+    // 13q. Strict single-form grammar (#[strict] / compile_omni_surface_strict_to_u16).
+    let strict_ok = "#[strict] fn main(a: i64) -> i64 { let b: i64 = a * 2; return b; }";
+    if execute_omni_surface_program(strict_ok, vec![OmniValue::Int(21)])? != OmniValue::Int(42) {
+        return Err(String::from("#[strict] typed program returned wrong result"));
+    }
+    let strict_cases: [(&str, &str, &str, bool); 5] = [
+        ("untyped_let", "fn main(a: i64) -> i64 { let b = a * 2; return b; }", "BAD_TYPE", true),
+        ("trit_alias", "fn main(a: i64) -> trit { let t: trit = TRIT_POS; return t; }", "AMBIGUOUS_GRAMMAR", true),
+        ("taint_prefix", "fn main(a: untrusted_i64) -> i64 { let b: i64 = 1; return b; }", "AMBIGUOUS_GRAMMAR", true),
+        ("type_alias", "fn main(a: int) -> i64 { return a; }", "AMBIGUOUS_GRAMMAR", true),
+        ("mod_directive", "mod \"helper.omni\"; fn main(a: i64) -> i64 { return a; }", "AMBIGUOUS_GRAMMAR", false),
+    ];
+    for &(label, src, code, lax_ok) in strict_cases.iter() {
+        expect_omni_error_code(label, compile_omni_surface_strict_to_u16(src), code)?;
+        if lax_ok && compile_omni_surface_to_u16(src).is_err() {
+            return Err(format!("Lax mode must keep accepting '{}' for backward compatibility", label));
+        }
+        checks += 1;
+    }
+
+    // 2.3 `@PACK5` is the default representation for `let v: trit_vec = [...]`.
+    let tv10 = "#[cap(AI)] fn main() -> i64 { let v: trit_vec = [+1t, -1t, 0t, +1t, +1t, -1t, 0t, -1t, +1t, +1t]; let p: bytes = pack5(v); let n: i64 = slen(p); return n; }";
+    let pattern = ["+1t", "-1t", "0t", "+1t", "+1t", "-1t", "0t", "-1t", "+1t", "+1t"];
+    let lit50: Vec<&str> = (0..50).map(|i| pattern[i % 10]).collect();
+    let tv50 = format!(
+        "#[cap(AI)] fn main() -> i64 {{ let v: trit_vec = [{}]; let p: bytes = pack5(v); let n: i64 = slen(p); return n; }}",
+        lit50.join(", ")
+    );
+    let b10 = execute_omni_surface_program(tv10, vec![])?;
+    let b50 = execute_omni_surface_program(&tv50, vec![])?;
+    if b10 != OmniValue::Int(2) || b50 != OmniValue::Int(10) {
+        return Err(format!("@PACK5 default trit_vec size mismatch: 10 trits -> {:?} (want 2 B vs 80 B i64), 50 trits -> {:?} (want 10 B vs 400 B i64)", b10, b50));
+    }
+    if compile_omni_surface_strict_to_u16(tv10).is_err() || compile_omni_surface_strict_to_u16(&tv50).is_err() {
+        return Err(String::from("Strict mode rejected canonical @PACK5 trit_vec programs"));
+    }
+    checks += 1;
+
+    // 13r. Machine-readable error codes for every diagnostic class.
+    let runaway = "#[step_budget(40)] fn main(n: i64) -> i64 { let i = n; let acc = 0; while (i <=> 0) { acc += i; i -= 1; } return acc; }";
+    let corrupt_u16 = assemble_omni_text_to_u16("CAP_MASK 16\nRET_TY I64\n%0 = ANEW 0\n%0 = ISET %0 250\n%1 = UNPACK5 %0 5\n%2 = EGATE %1\nRET %2\n")?;
+    let mut loop_vfs = BTreeMap::new();
+    loop_vfs.insert(String::from("loop.omni"), String::from("include \"loop.omni\"; fn f(x: i64) -> i64 { return x; }"));
+
+    expect_omni_error_code("TAINT_ON_RET", execute_omni_surface_program("fn main(x: i64 @untrusted) -> i64 { return x; }", vec![OmniValue::Int(1)]), "TAINT_ON_RET")?;
+    expect_omni_error_code("TAINT_SINK", execute_omni_surface_program("#[cap(AI)] fn main(x: i64 @untrusted) -> trit { let g = egate(x); return g; }", vec![OmniValue::Int(1)]), "TAINT_SINK")?;
+    expect_omni_error_code("MISSING_CAP", execute_omni_surface_program("fn main(x: i64) -> trit { let g = egate(x); return g; }", vec![OmniValue::Int(1)]), "MISSING_CAP")?;
+    expect_omni_error_code("LINEAR_LEAK", execute_omni_surface_program("fn main(x: i64) -> i64 { let a = arena(4096); return x; }", vec![OmniValue::Int(1)]), "LINEAR_LEAK")?;
+    expect_omni_error_code("BORROW_CONFLICT", execute_omni_surface_program("fn main(x: i64) -> i64 { let a = arena(4096); let r = borrow_r(a); drop(a); drop(r); return x; }", vec![OmniValue::Int(1)]), "BORROW_CONFLICT")?;
+    let undef = expect_omni_error_code("UNDEF_VAR", compile_omni_surface_to_u16("fn main(x: i64) -> i64 {\n    let r = missing_y + 1;\n    return r;\n}"), "UNDEF_VAR")?;
+    if undef.line != Some(2) || undef.col != Some(13) {
+        return Err(format!("UNDEF_VAR structured span mismatch: {:?}:{:?} (want 2:13)", undef.line, undef.col));
+    }
+    expect_omni_error_code("IMMUT_PARAM", compile_omni_surface_to_u16("fn main(x: i64) -> i64 { x = x + 1; return x; }"), "IMMUT_PARAM")?;
+    expect_omni_error_code("BAD_TYPE", compile_omni_surface_to_u16("fn main(x: float128) -> i64 { return 0; }"), "BAD_TYPE")?;
+    expect_omni_error_code("UNKNOWN_FN", compile_omni_surface_to_u16("fn main(x: i64) -> i64 { let r = foo_bar(x); return r; }"), "UNKNOWN_FN")?;
+    expect_omni_error_code("ARITY_MISMATCH", compile_omni_surface_to_u16("fn main(x: i64) -> i64 { let r = iabs(x, x); return r; }"), "ARITY_MISMATCH")?;
+    expect_omni_error_code("UNRESOLVED_LABEL", compile_omni_surface_to_u16("fn main(x: i64) -> i64 { goto 9; return x; }"), "UNRESOLVED_LABEL")?;
+    expect_omni_error_code("CIRCULAR_INCLUDE", resolve_omni_surface_includes("include \"loop.omni\"; fn main(x: i64) -> i64 { return x; }", None, Some(&loop_vfs)), "CIRCULAR_INCLUDE")?;
+    expect_omni_error_code("BUDGET_EXCEEDED(aot)", execute_omni_surface_program(runaway, vec![OmniValue::Int(1000)]), "BUDGET_EXCEEDED")?;
+    expect_omni_error_code("BUDGET_EXCEEDED(vm)", execute_omni_surface_program_with_budgets(runaway, vec![OmniValue::Int(1000)], Some(100_000), Some(1024 * 1024)), "BUDGET_EXCEEDED")?;
+    expect_omni_error_code("BUDGET_EXCEEDED(mem)", execute_omni_surface_program("#[mem_budget(16)] fn main(x: i64) -> str { let s = \"0123456789ABCDEF0123456789ABCDEF\"; let clean = san_dom(s); return clean; }", vec![OmniValue::Int(1)]), "BUDGET_EXCEEDED")?;
+    expect_omni_error_code("CORRUPT_PACK5", compile_pure_u16_to_wasm(&corrupt_u16), "CORRUPT_PACK5")?;
+    expect_omni_error_code("AMBIGUOUS_GRAMMAR", compile_omni_surface_strict_to_u16("fn main(a: i64) -> trit { let t: trit = TRIT_NEG; return t; }"), "AMBIGUOUS_GRAMMAR")?;
+    expect_omni_error_code("SYNTAX_ERROR", compile_omni_surface_to_u16("fn main(x: i64) -> i64 { let r = ; return r; }"), "SYNTAX_ERROR")?;
+    checks += 18;
+
+    // 13s. Full-stack route + request param + DB/KV host ABI goldens (zero new opcodes).
+    let route_kv = "#[cap(NET, DB_R, DB_W)]\nroute GET /users/:id (req: i64) {\n    let id = req.param(\"id\");\n    let saved = kv_put(id, 777);\n    let row = db_get(id);\n    respond(200, row);\n}";
+    let (kv_val, kv_backend) = execute_omni_surface_aot_first(route_kv, vec![OmniValue::Int(42)])?;
+    if kv_val != OmniValue::Int(200_000_777) || kv_backend != "vm" {
+        return Err(format!("route GET /users/:id kv golden mismatch: {:?} via {}", kv_val, kv_backend));
+    }
+    let route_q = "route GET /users/:id (req: i64) @cap(net, db_r) {\n    let id = req.param(\"id\");\n    let row = db_query(\"SELECT * FROM users WHERE id = ?\", id);\n    respond(200, row);\n}";
+    if execute_omni_surface_program(route_q, vec![OmniValue::Int(42)])? != OmniValue::Int(200_000_420) {
+        return Err(String::from("route GET /users/:id db_query golden mismatch (want HTTP 200 row 420)"));
+    }
+    let route_u16 = compile_omni_surface_to_u16(route_q)?;
+    if !route_u16.iter().any(|&t| t == 0x7F6C) || !route_u16.iter().any(|&t| t == 0x7F65) || !route_u16.iter().any(|&t| t == 0x7F6E) {
+        return Err(String::from("route lowering did not emit ROUTE/DB_QRY/RSP_JSON host opcodes"));
+    }
+    checks += 2;
+    expect_omni_error_code("route_no_caps", execute_omni_surface_program("route GET /users/:id (req: i64) {\n    let id = req.param(\"id\");\n    let row = db_get(id);\n    respond(200, row);\n}", vec![OmniValue::Int(42)]), "MISSING_CAP")?;
+    expect_omni_error_code("route_no_db_r", execute_omni_surface_program("route GET /users/:id (req: i64) @cap(net) {\n    let id = req.param(\"id\");\n    let row = db_get(id);\n    respond(200, row);\n}", vec![OmniValue::Int(42)]), "MISSING_CAP")?;
+    expect_omni_error_code("route_no_db_w", execute_omni_surface_program("#[cap(NET, DB_R)] route POST /users/:id (req: i64) {\n    let id = req.param(\"id\");\n    let saved = kv_put(id, 1);\n    respond(201, saved);\n}", vec![OmniValue::Int(42)]), "MISSING_CAP")?;
+    expect_omni_error_code("sql_injection", execute_omni_surface_program("#[cap(DB_R)] fn main(id: i64 @untrusted) -> i64 { let r = db_query(\"SELECT * FROM users WHERE id = ?\", id); return r; }", vec![OmniValue::Int(5)]), "TAINT_SINK")?;
+    let authed = "#[cap(DB_R, AUTH)] fn main(id: i64 @untrusted) -> i64 { let ok = auth_verify(id); let r = db_query(\"SELECT * FROM users WHERE id = ?\", ok); return r; }";
+    if execute_omni_surface_program(authed, vec![OmniValue::Int(5)])? != OmniValue::Int(50) {
+        return Err(String::from("auth_verify sanitizer did not clear @untrusted for db_query"));
+    }
+    checks += 5;
+
+    // 13t. Version-locked omni-harness JSON contract.
+    let want_version = format!("\"version\":\"{}\"", OMNI_HARNESS_CONTRACT_VERSION);
+    let contains_all = |s: &str, parts: &[&str], label: &str| -> Result<(), String> {
+        if s.contains('\n') {
+            return Err(format!("Harness '{}' output is not single-line JSON: {}", label, s));
+        }
+        for p in parts {
+            if !s.contains(p) {
+                return Err(format!("Harness '{}' output missing {}: {}", label, p, s));
+            }
+        }
+        Ok(())
+    };
+    let ok_json = run_omni_harness_json("fn main(a: i64, b: i64) -> i64 { return a + b; }", vec![OmniValue::Int(2), OmniValue::Int(3)], false, false);
+    contains_all(&ok_json, &["{\"ok\":true", &want_version, "\"result\":\"5\"", "\"tokens\":", "\"backend\":\"aot\""], "ok")?;
+    if ok_json != run_omni_harness_json("fn main(a: i64, b: i64) -> i64 { return a + b; }", vec![OmniValue::Int(2), OmniValue::Int(3)], false, false) {
+        return Err(String::from("Harness output is not deterministic"));
+    }
+    let taint_json = run_omni_harness_json("fn main(x: i64 @untrusted) -> i64 { return x; }", vec![OmniValue::Int(1)], false, true);
+    contains_all(&taint_json, &["{\"ok\":false", &want_version, "\"code\":\"TAINT_ON_RET\"", "\"retry_hint\":\"Sanitize"], "taint")?;
+    let cap_json = run_omni_harness_json("fn main(x: i64) -> trit { let g = egate(x); return g; }", vec![OmniValue::Int(1)], false, false);
+    contains_all(&cap_json, &["\"ok\":false", "\"code\":\"MISSING_CAP\""], "cap")?;
+    if cap_json.contains("retry_hint") {
+        return Err(String::from("Harness emitted retry_hint without --retry-hint"));
+    }
+    let budget_json = run_omni_harness_json(runaway, vec![OmniValue::Int(1000)], false, false);
+    contains_all(&budget_json, &["\"ok\":false", "\"code\":\"BUDGET_EXCEEDED\""], "budget")?;
+    let strict_json = run_omni_harness_json("fn main(a: i64) -> i64 {\n    let b = a * 2;\n    return b;\n}", vec![OmniValue::Int(1)], true, true);
+    contains_all(&strict_json, &["\"ok\":false", "\"code\":\"BAD_TYPE\"", "\"line\":2", "\"tokens\":null", "\"retry_hint\":"], "strict")?;
+    let route_json = run_omni_harness_json(route_kv, vec![OmniValue::Int(42)], false, false);
+    contains_all(&route_json, &["\"ok\":true", "\"result\":\"200000777\"", "\"backend\":\"vm\""], "route")?;
+    let trit_json = run_omni_harness_json("#[cap(AI)] fn main(a: i64, b: i64) -> trit { let g = egate(a - b); return g; }", vec![OmniValue::Int(30), OmniValue::Int(10)], false, false);
+    contains_all(&trit_json, &["\"ok\":true", "\"result\":\"+1t\""], "trit")?;
+    let spec = omni_harness_spec_json();
+    contains_all(&spec, &[&want_version, "\"error_codes\":", "\"capabilities\":", "\"strict_rules\":"], "spec")?;
+    for code in ["TAINT_ON_RET", "TAINT_SINK", "MISSING_CAP", "LINEAR_LEAK", "BORROW_CONFLICT", "UNDEF_VAR", "IMMUT_PARAM", "BAD_TYPE", "UNKNOWN_FN", "ARITY_MISMATCH", "UNRESOLVED_LABEL", "CIRCULAR_INCLUDE", "BUDGET_EXCEEDED", "CORRUPT_PACK5", "AMBIGUOUS_GRAMMAR", "SYNTAX_ERROR"].iter() {
+        if !spec.contains(&format!("\"{}\"", code)) {
+            return Err(format!("Harness --spec missing error code {}", code));
+        }
+    }
+    checks += 8;
+
+    Ok(checks)
+}
+
+/// Shared `harness` CLI front-end (`omni harness ...` / `omni-harness ...`).
+/// Usage: harness [--strict] [--retry-hint] (--spec | --version-check | <file.omni | - | "inline source">) [args...]
+/// Prints exactly one JSON line; exit code 0 on `"ok":true`, 1 otherwise, 2 on usage errors.
+pub fn run_omni_harness_cli(argv: &[String]) -> i32 {
+    let mut strict = false;
+    let mut retry_hint = false;
+    let mut rest: Vec<String> = Vec::new();
+    for a in argv {
+        match a.as_str() {
+            "--strict" => strict = true,
+            "--retry-hint" => retry_hint = true,
+            "--spec" => {
+                println!("{}", omni_harness_spec_json());
+                return 0;
+            }
+            "--version-check" | "--version" => {
+                println!("{{\"version\":\"{}\"}}", OMNI_HARNESS_CONTRACT_VERSION);
+                return 0;
+            }
+            _ => rest.push(a.clone()),
+        }
+    }
+    if rest.is_empty() {
+        eprintln!("usage: omni-harness [--strict] [--retry-hint] (--spec | --version-check | <file.omni | - | \"source\">) [args...]");
+        return 2;
+    }
+    let target = &rest[0];
+    let src = if target == "-" {
+        use std::io::Read;
+        let mut buf = String::new();
+        if std::io::stdin().read_to_string(&mut buf).is_err() {
+            eprintln!("failed to read source from stdin");
+            return 2;
+        }
+        buf
+    } else if target.ends_with(".omni") && std::path::Path::new(target).is_file() {
+        match std::fs::read_to_string(target) {
+            Ok(raw) => {
+                if strict && (raw.contains("mod ") || raw.contains("mod\"")) {
+                    raw
+                } else {
+                    let parent_dir = std::path::Path::new(target).parent();
+                    match resolve_omni_surface_includes(&raw, parent_dir, None) {
+                        Ok(expanded) => expanded,
+                        Err(e) => {
+                            let st = parse_omni_structured_error(&e);
+                            let line_json = st.line.map(|n| n.to_string()).unwrap_or_else(|| String::from("null"));
+                            let col_json = st.col.map(|n| n.to_string()).unwrap_or_else(|| String::from("null"));
+                            if retry_hint {
+                                println!(
+                                    "{{\"ok\":false,\"version\":\"{}\",\"code\":\"{}\",\"line\":{},\"col\":{},\"message\":\"{}\",\"tokens\":null,\"retry_hint\":\"{}\"}}",
+                                    OMNI_HARNESS_CONTRACT_VERSION,
+                                    st.code,
+                                    line_json,
+                                    col_json,
+                                    json_escape_str(&st.message),
+                                    json_escape_str(st.retry_hint)
+                                );
+                            } else {
+                                println!(
+                                    "{{\"ok\":false,\"version\":\"{}\",\"code\":\"{}\",\"line\":{},\"col\":{},\"message\":\"{}\",\"tokens\":null}}",
+                                    OMNI_HARNESS_CONTRACT_VERSION,
+                                    st.code,
+                                    line_json,
+                                    col_json,
+                                    json_escape_str(&st.message)
+                                );
+                            }
+                            return 1;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("failed to read '{}': {}", target, e);
+                return 2;
+            }
+        }
+    } else {
+        target.clone()
+    };
+    let vm_args: Vec<OmniValue> = rest[1..].iter().map(|s| parse_cli_omni_value(s)).collect();
+    let out = run_omni_harness_json(&src, vm_args, strict, retry_hint);
+    println!("{}", out);
+    if out.starts_with("{\"ok\":true") { 0 } else { 1 }
+}

@@ -20,11 +20,13 @@ use omni_ir::{
 };
 use omni_isa::*;
 use omni_lang::{
-    compile_omni_surface_file_to_u16, compile_omni_surface_to_asm, compile_omni_surface_to_u16,
-    compile_omni_surface_to_wasm, compile_omni_surface_to_x86_64_elf,
-    compile_omni_surface_via_stage1_to_elf, execute_omni_surface_aot_first,
-    execute_omni_surface_program, execute_omni_surface_program_with_budgets,
-    execute_omni_surface_wasm_i64, parse_cli_omni_value, resolve_omni_surface_includes,
+    compile_omni_surface_file_to_u16, compile_omni_surface_strict_to_u16,
+    compile_omni_surface_to_asm, compile_omni_surface_to_u16, compile_omni_surface_to_wasm,
+    compile_omni_surface_to_x86_64_elf, compile_omni_surface_via_stage1_to_elf,
+    execute_omni_surface_aot_first, execute_omni_surface_program,
+    execute_omni_surface_program_with_budgets, execute_omni_surface_wasm_i64,
+    omni_harness_spec_json, parse_cli_omni_value, resolve_omni_surface_includes,
+    run_ai_first_surface_selftests, run_omni_harness_cli, run_omni_harness_json,
 };
 use omni_verifier::{format_debug_lens, verify_binary_function, verify_u16_stream};
 use omni_vm::{OmniBinaryVm, OmniValue};
@@ -827,7 +829,7 @@ pub fn run_workspace_selftest() -> Result<usize, String> {
     }
 
     let corrupt_pack5_asm = "
-        CAP_MASK 1
+        CAP_MASK 16
         RET_TY I64
         %0 = ANEW 0
         %0 = ISET %0 250
@@ -860,6 +862,27 @@ pub fn run_workspace_selftest() -> Result<usize, String> {
     }
     checks += 3;
 
+    // 6q..6u. AI-First Surface Additions Differential: Golden Size Gate, Strict Single-Form Grammar,
+    // Machine-Readable Error Codes, Full-Stack Route + DB/KV Host ABI, and Version-Locked Harness
+    let ai_first_checks = run_ai_first_surface_selftests()?;
+    let m_ai_first_checks = monolith::run_ai_first_surface_selftests()?;
+    if ai_first_checks != m_ai_first_checks {
+        return Err(format!("Monolith vs workspace AI-first selftest count mismatch: {} != {}", m_ai_first_checks, ai_first_checks));
+    }
+    if omni_harness_spec_json() != monolith::omni_harness_spec_json() {
+        return Err("Monolith vs workspace omni_harness_spec_json mismatch".into());
+    }
+    let strict_prog = "#[strict] fn main(a: i64, b: i64) -> i64 { let s: i64 = a + b; return s; }";
+    if compile_omni_surface_strict_to_u16(strict_prog)? != monolith::compile_omni_surface_strict_to_u16(strict_prog)? {
+        return Err("Monolith vs workspace compile_omni_surface_strict_to_u16 mismatch".into());
+    }
+    let h_ws = run_omni_harness_json(strict_prog, vec![OmniValue::Int(10), OmniValue::Int(32)], true, true);
+    let h_m = monolith::run_omni_harness_json(strict_prog, vec![monolith::OmniValue::Int(10), monolith::OmniValue::Int(32)], true, true);
+    if h_ws != h_m {
+        return Err(format!("Monolith vs workspace run_omni_harness_json mismatch: {} != {}", h_m, h_ws));
+    }
+    checks += ai_first_checks;
+
     // 7. Stage-1 == Stage-2 Self-Compilation Fixed Point
     #[cfg(all(unix, target_arch = "x86_64"))]
     {
@@ -885,8 +908,16 @@ pub fn run_workspace_selftest() -> Result<usize, String> {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+    if args.first().map(|a| a.contains("omni-harness")).unwrap_or(false)
+        && args.get(1).map(|s| s.as_str()) != Some("harness")
+    {
+        std::process::exit(run_omni_harness_cli(&args[1..]));
+    }
     if args.len() >= 2 {
         match args[1].as_str() {
+            "harness" | "--harness" => {
+                std::process::exit(run_omni_harness_cli(&args[2..]));
+            }
             "selftest" => {
                 match run_workspace_selftest() {
                     Ok(n) => {
