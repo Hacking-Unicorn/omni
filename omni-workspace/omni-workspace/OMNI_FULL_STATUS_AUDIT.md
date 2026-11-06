@@ -33,7 +33,7 @@ Reproducible command:
 rustc -O omni_rust_bootstrap.rs -o omni && ./omni selftest
 ```
 
-Verified coverage (`248` non-vacuous checks = `148` core bootstrap checks + `100` `omni-lang` surface language, Phase 5, deep-audit & Phase 6 AI-first/harness/agent-driver/live-HTTP checks, `0` compiler warnings):
+Verified coverage (`253` non-vacuous checks = `148` core bootstrap checks + `105` `omni-lang` surface language, Phase 5, deep-audit & Phase 6 AI-first/harness/agent-driver/live-HTTP checks, `0` compiler warnings):
 - **Full Golden Differential (`OmniBinaryVm` == `Stage-1` == `x86-64` ELF == `execute_wasm_module_i64`)**: `compile_pure_u16_to_wasm` and `execute_wasm_module_i64` lower `LABEL (0x7F40)`, `JMP (0x7F41)`, `BR_TRIT (0x7F42)`, `BR_POS (0x7F43)`, `BR_NEG (0x7F44)`, `ANEW (0x7F0D)`, `IGET (0x7F0E)`, `ISET (0x7F0F)`, `SLEN (0x7F50)`, `ARENA (0x7F01)`, `DROP (0x7F05)`, `PACK5 (0x7F30)`, `UNPACK5 (0x7F31)`, `TDOT (0x7F34)`, `EGATE (0x7F35)`, and `TLOGIC (0x7F3F)` in addition to all numeric/bitwise/ternary opcodes. Every golden covered by the `x86-64` path is verified through `execute_wasm_module_i64` and `OmniBinaryVm` on both Windows and Linux.
 - **Explicit Standalone AOT Rejection (Check 6)**: Both `compile_pure_u16_to_x86_64_elf` and `compile_pure_u16_to_wasm` reject high-level VM-only runtime seeds (`1, 2, 3, 5, 7`) with `Err(...)`.
 
@@ -57,8 +57,8 @@ CARGO_INCREMENTAL=0 cargo build --workspace
 cargo run -p omni-cli -- selftest
 ```
 
-Verified workspace build & differential results (`209` checks on Windows, `210` checks on Linux `x86-64`, `0` compiler warnings):
-- **8-Crate Workspace (`omni-isa`, `omni-ir`, `omni-verifier`, `omni-vm`, `omni-assembler`, `omni-lang`, `omni-aot`, `omni-cli`)**: Compiles cleanly with zero external dependencies and runs `assert_verifier_clone_eq`, `assert_golden_monolith_vs_workspace`, all 64 corpus samples, and all 102 surface-language, Phase 5, deep-audit & Phase 6 AI-first/harness/agent-driver/live-HTTP differential checks against `mod monolith`.
+Verified workspace build & differential results (`214` checks on Windows, `215` checks on Linux `x86-64`, `0` compiler warnings):
+- **8-Crate Workspace (`omni-isa`, `omni-ir`, `omni-verifier`, `omni-vm`, `omni-assembler`, `omni-lang`, `omni-aot`, `omni-cli`)**: Compiles cleanly with zero external dependencies and runs `assert_verifier_clone_eq`, `assert_golden_monolith_vs_workspace`, all 64 corpus samples, and all 107 surface-language, Phase 5, deep-audit & Phase 6 AI-first/harness/agent-driver/live-HTTP differential checks against `mod monolith`.
 
 ## 4. Usable Omni Surface Language (`omni-lang`) — Properties & Goldens
 
@@ -81,7 +81,7 @@ cargo run -p omni-cli -- compile-wasm program.omni program.wasm
 cargo run -p omni-cli -- run-wasm program.omni 30 15
 ```
 
-Verified surface language properties, full-stack host ABI, live TCP HTTP/1.1 server & version-locked harness/agent-driver checks (`100` checks in Section `13` / `102` checks in `omni-cli`, `0` new opcodes):
+Verified surface language properties, full-stack host ABI, live TCP HTTP/1.1 + file-backed DB/KV server & version-locked harness/agent-driver checks (`105` checks in Section `13` / `107` checks in `omni-cli`, `0` new opcodes):
 
 | Surface Property / Feature | Lowering Mechanism (Existing Opcodes Only) | Verified Golden / Rejection Proof |
 |----------------------------|--------------------------------------------|-----------------------------------|

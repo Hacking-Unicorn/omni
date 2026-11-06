@@ -4263,6 +4263,7 @@ pub fn compile_omni_surface_to_asm(src: &str) -> Result<String, String> {
 pub struct SurfaceSourceMap {
     pub offset_to_span: BTreeMap<usize, (usize, usize)>,
     pub budget_span: (usize, usize),
+    pub pack5_span: Option<(usize, usize)>,
     pub default_span: (usize, usize),
 }
 
@@ -4271,12 +4272,13 @@ impl Default for SurfaceSourceMap {
         Self {
             offset_to_span: BTreeMap::new(),
             budget_span: (1, 1),
+            pack5_span: None,
             default_span: (1, 1),
         }
     }
 }
 
-/// Injects a 1-based `line <L>, col <C>` span into any verifier (`Offset N: ...`) or runtime (`BUDGET_EXCEEDED`) error string.
+/// Injects a 1-based `line <L>, col <C>` span into any verifier (`Offset N: ...`), `@PACK5` (`CORRUPT_PACK5`), or runtime (`BUDGET_EXCEEDED`) error string.
 pub fn annotate_omni_error_with_sourcemap(err: &str, sm: &SurfaceSourceMap) -> String {
     if err.contains("line ") && err.contains("col ") {
         return String::from(err);
@@ -4292,6 +4294,8 @@ pub fn annotate_omni_error_with_sourcemap(err: &str, sm: &SurfaceSourceMap) -> S
         }
     } else if err.contains("BUDGET_EXCEEDED") || err.contains("budget exceeded") {
         span = sm.budget_span;
+    } else if err.contains("CORRUPT_PACK5") || err.contains("PACK5_SENTINEL_OR_CORRUPT_BYTE") {
+        span = sm.pack5_span.unwrap_or(sm.default_span);
     }
     let line = span.0.max(1);
     let col = span.1.max(1);
@@ -4416,6 +4420,13 @@ pub fn compile_omni_surface_to_u16_with_sourcemap(
         let mut cur_off = 7 + 3 * params.len();
         for (pkt, sp) in ins_packets.iter().zip(pkt_spans.into_iter()) {
             sm.offset_to_span.insert(cur_off, sp);
+            if sm.pack5_span.is_none()
+                && pkt.get(1).copied().map_or(false, |op| {
+                    matches!(op, 0x7F30 | 0x7F31 | 0x7F34 | 0x7F35 | 0x7F3F)
+                })
+            {
+                sm.pack5_span = Some(sp);
+            }
             cur_off += pkt.len();
         }
         let stream = pack_fn_module(&[], fn_id, &params, ret_ty, cap_mask, &ins_packets);
@@ -4436,6 +4447,13 @@ pub fn compile_omni_surface_to_u16_with_sourcemap(
             stream.push(f_ins.len() as u16);
             for (pkt, sp) in f_ins.into_iter().zip(f_spans.into_iter()) {
                 sm.offset_to_span.insert(stream.len(), sp);
+                if sm.pack5_span.is_none()
+                    && pkt.get(1).copied().map_or(false, |op| {
+                        matches!(op, 0x7F30 | 0x7F31 | 0x7F34 | 0x7F35 | 0x7F3F)
+                    })
+                {
+                    sm.pack5_span = Some(sp);
+                }
                 stream.extend_from_slice(&pkt);
             }
         }
@@ -4659,7 +4677,7 @@ pub fn execute_omni_surface_program_with_budgets(
         (None, None) => None,
     };
     let (u16_stream, sm) = compile_omni_surface_to_u16_with_sourcemap(&wrapped, false)?;
-    for rep in verify_u16_stream(&u16_stream)? {
+    for rep in verify_u16_stream(&u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
         if !rep.passed {
             let first = rep.errors.first().cloned().unwrap_or_default();
             let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
@@ -4695,7 +4713,7 @@ pub fn execute_omni_surface_aot_first(
     let wrapped = wrap_omni_surface_snippet(src);
     let (attr_steps, attr_mem) = extract_omni_surface_budgets(&wrapped);
     let (u16_stream, sm) = compile_omni_surface_to_u16_with_sourcemap(&wrapped, false)?;
-    for rep in verify_u16_stream(&u16_stream)? {
+    for rep in verify_u16_stream(&u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
         if !rep.passed {
             let first = rep.errors.first().cloned().unwrap_or_default();
             let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
@@ -5471,6 +5489,78 @@ pub fn repair_omni_program_from_harness_error(
             }
             None
         }
+        "BORROW_CONFLICT" => {
+            let lines: Vec<&str> = src.lines().collect();
+            if target_line <= lines.len() && target_line < lines.len() {
+                let cur_l = lines[target_line - 1].trim();
+                let next_l = lines[target_line].trim();
+                if cur_l.starts_with("drop(") && next_l.starts_with("drop(") {
+                    let mut new_lines: Vec<String> = lines.iter().map(|s| String::from(*s)).collect();
+                    new_lines.swap(target_line - 1, target_line);
+                    let out = new_lines.join("\n");
+                    if out != src {
+                        return Some(out);
+                    }
+                }
+            }
+            None
+        }
+        "IMMUT_PARAM" => {
+            if let Some(q1) = err.message.find("parameter '") {
+                let rest = &err.message[q1 + 11..];
+                if let Some(q2) = rest.find('\'') {
+                    let p_name = &rest[..q2];
+                    let lhs_pat = format!("{} =", p_name);
+                    let mut new_lines: Vec<String> = Vec::new();
+                    let mut replaced = false;
+                    let mut_name = format!("{}_mut", p_name);
+                    for (idx, line_s) in src.lines().enumerate() {
+                        if !replaced && (idx + 1 == target_line || line_s.contains(&lhs_pat)) {
+                            if let Some(p_pos) = line_s.find(&lhs_pat) {
+                                let rhs = &line_s[p_pos + lhs_pat.len()..];
+                                let ty = infer_surface_rhs_type(rhs);
+                                new_lines.push(format!(
+                                    "{}let {}: {} ={}",
+                                    &line_s[..p_pos],
+                                    mut_name,
+                                    ty,
+                                    rhs
+                                ));
+                                replaced = true;
+                                continue;
+                            }
+                        }
+                        if replaced && line_s.contains(&format!("return {};", p_name)) {
+                            new_lines.push(line_s.replace(
+                                &format!("return {};", p_name),
+                                &format!("return {};", mut_name),
+                            ));
+                        } else {
+                            new_lines.push(String::from(line_s));
+                        }
+                    }
+                    let out = new_lines.join("\n");
+                    if out != src {
+                        return Some(out);
+                    }
+                }
+            }
+            None
+        }
+        "CORRUPT_PACK5" => {
+            let mut out = String::from(src);
+            for bad_byte in 243..=255u16 {
+                let pat = format!(", {})", bad_byte);
+                if out.contains(&pat) {
+                    out = out.replace(&pat, ", 242)");
+                }
+            }
+            if out != src {
+                Some(out)
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -5564,6 +5654,63 @@ fn extract_structured_error_from_harness_json(
     src: &str,
     strict: bool,
 ) -> OmniStructuredError {
+    let mut parsed_code: Option<&'static str> = None;
+    if let Some(c_idx) = harness_json.find("\"code\":\"") {
+        let rest = &harness_json[c_idx + 8..];
+        if let Some(end_q) = rest.find('"') {
+            parsed_code = map_error_code_str(&rest[..end_q]);
+        }
+    }
+    let mut parsed_line: Option<usize> = None;
+    if let Some(l_idx) = harness_json.find("\"line\":") {
+        let rest = &harness_json[l_idx + 7..];
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(n) = digits.parse::<usize>() {
+            parsed_line = Some(n.max(1));
+        }
+    }
+    let mut parsed_col: Option<usize> = None;
+    if let Some(col_idx) = harness_json.find("\"col\":") {
+        let rest = &harness_json[col_idx + 6..];
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(n) = digits.parse::<usize>() {
+            parsed_col = Some(n.max(1));
+        }
+    }
+    let mut parsed_msg: Option<String> = None;
+    if let Some(m_idx) = harness_json.find("\"message\":\"") {
+        let rest = &harness_json[m_idx + 11..];
+        let mut msg = String::new();
+        let mut chars = rest.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '\\' {
+                if let Some(esc) = chars.next() {
+                    match esc {
+                        'n' => msg.push('\n'),
+                        'r' => msg.push('\r'),
+                        't' => msg.push('\t'),
+                        other => msg.push(other),
+                    }
+                }
+            } else if ch == '"' {
+                break;
+            } else {
+                msg.push(ch);
+            }
+        }
+        parsed_msg = Some(msg);
+    }
+    if let (Some(code), Some(line), Some(col), Some(message)) =
+        (parsed_code, parsed_line, parsed_col, parsed_msg)
+    {
+        return OmniStructuredError {
+            code,
+            line: Some(line),
+            col: Some(col),
+            message,
+            retry_hint: retry_hint_for_code(code),
+        };
+    }
     let wrapped = if strict {
         String::from(src)
     } else {
@@ -5576,11 +5723,29 @@ fn extract_structured_error_from_harness_json(
     };
     match u16_res {
         Err(e) => parse_omni_structured_error(&e),
-        Ok(_) => match execute_omni_surface_aot_first(&wrapped, vec![]) {
-            Err(e) => parse_omni_structured_error(&e),
-            Ok(_) => parse_omni_structured_error(harness_json),
-        },
+        Ok(_) => parse_omni_structured_error(harness_json),
     }
+}
+
+/// Builds a deterministic single-line JSON repair prompt payload for an external LLM or `--repair-cmd` tool.
+pub fn build_omni_agent_repair_prompt_json(
+    attempt: usize,
+    current_src: &str,
+    err: &OmniStructuredError,
+    spec_json: &str,
+) -> String {
+    format!(
+        "{{\"version\":\"{}\",\"attempt\":{},\"source\":\"{}\",\"error\":{{\"code\":\"{}\",\"line\":{},\"col\":{},\"message\":\"{}\",\"retry_hint\":\"{}\"}},\"spec\":{}}}",
+        OMNI_HARNESS_CONTRACT_VERSION,
+        attempt,
+        json_escape_str(current_src),
+        err.code,
+        err.line.unwrap_or(1).max(1),
+        err.col.unwrap_or(1).max(1),
+        json_escape_str(&err.message),
+        json_escape_str(err.retry_hint),
+        spec_json
+    )
 }
 
 /// Runs the version-locked `omni-agent-driver` loop using the built-in structured feedback repair rule engine.
@@ -5644,22 +5809,25 @@ pub fn run_omni_agent_driver_json(
 }
 
 /// Shared CLI front-end for `omni-agent-driver` / `omni agent-driver`.
-/// Usage: omni-agent-driver [--strict] [--max-attempts N] [--expect-version VER] (<file.omni | - | "source">) [args...]
+/// Usage: omni-agent-driver [--strict] [--max-attempts N] [--expect-version VER] [--repair-cmd CMD] [--emit-repair-prompt] (<file.omni | - | "source">) [args...]
 pub fn run_omni_agent_driver_cli(argv: &[String]) -> i32 {
     let mut strict = false;
     let mut max_attempts = 6usize;
     let mut expected_ver = String::from(OMNI_HARNESS_CONTRACT_VERSION);
+    let mut repair_cmd: Option<String> = None;
+    let mut emit_repair_prompt = false;
     let mut rest: Vec<String> = Vec::new();
     let mut i = 0usize;
     while i < argv.len() {
         match argv[i].as_str() {
             "--strict" => strict = true,
+            "--emit-repair-prompt" => emit_repair_prompt = true,
             "--max-attempts" => {
                 if i + 1 >= argv.len() {
                     eprintln!("--max-attempts requires an integer argument");
                     return 2;
                 }
-                max_attempts = argv[i + 1].parse::<usize>().unwrap_or(4).max(1);
+                max_attempts = argv[i + 1].parse::<usize>().unwrap_or(6).max(1);
                 i += 1;
             }
             "--expect-version" => {
@@ -5670,12 +5838,20 @@ pub fn run_omni_agent_driver_cli(argv: &[String]) -> i32 {
                 expected_ver = argv[i + 1].clone();
                 i += 1;
             }
+            "--repair-cmd" => {
+                if i + 1 >= argv.len() {
+                    eprintln!("--repair-cmd requires a command string");
+                    return 2;
+                }
+                repair_cmd = Some(argv[i + 1].clone());
+                i += 1;
+            }
             _ => rest.push(argv[i].clone()),
         }
         i += 1;
     }
     if rest.is_empty() {
-        eprintln!("usage: omni-agent-driver [--strict] [--max-attempts N] [--expect-version VER] (<file.omni | - | \"source\">) [args...]");
+        eprintln!("usage: omni-agent-driver [--strict] [--max-attempts N] [--expect-version VER] [--repair-cmd CMD] [--emit-repair-prompt] (<file.omni | - | \"source\">) [args...]");
         return 2;
     }
     let target = &rest[0];
@@ -5699,6 +5875,98 @@ pub fn run_omni_agent_driver_cli(argv: &[String]) -> i32 {
         target.clone()
     };
     let vm_args: Vec<OmniValue> = rest[1..].iter().map(|s| parse_cli_omni_value(s)).collect();
+    if emit_repair_prompt {
+        let spec_json = omni_harness_spec_json();
+        let harness_json = run_omni_harness_json(&src, vm_args, strict, true);
+        if harness_json.starts_with("{\"ok\":true") {
+            println!("{}", harness_json);
+            return 0;
+        }
+        let err = extract_structured_error_from_harness_json(&harness_json, &src, strict);
+        println!("{}", build_omni_agent_repair_prompt_json(1, &src, &err, &spec_json));
+        return 1;
+    }
+    if let Some(cmd_str) = repair_cmd {
+        let mut attempt_counter = 0usize;
+        let res = run_omni_agent_repair_loop_with_model(
+            &src,
+            vm_args,
+            strict,
+            max_attempts,
+            &expected_ver,
+            |cur_src, err, spec_json| {
+                attempt_counter += 1;
+                let payload = build_omni_agent_repair_prompt_json(attempt_counter, cur_src, err, spec_json);
+                use std::io::Write;
+                use std::process::{Command, Stdio};
+                let mut child = if cfg!(target_os = "windows") {
+                    Command::new("powershell")
+                        .args(["-NoProfile", "-Command", &cmd_str])
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .spawn()
+                        .ok()?
+                } else {
+                    Command::new("sh")
+                        .args(["-c", &cmd_str])
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .spawn()
+                        .ok()?
+                };
+                if let Some(mut sin) = child.stdin.take() {
+                    let _ = sin.write_all(payload.as_bytes());
+                }
+                let out = child.wait_with_output().ok()?;
+                if !out.status.success() {
+                    return None;
+                }
+                let candidate = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if candidate.is_empty() {
+                    None
+                } else {
+                    Some(candidate)
+                }
+            },
+        );
+        match res {
+            Ok(rep) => {
+                let codes: Vec<String> = rep
+                    .attempts
+                    .iter()
+                    .map(|a| match &a.error {
+                        Some(e) => format!(
+                            "{{\"attempt\":{},\"ok\":false,\"code\":\"{}\",\"line\":{},\"col\":{}}}",
+                            a.attempt,
+                            e.code,
+                            e.line.unwrap_or(1),
+                            e.col.unwrap_or(1)
+                        ),
+                        None => format!("{{\"attempt\":{},\"ok\":true}}", a.attempt),
+                    })
+                    .collect();
+                let out = format!(
+                    "{{\"ok\":{},\"version\":\"{}\",\"attempts\":{},\"history\":[{}],\"final_source\":\"{}\",\"harness\":{}}}",
+                    rep.ok,
+                    rep.contract_version,
+                    rep.attempts.len(),
+                    codes.join(","),
+                    json_escape_str(&rep.final_source),
+                    rep.final_json
+                );
+                println!("{}", out);
+                return if rep.ok { 0 } else { 1 };
+            }
+            Err(e) => {
+                println!(
+                    "{{\"ok\":false,\"version\":\"{}\",\"code\":\"VERSION_MISMATCH\",\"line\":1,\"col\":1,\"message\":\"{}\"}}",
+                    expected_ver,
+                    json_escape_str(&e)
+                );
+                return 1;
+            }
+        }
+    }
     let out = run_omni_agent_driver_json(&src, vm_args, strict, max_attempts, &expected_ver);
     println!("{}", out);
     if out.starts_with("{\"ok\":true") { 0 } else { 1 }
@@ -5893,6 +6161,38 @@ pub fn handle_omni_http_request(
     })
 }
 
+/// Loads a persistent host KV/DB store from a deterministic `key=value` file on disk (returning an empty map if the file does not exist).
+pub fn load_omni_kv_file(path: &std::path::Path) -> Result<BTreeMap<i64, i64>, String> {
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read host DB file '{}': {}", path.display(), e))?;
+    let mut kv = BTreeMap::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some((k_str, v_str)) = trimmed.split_once('=') {
+            if let (Ok(k), Ok(v)) = (k_str.trim().parse::<i64>(), v_str.trim().parse::<i64>()) {
+                kv.insert(k, v);
+            }
+        }
+    }
+    Ok(kv)
+}
+
+/// Atomically persists a host KV/DB store to disk as sorted `key=value` lines.
+pub fn save_omni_kv_file(path: &std::path::Path, kv: &BTreeMap<i64, i64>) -> Result<(), String> {
+    let mut buf = String::new();
+    for (k, v) in kv {
+        buf.push_str(&format!("{}={}\n", k, v));
+    }
+    std::fs::write(path, buf.as_bytes())
+        .map_err(|e| format!("Failed to write host DB file '{}': {}", path.display(), e))
+}
+
 /// Compiles and statically verifies `src` up front (failing immediately with `MISSING_CAP`, `TAINT_SINK`, etc.
 /// before binding a socket if verification fails), then binds a real `std::net::TcpListener` on `bind_addr`
 /// and serves `num_requests` real HTTP/1.1 requests over TCP against a persistent host DB/KV store.
@@ -5900,6 +6200,46 @@ pub fn serve_omni_http_batch(
     src: &str,
     bind_addr: &str,
     initial_kv: BTreeMap<i64, i64>,
+    num_requests: usize,
+) -> Result<
+    (
+        std::net::SocketAddr,
+        std::thread::JoinHandle<Result<(Vec<OmniHttpResponse>, BTreeMap<i64, i64>), String>>,
+    ),
+    String,
+> {
+    serve_omni_http_batch_inner(src, bind_addr, initial_kv, None, num_requests)
+}
+
+/// Serves `num_requests` real HTTP/1.1 requests over TCP backed by a persistent on-disk KV/DB file (`db_path`).
+/// Loads existing rows from `db_path` at startup and flushes updated rows to `db_path` after each request.
+pub fn serve_omni_http_batch_with_db_file(
+    src: &str,
+    bind_addr: &str,
+    db_path: &std::path::Path,
+    num_requests: usize,
+) -> Result<
+    (
+        std::net::SocketAddr,
+        std::thread::JoinHandle<Result<(Vec<OmniHttpResponse>, BTreeMap<i64, i64>), String>>,
+    ),
+    String,
+> {
+    let initial_kv = load_omni_kv_file(db_path)?;
+    serve_omni_http_batch_inner(
+        src,
+        bind_addr,
+        initial_kv,
+        Some(db_path.to_path_buf()),
+        num_requests,
+    )
+}
+
+fn serve_omni_http_batch_inner(
+    src: &str,
+    bind_addr: &str,
+    initial_kv: BTreeMap<i64, i64>,
+    db_file: Option<std::path::PathBuf>,
     num_requests: usize,
 ) -> Result<
     (
@@ -5947,6 +6287,9 @@ pub fn serve_omni_http_batch(
             let method = parts.next().unwrap_or("GET");
             let req_path = parts.next().unwrap_or("/");
             let resp = handle_omni_http_request(&src_owned, method, req_path, &mut kv_store)?;
+            if let Some(ref p) = db_file {
+                save_omni_kv_file(p, &kv_store)?;
+            }
             let wire = resp.to_http11_wire_bytes();
             stream
                 .write_all(&wire)
@@ -5984,10 +6327,10 @@ pub fn serve_omni_http_once(
     Ok((addr, single_handle))
 }
 
-/// Runs a live HTTP/1.1 server for `.omni` `route` handlers (`omni serve <file.omni> [bind_addr] [--max-requests N]`).
+/// Runs a live HTTP/1.1 server for `.omni` `route` handlers (`omni serve <file.omni> [bind_addr] [--max-requests N] [--db <path>]`).
 pub fn run_omni_serve_cli(argv: &[String]) -> i32 {
     if argv.is_empty() {
-        eprintln!("usage: omni serve <file.omni | \"source\"> [bind_addr] [--max-requests N]");
+        eprintln!("usage: omni serve <file.omni | \"source\"> [bind_addr] [--max-requests N] [--db <path>]");
         return 2;
     }
     let target = &argv[0];
@@ -6013,17 +6356,25 @@ pub fn run_omni_serve_cli(argv: &[String]) -> i32 {
     };
     let mut bind_addr = String::from("127.0.0.1:8080");
     let mut max_requests = 1usize;
+    let mut db_path: Option<std::path::PathBuf> = None;
     let mut i = 1usize;
     while i < argv.len() {
         if argv[i] == "--max-requests" && i + 1 < argv.len() {
             max_requests = argv[i + 1].parse::<usize>().unwrap_or(1).max(1);
+            i += 2;
+        } else if argv[i] == "--db" && i + 1 < argv.len() {
+            db_path = Some(std::path::PathBuf::from(&argv[i + 1]));
             i += 2;
         } else {
             bind_addr = argv[i].clone();
             i += 1;
         }
     }
-    match serve_omni_http_batch(&src, &bind_addr, BTreeMap::new(), max_requests) {
+    let serve_res = match db_path {
+        Some(ref p) => serve_omni_http_batch_with_db_file(&src, &bind_addr, p, max_requests),
+        None => serve_omni_http_batch(&src, &bind_addr, BTreeMap::new(), max_requests),
+    };
+    match serve_res {
         Ok((addr, handle)) => {
             println!("Omni HTTP/1.1 + DB/KV host listening on http://{}", addr);
             match handle.join() {
@@ -6200,11 +6551,26 @@ pub fn run_ai_first_surface_selftests() -> Result<usize, String> {
     if undef.line != Some(2) || undef.col != Some(13) {
         return Err(format!("UNDEF_VAR structured span mismatch: {:?}:{:?} (want 2:13)", undef.line, undef.col));
     }
-    expect_omni_error_code("IMMUT_PARAM", compile_omni_surface_to_u16("fn main(x: i64) -> i64 { x = x + 1; return x; }"), "IMMUT_PARAM")?;
-    expect_omni_error_code("BAD_TYPE", compile_omni_surface_to_u16("fn main(x: float128) -> i64 { return 0; }"), "BAD_TYPE")?;
-    expect_omni_error_code("UNKNOWN_FN", compile_omni_surface_to_u16("fn main(x: i64) -> i64 { let r = foo_bar(x); return r; }"), "UNKNOWN_FN")?;
-    expect_omni_error_code("ARITY_MISMATCH", compile_omni_surface_to_u16("fn main(x: i64) -> i64 { let r = iabs(x, x); return r; }"), "ARITY_MISMATCH")?;
-    expect_omni_error_code("UNRESOLVED_LABEL", compile_omni_surface_to_u16("fn main(x: i64) -> i64 { goto 9; return x; }"), "UNRESOLVED_LABEL")?;
+    let st_immut = expect_omni_error_code("IMMUT_PARAM", compile_omni_surface_to_u16("fn main(x: i64) -> i64 {\n    x = x + 1;\n    return x;\n}"), "IMMUT_PARAM")?;
+    if st_immut.line != Some(2) || st_immut.col != Some(5) {
+        return Err(format!("IMMUT_PARAM span mismatch: {:?}:{:?} (want 2:5)", st_immut.line, st_immut.col));
+    }
+    let st_bad_ty = expect_omni_error_code("BAD_TYPE", compile_omni_surface_to_u16("fn main(x: float128) -> i64 { return 0; }"), "BAD_TYPE")?;
+    if st_bad_ty.line != Some(1) || st_bad_ty.col != Some(12) {
+        return Err(format!("BAD_TYPE span mismatch: {:?}:{:?} (want 1:12)", st_bad_ty.line, st_bad_ty.col));
+    }
+    let st_unk_fn = expect_omni_error_code("UNKNOWN_FN", compile_omni_surface_to_u16("fn main(x: i64) -> i64 {\n    let r = foo_bar(x);\n    return r;\n}"), "UNKNOWN_FN")?;
+    if st_unk_fn.line != Some(2) || st_unk_fn.col != Some(13) {
+        return Err(format!("UNKNOWN_FN span mismatch: {:?}:{:?} (want 2:13)", st_unk_fn.line, st_unk_fn.col));
+    }
+    let st_arity = expect_omni_error_code("ARITY_MISMATCH", compile_omni_surface_to_u16("fn main(x: i64) -> i64 {\n    let r = iabs(x, x);\n    return r;\n}"), "ARITY_MISMATCH")?;
+    if st_arity.line != Some(2) || st_arity.col != Some(13) {
+        return Err(format!("ARITY_MISMATCH span mismatch: {:?}:{:?} (want 2:13)", st_arity.line, st_arity.col));
+    }
+    let st_unres = expect_omni_error_code("UNRESOLVED_LABEL", compile_omni_surface_to_u16("fn main(x: i64) -> i64 {\n    goto 9;\n    return x;\n}"), "UNRESOLVED_LABEL")?;
+    if st_unres.line != Some(2) || st_unres.col != Some(10) {
+        return Err(format!("UNRESOLVED_LABEL span mismatch: {:?}:{:?} (want 2:10)", st_unres.line, st_unres.col));
+    }
     expect_omni_error_code("CIRCULAR_INCLUDE", resolve_omni_surface_includes("include \"loop.omni\"; fn main(x: i64) -> i64 { return x; }", None, Some(&loop_vfs)), "CIRCULAR_INCLUDE")?;
     let st_bud_aot = expect_omni_error_code("BUDGET_EXCEEDED(aot)", execute_omni_surface_program(runaway, vec![OmniValue::Int(1000)]), "BUDGET_EXCEEDED")?;
     if st_bud_aot.line != Some(1) || st_bud_aot.col != Some(3) {
@@ -6213,9 +6579,20 @@ pub fn run_ai_first_surface_selftests() -> Result<usize, String> {
     expect_omni_error_code("BUDGET_EXCEEDED(vm)", execute_omni_surface_program_with_budgets(runaway, vec![OmniValue::Int(1000)], Some(100_000), Some(1024 * 1024)), "BUDGET_EXCEEDED")?;
     expect_omni_error_code("BUDGET_EXCEEDED(mem)", execute_omni_surface_program("#[mem_budget(16)] fn main(x: i64) -> str { let s = \"0123456789ABCDEF0123456789ABCDEF\"; let clean = san_dom(s); return clean; }", vec![OmniValue::Int(1)]), "BUDGET_EXCEEDED")?;
     expect_omni_error_code("CORRUPT_PACK5", compile_pure_u16_to_wasm(&corrupt_u16), "CORRUPT_PACK5")?;
-    expect_omni_error_code("AMBIGUOUS_GRAMMAR", compile_omni_surface_strict_to_u16("fn main(a: i64) -> trit { let t: trit = TRIT_NEG; return t; }"), "AMBIGUOUS_GRAMMAR")?;
-    expect_omni_error_code("SYNTAX_ERROR", compile_omni_surface_to_u16("fn main(x: i64) -> i64 { let r = ; return r; }"), "SYNTAX_ERROR")?;
-    checks += 18;
+    let corrupt_surface = "#[cap(AI)]\nfn main() -> trit {\n    let b: bytes = anew(0);\n    b = iset(b, 250);\n    let v: trit_vec = unpack5(b, 5);\n    let g: trit = egate(v);\n    return g;\n}";
+    let st_corrupt_surf = expect_omni_error_code("CORRUPT_PACK5(surface)", execute_omni_surface_program(corrupt_surface, vec![]), "CORRUPT_PACK5")?;
+    if st_corrupt_surf.line != Some(5) || st_corrupt_surf.col != Some(23) {
+        return Err(format!("CORRUPT_PACK5(surface) span mismatch: {:?}:{:?} (want 5:23)", st_corrupt_surf.line, st_corrupt_surf.col));
+    }
+    let st_ambig = expect_omni_error_code("AMBIGUOUS_GRAMMAR", compile_omni_surface_strict_to_u16("fn main(a: i64) -> trit {\n    let t: trit = TRIT_NEG;\n    return t;\n}"), "AMBIGUOUS_GRAMMAR")?;
+    if st_ambig.line != Some(2) || st_ambig.col != Some(19) {
+        return Err(format!("AMBIGUOUS_GRAMMAR span mismatch: {:?}:{:?} (want 2:19)", st_ambig.line, st_ambig.col));
+    }
+    let st_syn = expect_omni_error_code("SYNTAX_ERROR", compile_omni_surface_to_u16("fn main(x: i64) -> i64 {\n    let r = ;\n    return r;\n}"), "SYNTAX_ERROR")?;
+    if st_syn.line != Some(2) || st_syn.col != Some(13) {
+        return Err(format!("SYNTAX_ERROR span mismatch: {:?}:{:?} (want 2:13)", st_syn.line, st_syn.col));
+    }
+    checks += 19;
 
     // 13s. Full-stack route + request param + DB/KV host ABI goldens (zero new opcodes).
     let route_kv = "#[cap(NET, DB_R, DB_W)]\nroute GET /users/:id (req: i64) {\n    let id = req.param(\"id\");\n    let saved = kv_put(id, 777);\n    let row = db_get(id);\n    respond(200, row);\n}";
@@ -6362,7 +6739,42 @@ pub fn run_ai_first_surface_selftests() -> Result<usize, String> {
     }
     checks += 1;
 
-    // 13v. Live Native TCP HTTP/1.1 + DB/KV Host Golden (`serve_omni_http_batch` & `serve_omni_http_once`).
+    // Repair case 6: IMMUT_PARAM + BORROW_CONFLICT + CORRUPT_PACK5 + external repair prompt builder
+    let rep_immut = run_omni_agent_repair_loop(
+        "fn main(x: i64) -> i64 {\n    x = x + 5;\n    return x;\n}",
+        vec![OmniValue::Int(10)],
+        true,
+        3,
+        OMNI_HARNESS_CONTRACT_VERSION,
+    )?;
+    if !rep_immut.ok || !rep_immut.final_json.contains("\"result\":\"15\"") {
+        return Err(format!("Agent driver IMMUT_PARAM repair failed: {:?}", rep_immut));
+    }
+    let rep_borrow = run_omni_agent_repair_loop(
+        "fn main(x: i64) -> i64 {\n    let a: arena = arena(4096);\n    let r: arena = borrow_r(a);\n    drop(a);\n    drop(r);\n    return x;\n}",
+        vec![OmniValue::Int(77)],
+        true,
+        3,
+        OMNI_HARNESS_CONTRACT_VERSION,
+    )?;
+    if !rep_borrow.ok || !rep_borrow.final_json.contains("\"result\":\"77\"") {
+        return Err(format!("Agent driver BORROW_CONFLICT repair failed: {:?}", rep_borrow));
+    }
+    let rep_pack5 = run_omni_agent_repair_loop(
+        corrupt_surface,
+        vec![],
+        true,
+        3,
+        OMNI_HARNESS_CONTRACT_VERSION,
+    )?;
+    if !rep_pack5.ok || !rep_pack5.final_json.contains("\"result\":\"+1t\"") {
+        return Err(format!("Agent driver CORRUPT_PACK5 repair failed: {:?}", rep_pack5));
+    }
+    let prompt_json = build_omni_agent_repair_prompt_json(1, corrupt_surface, &st_corrupt_surf, &spec);
+    contains_all(&prompt_json, &[&want_version, "\"attempt\":1", "\"code\":\"CORRUPT_PACK5\"", "\"line\":5,\"col\":23", "\"spec\":{"], "repair_prompt")?;
+    checks += 4;
+
+    // 13v. Live Native TCP HTTP/1.1 + DB/KV Host Golden (`serve_omni_http_batch`, `serve_omni_http_batch_with_db_file` & `serve_omni_http_once`).
     // 1) Verifier must reject serving a route without required capabilities before binding a port.
     let uncap_route = "route GET /users/:id (req: i64) {\n    let id: i64 = req.param(\"id\");\n    let row: i64 = db_query(\"SELECT * FROM users WHERE id = ?\", id);\n    respond(200, row);\n}";
     expect_omni_error_code(
@@ -6372,12 +6784,15 @@ pub fn run_ai_first_surface_selftests() -> Result<usize, String> {
     )?;
     checks += 1;
 
-    // 2) Live end-to-end TCP HTTP/1.1 golden: POST /users/42 writes 777 into host KV, GET /users/42 reads 777 back over real TCP sockets!
+    // 2) Live end-to-end TCP HTTP/1.1 golden + persistent on-disk KV/DB file across server restarts:
+    // Instance #1 handles POST /users/42 -> persists 42=777 to disk; Instance #2 loads from disk and serves GET /users/42 -> 777!
     let live_fullstack_omni = "#[strict]\n#[cap(NET, DB_W)]\nroute POST /users/:id (req: i64) {\n    let id: i64 = req.param(\"id\");\n    let saved: i64 = kv_put(id, 777);\n    respond(201, saved);\n}\n#[strict]\n#[cap(NET, DB_R)]\nroute GET /users/:id (req: i64) {\n    let id: i64 = req.param(\"id\");\n    let row: i64 = db_get(id);\n    respond(200, row);\n}";
-    let (listen_addr, server_handle) = serve_omni_http_batch(live_fullstack_omni, "127.0.0.1:0", BTreeMap::new(), 2)?;
+    let db_path = std::env::temp_dir().join(format!("omni_live_host_db_{}.kv", std::process::id()));
+    let _ = std::fs::remove_file(&db_path);
+    let (listen_addr1, server_handle1) = serve_omni_http_batch_with_db_file(live_fullstack_omni, "127.0.0.1:0", &db_path, 1)?;
     {
         use std::io::{Read, Write};
-        let mut client1 = std::net::TcpStream::connect(listen_addr)
+        let mut client1 = std::net::TcpStream::connect(listen_addr1)
             .map_err(|e| format!("TCP client1 connect failed: {}", e))?;
         client1
             .write_all(b"POST /users/42 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
@@ -6387,10 +6802,23 @@ pub fn run_ai_first_surface_selftests() -> Result<usize, String> {
             .read_to_string(&mut wire1)
             .map_err(|e| format!("TCP client1 read failed: {}", e))?;
         if !wire1.starts_with("HTTP/1.1 201 Created\r\n") || !wire1.contains("{\"status\":201,\"data\":777}") {
+            let _ = std::fs::remove_file(&db_path);
             return Err(format!("Live HTTP POST /users/42 unexpected wire response: {}", wire1));
         }
+    }
+    let (resps1, final_kv1) = server_handle1
+        .join()
+        .map_err(|_| String::from("Live HTTP server1 thread panicked"))??;
+    if resps1.len() != 1 || final_kv1.get(&42) != Some(&777) {
+        let _ = std::fs::remove_file(&db_path);
+        return Err(format!("Live HTTP host1 KV state mismatch: {:?}", final_kv1));
+    }
 
-        let mut client2 = std::net::TcpStream::connect(listen_addr)
+    // Instance #2 starts fresh and loads `db_path` from disk to serve GET /users/42
+    let (listen_addr2, server_handle2) = serve_omni_http_batch_with_db_file(live_fullstack_omni, "127.0.0.1:0", &db_path, 1)?;
+    {
+        use std::io::{Read, Write};
+        let mut client2 = std::net::TcpStream::connect(listen_addr2)
             .map_err(|e| format!("TCP client2 connect failed: {}", e))?;
         client2
             .write_all(b"GET /users/42 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
@@ -6400,14 +6828,16 @@ pub fn run_ai_first_surface_selftests() -> Result<usize, String> {
             .read_to_string(&mut wire2)
             .map_err(|e| format!("TCP client2 read failed: {}", e))?;
         if !wire2.starts_with("HTTP/1.1 200 OK\r\n") || !wire2.contains("{\"status\":200,\"data\":777}") {
+            let _ = std::fs::remove_file(&db_path);
             return Err(format!("Live HTTP GET /users/42 unexpected wire response: {}", wire2));
         }
     }
-    let (resps, final_kv) = server_handle
+    let (resps2, final_kv2) = server_handle2
         .join()
-        .map_err(|_| String::from("Live HTTP server thread panicked"))??;
-    if resps.len() != 2 || final_kv.get(&42) != Some(&777) {
-        return Err(format!("Live HTTP host KV state mismatch: {:?}", final_kv));
+        .map_err(|_| String::from("Live HTTP server2 thread panicked"))??;
+    let _ = std::fs::remove_file(&db_path);
+    if resps2.len() != 1 || final_kv2.get(&42) != Some(&777) {
+        return Err(format!("Live HTTP host2 persistent KV state mismatch: {:?}", final_kv2));
     }
     checks += 2;
 
