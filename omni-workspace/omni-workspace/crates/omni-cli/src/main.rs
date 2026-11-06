@@ -26,7 +26,8 @@ use omni_lang::{
     execute_omni_surface_aot_first, execute_omni_surface_program,
     execute_omni_surface_program_with_budgets, execute_omni_surface_wasm_i64,
     omni_harness_spec_json, parse_cli_omni_value, resolve_omni_surface_includes,
-    run_ai_first_surface_selftests, run_omni_harness_cli, run_omni_harness_json,
+    run_ai_first_surface_selftests, run_omni_agent_driver_cli, run_omni_agent_driver_json,
+    run_omni_harness_cli, run_omni_harness_json, run_omni_serve_cli,
 };
 use omni_verifier::{format_debug_lens, verify_binary_function, verify_u16_stream};
 use omni_vm::{OmniBinaryVm, OmniValue};
@@ -881,6 +882,12 @@ pub fn run_workspace_selftest() -> Result<usize, String> {
     if h_ws != h_m {
         return Err(format!("Monolith vs workspace run_omni_harness_json mismatch: {} != {}", h_m, h_ws));
     }
+    let broken_agent_src = "fn main(a: i64, b: i64) -> trit {\n    let g: trit = egate(a - b);\n    return g;\n}";
+    let ad_ws = run_omni_agent_driver_json(broken_agent_src, vec![OmniValue::Int(30), OmniValue::Int(10)], true, 3, OMNI_HARNESS_CONTRACT_VERSION);
+    let ad_m = monolith::run_omni_agent_driver_json(broken_agent_src, vec![monolith::OmniValue::Int(30), monolith::OmniValue::Int(10)], true, 3, OMNI_HARNESS_CONTRACT_VERSION);
+    if ad_ws != ad_m || !ad_ws.starts_with("{\"ok\":true") {
+        return Err(format!("Monolith vs workspace run_omni_agent_driver_json mismatch: {} != {}", ad_m, ad_ws));
+    }
     checks += ai_first_checks;
 
     // 7. Stage-1 == Stage-2 Self-Compilation Fixed Point
@@ -917,6 +924,12 @@ fn main() {
         match args[1].as_str() {
             "harness" | "--harness" => {
                 std::process::exit(run_omni_harness_cli(&args[2..]));
+            }
+            "agent-driver" | "--agent-driver" => {
+                std::process::exit(run_omni_agent_driver_cli(&args[2..]));
+            }
+            "serve" | "--serve" => {
+                std::process::exit(run_omni_serve_cli(&args[2..]));
             }
             "selftest" => {
                 match run_workspace_selftest() {

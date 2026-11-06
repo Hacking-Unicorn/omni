@@ -16,14 +16,15 @@ jobs:
       - name: Install Rust stable toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Run standalone monolith selftest (237 checks + Stage-1/Stage-2 ELF64 fixed point + harness contract)
+      - name: Run standalone monolith selftest (248 checks + Stage-1/Stage-2 ELF64 fixed point + harness & agent-driver contract)
         run: |
           rustc -O omni_rust_bootstrap.rs -o omni
           ./omni selftest
           ./omni harness --spec
           ./omni harness --version-check
+          ./omni agent-driver --strict "fn main(a: int) -> trit { let d = a - 10; let g = egate(d); return g; }" 25
 
-      - name: Build and run 8-crate Cargo workspace differential selftest (198/199 checks + omni-harness binary)
+      - name: Build and run 8-crate Cargo workspace differential selftest (209/210 checks + omni-harness & omni-agent-driver binaries)
         working-directory: omni-workspace/omni-workspace
         env:
           CARGO_INCREMENTAL: "0"
@@ -31,3 +32,4 @@ jobs:
           cargo build --workspace
           cargo run -p omni-cli -- selftest
           cargo run -p omni-cli --bin omni-harness -- --spec
+          cargo run -p omni-cli --bin omni-agent-driver -- --strict "fn main(a: int) -> trit { let d = a - 10; let g = egate(d); return g; }" 25

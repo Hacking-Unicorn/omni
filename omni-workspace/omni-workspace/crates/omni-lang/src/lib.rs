@@ -55,11 +55,14 @@ struct SurfaceFnDef {
     cap_mask: CapMask,
     step_budget_attr: Option<u64>,
     mem_budget_attr: Option<usize>,
+    budget_span: Option<(usize, usize)>,
     strict_attr: bool,
     is_route: bool,
     route_method: Option<String>,
     route_path: Option<String>,
     name: String,
+    fn_line: usize,
+    fn_col: usize,
     params: Vec<SurfaceParam>,
     ret_ty: String,
     ret_line: usize,
@@ -108,6 +111,21 @@ enum SurfaceStmt {
     Goto(u16, usize, usize),
     Ret(SurfaceExpr, usize, usize),
     Expr(SurfaceExpr, usize, usize),
+}
+
+impl SurfaceStmt {
+    fn span(&self) -> (usize, usize) {
+        match *self {
+            SurfaceStmt::Let(_, _, _, l, c)
+            | SurfaceStmt::Assign(_, _, l, c)
+            | SurfaceStmt::DoWhile(_, _, l, c)
+            | SurfaceStmt::While(_, _, l, c)
+            | SurfaceStmt::Label(_, l, c)
+            | SurfaceStmt::Goto(_, l, c)
+            | SurfaceStmt::Ret(_, l, c)
+            | SurfaceStmt::Expr(_, l, c) => (l, c),
+        }
+    }
 }
 
 fn tokenize_omni_surface_inner(src: &str, strict: bool) -> Result<Vec<SpannedSurfaceTok>, String> {
@@ -533,6 +551,7 @@ impl SurfaceParser {
         let mut cap_mask: CapMask = 0x0000;
         let mut step_budget_attr: Option<u64> = None;
         let mut mem_budget_attr: Option<usize> = None;
+        let mut budget_span: Option<(usize, usize)> = None;
         let mut fn_strict = self.strict_mode;
         self.extra_fn_caps = 0;
 
@@ -572,6 +591,7 @@ impl SurfaceParser {
                         ));
                     }
                     step_budget_attr = Some(b_val as u64);
+                    budget_span = Some((al, ac));
                     self.expect_sym(")")?;
                 } else if attr == "mem_budget" || attr == "memory_budget" {
                     self.expect_sym("(")?;
@@ -583,6 +603,7 @@ impl SurfaceParser {
                         ));
                     }
                     mem_budget_attr = Some(m_val as usize);
+                    budget_span = Some((al, ac));
                     self.expect_sym(")")?;
                 } else if attr == "strict" {
                     fn_strict = true;
@@ -686,11 +707,14 @@ impl SurfaceParser {
                 cap_mask,
                 step_budget_attr,
                 mem_budget_attr,
+                budget_span,
                 strict_attr: fn_strict,
                 is_route: true,
                 route_method: Some(method.to_ascii_uppercase()),
                 route_path: Some(path),
                 name: route_fn_name,
+                fn_line: route_st.line,
+                fn_col: route_st.col,
                 params,
                 ret_ty,
                 ret_line: rl,
@@ -699,7 +723,7 @@ impl SurfaceParser {
             });
         }
 
-        self.expect_ident_kw("fn")?;
+        let (fn_kw_line, fn_kw_col) = self.expect_ident_kw("fn")?;
         let (fn_name, _fl, _fc) = self.expect_ident_spanned()?;
         self.expect_sym("(")?;
         let mut params = Vec::new();
@@ -760,11 +784,14 @@ impl SurfaceParser {
             cap_mask,
             step_budget_attr,
             mem_budget_attr,
+            budget_span,
             strict_attr: fn_strict,
             is_route: false,
             route_method: None,
             route_path: None,
             name: fn_name,
+            fn_line: fn_kw_line,
+            fn_col: fn_kw_col,
             params,
             ret_ty,
             ret_line: rl,
@@ -1300,8 +1327,10 @@ struct SurfaceLowerCtx {
     used_labels: Vec<(u16, usize, usize)>,
     ret_ty_tok: u16,
     emit_asm: bool,
+    cur_span: (usize, usize),
     lines: Vec<String>,
     packets: Vec<Vec<u16>>,
+    pkt_spans: Vec<(usize, usize)>,
 }
 
 impl SurfaceLowerCtx {
@@ -1324,8 +1353,10 @@ impl SurfaceLowerCtx {
             used_labels: Vec::new(),
             ret_ty_tok,
             emit_asm,
+            cur_span: (1, 1),
             lines: Vec::new(),
             packets: Vec::new(),
+            pkt_spans: Vec::new(),
         }
     }
 
@@ -1335,6 +1366,7 @@ impl SurfaceLowerCtx {
         } else {
             let pkt = encode_asm_ins_packet_u16(&line, self.ret_ty_tok)?;
             self.packets.push(pkt);
+            self.pkt_spans.push((self.cur_span.0.max(1), self.cur_span.1.max(1)));
         }
         Ok(())
     }
@@ -1714,12 +1746,14 @@ impl SurfaceLowerCtx {
         target_reg: Option<&str>,
         has_shared_join: bool,
     ) -> Result<String, String> {
+        self.cur_span = expr.span();
         match expr {
             SurfaceExpr::Int(v, line, col) => {
                 let dst = match target_reg {
                     Some(r) => String::from(r),
                     None => self.alloc_reg(*line, *col)?,
                 };
+                self.cur_span = (*line, *col);
                 self.emit(format!("{} = CINT {}", dst, v))?;
                 Ok(dst)
             }
@@ -1728,10 +1762,12 @@ impl SurfaceLowerCtx {
                     Some(r) => String::from(r),
                     None => self.alloc_reg(*line, *col)?,
                 };
+                self.cur_span = (*line, *col);
                 self.emit(format!("{} = CTRIT {}", dst, s))?;
                 Ok(dst)
             }
             SurfaceExpr::TritVecLit(trits, line, col) => {
+                self.cur_span = (*line, *col);
                 self.lower_trit_vec_pack5(trits, target_reg, true, *line, *col)
             }
             SurfaceExpr::StrLit(s, line, col) => {
@@ -1743,6 +1779,7 @@ impl SurfaceLowerCtx {
                 for &b in s.as_bytes() {
                     hex_str.push_str(&format!("{:02x}", b));
                 }
+                self.cur_span = (*line, *col);
                 self.emit(format!("{} = CSTR@UNTRUSTED @str:{}", dst, hex_str))?;
                 Ok(dst)
             }
@@ -1756,6 +1793,7 @@ impl SurfaceLowerCtx {
                     Some(r) => String::from(r),
                     None => self.alloc_reg(*line, *col)?,
                 };
+                self.cur_span = (*line, *col);
                 self.emit(format!("{} = CINT {}", dst, src))?;
                 Ok(dst)
             }
@@ -1765,6 +1803,7 @@ impl SurfaceLowerCtx {
                     Some(r) => String::from(r),
                     None => self.alloc_reg(*line, *col)?,
                 };
+                self.cur_span = (*line, *col);
                 self.emit(format!("{} = {} {}", dst, mnem, op_s))?;
                 Ok(dst)
             }
@@ -1775,6 +1814,7 @@ impl SurfaceLowerCtx {
                     Some(r) => String::from(r),
                     None => self.alloc_reg(*line, *col)?,
                 };
+                self.cur_span = (*line, *col);
                 self.emit(format!("{} = {} {} {}", dst, mnem, l_op, r_op))?;
                 Ok(dst)
             }
@@ -1787,6 +1827,7 @@ impl SurfaceLowerCtx {
                         ));
                     }
                     if let SurfaceExpr::TritVecLit(ref trits, l, c) = args[0] {
+                        self.cur_span = (l, c);
                         return self.lower_trit_vec_pack5(trits, target_reg, false, l, c);
                     } else {
                         return Err(format!(
@@ -1800,6 +1841,7 @@ impl SurfaceLowerCtx {
                     Some(r) => String::from(r),
                     None => self.alloc_reg(*line, *col)?,
                 };
+                self.cur_span = (*line, *col);
                 self.emit(format!("{} = {}", dst, rhs))?;
                 Ok(dst)
             }
@@ -1810,6 +1852,7 @@ impl SurfaceLowerCtx {
                     None => self.alloc_reg(*line, *col)?,
                 };
                 let l_then = self.alloc_lbl(*line, *col)?;
+                self.cur_span = (*line, *col);
                 self.emit(format!("{} {} {}", br_mnem, cond_op, l_then))?;
                 let saved_vars = self.var_map.clone();
                 self.lower_block_into_target(else_blk, &dst, false, *line, *col)?;
@@ -1819,7 +1862,9 @@ impl SurfaceLowerCtx {
                     self.lines.push(String::from("JMP __JOIN__"));
                 } else {
                     self.packets.push(vec![0x7F41, 0xFFFF, TOK_INS_END]);
+                    self.pkt_spans.push(((*line).max(1), (*col).max(1)));
                 }
+                self.cur_span = (*line, *col);
                 self.emit(format!("LABEL {}", l_then))?;
                 self.lower_block_into_target(then_blk, &dst, true, *line, *col)?;
                 self.var_map = saved_vars;
@@ -1839,6 +1884,7 @@ impl SurfaceLowerCtx {
                             }
                         }
                     }
+                    self.cur_span = (*line, *col);
                     self.emit(format!("LABEL {}", l_join))?;
                 }
                 Ok(dst)
@@ -1853,19 +1899,26 @@ impl SurfaceLowerCtx {
                 let l_zero = self.alloc_lbl(*line, *col)?;
                 let l_pos = self.alloc_lbl(*line, *col)?;
                 let l_join = self.alloc_lbl(*line, *col)?;
+                self.cur_span = (*line, *col);
                 self.emit(format!("BR_TRIT {} {} {} {}", cond_op, l_neg, l_zero, l_pos))?;
                 let saved_vars = self.var_map.clone();
+                self.cur_span = (*line, *col);
                 self.emit(format!("LABEL {}", l_neg))?;
                 self.lower_block_into_target(neg_blk, &dst, false, *line, *col)?;
                 self.var_map = saved_vars.clone();
+                self.cur_span = (*line, *col);
                 self.emit(format!("JMP {}", l_join))?;
+                self.cur_span = (*line, *col);
                 self.emit(format!("LABEL {}", l_zero))?;
                 self.lower_block_into_target(zero_blk, &dst, false, *line, *col)?;
                 self.var_map = saved_vars.clone();
+                self.cur_span = (*line, *col);
                 self.emit(format!("JMP {}", l_join))?;
+                self.cur_span = (*line, *col);
                 self.emit(format!("LABEL {}", l_pos))?;
                 self.lower_block_into_target(pos_blk, &dst, false, *line, *col)?;
                 self.var_map = saved_vars;
+                self.cur_span = (*line, *col);
                 self.emit(format!("LABEL {}", l_join))?;
                 Ok(dst)
             }
@@ -1873,6 +1926,7 @@ impl SurfaceLowerCtx {
     }
 
     fn lower_stmt(&mut self, stmt: &SurfaceStmt) -> Result<(), String> {
+        self.cur_span = stmt.span();
         match stmt {
             SurfaceStmt::Let(name, _ty_opt, expr, _line, _col) => {
                 let reg = self.lower_expr_into(expr, None, false)?;
@@ -1907,11 +1961,13 @@ impl SurfaceLowerCtx {
                     ));
                 }
                 let l_top = self.alloc_lbl(*line, *col)?;
+                self.cur_span = (*line, *col);
                 self.emit(format!("LABEL {}", l_top))?;
                 for s in body {
                     self.lower_stmt(s)?;
                 }
                 let cond_op = self.eval_to_operand(cond_expr)?;
+                self.cur_span = (*line, *col);
                 self.emit(format!("BR_POS {} {}", cond_op, l_top))?;
                 Ok(())
             }
@@ -1925,30 +1981,36 @@ impl SurfaceLowerCtx {
                 let l_top = self.alloc_lbl(*line, *col)?;
                 let l_body = self.alloc_lbl(*line, *col)?;
                 let l_exit = self.alloc_lbl(*line, *col)?;
+                self.cur_span = (*line, *col);
                 self.emit(format!("LABEL {}", l_top))?;
                 let cond_op = self.eval_to_operand(cond_expr)?;
+                self.cur_span = (*line, *col);
                 self.emit(format!("BR_POS {} {}", cond_op, l_body))?;
                 self.emit(format!("JMP {}", l_exit))?;
                 self.emit(format!("LABEL {}", l_body))?;
                 for s in body {
                     self.lower_stmt(s)?;
                 }
+                self.cur_span = (*line, *col);
                 self.emit(format!("JMP {}", l_top))?;
                 self.emit(format!("LABEL {}", l_exit))?;
                 Ok(())
             }
-            SurfaceStmt::Label(lid, _line, _col) => {
+            SurfaceStmt::Label(lid, line, col) => {
                 self.defined_labels.push(*lid);
+                self.cur_span = (*line, *col);
                 self.emit(format!("LABEL {}", lid))?;
                 Ok(())
             }
             SurfaceStmt::Goto(lid, line, col) => {
                 self.used_labels.push((*lid, *line, *col));
+                self.cur_span = (*line, *col);
                 self.emit(format!("JMP {}", lid))?;
                 Ok(())
             }
-            SurfaceStmt::Ret(expr, _line, _col) => {
+            SurfaceStmt::Ret(expr, line, col) => {
                 let op = self.eval_to_operand(expr)?;
+                self.cur_span = (*line, *col);
                 self.emit(format!("RET {}", op))?;
                 Ok(())
             }
@@ -1971,6 +2033,7 @@ impl SurfaceLowerCtx {
                                 ));
                             }
                             self.used_labels.push((lid as u16, ll, lc));
+                            self.cur_span = (*cl, *cc);
                             self.emit(format!("{} {} {}", low.to_ascii_uppercase(), c_op, lid))?;
                             return Ok(());
                         } else {
@@ -2005,6 +2068,7 @@ impl SurfaceLowerCtx {
                                 ));
                             }
                         }
+                        self.cur_span = (*cl, *cc);
                         self.emit(format!("BR_TRIT {} {}", c_op, lids.join(" ")))?;
                         return Ok(());
                     } else if low == "drop" {
@@ -2012,10 +2076,12 @@ impl SurfaceLowerCtx {
                         for a in args {
                             ops.push(self.eval_to_operand(a)?);
                         }
+                        self.cur_span = (*cl, *cc);
                         self.emit(format!("DROP {}", ops.join(" ")))?;
                         return Ok(());
                     } else if low == "respond" || low == "respond_json" || low == "respond_html" {
                         let op = self.lower_expr_into(expr, None, false)?;
+                        self.cur_span = (*cl, *cc);
                         self.emit(format!("RET {}", op))?;
                         return Ok(());
                     }
@@ -2198,14 +2264,70 @@ pub fn compile_omni_surface_to_asm(src: &str) -> Result<String, String> {
     compile_omni_surface_to_asm_inner(src, false)
 }
 
-fn compile_omni_surface_to_u16_inner(src: &str, strict: bool) -> Result<Vec<u16>, String> {
+/// Maps binary `u16` stream instruction offsets and runtime budget traps back to 1-based `(line, col)` surface coordinates.
+#[derive(Clone, Debug)]
+pub struct SurfaceSourceMap {
+    pub offset_to_span: BTreeMap<usize, (usize, usize)>,
+    pub budget_span: (usize, usize),
+    pub default_span: (usize, usize),
+}
+
+impl Default for SurfaceSourceMap {
+    fn default() -> Self {
+        Self {
+            offset_to_span: BTreeMap::new(),
+            budget_span: (1, 1),
+            default_span: (1, 1),
+        }
+    }
+}
+
+/// Injects a 1-based `line <L>, col <C>` span into any verifier (`Offset N: ...`) or runtime (`BUDGET_EXCEEDED`) error string.
+pub fn annotate_omni_error_with_sourcemap(err: &str, sm: &SurfaceSourceMap) -> String {
+    if err.contains("line ") && err.contains("col ") {
+        return String::from(err);
+    }
+    let mut span = sm.default_span;
+    if let Some(off_idx) = err.find("Offset ") {
+        let rest = &err[off_idx + 7..];
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(off) = digits.parse::<usize>() {
+            if let Some(&mapped) = sm.offset_to_span.get(&off) {
+                span = mapped;
+            }
+        }
+    } else if err.contains("BUDGET_EXCEEDED") || err.contains("budget exceeded") {
+        span = sm.budget_span;
+    }
+    let line = span.0.max(1);
+    let col = span.1.max(1);
+    if let Some(e_start) = err.find("error[") {
+        if let Some(rel_end) = err[e_start..].find(']') {
+            let bracket_end = e_start + rel_end + 1;
+            return format!(
+                "{} line {}, col {}{}",
+                &err[..bracket_end],
+                line,
+                col,
+                &err[bracket_end..]
+            );
+        }
+    }
+    format!("line {}, col {}: {}", line, col, err)
+}
+
+/// Compiles an Omni surface program into a `Vec<u16>` token stream alongside its 1-based `SurfaceSourceMap`.
+pub fn compile_omni_surface_to_u16_with_sourcemap(
+    src: &str,
+    strict: bool,
+) -> Result<(Vec<u16>, SurfaceSourceMap), String> {
     let effective_strict = strict || src.contains("#[strict]");
     let tokens = tokenize_omni_surface_inner(src, effective_strict)?;
     let mut parser = SurfaceParser::new_with_strict(tokens, effective_strict);
     let (includes, fns) = parser.parse_module()?;
     if !includes.is_empty() {
         let expanded = resolve_omni_surface_includes(src, None, None)?;
-        return compile_omni_surface_to_u16_inner(&expanded, effective_strict);
+        return compile_omni_surface_to_u16_with_sourcemap(&expanded, effective_strict);
     }
 
     let multi_fn = fns.len() > 1;
@@ -2235,9 +2357,33 @@ fn compile_omni_surface_to_u16_inner(src: &str, strict: bool) -> Result<Vec<u16>
         assigned_ids.push(fid);
     }
 
-    let mut completed_fns: Vec<(u16, Vec<(u16, u16, u16)>, u16, CapMask, Vec<Vec<u16>>)> =
-        Vec::with_capacity(fns.len());
+    let mut sm = SurfaceSourceMap::default();
+    if let Some(first_fn) = fns.first() {
+        sm.default_span = (first_fn.fn_line.max(1), first_fn.fn_col.max(1));
+        sm.budget_span = sm.default_span;
+    }
+
+    let mut completed_fns: Vec<(
+        u16,
+        Vec<(u16, u16, u16)>,
+        u16,
+        CapMask,
+        Vec<Vec<u16>>,
+        Vec<(usize, usize)>,
+    )> = Vec::with_capacity(fns.len());
+
     for (idx, f) in fns.iter().enumerate() {
+        if let Some(bs) = f.budget_span {
+            sm.budget_span = (bs.0.max(1), bs.1.max(1));
+        } else {
+            for st in &f.body {
+                if matches!(st, SurfaceStmt::While(_, _, _, _) | SurfaceStmt::DoWhile(_, _, _, _)) {
+                    let sp = st.span();
+                    sm.budget_span = (sp.0.max(1), sp.1.max(1));
+                    break;
+                }
+            }
+        }
         let fid = assigned_ids[idx];
         let fn_strict = effective_strict || f.strict_attr;
         let mut params = Vec::with_capacity(f.params.len());
@@ -2250,6 +2396,7 @@ fn compile_omni_surface_to_u16_inner(src: &str, strict: bool) -> Result<Vec<u16>
         let ret_ty_tok = parse_asm_ty_tok(ret_ty_str);
 
         let mut ctx = SurfaceLowerCtx::new(&f.params, fn_sigs.clone(), ret_ty_tok, false);
+        ctx.cur_span = (f.fn_line.max(1), f.fn_col.max(1));
         if f.is_route {
             let method_code = match f.route_method.as_deref() {
                 Some("GET") => 1,
@@ -2259,22 +2406,29 @@ fn compile_omni_surface_to_u16_inner(src: &str, strict: bool) -> Result<Vec<u16>
                 _ => 0,
             };
             let path_hash = fnv1a_32_positive(f.route_path.as_deref().unwrap_or("/"));
-            let r_rt = ctx.alloc_reg(f.ret_line, f.ret_col)?;
+            let r_rt = ctx.alloc_reg(f.fn_line, f.fn_col)?;
+            ctx.cur_span = (f.fn_line.max(1), f.fn_col.max(1));
             ctx.emit(format!("{} = ROUTE {} {}", r_rt, method_code, path_hash))?;
         }
         for stmt in &f.body {
             ctx.lower_stmt(stmt)?;
         }
         ctx.check_unresolved_labels()?;
-        completed_fns.push((fid, params, ret_ty_tok, f.cap_mask, ctx.packets));
+        completed_fns.push((fid, params, ret_ty_tok, f.cap_mask, ctx.packets, ctx.pkt_spans));
     }
 
     if completed_fns.len() == 1 {
-        let (fn_id, params, ret_ty, cap_mask, ins_packets) = completed_fns.pop().unwrap();
-        Ok(pack_fn_module(&[], fn_id, &params, ret_ty, cap_mask, &ins_packets))
+        let (fn_id, params, ret_ty, cap_mask, ins_packets, pkt_spans) = completed_fns.pop().unwrap();
+        let mut cur_off = 7 + 3 * params.len();
+        for (pkt, sp) in ins_packets.iter().zip(pkt_spans.into_iter()) {
+            sm.offset_to_span.insert(cur_off, sp);
+            cur_off += pkt.len();
+        }
+        let stream = pack_fn_module(&[], fn_id, &params, ret_ty, cap_mask, &ins_packets);
+        Ok((stream, sm))
     } else {
         let mut stream = vec![TOK_MOD_BEGIN];
-        for (f_id, f_params, f_ret, f_cap, f_ins) in completed_fns {
+        for (f_id, f_params, f_ret, f_cap, f_ins, f_spans) in completed_fns {
             stream.push(TOK_FN_DEF);
             stream.push(f_id);
             stream.push(f_params.len() as u16);
@@ -2286,13 +2440,18 @@ fn compile_omni_surface_to_u16_inner(src: &str, strict: bool) -> Result<Vec<u16>
             stream.push(f_ret);
             stream.push(f_cap);
             stream.push(f_ins.len() as u16);
-            for pkt in f_ins {
+            for (pkt, sp) in f_ins.into_iter().zip(f_spans.into_iter()) {
+                sm.offset_to_span.insert(stream.len(), sp);
                 stream.extend_from_slice(&pkt);
             }
         }
         stream.push(TOK_MOD_END);
-        Ok(stream)
+        Ok((stream, sm))
     }
+}
+
+fn compile_omni_surface_to_u16_inner(src: &str, strict: bool) -> Result<Vec<u16>, String> {
+    compile_omni_surface_to_u16_with_sourcemap(src, strict).map(|(s, _)| s)
 }
 
 /// Compiles an Omni surface language program directly into a `Vec<u16>` token stream without
@@ -2505,11 +2664,12 @@ pub fn execute_omni_surface_program_with_budgets(
         (None, Some(b)) => Some(b),
         (None, None) => None,
     };
-    let u16_stream = compile_omni_surface_to_u16(&wrapped)?;
-    for rep in verify_u16_stream(&u16_stream)? {
+    let (u16_stream, sm) = compile_omni_surface_to_u16_with_sourcemap(&wrapped, false)?;
+    for rep in verify_u16_stream(&u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
         if !rep.passed {
             let first = rep.errors.first().cloned().unwrap_or_default();
-            return Err(format!("{} (fn #{}: {:?})", first, rep.fn_idx, rep.errors));
+            let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
+            return Err(format!("{} (fn #{}: {:?})", annotated, rep.fn_idx, rep.errors));
         }
     }
     let module = decode_omni_token_stream(&u16_stream)?;
@@ -2526,6 +2686,7 @@ pub fn execute_omni_surface_program_with_budgets(
         vm.memory_budget_bytes = mb;
     }
     vm.execute_function(&module, entry_fn_idx, args)
+        .map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))
 }
 
 /// Executes an Omni surface program using the AOT hot path (`compile_pure_u16_to_wasm` ->
@@ -2539,11 +2700,12 @@ pub fn execute_omni_surface_aot_first(
 ) -> Result<(OmniValue, &'static str), String> {
     let wrapped = wrap_omni_surface_snippet(src);
     let (attr_steps, attr_mem) = extract_omni_surface_budgets(&wrapped);
-    let u16_stream = compile_omni_surface_to_u16(&wrapped)?;
-    for rep in verify_u16_stream(&u16_stream)? {
+    let (u16_stream, sm) = compile_omni_surface_to_u16_with_sourcemap(&wrapped, false)?;
+    for rep in verify_u16_stream(&u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
         if !rep.passed {
             let first = rep.errors.first().cloned().unwrap_or_default();
-            return Err(format!("{} (fn #{}: {:?})", first, rep.fn_idx, rep.errors));
+            let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
+            return Err(format!("{} (fn #{}: {:?})", annotated, rep.fn_idx, rep.errors));
         }
     }
     let module = decode_omni_token_stream(&u16_stream)?;
@@ -2551,7 +2713,8 @@ pub fn execute_omni_surface_aot_first(
         let rep = verify_binary_function(func);
         if !rep.passed {
             let first = rep.errors.first().cloned().unwrap_or_default();
-            return Err(format!("{} (fn #{}: {:?})", first, func.fn_idx, rep.errors));
+            let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
+            return Err(format!("{} (fn #{}: {:?})", annotated, func.fn_idx, rep.errors));
         }
     }
     let entry_fn_idx = if module.functions.iter().any(|f| f.fn_idx == 0) {
@@ -2585,10 +2748,11 @@ pub fn execute_omni_surface_aot_first(
             }
         }
         if static_alloc_bytes > mem_b {
-            return Err(format!(
+            let raw_err = format!(
                 "error[BUDGET_EXCEEDED]: AOT memory budget exceeded ({} > {} bytes)",
                 static_alloc_bytes, mem_b
-            ));
+            );
+            return Err(annotate_omni_error_with_sourcemap(&raw_err, &sm));
         }
         let i64_args: Vec<i64> = args
             .iter()
@@ -2598,8 +2762,10 @@ pub fn execute_omni_surface_aot_first(
                 _ => 0,
             })
             .collect();
-        let wasm = compile_pure_u16_to_wasm(&u16_stream)?;
-        let raw_i64 = execute_wasm_module_i64_with_budgets(&wasm, &i64_args, step_b, mem_b)?;
+        let wasm = compile_pure_u16_to_wasm(&u16_stream)
+            .map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))?;
+        let raw_i64 = execute_wasm_module_i64_with_budgets(&wasm, &i64_args, step_b, mem_b)
+            .map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))?;
         let out_val = if entry_ret_ty_tok == TY_TRIT {
             OmniValue::Trit(raw_i64.clamp(-1, 1) as i8)
         } else {
@@ -2615,7 +2781,9 @@ pub fn execute_omni_surface_aot_first(
     if let Some(mb) = attr_mem {
         vm.memory_budget_bytes = mb;
     }
-    let val = vm.execute_function(&module, entry_fn_idx, args)?;
+    let val = vm
+        .execute_function(&module, entry_fn_idx, args)
+        .map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))?;
     Ok((val, "vm"))
 }
 
@@ -2831,8 +2999,8 @@ pub fn parse_omni_structured_error(err: &str) -> OmniStructuredError {
 
     OmniStructuredError {
         code,
-        line: line_num,
-        col: col_num,
+        line: Some(line_num.unwrap_or(1).max(1)),
+        col: Some(col_num.unwrap_or(1).max(1)),
         message: String::from(err),
         retry_hint: retry_hint_for_code(code),
     }
@@ -2975,25 +3143,939 @@ pub fn run_omni_harness_json(
     }
 }
 
-/// Expects `res` to fail with a diagnostic whose machine-readable code equals `code`.
+// ==============================================================================
+// 7D. VERSION-LOCKED AGENT DRIVER (`omni-agent-driver`) & LIVE HTTP/DB HOST
+// ==============================================================================
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OmniAgentAttempt {
+    pub attempt: usize,
+    pub source: String,
+    pub harness_json: String,
+    pub error: Option<OmniStructuredError>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OmniAgentRepairReport {
+    pub ok: bool,
+    pub contract_version: String,
+    pub attempts: Vec<OmniAgentAttempt>,
+    pub final_source: String,
+    pub final_json: String,
+}
+
+fn infer_surface_rhs_type(rhs: &str) -> &'static str {
+    let first_stmt = rhs.split(';').next().unwrap_or(rhs);
+    let e = first_stmt.trim();
+    if e.starts_with('"')
+        || e.starts_with("san_sql(")
+        || e.starts_with("san_dom(")
+        || e.starts_with("san_prm(")
+        || e.starts_with("scat(")
+        || e.starts_with("sconc(")
+        || e.starts_with("i2s(")
+    {
+        "str"
+    } else if e.starts_with('[') || e.starts_with("unpack5(") {
+        "trit_vec"
+    } else if e.starts_with("pack5_bytes(") || e.starts_with("anew(") || e.starts_with("pack5(") {
+        "bytes"
+    } else if e.starts_with("arena(") {
+        "arena"
+    } else if e.contains("<=>")
+        || e.contains("==")
+        || e.contains("!=")
+        || e.contains("<=")
+        || e.contains(">=")
+        || e.contains(" < ")
+        || e.contains(" > ")
+        || e.starts_with("egate(")
+        || e.starts_with("decision_hook(")
+        || e.starts_with("tlogic(")
+        || e.starts_with("tmaj(")
+        || e.starts_with("tand(")
+        || e.starts_with("tor(")
+        || e.starts_with("txor(")
+        || e.starts_with("tcmp(")
+        || e == "+1t"
+        || e == "0t"
+        || e == "-1t"
+        || e.starts_with('!')
+    {
+        "trit"
+    } else {
+        "i64"
+    }
+}
+
+/// Repairs a candidate `.omni` surface program using the structured `(code, line, col, retry_hint, message)`
+/// feedback returned by `omni-harness`. Lives outside the token ISA and verifier.
+pub fn repair_omni_program_from_harness_error(
+    src: &str,
+    err: &OmniStructuredError,
+    _strict: bool,
+) -> Option<String> {
+    let target_line = err.line.unwrap_or(1).max(1);
+    match err.code {
+        "MISSING_CAP" => {
+            let mut needed: Vec<&'static str> = Vec::new();
+            if src.contains("route ")
+                || src.contains("req.param")
+                || src.contains("req_param")
+                || src.contains("respond(")
+                || src.contains("respond_json(")
+                || src.contains("respond_html(")
+                || err.message.contains("0x7F6C")
+                || err.message.contains("0x7F6E")
+                || err.message.contains("0x7F6F")
+            {
+                needed.push("NET");
+            }
+            if src.contains("db_query")
+                || src.contains("db_get")
+                || src.contains("kv_get")
+                || src.contains("db_count")
+                || err.message.contains("0x7F64")
+                || err.message.contains("0x7F65")
+                || err.message.contains("0x7F68")
+            {
+                needed.push("DB_R");
+            }
+            if src.contains("kv_put") || src.contains("db_put") || err.message.contains("0x7F6B") {
+                needed.push("DB_W");
+            }
+            if src.contains("egate(")
+                || src.contains("decision_hook(")
+                || src.contains("pack5_gate(")
+                || err.message.contains("0x7F35")
+            {
+                needed.push("AI");
+            }
+            if src.contains("auth_verify(") || err.message.contains("0x7F70") {
+                needed.push("AUTH");
+            }
+            if src.contains("san_dom(") {
+                needed.push("DOM");
+            }
+            if needed.is_empty() {
+                needed.extend(["AI", "NET", "DB_R", "DB_W", "AUTH", "DOM"]);
+            }
+            let cap_attr = format!("#[cap({})]", needed.join(", "));
+            if let Some(c_start) = src.find("#[cap(") {
+                if let Some(rel_end) = src[c_start..].find(")]") {
+                    let existing = &src[c_start + 6..c_start + rel_end];
+                    let mut merged: Vec<String> = existing
+                        .split(',')
+                        .map(|s| s.trim().to_ascii_uppercase())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    for n in needed {
+                        if !merged.iter().any(|m| m == n) {
+                            merged.push(String::from(n));
+                        }
+                    }
+                    let mut out = String::new();
+                    out.push_str(&src[..c_start]);
+                    out.push_str(&format!("#[cap({})]", merged.join(", ")));
+                    out.push_str(&src[c_start + rel_end + 2..]);
+                    if out != src {
+                        return Some(out);
+                    }
+                }
+            }
+            if let Some(pos) = src.find("route ").or_else(|| src.find("fn ")) {
+                let mut out = String::new();
+                out.push_str(&src[..pos]);
+                out.push_str(&cap_attr);
+                out.push(' ');
+                out.push_str(&src[pos..]);
+                return Some(out);
+            }
+            Some(format!("{}\n{}", cap_attr, src))
+        }
+        "TAINT_ON_RET" | "TAINT_SINK" => {
+            if src.contains("@untrusted") {
+                let mut sanitized = src.replace("@untrusted", "@safe");
+                if err.code == "TAINT_ON_RET" {
+                    let lines: Vec<&str> = src.lines().collect();
+                    if target_line <= lines.len() {
+                        let line_s = lines[target_line - 1];
+                        if let Some(ret_idx) = line_s.find("return ") {
+                            let var_expr = line_s[ret_idx + 7..].trim().trim_end_matches(';').trim();
+                            let rep_stmt = format!(
+                                "let __clean: i64 = auth_verify({}); return __clean;",
+                                var_expr
+                            );
+                            let mut new_lines: Vec<String> = lines.iter().map(|s| String::from(*s)).collect();
+                            new_lines[target_line - 1] = format!(
+                                "{}{}",
+                                &line_s[..ret_idx],
+                                rep_stmt
+                            );
+                            let joined = new_lines.join("\n");
+                            sanitized = if joined.contains("#[cap(") {
+                                joined.replacen("#[cap(", "#[cap(AUTH, ", 1)
+                            } else {
+                                format!("#[cap(AUTH)] {}", joined)
+                            };
+                        }
+                    }
+                } else if err.code == "TAINT_SINK" {
+                    let lines: Vec<&str> = src.lines().collect();
+                    if target_line <= lines.len() {
+                        let line_s = lines[target_line - 1];
+                        if line_s.contains("egate(") {
+                            let mut new_lines: Vec<String> = lines.iter().map(|s| String::from(*s)).collect();
+                            new_lines[target_line - 1] = line_s.replace("egate(", "egate(auth_verify(").replace(");", "));");
+                            let joined = new_lines.join("\n");
+                            sanitized = if joined.contains("#[cap(") {
+                                joined.replacen("#[cap(", "#[cap(AUTH, ", 1)
+                            } else {
+                                format!("#[cap(AI, AUTH)] {}", joined)
+                            };
+                        } else if line_s.contains("db_query(") {
+                            let mut new_lines: Vec<String> = lines.iter().map(|s| String::from(*s)).collect();
+                            if let Some(comma) = line_s.rfind(',') {
+                                if let Some(rparen) = line_s.rfind(')') {
+                                    let arg2 = line_s[comma + 1..rparen].trim();
+                                    new_lines[target_line - 1] = format!(
+                                        "{}, auth_verify({}){}",
+                                        &line_s[..comma],
+                                        arg2,
+                                        &line_s[rparen..]
+                                    );
+                                    let joined = new_lines.join("\n");
+                                    sanitized = if joined.contains("#[cap(") {
+                                        joined.replacen("#[cap(", "#[cap(AUTH, ", 1)
+                                    } else {
+                                        format!("#[cap(DB_R, AUTH)] {}", joined)
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
+                if sanitized != src {
+                    return Some(sanitized);
+                }
+            }
+            None
+        }
+        "BAD_TYPE" => {
+            if err.message.contains("Missing explicit type annotation on 'let ") {
+                let mut new_lines: Vec<String> = Vec::new();
+                for (idx, line_s) in src.lines().enumerate() {
+                    if idx + 1 == target_line || line_s.contains("let ") {
+                        let mut search_offset = 0usize;
+                        let mut fixed_this_line = None;
+                        while let Some(rel_let) = line_s[search_offset..].find("let ") {
+                            let let_pos = search_offset + rel_let;
+                            let after_let = &line_s[let_pos + 4..];
+                            if let Some(eq_pos) = after_let.find('=') {
+                                let lhs_var = after_let[..eq_pos].trim();
+                                if !lhs_var.contains(':') && !lhs_var.contains(';') {
+                                    let rhs = &after_let[eq_pos + 1..];
+                                    let inferred_ty = infer_surface_rhs_type(rhs);
+                                    fixed_this_line = Some(format!(
+                                        "{}let {}: {} ={}",
+                                        &line_s[..let_pos],
+                                        lhs_var,
+                                        inferred_ty,
+                                        rhs
+                                    ));
+                                    break;
+                                }
+                            }
+                            search_offset = let_pos + 4;
+                        }
+                        if let Some(fixed_line) = fixed_this_line {
+                            new_lines.push(fixed_line);
+                            continue;
+                        }
+                    }
+                    new_lines.push(String::from(line_s));
+                }
+                let out = new_lines.join("\n");
+                if out != src {
+                    return Some(out);
+                }
+            } else if err.message.contains("Unknown surface type '") {
+                if let Some(q1) = err.message.find("Unknown surface type '") {
+                    let rest = &err.message[q1 + 22..];
+                    if let Some(q2) = rest.find('\'') {
+                        let bad_ty = &rest[..q2];
+                        let out = src.replace(bad_ty, "i64");
+                        if out != src {
+                            return Some(out);
+                        }
+                    }
+                }
+            }
+            None
+        }
+        "AMBIGUOUS_GRAMMAR" => {
+            let mut out = String::from(src);
+            out = out.replace("TRIT_POS", "+1t");
+            out = out.replace("TRIT_ZERO", "0t");
+            out = out.replace("TRIT_NEG", "-1t");
+            out = out.replace("untrusted_i64", "i64 @untrusted");
+            out = out.replace("untrusted_str", "str @untrusted");
+            out = out.replace(": int", ": i64");
+            out = out.replace("-> int", "-> i64");
+            out = out.replace(": tvec", ": trit_vec");
+            out = out.replace("-> tvec", "-> trit_vec");
+            if out.contains("mod \"") {
+                out = out.replace("mod \"", "include \"");
+            }
+            if out != src {
+                Some(out)
+            } else {
+                None
+            }
+        }
+        "BUDGET_EXCEEDED" => {
+            let mut out = String::from(src);
+            if let Some(sb_pos) = out.find("#[step_budget(") {
+                if let Some(end_p) = out[sb_pos..].find(")]") {
+                    out = format!(
+                        "{}#[step_budget(500000)]{}",
+                        &out[..sb_pos],
+                        &out[sb_pos + end_p + 2..]
+                    );
+                    return Some(out);
+                }
+            }
+            if let Some(mb_pos) = out.find("#[mem_budget(") {
+                if let Some(end_p) = out[mb_pos..].find(")]") {
+                    out = format!(
+                        "{}#[mem_budget(1048576)]{}",
+                        &out[..mb_pos],
+                        &out[mb_pos + end_p + 2..]
+                    );
+                    return Some(out);
+                }
+            }
+            None
+        }
+        "LINEAR_LEAK" => {
+            if let Some(a_pos) = src.find("arena(") {
+                let before = &src[..a_pos];
+                if let Some(let_pos) = before.rfind("let ") {
+                    let var_part = &before[let_pos + 4..];
+                    let v_name = var_part
+                        .split(|c: char| c == ':' || c == '=' || c.is_ascii_whitespace())
+                        .next()
+                        .unwrap_or("")
+                        .trim();
+                    if !v_name.is_empty() && src.contains("return ") {
+                        let out = src.replacen("return ", &format!("drop({}); return ", v_name), 1);
+                        if out != src {
+                            return Some(out);
+                        }
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Runs the version-locked `omni-agent-driver` loop with a caller-supplied repair callback:
+/// 1. Queries `omni_harness_spec_json()` (`omni-harness --spec`) and verifies that its contract version
+///    matches `expected_contract_version` (`"omni-harness-v1.0.0"`), refusing to run on mismatch.
+/// 2. Submits candidate `.omni` source to `run_omni_harness_json(..., true)`.
+/// 3. On failure, extracts the structured `OmniStructuredError` (`code`, 1-based `line`/`col`, `retry_hint`, `message`)
+///    and invokes `repair_fn(current_src, &err, &spec_json)` up to `max_attempts`.
+pub fn run_omni_agent_repair_loop_with_model<F>(
+    initial_src: &str,
+    args: Vec<OmniValue>,
+    strict: bool,
+    max_attempts: usize,
+    expected_contract_version: &str,
+    mut repair_fn: F,
+) -> Result<OmniAgentRepairReport, String>
+where
+    F: FnMut(&str, &OmniStructuredError, &str) -> Option<String>,
+{
+    let spec_json = omni_harness_spec_json();
+    let expected_tag = format!("\"version\":\"{}\"", expected_contract_version);
+    if !spec_json.contains(&expected_tag) {
+        return Err(format!(
+            "error[VERSION_MISMATCH]: omni-agent-driver expected harness contract version '{}', but omni-harness --spec reported {}",
+            expected_contract_version, spec_json
+        ));
+    }
+    let limit = max_attempts.max(1);
+    let mut current_src = String::from(initial_src);
+    let mut attempts = Vec::with_capacity(limit);
+
+    for attempt_idx in 1..=limit {
+        let harness_json = run_omni_harness_json(&current_src, args.clone(), strict, true);
+        if harness_json.starts_with("{\"ok\":true") {
+            attempts.push(OmniAgentAttempt {
+                attempt: attempt_idx,
+                source: current_src.clone(),
+                harness_json: harness_json.clone(),
+                error: None,
+            });
+            return Ok(OmniAgentRepairReport {
+                ok: true,
+                contract_version: String::from(OMNI_HARNESS_CONTRACT_VERSION),
+                attempts,
+                final_source: current_src,
+                final_json: harness_json,
+            });
+        }
+
+        let err = extract_structured_error_from_harness_json(&harness_json, &current_src, strict);
+        attempts.push(OmniAgentAttempt {
+            attempt: attempt_idx,
+            source: current_src.clone(),
+            harness_json: harness_json.clone(),
+            error: Some(err.clone()),
+        });
+
+        if attempt_idx == limit {
+            return Ok(OmniAgentRepairReport {
+                ok: false,
+                contract_version: String::from(OMNI_HARNESS_CONTRACT_VERSION),
+                attempts,
+                final_source: current_src,
+                final_json: harness_json,
+            });
+        }
+
+        match repair_fn(&current_src, &err, &spec_json) {
+            Some(next_src) if next_src != current_src => {
+                current_src = next_src;
+            }
+            _ => {
+                return Ok(OmniAgentRepairReport {
+                    ok: false,
+                    contract_version: String::from(OMNI_HARNESS_CONTRACT_VERSION),
+                    attempts,
+                    final_source: current_src,
+                    final_json: harness_json,
+                });
+            }
+        }
+    }
+
+    unreachable!()
+}
+
+fn extract_structured_error_from_harness_json(
+    harness_json: &str,
+    src: &str,
+    strict: bool,
+) -> OmniStructuredError {
+    let wrapped = if strict {
+        String::from(src)
+    } else {
+        wrap_omni_surface_snippet(src)
+    };
+    let u16_res = if strict {
+        compile_omni_surface_strict_to_u16(&wrapped)
+    } else {
+        compile_omni_surface_to_u16(&wrapped)
+    };
+    match u16_res {
+        Err(e) => parse_omni_structured_error(&e),
+        Ok(_) => match execute_omni_surface_aot_first(&wrapped, vec![]) {
+            Err(e) => parse_omni_structured_error(&e),
+            Ok(_) => parse_omni_structured_error(harness_json),
+        },
+    }
+}
+
+/// Runs the version-locked `omni-agent-driver` loop using the built-in structured feedback repair rule engine.
+pub fn run_omni_agent_repair_loop(
+    initial_src: &str,
+    args: Vec<OmniValue>,
+    strict: bool,
+    max_attempts: usize,
+    expected_contract_version: &str,
+) -> Result<OmniAgentRepairReport, String> {
+    run_omni_agent_repair_loop_with_model(
+        initial_src,
+        args,
+        strict,
+        max_attempts,
+        expected_contract_version,
+        |cur_src, err, _spec| repair_omni_program_from_harness_error(cur_src, err, strict),
+    )
+}
+
+/// Formats an `OmniAgentRepairReport` as a deterministic single-line JSON object.
+pub fn run_omni_agent_driver_json(
+    initial_src: &str,
+    args: Vec<OmniValue>,
+    strict: bool,
+    max_attempts: usize,
+    expected_contract_version: &str,
+) -> String {
+    match run_omni_agent_repair_loop(initial_src, args, strict, max_attempts, expected_contract_version) {
+        Ok(rep) => {
+            let codes: Vec<String> = rep
+                .attempts
+                .iter()
+                .map(|a| match &a.error {
+                    Some(e) => format!(
+                        "{{\"attempt\":{},\"ok\":false,\"code\":\"{}\",\"line\":{},\"col\":{}}}",
+                        a.attempt,
+                        e.code,
+                        e.line.unwrap_or(1),
+                        e.col.unwrap_or(1)
+                    ),
+                    None => format!("{{\"attempt\":{},\"ok\":true}}", a.attempt),
+                })
+                .collect();
+            format!(
+                "{{\"ok\":{},\"version\":\"{}\",\"attempts\":{},\"history\":[{}],\"final_source\":\"{}\",\"harness\":{}}}",
+                rep.ok,
+                rep.contract_version,
+                rep.attempts.len(),
+                codes.join(","),
+                json_escape_str(&rep.final_source),
+                rep.final_json
+            )
+        }
+        Err(e) => format!(
+            "{{\"ok\":false,\"version\":\"{}\",\"code\":\"VERSION_MISMATCH\",\"line\":1,\"col\":1,\"message\":\"{}\"}}",
+            expected_contract_version,
+            json_escape_str(&e)
+        ),
+    }
+}
+
+/// Shared CLI front-end for `omni-agent-driver` / `omni agent-driver`.
+/// Usage: omni-agent-driver [--strict] [--max-attempts N] [--expect-version VER] (<file.omni | - | "source">) [args...]
+pub fn run_omni_agent_driver_cli(argv: &[String]) -> i32 {
+    let mut strict = false;
+    let mut max_attempts = 6usize;
+    let mut expected_ver = String::from(OMNI_HARNESS_CONTRACT_VERSION);
+    let mut rest: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--strict" => strict = true,
+            "--max-attempts" => {
+                if i + 1 >= argv.len() {
+                    eprintln!("--max-attempts requires an integer argument");
+                    return 2;
+                }
+                max_attempts = argv[i + 1].parse::<usize>().unwrap_or(4).max(1);
+                i += 1;
+            }
+            "--expect-version" => {
+                if i + 1 >= argv.len() {
+                    eprintln!("--expect-version requires a version string");
+                    return 2;
+                }
+                expected_ver = argv[i + 1].clone();
+                i += 1;
+            }
+            _ => rest.push(argv[i].clone()),
+        }
+        i += 1;
+    }
+    if rest.is_empty() {
+        eprintln!("usage: omni-agent-driver [--strict] [--max-attempts N] [--expect-version VER] (<file.omni | - | \"source\">) [args...]");
+        return 2;
+    }
+    let target = &rest[0];
+    let src = if target == "-" {
+        use std::io::Read;
+        let mut buf = String::new();
+        if std::io::stdin().read_to_string(&mut buf).is_err() {
+            eprintln!("failed to read source from stdin");
+            return 2;
+        }
+        buf
+    } else if target.ends_with(".omni") && std::path::Path::new(target).is_file() {
+        match std::fs::read_to_string(target) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("failed to read '{}': {}", target, e);
+                return 2;
+            }
+        }
+    } else {
+        target.clone()
+    };
+    let vm_args: Vec<OmniValue> = rest[1..].iter().map(|s| parse_cli_omni_value(s)).collect();
+    let out = run_omni_agent_driver_json(&src, vm_args, strict, max_attempts, &expected_ver);
+    println!("{}", out);
+    if out.starts_with("{\"ok\":true") { 0 } else { 1 }
+}
+
+// ==============================================================================
+// 7E. REAL NATIVE HTTP/1.1 & DB/KV HOST RUNTIME (`OmniHostRuntime` / `omni serve`)
+// ==============================================================================
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OmniRouteSpec {
+    pub fn_idx: u16,
+    pub method: String,
+    pub path_pattern: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OmniHttpResponse {
+    pub status: u16,
+    pub content_type: String,
+    pub body: String,
+}
+
+impl OmniHttpResponse {
+    pub fn status_text(status: u16) -> &'static str {
+        match status {
+            200 => "OK",
+            201 => "Created",
+            204 => "No Content",
+            400 => "Bad Request",
+            401 => "Unauthorized",
+            403 => "Forbidden",
+            404 => "Not Found",
+            500 => "Internal Server Error",
+            _ => "OK",
+        }
+    }
+
+    pub fn to_http11_wire_bytes(&self) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            self.status,
+            Self::status_text(self.status),
+            self.content_type,
+            self.body.len(),
+            self.body
+        )
+        .into_bytes()
+    }
+}
+
+/// Extracts all `route <METHOD> <path>` declarations from a surface `.omni` module alongside their assigned `fn_idx`.
+pub fn extract_omni_routes(src: &str) -> Result<Vec<OmniRouteSpec>, String> {
+    let effective_strict = src.contains("#[strict]");
+    let tokens = tokenize_omni_surface_inner(src, effective_strict)?;
+    let mut parser = SurfaceParser::new_with_strict(tokens, effective_strict);
+    let (includes, fns) = parser.parse_module()?;
+    if !includes.is_empty() {
+        let expanded = resolve_omni_surface_includes(src, None, None)?;
+        return extract_omni_routes(&expanded);
+    }
+    let multi_fn = fns.len() > 1;
+    let mut routes = Vec::new();
+    for (idx, f) in fns.iter().enumerate() {
+        let fid = if let Some(id_attr) = f.fn_id_attr {
+            id_attr
+        } else if !multi_fn || idx + 1 == fns.len() {
+            0
+        } else {
+            (idx + 1) as u16
+        };
+        if f.is_route {
+            routes.push(OmniRouteSpec {
+                fn_idx: fid,
+                method: f.route_method.clone().unwrap_or_else(|| String::from("GET")),
+                path_pattern: f.route_path.clone().unwrap_or_else(|| String::from("/")),
+            });
+        }
+    }
+    Ok(routes)
+}
+
+/// Matches a route pattern (e.g. `"/users/:id"`) against an incoming HTTP request path (e.g. `"/users/42?role=7"`),
+/// returning `(primary_param_i64, req_params_by_fnv1a32)`.
+pub fn match_omni_route_pattern(
+    pattern: &str,
+    request_path: &str,
+) -> Option<(i64, BTreeMap<i64, i64>)> {
+    let (clean_path, query_opt) = match request_path.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (request_path, None),
+    };
+    let pat_segs: Vec<&str> = pattern.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+    let req_segs: Vec<&str> = clean_path.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+    if pat_segs.len() != req_segs.len() {
+        return None;
+    }
+    let mut params = BTreeMap::new();
+    let mut primary_val: Option<i64> = None;
+    for (ps, rs) in pat_segs.into_iter().zip(req_segs.into_iter()) {
+        if let Some(param_name) = ps.strip_prefix(':') {
+            let parsed = rs.parse::<i64>().unwrap_or_else(|_| fnv1a_32_positive(rs));
+            params.insert(fnv1a_32_positive(param_name), parsed);
+            if primary_val.is_none() {
+                primary_val = Some(parsed);
+            }
+        } else if ps != rs {
+            return None;
+        }
+    }
+    if let Some(q) = query_opt {
+        for pair in q.split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                let parsed = v.parse::<i64>().unwrap_or_else(|_| fnv1a_32_positive(v));
+                params.insert(fnv1a_32_positive(k), parsed);
+                if primary_val.is_none() {
+                    primary_val = Some(parsed);
+                }
+            }
+        }
+    }
+    Some((primary_val.unwrap_or(0), params))
+}
+
+/// Compiles and statically verifies a `.omni` route program, then dispatches an HTTP request
+/// (`method`, `request_path`) against the host's `kv_store` and returns a real `OmniHttpResponse`.
+pub fn handle_omni_http_request(
+    src: &str,
+    method: &str,
+    request_path: &str,
+    kv_store: &mut BTreeMap<i64, i64>,
+) -> Result<OmniHttpResponse, String> {
+    let routes = extract_omni_routes(src)?;
+    if routes.is_empty() {
+        return Err(String::from("error[SYNTAX_ERROR] line 1, col 1: Surface program contains no 'route' handlers"));
+    }
+    let (u16_stream, sm) = compile_omni_surface_to_u16_with_sourcemap(src, false)?;
+    for rep in verify_u16_stream(&u16_stream)? {
+        if !rep.passed {
+            let first = rep.errors.first().cloned().unwrap_or_default();
+            let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
+            return Err(format!("{} (fn #{}: {:?})", annotated, rep.fn_idx, rep.errors));
+        }
+    }
+    let module = decode_omni_token_stream(&u16_stream)?;
+    let norm_method = method.trim().to_ascii_uppercase();
+
+    for rt in &routes {
+        if rt.method == norm_method {
+            if let Some((primary_arg, req_params)) = match_omni_route_pattern(&rt.path_pattern, request_path) {
+                let (attr_steps, attr_mem) = extract_omni_surface_budgets(src);
+                let mut vm = OmniBinaryVm::new();
+                if let Some(sb) = attr_steps {
+                    vm.step_limit = sb;
+                }
+                if let Some(mb) = attr_mem {
+                    vm.memory_budget_bytes = mb;
+                }
+                vm.kv_store = kv_store.clone();
+                vm.req_params = req_params;
+                let val = vm
+                    .execute_function(&module, rt.fn_idx, vec![OmniValue::Int(primary_arg)])
+                    .map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))?;
+                *kv_store = vm.kv_store;
+                if let Some((status, content_type, body)) = vm.last_http_response {
+                    return Ok(OmniHttpResponse {
+                        status,
+                        content_type,
+                        body,
+                    });
+                }
+                let body = format!(
+                    "{{\"status\":200,\"data\":{}}}",
+                    format_omni_value_compact(&val)
+                );
+                return Ok(OmniHttpResponse {
+                    status: 200,
+                    content_type: String::from("application/json"),
+                    body,
+                });
+            }
+        }
+    }
+
+    Ok(OmniHttpResponse {
+        status: 404,
+        content_type: String::from("application/json"),
+        body: format!(
+            "{{\"status\":404,\"error\":\"No route matched {} {}\"}}",
+            norm_method, request_path
+        ),
+    })
+}
+
+/// Compiles and statically verifies `src` up front (failing immediately with `MISSING_CAP`, `TAINT_SINK`, etc.
+/// before binding a socket if verification fails), then binds a real `std::net::TcpListener` on `bind_addr`
+/// and serves `num_requests` real HTTP/1.1 requests over TCP against a persistent host DB/KV store.
+pub fn serve_omni_http_batch(
+    src: &str,
+    bind_addr: &str,
+    initial_kv: BTreeMap<i64, i64>,
+    num_requests: usize,
+) -> Result<
+    (
+        std::net::SocketAddr,
+        std::thread::JoinHandle<Result<(Vec<OmniHttpResponse>, BTreeMap<i64, i64>), String>>,
+    ),
+    String,
+> {
+    let routes = extract_omni_routes(src)?;
+    if routes.is_empty() {
+        return Err(String::from("error[SYNTAX_ERROR] line 1, col 1: Surface program contains no 'route' handlers"));
+    }
+    let (u16_stream, sm) = compile_omni_surface_to_u16_with_sourcemap(src, false)?;
+    for rep in verify_u16_stream(&u16_stream)? {
+        if !rep.passed {
+            let first = rep.errors.first().cloned().unwrap_or_default();
+            let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
+            return Err(format!("{} (fn #{}: {:?})", annotated, rep.fn_idx, rep.errors));
+        }
+    }
+
+    let listener = std::net::TcpListener::bind(bind_addr)
+        .map_err(|e| format!("Failed to bind TCP listener on '{}': {}", bind_addr, e))?;
+    let local_addr = listener
+        .local_addr()
+        .map_err(|e| format!("Failed to query local socket addr: {}", e))?;
+    let src_owned = String::from(src);
+
+    let handle = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let mut kv_store = initial_kv;
+        let mut responses = Vec::with_capacity(num_requests);
+        for _ in 0..num_requests {
+            let (mut stream, _) = listener
+                .accept()
+                .map_err(|e| format!("TCP accept failed: {}", e))?;
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+            let mut req_buf = [0u8; 4096];
+            let n = stream
+                .read(&mut req_buf)
+                .map_err(|e| format!("TCP read failed: {}", e))?;
+            let req_str = String::from_utf8_lossy(&req_buf[..n]);
+            let first_line = req_str.lines().next().unwrap_or("GET / HTTP/1.1");
+            let mut parts = first_line.split_whitespace();
+            let method = parts.next().unwrap_or("GET");
+            let req_path = parts.next().unwrap_or("/");
+            let resp = handle_omni_http_request(&src_owned, method, req_path, &mut kv_store)?;
+            let wire = resp.to_http11_wire_bytes();
+            stream
+                .write_all(&wire)
+                .map_err(|e| format!("TCP write failed: {}", e))?;
+            let _ = stream.flush();
+            responses.push(resp);
+        }
+        Ok((responses, kv_store))
+    });
+
+    Ok((local_addr, handle))
+}
+
+/// Serves a single live HTTP/1.1 request over TCP on `bind_addr` (e.g. `"127.0.0.1:0"`).
+pub fn serve_omni_http_once(
+    src: &str,
+    bind_addr: &str,
+    initial_kv: BTreeMap<i64, i64>,
+) -> Result<
+    (
+        std::net::SocketAddr,
+        std::thread::JoinHandle<Result<OmniHttpResponse, String>>,
+    ),
+    String,
+> {
+    let (addr, batch_handle) = serve_omni_http_batch(src, bind_addr, initial_kv, 1)?;
+    let single_handle = std::thread::spawn(move || {
+        let (mut resps, _) = batch_handle
+            .join()
+            .map_err(|_| String::from("HTTP host thread panicked"))??;
+        resps
+            .pop()
+            .ok_or_else(|| String::from("No HTTP response produced"))
+    });
+    Ok((addr, single_handle))
+}
+
+/// Runs a live HTTP/1.1 server for `.omni` `route` handlers (`omni serve <file.omni> [bind_addr] [--max-requests N]`).
+pub fn run_omni_serve_cli(argv: &[String]) -> i32 {
+    if argv.is_empty() {
+        eprintln!("usage: omni serve <file.omni | \"source\"> [bind_addr] [--max-requests N]");
+        return 2;
+    }
+    let target = &argv[0];
+    let src = if target.ends_with(".omni") && std::path::Path::new(target).is_file() {
+        match std::fs::read_to_string(target) {
+            Ok(raw) => {
+                let parent_dir = std::path::Path::new(target).parent();
+                match resolve_omni_surface_includes(&raw, parent_dir, None) {
+                    Ok(exp) => exp,
+                    Err(e) => {
+                        eprintln!("{}", e);
+                        return 1;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("failed to read '{}': {}", target, e);
+                return 2;
+            }
+        }
+    } else {
+        target.clone()
+    };
+    let mut bind_addr = String::from("127.0.0.1:8080");
+    let mut max_requests = 1usize;
+    let mut i = 1usize;
+    while i < argv.len() {
+        if argv[i] == "--max-requests" && i + 1 < argv.len() {
+            max_requests = argv[i + 1].parse::<usize>().unwrap_or(1).max(1);
+            i += 2;
+        } else {
+            bind_addr = argv[i].clone();
+            i += 1;
+        }
+    }
+    match serve_omni_http_batch(&src, &bind_addr, BTreeMap::new(), max_requests) {
+        Ok((addr, handle)) => {
+            println!("Omni HTTP/1.1 + DB/KV host listening on http://{}", addr);
+            match handle.join() {
+                Ok(Ok((resps, _))) => {
+                    println!("Served {} HTTP request(s) cleanly.", resps.len());
+                    0
+                }
+                Ok(Err(e)) => {
+                    eprintln!("HTTP host error: {}", e);
+                    1
+                }
+                Err(_) => {
+                    eprintln!("HTTP host thread panicked");
+                    1
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("{}", e);
+            1
+        }
+    }
+}
+
+/// Expects `res` to fail with a diagnostic whose machine-readable code equals `code` and has non-null 1-based `(line, col)`.
 fn expect_omni_error_code<T: std::fmt::Debug>(label: &str, res: Result<T, String>, code: &str) -> Result<OmniStructuredError, String> {
     match res {
         Ok(v) => Err(format!("Error-code case '{}' unexpectedly succeeded: {:?}", label, v)),
         Err(e) => {
             let st = parse_omni_structured_error(&e);
             if st.code != code {
-                Err(format!("Error-code case '{}': got code {} (want {}) from '{}'", label, st.code, code, e))
-            } else {
-                Ok(st)
+                return Err(format!("Error-code case '{}': got code {} (want {}) from '{}'", label, st.code, code, e));
             }
+            if st.line.unwrap_or(0) == 0 || st.col.unwrap_or(0) == 0 {
+                return Err(format!("Error-code case '{}': missing 1-based line/col span in {:?}", label, st));
+            }
+            Ok(st)
         }
     }
 }
 
-/// AI-first surface additions selftests (monolith 13p..13t / workspace 6q..6u):
+/// AI-first surface additions selftests (monolith 13p..13v / workspace 6q..6w):
 /// golden size regression gate, strict single-form grammar + default `@PACK5` trit vectors,
-/// machine-readable error codes, full-stack `route` + DB/KV host ABI goldens, and the
-/// version-locked `omni-harness` JSON contract.
+/// machine-readable error codes with 1-based `(line, col)` spans on all verifier/compiler/runtime failures,
+/// full-stack `route` + DB/KV host ABI goldens, version-locked `omni-harness` JSON contract,
+/// `omni-agent-driver` automated emit + repair loops, and live TCP HTTP/1.1 + DB/KV server golden.
 pub fn run_ai_first_surface_selftests() -> Result<usize, String> {
     let mut checks = 0usize;
 
@@ -3074,17 +4156,52 @@ pub fn run_ai_first_surface_selftests() -> Result<usize, String> {
     }
     checks += 1;
 
-    // 13r. Machine-readable error codes for every diagnostic class.
-    let runaway = "#[step_budget(40)] fn main(n: i64) -> i64 { let i = n; let acc = 0; while (i <=> 0) { acc += i; i -= 1; } return acc; }";
+    // 13r. Machine-readable error codes AND 1-based (line, col) source spans for every diagnostic class.
+    let runaway = "#[step_budget(40)]\nfn main(n: i64) -> i64 {\n    let i = n;\n    let acc = 0;\n    while (i <=> 0) { acc += i; i -= 1; }\n    return acc;\n}";
     let corrupt_u16 = assemble_omni_text_to_u16("CAP_MASK 16\nRET_TY I64\n%0 = ANEW 0\n%0 = ISET %0 250\n%1 = UNPACK5 %0 5\n%2 = EGATE %1\nRET %2\n")?;
     let mut loop_vfs = BTreeMap::new();
     loop_vfs.insert(String::from("loop.omni"), String::from("include \"loop.omni\"; fn f(x: i64) -> i64 { return x; }"));
 
-    expect_omni_error_code("TAINT_ON_RET", execute_omni_surface_program("fn main(x: i64 @untrusted) -> i64 { return x; }", vec![OmniValue::Int(1)]), "TAINT_ON_RET")?;
-    expect_omni_error_code("TAINT_SINK", execute_omni_surface_program("#[cap(AI)] fn main(x: i64 @untrusted) -> trit { let g = egate(x); return g; }", vec![OmniValue::Int(1)]), "TAINT_SINK")?;
-    expect_omni_error_code("MISSING_CAP", execute_omni_surface_program("fn main(x: i64) -> trit { let g = egate(x); return g; }", vec![OmniValue::Int(1)]), "MISSING_CAP")?;
-    expect_omni_error_code("LINEAR_LEAK", execute_omni_surface_program("fn main(x: i64) -> i64 { let a = arena(4096); return x; }", vec![OmniValue::Int(1)]), "LINEAR_LEAK")?;
-    expect_omni_error_code("BORROW_CONFLICT", execute_omni_surface_program("fn main(x: i64) -> i64 { let a = arena(4096); let r = borrow_r(a); drop(a); drop(r); return x; }", vec![OmniValue::Int(1)]), "BORROW_CONFLICT")?;
+    let st_taint_ret = expect_omni_error_code(
+        "TAINT_ON_RET",
+        execute_omni_surface_program("fn main(x: i64 @untrusted) -> i64 {\n    let safe_a = 1;\n    return x;\n}", vec![OmniValue::Int(1)]),
+        "TAINT_ON_RET",
+    )?;
+    if st_taint_ret.line != Some(3) || st_taint_ret.col != Some(5) {
+        return Err(format!("TAINT_ON_RET span mismatch: {:?}:{:?} (want 3:5)", st_taint_ret.line, st_taint_ret.col));
+    }
+    let st_taint_sink = expect_omni_error_code(
+        "TAINT_SINK",
+        execute_omni_surface_program("#[cap(AI)]\nfn main(x: i64 @untrusted) -> trit {\n    let g = egate(x);\n    return g;\n}", vec![OmniValue::Int(1)]),
+        "TAINT_SINK",
+    )?;
+    if st_taint_sink.line != Some(3) || st_taint_sink.col != Some(13) {
+        return Err(format!("TAINT_SINK span mismatch: {:?}:{:?} (want 3:13)", st_taint_sink.line, st_taint_sink.col));
+    }
+    let st_missing_cap = expect_omni_error_code(
+        "MISSING_CAP",
+        execute_omni_surface_program("fn main(x: i64) -> trit {\n    let g = egate(x);\n    return g;\n}", vec![OmniValue::Int(1)]),
+        "MISSING_CAP",
+    )?;
+    if st_missing_cap.line != Some(2) || st_missing_cap.col != Some(13) {
+        return Err(format!("MISSING_CAP span mismatch: {:?}:{:?} (want 2:13)", st_missing_cap.line, st_missing_cap.col));
+    }
+    let st_leak = expect_omni_error_code(
+        "LINEAR_LEAK",
+        execute_omni_surface_program("fn main(x: i64) -> i64 {\n    let a = arena(4096);\n    return x;\n}", vec![OmniValue::Int(1)]),
+        "LINEAR_LEAK",
+    )?;
+    if st_leak.line != Some(3) || st_leak.col != Some(5) {
+        return Err(format!("LINEAR_LEAK span mismatch: {:?}:{:?} (want 3:5)", st_leak.line, st_leak.col));
+    }
+    let st_borrow = expect_omni_error_code(
+        "BORROW_CONFLICT",
+        execute_omni_surface_program("fn main(x: i64) -> i64 {\n    let a = arena(4096);\n    let r = borrow_r(a);\n    drop(a);\n    drop(r);\n    return x;\n}", vec![OmniValue::Int(1)]),
+        "BORROW_CONFLICT",
+    )?;
+    if st_borrow.line != Some(4) || st_borrow.col != Some(5) {
+        return Err(format!("BORROW_CONFLICT span mismatch: {:?}:{:?} (want 4:5)", st_borrow.line, st_borrow.col));
+    }
     let undef = expect_omni_error_code("UNDEF_VAR", compile_omni_surface_to_u16("fn main(x: i64) -> i64 {\n    let r = missing_y + 1;\n    return r;\n}"), "UNDEF_VAR")?;
     if undef.line != Some(2) || undef.col != Some(13) {
         return Err(format!("UNDEF_VAR structured span mismatch: {:?}:{:?} (want 2:13)", undef.line, undef.col));
@@ -3095,7 +4212,10 @@ pub fn run_ai_first_surface_selftests() -> Result<usize, String> {
     expect_omni_error_code("ARITY_MISMATCH", compile_omni_surface_to_u16("fn main(x: i64) -> i64 { let r = iabs(x, x); return r; }"), "ARITY_MISMATCH")?;
     expect_omni_error_code("UNRESOLVED_LABEL", compile_omni_surface_to_u16("fn main(x: i64) -> i64 { goto 9; return x; }"), "UNRESOLVED_LABEL")?;
     expect_omni_error_code("CIRCULAR_INCLUDE", resolve_omni_surface_includes("include \"loop.omni\"; fn main(x: i64) -> i64 { return x; }", None, Some(&loop_vfs)), "CIRCULAR_INCLUDE")?;
-    expect_omni_error_code("BUDGET_EXCEEDED(aot)", execute_omni_surface_program(runaway, vec![OmniValue::Int(1000)]), "BUDGET_EXCEEDED")?;
+    let st_bud_aot = expect_omni_error_code("BUDGET_EXCEEDED(aot)", execute_omni_surface_program(runaway, vec![OmniValue::Int(1000)]), "BUDGET_EXCEEDED")?;
+    if st_bud_aot.line != Some(1) || st_bud_aot.col != Some(3) {
+        return Err(format!("BUDGET_EXCEEDED(aot) span mismatch: {:?}:{:?} (want 1:3)", st_bud_aot.line, st_bud_aot.col));
+    }
     expect_omni_error_code("BUDGET_EXCEEDED(vm)", execute_omni_surface_program_with_budgets(runaway, vec![OmniValue::Int(1000)], Some(100_000), Some(1024 * 1024)), "BUDGET_EXCEEDED")?;
     expect_omni_error_code("BUDGET_EXCEEDED(mem)", execute_omni_surface_program("#[mem_budget(16)] fn main(x: i64) -> str { let s = \"0123456789ABCDEF0123456789ABCDEF\"; let clean = san_dom(s); return clean; }", vec![OmniValue::Int(1)]), "BUDGET_EXCEEDED")?;
     expect_omni_error_code("CORRUPT_PACK5", compile_pure_u16_to_wasm(&corrupt_u16), "CORRUPT_PACK5")?;
@@ -3128,11 +4248,14 @@ pub fn run_ai_first_surface_selftests() -> Result<usize, String> {
     }
     checks += 5;
 
-    // 13t. Version-locked omni-harness JSON contract.
+    // 13t. Version-locked omni-harness JSON contract (with non-null 1-based line and col on all failures).
     let want_version = format!("\"version\":\"{}\"", OMNI_HARNESS_CONTRACT_VERSION);
     let contains_all = |s: &str, parts: &[&str], label: &str| -> Result<(), String> {
         if s.contains('\n') {
             return Err(format!("Harness '{}' output is not single-line JSON: {}", label, s));
+        }
+        if s.starts_with("{\"ok\":false") && (s.contains("\"line\":null") || s.contains("\"col\":null")) {
+            return Err(format!("Harness '{}' failure JSON contains null line/col span: {}", label, s));
         }
         for p in parts {
             if !s.contains(p) {
@@ -3146,17 +4269,21 @@ pub fn run_ai_first_surface_selftests() -> Result<usize, String> {
     if ok_json != run_omni_harness_json("fn main(a: i64, b: i64) -> i64 { return a + b; }", vec![OmniValue::Int(2), OmniValue::Int(3)], false, false) {
         return Err(String::from("Harness output is not deterministic"));
     }
-    let taint_json = run_omni_harness_json("fn main(x: i64 @untrusted) -> i64 { return x; }", vec![OmniValue::Int(1)], false, true);
-    contains_all(&taint_json, &["{\"ok\":false", &want_version, "\"code\":\"TAINT_ON_RET\"", "\"retry_hint\":\"Sanitize"], "taint")?;
-    let cap_json = run_omni_harness_json("fn main(x: i64) -> trit { let g = egate(x); return g; }", vec![OmniValue::Int(1)], false, false);
-    contains_all(&cap_json, &["\"ok\":false", "\"code\":\"MISSING_CAP\""], "cap")?;
+    let taint_json = run_omni_harness_json("fn main(x: i64 @untrusted) -> i64 {\n    return x;\n}", vec![OmniValue::Int(1)], false, true);
+    contains_all(&taint_json, &["{\"ok\":false", &want_version, "\"code\":\"TAINT_ON_RET\"", "\"line\":2,\"col\":5", "\"retry_hint\":\"Sanitize"], "taint")?;
+    let cap_json = run_omni_harness_json("fn main(x: i64) -> trit {\n    let g = egate(x);\n    return g;\n}", vec![OmniValue::Int(1)], false, false);
+    contains_all(&cap_json, &["\"ok\":false", "\"code\":\"MISSING_CAP\"", "\"line\":2,\"col\":13"], "cap")?;
     if cap_json.contains("retry_hint") {
         return Err(String::from("Harness emitted retry_hint without --retry-hint"));
     }
     let budget_json = run_omni_harness_json(runaway, vec![OmniValue::Int(1000)], false, false);
-    contains_all(&budget_json, &["\"ok\":false", "\"code\":\"BUDGET_EXCEEDED\""], "budget")?;
+    contains_all(&budget_json, &["\"ok\":false", "\"code\":\"BUDGET_EXCEEDED\"", "\"line\":1,\"col\":3"], "budget")?;
     let strict_json = run_omni_harness_json("fn main(a: i64) -> i64 {\n    let b = a * 2;\n    return b;\n}", vec![OmniValue::Int(1)], true, true);
-    contains_all(&strict_json, &["\"ok\":false", "\"code\":\"BAD_TYPE\"", "\"line\":2", "\"tokens\":null", "\"retry_hint\":"], "strict")?;
+    contains_all(&strict_json, &["\"ok\":false", "\"code\":\"BAD_TYPE\"", "\"line\":2,\"col\":9", "\"tokens\":null", "\"retry_hint\":"], "strict")?;
+    let undef_json = run_omni_harness_json("fn main(a: i64) -> i64 {\n    let b = unknown_v + 1;\n    return b;\n}", vec![OmniValue::Int(1)], false, true);
+    contains_all(&undef_json, &["\"ok\":false", "\"code\":\"UNDEF_VAR\"", "\"line\":2,\"col\":13"], "undef")?;
+    let syn_json = run_omni_harness_json("fn main(a: i64) -> i64 {\n    let b = ;\n    return b;\n}", vec![OmniValue::Int(1)], false, true);
+    contains_all(&syn_json, &["\"ok\":false", "\"code\":\"SYNTAX_ERROR\"", "\"line\":2,\"col\":13"], "syntax")?;
     let route_json = run_omni_harness_json(route_kv, vec![OmniValue::Int(42)], false, false);
     contains_all(&route_json, &["\"ok\":true", "\"result\":\"200000777\"", "\"backend\":\"vm\""], "route")?;
     let trit_json = run_omni_harness_json("#[cap(AI)] fn main(a: i64, b: i64) -> trit { let g = egate(a - b); return g; }", vec![OmniValue::Int(30), OmniValue::Int(10)], false, false);
@@ -3168,7 +4295,127 @@ pub fn run_ai_first_surface_selftests() -> Result<usize, String> {
             return Err(format!("Harness --spec missing error code {}", code));
         }
     }
-    checks += 8;
+    checks += 10;
+
+    // 13u. Version-locked Agent Driver (`omni-agent-driver`) emit + repair loop selftests.
+    if run_omni_agent_repair_loop("fn main() -> i64 { return 1; }", vec![], false, 3, "omni-harness-v0.9.0").is_ok() {
+        return Err(String::from("Agent driver must refuse mismatched harness contract version"));
+    }
+    checks += 1;
+
+    // Repair case 1: MISSING_CAP on egate -> repairs to #[cap(AI)] and returns +1t
+    let rep_cap = run_omni_agent_repair_loop(
+        "fn main(a: i64, b: i64) -> trit {\n    let g: trit = egate(a - b);\n    return g;\n}",
+        vec![OmniValue::Int(30), OmniValue::Int(10)],
+        true,
+        3,
+        OMNI_HARNESS_CONTRACT_VERSION,
+    )?;
+    if !rep_cap.ok || rep_cap.attempts.len() != 2 || rep_cap.attempts[0].error.as_ref().map(|e| (e.code, e.line, e.col)) != Some(("MISSING_CAP", Some(2), Some(19))) {
+        return Err(format!("Agent driver MISSING_CAP repair failed: {:?}", rep_cap));
+    }
+    checks += 1;
+
+    // Repair case 2: TAINT_ON_RET -> sanitizes return value with auth_verify and #[cap(AUTH)]
+    let rep_taint = run_omni_agent_repair_loop(
+        "fn main(x: i64 @untrusted) -> i64 {\n    return x;\n}",
+        vec![OmniValue::Int(42)],
+        true,
+        3,
+        OMNI_HARNESS_CONTRACT_VERSION,
+    )?;
+    if !rep_taint.ok || rep_taint.attempts.len() != 2 || rep_taint.attempts[0].error.as_ref().map(|e| (e.code, e.line)) != Some(("TAINT_ON_RET", Some(2))) {
+        return Err(format!("Agent driver TAINT_ON_RET repair failed: {:?}", rep_taint));
+    }
+    checks += 1;
+
+    // Repair case 3: TAINT_SINK on db_query -> sanitizes query parameter and adds AUTH capability
+    let rep_sink = run_omni_agent_repair_loop(
+        "#[cap(DB_R)]\nfn main(id: i64 @untrusted) -> i64 {\n    let r: i64 = db_query(\"SELECT * FROM users WHERE id = ?\", id);\n    return r;\n}",
+        vec![OmniValue::Int(42)],
+        true,
+        3,
+        OMNI_HARNESS_CONTRACT_VERSION,
+    )?;
+    if !rep_sink.ok || rep_sink.attempts.len() != 2 || !rep_sink.final_json.contains("\"result\":\"420\"") {
+        return Err(format!("Agent driver TAINT_SINK repair failed: {:?}", rep_sink));
+    }
+    checks += 1;
+
+    // Repair case 4: Multi-step strict repair (AMBIGUOUS_GRAMMAR + untyped let BAD_TYPE + MISSING_CAP)
+    let rep_multi = run_omni_agent_repair_loop(
+        "fn main(a: int) -> trit {\n    let d = a - 10;\n    let g = egate(d);\n    return g;\n}",
+        vec![OmniValue::Int(25)],
+        true,
+        5,
+        OMNI_HARNESS_CONTRACT_VERSION,
+    )?;
+    if !rep_multi.ok || rep_multi.attempts.len() < 3 || !rep_multi.final_json.contains("\"result\":\"+1t\"") {
+        return Err(format!("Agent driver multi-step strict repair failed: {:?}", rep_multi));
+    }
+    checks += 1;
+
+    // Repair case 5: BUDGET_EXCEEDED -> raises #[step_budget(N)] and completes
+    let rep_budget = run_omni_agent_repair_loop(
+        runaway,
+        vec![OmniValue::Int(10)],
+        false,
+        3,
+        OMNI_HARNESS_CONTRACT_VERSION,
+    )?;
+    if !rep_budget.ok || rep_budget.attempts.len() != 2 || !rep_budget.final_json.contains("\"result\":\"55\"") {
+        return Err(format!("Agent driver BUDGET_EXCEEDED repair failed: {:?}", rep_budget));
+    }
+    checks += 1;
+
+    // 13v. Live Native TCP HTTP/1.1 + DB/KV Host Golden (`serve_omni_http_batch` & `serve_omni_http_once`).
+    // 1) Verifier must reject serving a route without required capabilities before binding a port.
+    let uncap_route = "route GET /users/:id (req: i64) {\n    let id: i64 = req.param(\"id\");\n    let row: i64 = db_query(\"SELECT * FROM users WHERE id = ?\", id);\n    respond(200, row);\n}";
+    expect_omni_error_code(
+        "live_host_missing_cap",
+        serve_omni_http_once(uncap_route, "127.0.0.1:0", BTreeMap::new()).map(|(a, _)| a),
+        "MISSING_CAP",
+    )?;
+    checks += 1;
+
+    // 2) Live end-to-end TCP HTTP/1.1 golden: POST /users/42 writes 777 into host KV, GET /users/42 reads 777 back over real TCP sockets!
+    let live_fullstack_omni = "#[strict]\n#[cap(NET, DB_W)]\nroute POST /users/:id (req: i64) {\n    let id: i64 = req.param(\"id\");\n    let saved: i64 = kv_put(id, 777);\n    respond(201, saved);\n}\n#[strict]\n#[cap(NET, DB_R)]\nroute GET /users/:id (req: i64) {\n    let id: i64 = req.param(\"id\");\n    let row: i64 = db_get(id);\n    respond(200, row);\n}";
+    let (listen_addr, server_handle) = serve_omni_http_batch(live_fullstack_omni, "127.0.0.1:0", BTreeMap::new(), 2)?;
+    {
+        use std::io::{Read, Write};
+        let mut client1 = std::net::TcpStream::connect(listen_addr)
+            .map_err(|e| format!("TCP client1 connect failed: {}", e))?;
+        client1
+            .write_all(b"POST /users/42 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .map_err(|e| format!("TCP client1 write failed: {}", e))?;
+        let mut wire1 = String::new();
+        client1
+            .read_to_string(&mut wire1)
+            .map_err(|e| format!("TCP client1 read failed: {}", e))?;
+        if !wire1.starts_with("HTTP/1.1 201 Created\r\n") || !wire1.contains("{\"status\":201,\"data\":777}") {
+            return Err(format!("Live HTTP POST /users/42 unexpected wire response: {}", wire1));
+        }
+
+        let mut client2 = std::net::TcpStream::connect(listen_addr)
+            .map_err(|e| format!("TCP client2 connect failed: {}", e))?;
+        client2
+            .write_all(b"GET /users/42 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .map_err(|e| format!("TCP client2 write failed: {}", e))?;
+        let mut wire2 = String::new();
+        client2
+            .read_to_string(&mut wire2)
+            .map_err(|e| format!("TCP client2 read failed: {}", e))?;
+        if !wire2.starts_with("HTTP/1.1 200 OK\r\n") || !wire2.contains("{\"status\":200,\"data\":777}") {
+            return Err(format!("Live HTTP GET /users/42 unexpected wire response: {}", wire2));
+        }
+    }
+    let (resps, final_kv) = server_handle
+        .join()
+        .map_err(|_| String::from("Live HTTP server thread panicked"))??;
+    if resps.len() != 2 || final_kv.get(&42) != Some(&777) {
+        return Err(format!("Live HTTP host KV state mismatch: {:?}", final_kv));
+    }
+    checks += 2;
 
     Ok(checks)
 }

@@ -82,13 +82,16 @@
 ## Phase 6: AI-First Surface Additions, Full-Stack Host ABI & Version-Locked Harness (Complete)
 - [x] **1. CI, Standalone Edition-Free Compilation & Workspace Path Sync (Section 1)**:
   - Added `use std::convert::TryInto;` to `omni_rust_bootstrap.rs` so `rustc -O omni_rust_bootstrap.rs -o omni` compiles cleanly with `0` warnings without needing `--edition 2021`.
-  - Synchronized `.github/workflows/ci.yml`, `README.md`, `spec.md`, `omni_full_status_audit.md`, and `omni_progress_checklist.md` (`237` monolith checks / `198` Windows & `199` Linux workspace differential checks).
+  - Synchronized `.github/workflows/ci.yml`, `README.md`, `spec.md`, `omni_full_status_audit.md`, and `omni_progress_checklist.md` (`248` monolith checks / `209` Windows & `210` Linux workspace differential checks).
 - [x] **2. Golden Size Regression Gate & Stricter Single-Form Grammar (`#[strict]` / `--strict`, Section 2.1, 2.3, 2.4)**:
   - Locked exact `u16` token counts `[53, 34, 34, 91, 40, 20, 22, 22, 49, 49, 51, 74, 69, 57, 86]` across all 15 `SPEC.md` goldens (`13p` / `6q`).
   - Added zero-cost explicit `: <ty>` annotations on `let` (`let x: i64 = ...;`, `let v: trit_vec = [...]` traveling as `@PACK5` by default: `2` B vs `80` B for 10 trits, `10` B vs `400` B for 50 trits) and `compile_omni_surface_strict_to_u16` (`13q` / `6r`).
-- [x] **3. Machine-Readable Error Codes (`error[<CODE>]`, Section 2.2 & 2.5)**:
+- [x] **3. Machine-Readable Error Codes & Non-Null 1-Based Source Spans (`error[<CODE>]`, Section 2.2 & 2.5)**:
   - Standardized all 16 error codes across lexer, parser, lowering, static verifier, `@PACK5`, and step/memory budgets (`TAINT_ON_RET`, `TAINT_SINK`, `MISSING_CAP`, `LINEAR_LEAK`, `BORROW_CONFLICT`, `UNDEF_VAR`, `IMMUT_PARAM`, `BAD_TYPE`, `UNKNOWN_FN`, `ARITY_MISMATCH`, `UNRESOLVED_LABEL`, `CIRCULAR_INCLUDE`, `BUDGET_EXCEEDED`, `CORRUPT_PACK5`, `AMBIGUOUS_GRAMMAR`, `SYNTAX_ERROR`, `13r` / `6s`).
-- [x] **4. Full-Stack `route` + `req.param` + DB/KV Host ABI (Zero New Opcodes, Section 3)**:
+  - Added `SurfaceSourceMap` (`compile_omni_surface_to_u16_with_sourcemap` + `annotate_omni_error_with_sourcemap`) mapping binary verifier instruction offsets (`Offset N: ...`) and runtime budget traps (`BUDGET_EXCEEDED`) back to 1-based `(line, col)` `.omni` source coordinates so every `omni-harness` failure includes non-null `"line"` and `"col"`.
+- [x] **4. Full-Stack `route` + `req.param` + DB/KV Host ABI & Live TCP HTTP/1.1 Server (Zero New Opcodes, Section 3)**:
   - Wired existing `OMNI_ISA_TABLE` opcodes `0x7F64..=0x7F70` (`DB_GET`, `DB_QRY`, `DB_CNT`, `KV_PUT`, `ROUTE`, `REQ_PAR`, `RSP_JSON`, `RSP_HTML`, `AUTH_VER`) through the assembler, `OmniBinaryVm`, and `omni-lang`, with capability (`MISSING_CAP`) and taint (`TAINT_SINK`) verification (`13s` / `6t`).
-- [x] **5. Version-Locked Model Harness (`omni-harness` / `omni-harness-v1.0.0`, Section 4)**:
-  - Added `OMNI_HARNESS_CONTRACT_VERSION = "omni-harness-v1.0.0"`, `run_omni_harness_json`, `omni_harness_spec_json`, `omni harness`, and the standalone `omni-harness` binary target (`13t` / `6u`, `237` monolith checks / `198` Windows & `199` Linux workspace differential checks passing with `0` warnings).
+  - Added live native TCP HTTP/1.1 + DB/KV host runtime (`serve_omni_http_once`, `serve_omni_http_batch`, `handle_omni_http_request`, `omni serve`) verified with real `std::net::TcpListener` / `std::net::TcpStream` `POST /users/42` (`201 Created`) + `GET /users/42` (`200 OK`) wire requests (`13v` / `6w`).
+- [x] **5. Version-Locked Model Harness (`omni-harness`) & Autonomous Agent Driver (`omni-agent-driver`, Section 4)**:
+  - Added `OMNI_HARNESS_CONTRACT_VERSION = "omni-harness-v1.0.0"`, `run_omni_harness_json`, `omni_harness_spec_json`, `omni harness`, and the standalone `omni-harness` binary target (`13t` / `6u`).
+  - Added `omni-agent-driver` (`run_omni_agent_repair_loop_with_model`, `run_omni_agent_repair_loop`, `run_omni_agent_driver_json`, `run_omni_agent_driver_cli`) beside `omni-harness` with strict contract version lock (`VERSION_MISMATCH`) and multi-step emit-and-repair loops verified across 6 error categories (`13u` / `6v`, `248` monolith checks / `209` Windows & `210` Linux workspace differential checks passing with `0` warnings).

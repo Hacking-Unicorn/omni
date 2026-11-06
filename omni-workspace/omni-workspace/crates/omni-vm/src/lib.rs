@@ -30,6 +30,8 @@ pub const MAX_VM_CALL_DEPTH: usize = 64;
 pub struct OmniBinaryVm {
     pub tables: HashMap<u16, Vec<BTreeMap<u16, OmniValue>>>,
     pub kv_store: BTreeMap<i64, i64>,
+    pub req_params: BTreeMap<i64, i64>,
+    pub last_http_response: Option<(u16, String, String)>,
     pub step_limit: u64,
     pub steps_executed: u64,
     pub memory_budget_bytes: usize,
@@ -42,6 +44,8 @@ impl OmniBinaryVm {
         Self {
             tables: HashMap::new(),
             kv_store: BTreeMap::new(),
+            req_params: BTreeMap::new(),
+            last_http_response: None,
             step_limit: DEFAULT_VM_STEP_LIMIT,
             steps_executed: 0,
             memory_budget_bytes: DEFAULT_VM_MEMORY_BUDGET_BYTES,
@@ -54,6 +58,8 @@ impl OmniBinaryVm {
         Self {
             tables: HashMap::new(),
             kv_store: BTreeMap::new(),
+            req_params: BTreeMap::new(),
+            last_http_response: None,
             step_limit,
             steps_executed: 0,
             memory_budget_bytes,
@@ -65,6 +71,8 @@ impl OmniBinaryVm {
     pub fn clear_tables(&mut self) {
         self.tables.clear();
         self.kv_store.clear();
+        self.req_params.clear();
+        self.last_http_response = None;
         self.steps_executed = 0;
         self.allocated_bytes = 0;
         self.call_depth = 0;
@@ -520,17 +528,49 @@ impl OmniBinaryVm {
                     OmniValue::Int(method_id.wrapping_mul(1000).wrapping_add(route_id & 0x3FF))
                 }
                 0x7F6D => {
-                    if let Some(op0) = ins.operands.first() {
-                        match op0 {
-                            BinOperand::ImmInt(p_idx) if (0..32).contains(p_idx) => {
-                                let slot = 192 + (*p_idx as usize);
-                                if regs[slot] != OmniValue::Void {
-                                    regs[slot].clone()
-                                } else {
-                                    OmniValue::Int(*p_idx)
+                    if let Some(op1) = ins.operands.get(1) {
+                        if let Some(key_hash) = Self::eval_as_i64(op1, &regs) {
+                            if let Some(&val) = self.req_params.get(&key_hash) {
+                                OmniValue::Int(val)
+                            } else if let Some(op0) = ins.operands.first() {
+                                match op0 {
+                                    BinOperand::ImmInt(p_idx) if (0..32).contains(p_idx) => {
+                                        let slot = 192 + (*p_idx as usize);
+                                        if regs[slot] != OmniValue::Void {
+                                            regs[slot].clone()
+                                        } else {
+                                            OmniValue::Int(*p_idx)
+                                        }
+                                    }
+                                    other => Self::eval_op(other, &regs),
+                                }
+                            } else {
+                                OmniValue::Int(0)
+                            }
+                        } else if let Some(op0) = ins.operands.first() {
+                            Self::eval_op(op0, &regs)
+                        } else {
+                            OmniValue::Int(0)
+                        }
+                    } else if let Some(op0) = ins.operands.first() {
+                        if let Some(key_hash) = Self::eval_as_i64(op0, &regs) {
+                            if let Some(&val) = self.req_params.get(&key_hash) {
+                                OmniValue::Int(val)
+                            } else {
+                                match op0 {
+                                    BinOperand::ImmInt(p_idx) if (0..32).contains(p_idx) => {
+                                        let slot = 192 + (*p_idx as usize);
+                                        if regs[slot] != OmniValue::Void {
+                                            regs[slot].clone()
+                                        } else {
+                                            OmniValue::Int(*p_idx)
+                                        }
+                                    }
+                                    other => Self::eval_op(other, &regs),
                                 }
                             }
-                            other => Self::eval_op(other, &regs),
+                        } else {
+                            Self::eval_op(op0, &regs)
                         }
                     } else {
                         OmniValue::Int(0)
@@ -539,6 +579,12 @@ impl OmniBinaryVm {
                 0x7F6E => {
                     let status = ins.operands.first().and_then(|op| Self::eval_as_i64(op, &regs)).unwrap_or(200);
                     let body = ins.operands.get(1).and_then(|op| Self::eval_as_i64(op, &regs)).unwrap_or(0);
+                    let json_body = format!("{{\"status\":{},\"data\":{}}}", status, body);
+                    self.last_http_response = Some((
+                        status.clamp(100, 599) as u16,
+                        String::from("application/json"),
+                        json_body,
+                    ));
                     OmniValue::Int(status.wrapping_mul(1_000_000).wrapping_add(body))
                 }
                 0x7F6F => {
@@ -546,6 +592,11 @@ impl OmniBinaryVm {
                     let body = ins.operands.get(1).map(|op| Self::eval_op(op, &regs)).unwrap_or(OmniValue::Void);
                     let out_s = format!("<http status=\"{}\">{:?}</http>", status, body);
                     self.charge_memory(out_s.len())?;
+                    self.last_http_response = Some((
+                        status.clamp(100, 599) as u16,
+                        String::from("text/html; charset=utf-8"),
+                        out_s.clone(),
+                    ));
                     OmniValue::Str(out_s)
                 }
                 0x7F70 => {

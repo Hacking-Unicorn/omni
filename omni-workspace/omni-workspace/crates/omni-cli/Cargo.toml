@@ -12,6 +12,10 @@ path = "src/main.rs"
 name = "omni-harness"
 path = "src/bin/omni-harness.rs"
 
+[[bin]]
+name = "omni-agent-driver"
+path = "src/bin/omni-agent-driver.rs"
+
 [dependencies]
 omni-isa = { path = "../omni-isa" }
 omni-ir = { path = "../omni-ir" }
