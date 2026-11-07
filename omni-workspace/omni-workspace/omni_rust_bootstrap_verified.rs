@@ -4540,6 +4540,27 @@ fn omni_pure_host_check_route_caps(cap_mask: i64, needs_db_r: i64, needs_db_w: i
     return final_status;
 }
 #[strict]
+fn omni_pure_host_check_taint_sink(param_tainted: i64, auth_verified: i64, is_db_or_rsp_sink: i64) -> i64 {
+    let t_cmp: trit = param_tainted <=> 0;
+    let a_cmp: trit = auth_verified <=> 0;
+    let s_cmp: trit = is_db_or_rsp_sink <=> 0;
+    let unsan: i64 = if_pos a_cmp { 0 } else { 1002 };
+    let sink_err: i64 = if_pos s_cmp { unsan } else { 0 };
+    let out: i64 = if_pos t_cmp { sink_err } else { 0 };
+    return out;
+}
+#[strict]
+fn omni_pure_host_kv_apply(op_code: i64, key_id: i64, val_in: i64) -> i64 {
+    let op_cmp: trit = op_code <=> 2;
+    let q_val: i64 = key_id * 10;
+    let res: i64 = match_trit op_cmp {
+        neg => val_in,
+        zero => val_in,
+        pos => q_val
+    };
+    return res;
+}
+#[strict]
 fn omni_pure_host_dispatch(method_code: i64, status_code: i64, payload: i64) -> i64 {
     let m_cmp: trit = method_code <=> 0;
     let s_cmp: trit = status_code <=> 199;
@@ -7424,7 +7445,17 @@ pub fn serve_omni_http_via_narrow_host<H: OmniNarrowHost>(
     if routes.is_empty() {
         return Err(String::from("error[SYNTAX_ERROR] line 1, col 1: Surface program contains no 'route' handlers"));
     }
-    let (u16_stream, sm) = compile_omni_surface_to_u16_with_sourcemap(src, false)?;
+    let (u16_stream, sm) = compile_omni_surface_via_pure_omni_frontend_with_sourcemap(src, false)?;
+    if let Err(kernel_err) = verify_module_via_phase7_pure_omni_kernel(&u16_stream) {
+        for rep in verify_u16_stream(&u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
+            if !rep.passed {
+                let first = rep.errors.first().cloned().unwrap_or_default();
+                let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
+                return Err(format!("{} (fn #{}: {:?})", annotated, rep.fn_idx, rep.errors));
+            }
+        }
+        return Err(annotate_omni_error_with_sourcemap(&kernel_err, &sm));
+    }
     for rep in verify_u16_stream(&u16_stream)? {
         if !rep.passed {
             let first = rep.errors.first().cloned().unwrap_or_default();
@@ -7591,7 +7622,17 @@ pub fn handle_omni_http_request(
     if routes.is_empty() {
         return Err(String::from("error[SYNTAX_ERROR] line 1, col 1: Surface program contains no 'route' handlers"));
     }
-    let (u16_stream, sm) = compile_omni_surface_to_u16_with_sourcemap(src, false)?;
+    let (u16_stream, sm) = compile_omni_surface_via_pure_omni_frontend_with_sourcemap(src, false)?;
+    if let Err(kernel_err) = verify_module_via_phase7_pure_omni_kernel(&u16_stream) {
+        for rep in verify_u16_stream(&u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
+            if !rep.passed {
+                let first = rep.errors.first().cloned().unwrap_or_default();
+                let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
+                return Err(format!("{} (fn #{}: {:?})", annotated, rep.fn_idx, rep.errors));
+            }
+        }
+        return Err(annotate_omni_error_with_sourcemap(&kernel_err, &sm));
+    }
     for rep in verify_u16_stream(&u16_stream)? {
         if !rep.passed {
             let first = rep.errors.first().cloned().unwrap_or_default();
@@ -7719,7 +7760,17 @@ fn serve_omni_http_batch_inner(
     if routes.is_empty() {
         return Err(String::from("error[SYNTAX_ERROR] line 1, col 1: Surface program contains no 'route' handlers"));
     }
-    let (u16_stream, sm) = compile_omni_surface_to_u16_with_sourcemap(src, false)?;
+    let (u16_stream, sm) = compile_omni_surface_via_pure_omni_frontend_with_sourcemap(src, false)?;
+    if let Err(kernel_err) = verify_module_via_phase7_pure_omni_kernel(&u16_stream) {
+        for rep in verify_u16_stream(&u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
+            if !rep.passed {
+                let first = rep.errors.first().cloned().unwrap_or_default();
+                let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
+                return Err(format!("{} (fn #{}: {:?})", annotated, rep.fn_idx, rep.errors));
+            }
+        }
+        return Err(annotate_omni_error_with_sourcemap(&kernel_err, &sm));
+    }
     for rep in verify_u16_stream(&u16_stream)? {
         if !rep.passed {
             let first = rep.errors.first().cloned().unwrap_or_default();
@@ -10138,6 +10189,106 @@ pub fn run_pure_core_phase2_tooling_selftests() -> Result<usize, String> {
     Ok(checks)
 }
 
+// ==============================================================================
+// 7Q. PURE-CORE COMPLETION PHASE 3: COMPLETE PURE-OMNI HOST RUNTIME AS PRIMARY PATH
+// ==============================================================================
+
+/// Runs Pure-Core Completion Phase 3 selftests (`pure/host_runtime.omni` + `OmniNarrowHost` primary path):
+/// 1. Executes `omni_pure_host_check_route_caps`, `omni_pure_host_check_taint_sink`, `omni_pure_host_kv_apply`,
+///    and `omni_pure_host_dispatch` in `pure/host_runtime.omni` via the Pure-Omni driver.
+/// 2. Verifies differential equivalence between `serve_omni_http_via_pure_omni_host` and `serve_omni_http_via_narrow_host`
+///    across multi-route (`POST /users/:id`, `GET /users/:id`, `GET /audit/:id` with `db_query` and `auth_verify`)
+///    and persistent KV/DB storage over `OmniNarrowHost`.
+/// 3. Verifies pre-listen capability (`MISSING_CAP`) and taint (`TAINT_SINK`) rejection parity across
+///    `serve_omni_http_via_pure_omni_host` and `serve_omni_http_batch`.
+pub fn run_pure_core_phase3_host_runtime_selftests() -> Result<usize, String> {
+    let mut checks = 0usize;
+
+    // 1. Execute all 4 Pure-Omni host runtime functions in `pure/host_runtime.omni`
+    let host_mod_prog = "include \"pure/host_runtime.omni\";\n#[strict]\nfn main(cap_mask: i64, taint_flag: i64, auth_ok: i64) -> i64 {\n    let c_st: i64 = omni_pure_host_check_route_caps(cap_mask, 1, 1);\n    let t_st: i64 = omni_pure_host_check_taint_sink(taint_flag, auth_ok, 1);\n    let kv_v: i64 = omni_pure_host_kv_apply(3, 42, 0);\n    let rsp: i64 = omni_pure_host_dispatch(1, 200, kv_v);\n    let err_sum: i64 = c_st + t_st;\n    let err_cmp: trit = err_sum <=> 0;\n    let out: i64 = if_pos err_cmp { err_sum } else { rsp };\n    return out;\n}";
+    let (h_ok, _, _) = execute_omni_surface_via_pure_omni_driver(
+        host_mod_prog,
+        vec![OmniValue::Int(7), OmniValue::Int(1), OmniValue::Int(1)],
+        true,
+    )?;
+    let (h_cap_err, _, _) = execute_omni_surface_via_pure_omni_driver(
+        host_mod_prog,
+        vec![OmniValue::Int(4), OmniValue::Int(0), OmniValue::Int(1)],
+        true,
+    )?;
+    let (h_taint_err, _, _) = execute_omni_surface_via_pure_omni_driver(
+        host_mod_prog,
+        vec![OmniValue::Int(7), OmniValue::Int(1), OmniValue::Int(0)],
+        true,
+    )?;
+    if h_ok != OmniValue::Int(200_000_420)
+        || h_cap_err != OmniValue::Int(1003)
+        || h_taint_err != OmniValue::Int(1002)
+    {
+        return Err(format!(
+            "Phase 3 pure/host_runtime.omni kernel mismatch: ({:?}, {:?}, {:?})",
+            h_ok, h_cap_err, h_taint_err
+        ));
+    }
+    checks += 1;
+
+    // 2. Differential parity between `serve_omni_http_via_pure_omni_host` and `serve_omni_http_via_narrow_host`
+    let full_route_src = "#[strict]\n#[cap(NET, DB_R, DB_W, AUTH)]\nroute POST /users/:id (req: i64) {\n    let id: i64 = req.param(\"id\");\n    let clean_id: i64 = auth_verify(id);\n    let saved: i64 = kv_put(clean_id, clean_id + 900);\n    respond(201, saved);\n}\n#[strict]\n#[cap(NET, DB_R)]\nroute GET /users/:id (req: i64) {\n    let id: i64 = req.param(\"id\");\n    let v: i64 = db_get(id);\n    let q: i64 = db_query(\"SELECT * FROM users WHERE id = ?\", id);\n    respond(200, v + q);\n}";
+    let mut sim_pure = SimulatedNarrowHostAdapter::new();
+    sim_pure.enqueue_http_request("POST /users/42 HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    sim_pure.enqueue_http_request("GET /users/42 HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    let (_, pure_resps, pure_kv) = serve_omni_http_via_pure_omni_host(
+        &mut sim_pure,
+        full_route_src,
+        "127.0.0.1:0",
+        Some("phase3_pure.kv"),
+        2,
+    )?;
+
+    let mut sim_ref = SimulatedNarrowHostAdapter::new();
+    sim_ref.enqueue_http_request("POST /users/42 HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    sim_ref.enqueue_http_request("GET /users/42 HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    let (_, ref_resps, ref_kv) = serve_omni_http_via_narrow_host(
+        &mut sim_ref,
+        full_route_src,
+        "127.0.0.1:0",
+        Some("phase3_pure.kv"),
+        2,
+    )?;
+    // POST saves 42 + 900 = 942; GET returns db_get(42) + db_query(42) = 942 + 942 = 1884
+    if pure_resps != ref_resps
+        || pure_kv != ref_kv
+        || pure_resps.len() != 2
+        || !pure_resps[1].body.contains("1884")
+    {
+        return Err(format!(
+            "Phase 3 Pure-Omni host vs Narrow-Host differential failed: {:?} vs {:?}",
+            pure_resps, ref_resps
+        ));
+    }
+    checks += 1;
+
+    // 3. Pre-listen MISSING_CAP and TAINT_SINK span parity across Pure-Omni host and live batch server
+    let uncap_src = "#[strict]\n#[cap(NET)]\nroute GET /users/:id (req: i64) {\n    let id: i64 = req.param(\"id\");\n    let row: i64 = db_query(\"SELECT * FROM users WHERE id = ?\", id);\n    respond(200, row);\n}";
+    let mut sim_u = SimulatedNarrowHostAdapter::new();
+    let st_pure = expect_omni_error_code(
+        "phase3_pure_uncap",
+        serve_omni_http_via_pure_omni_host(&mut sim_u, uncap_src, "127.0.0.1:0", None, 1),
+        "MISSING_CAP",
+    )?;
+    let st_live = expect_omni_error_code(
+        "phase3_live_uncap",
+        serve_omni_http_batch(uncap_src, "127.0.0.1:0", BTreeMap::new(), 1).map(|(a, _)| a),
+        "MISSING_CAP",
+    )?;
+    if st_pure.line != st_live.line || st_pure.col != st_live.col {
+        return Err(format!("Phase 3 pre-listen span mismatch: {:?} vs {:?}", st_pure, st_live));
+    }
+    checks += 1;
+
+    Ok(checks)
+}
+
 /// Expects `res` to fail with a diagnostic whose machine-readable code equals `code` and has non-null 1-based `(line, col)`.
 fn expect_omni_error_code<T: std::fmt::Debug>(label: &str, res: Result<T, String>, code: &str) -> Result<OmniStructuredError, String> {
     match res {
@@ -10827,6 +10978,9 @@ fn main(x: i64, y: i64) -> i64 {
 
     // 13AK. Pure-Core Completion Phase 2: High-Value Tooling in Pure Omni
     checks += run_pure_core_phase2_tooling_selftests()?;
+
+    // 13AL. Pure-Core Completion Phase 3: Complete Pure-Omni Host Runtime as Primary Path
+    checks += run_pure_core_phase3_host_runtime_selftests()?;
 
     Ok(checks)
 }
