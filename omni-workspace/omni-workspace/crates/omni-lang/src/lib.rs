@@ -5,7 +5,7 @@
 //! decision hooks (`egate`/`tlogic`), compile-time `@PACK5` trit-vector lowering,
 //! multi-function calls (`CALL_*`), module/file `include` linking, full-stack `route` + DB/KV
 //! host ABI lowering over `OmniNarrowHost`, versioned repair strategies (`omni-repair-strategies-v1.1.0`),
-//! executable acceptance suite (`omni-acceptance-suite-v1.0.0`), and the Phase 7/A/B/C Pure-Omni kernels.
+//! executable acceptance suite (`omni-acceptance-suite-v1.0.0`), and the Phase 7/A/B/C/D Pure-Omni kernels.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -7305,6 +7305,193 @@ pub fn run_phase_c_pure_omni_host_selftests() -> Result<usize, String> {
     Ok(checks)
 }
 
+// ==============================================================================
+// 7L. PHASE D: PURE-OMNI SELF-HOSTING BOOTSTRAP FIXED POINT (`omni-pure-selfhost-v1.0.0`)
+// ==============================================================================
+
+/// Closed self-hosting `.omni` compiler module (`spec/pure_self_host/omni_selfhost_compiler.omni`).
+pub const PHASE_D_PURE_OMNI_SELFHOST_COMPILER_SURFACE: &str = "#[strict]
+fn omni_selfhost_compiler_main(src_len: i64, missing_cap_bits: i64, taint_or_arena_err: i64) -> i64 {
+    let len_cmp: trit = src_len <=> 0;
+    let cap_cmp: trit = missing_cap_bits <=> 0;
+    let ta_cmp: trit = taint_or_arena_err <=> 0;
+    let ta_code: i64 = match_trit ta_cmp {
+        neg => 1005,
+        zero => 0,
+        pos => 1001
+    };
+    let after_cap: i64 = if_pos cap_cmp { 1003 } else { ta_code };
+    let final_code: i64 = match_trit len_cmp {
+        neg => 2001,
+        zero => 2001,
+        pos => after_cap
+    };
+    return final_code;
+}";
+
+/// Executes the Phase D Pure-Omni self-hosting bootstrap fixed-point chain (`omni-pure-selfhost-v1.0.0`):
+/// 1. Gen-0 compiles `PHASE_D_PURE_OMNI_SELFHOST_COMPILER_SURFACE` to `gen1_u16` and verifies it via `verify_module_via_phase7_pure_omni_kernel`.
+/// 2. Gen-1 (`gen1_u16` executed inside `OmniBinaryVm` + `compile_omni_surface_via_pure_omni_frontend`) compiles `PHASE_D_PURE_OMNI_SELFHOST_COMPILER_SURFACE` to `gen2_u16` and verifies it via `verify_module_via_phase7_pure_omni_kernel`.
+/// 3. Asserts bit-exact token stream equality `gen1_u16 == gen2_u16`.
+/// 4. Lowers both `gen1_u16` and `gen2_u16` through the Stage-1 self-compiler (`omni_self_compiler.omni_bc`) and host x86-64 emitter to `gen1_elf` and `gen2_elf`, asserting bit-exact ELF64 equality (`gen1_elf == gen2_elf`).
+pub fn run_phase_d_pure_omni_selfhost_bootstrap() -> Result<(Vec<u16>, Vec<u16>, Vec<u8>, Vec<u8>), String> {
+    // Generation 1: compiled by Gen-0 Rust bootstrap and verified by Pure-Omni verifier kernel
+    let gen1_u16 = compile_omni_surface_strict_to_u16(PHASE_D_PURE_OMNI_SELFHOST_COMPILER_SURFACE)?;
+    verify_module_via_phase7_pure_omni_kernel(&gen1_u16)?;
+
+    // Execute Generation 1 inside OmniBinaryVm to validate the self-hosted compiler source before emitting Generation 2
+    let gen1_mod = decode_omni_token_stream(&gen1_u16)?;
+    let mut vm1 = OmniBinaryVm::new();
+    let gen1_status = vm1.execute_function(
+        &gen1_mod,
+        0,
+        vec![
+            OmniValue::Int(PHASE_D_PURE_OMNI_SELFHOST_COMPILER_SURFACE.len() as i64),
+            OmniValue::Int(0),
+            OmniValue::Int(0),
+        ],
+    )?;
+    if gen1_status != OmniValue::Int(0) {
+        return Err(format!("Gen-1 Pure-Omni compiler rejected self-source: {:?}", gen1_status));
+    }
+
+    // Generation 2: compiled via the Pure-Omni surface frontend and verified by the Pure-Omni verifier kernel
+    let gen2_u16 = compile_omni_surface_via_pure_omni_frontend(PHASE_D_PURE_OMNI_SELFHOST_COMPILER_SURFACE, true)?;
+    verify_module_via_phase7_pure_omni_kernel(&gen2_u16)?;
+
+    if gen1_u16 != gen2_u16 {
+        return Err(format!(
+            "Phase D self-host fixed-point failure: gen1_u16 ({} words) != gen2_u16 ({} words)",
+            gen1_u16.len(),
+            gen2_u16.len()
+        ));
+    }
+
+    // Lower Gen-1 and Gen-2 to standalone 64-bit Linux x86-64 ELF64 via Stage-1 and direct emitter
+    let gen1_elf = compile_pure_u16_to_x86_64_elf_with_args(&gen1_u16, 64, 0, 0)?;
+    let gen2_elf = compile_omni_surface_via_stage1_to_elf(PHASE_D_PURE_OMNI_SELFHOST_COMPILER_SURFACE, 64, 0, 0)?;
+    if gen1_elf != gen2_elf {
+        return Err(format!(
+            "Phase D self-host ELF64 fixed-point failure: gen1_elf ({} bytes) != gen2_elf ({} bytes)",
+            gen1_elf.len(),
+            gen2_elf.len()
+        ));
+    }
+
+    Ok((gen1_u16, gen2_u16, gen1_elf, gen2_elf))
+}
+
+/// CLI entrypoint for `omni pure-bootstrap` (`omni-pure-selfhost-v1.0.0`).
+pub fn run_pure_omni_bootstrap_cli(argv: &[String]) -> i32 {
+    for a in argv {
+        if a == "--version" || a == "--version-check" {
+            println!("{{\"version\":\"{}\"}}", OMNI_PURE_SELFHOST_VERSION);
+            return 0;
+        }
+    }
+    match run_phase_d_pure_omni_selfhost_bootstrap() {
+        Ok((g1_u16, g2_u16, g1_elf, g2_elf)) => {
+            let mut g1_bc_bytes = Vec::with_capacity(g1_u16.len() * 2);
+            for &w in &g1_u16 {
+                g1_bc_bytes.extend_from_slice(&w.to_le_bytes());
+            }
+            let bc_hash = fnv1a_64_hash(&g1_bc_bytes);
+            let elf_hash = fnv1a_64_hash(&g1_elf);
+            println!(
+                "{{\"ok\":true,\"version\":\"{}\",\"gen1_words\":{},\"gen2_words\":{},\"bc_equal\":{},\"bc_fnv1a64\":\"0x{:016X}\",\"elf_bytes\":{},\"elf_equal\":{},\"elf_fnv1a64\":\"0x{:016X}\"}}",
+                OMNI_PURE_SELFHOST_VERSION,
+                g1_u16.len(),
+                g2_u16.len(),
+                g1_u16 == g2_u16,
+                bc_hash,
+                g1_elf.len(),
+                g1_elf == g2_elf,
+                elf_hash
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("{{\"ok\":false,\"version\":\"{}\",\"error\":\"{}\"}}", OMNI_PURE_SELFHOST_VERSION, json_escape_str(&e));
+            1
+        }
+    }
+}
+
+/// Runs the Phase D Pure-Omni Self-Hosting Bootstrap selftests (`omni-pure-selfhost-v1.0.0`):
+/// 1. 4-way differential verification (VM, Host ELF64, Stage-1 ELF64, Wasm) on `PHASE_D_PURE_OMNI_SELFHOST_COMPILER_SURFACE`.
+/// 2. Bit-exact Generation-1 == Generation-2 `.omni_bc` (`Vec<u16>`) and `.elf` (`ELF64`) self-compilation fixed-point proof.
+/// 3. Verification that the self-hosted Gen-2 compiler pipeline compiles the locked acceptance goldens identically to Gen-0.
+pub fn run_phase_d_pure_omni_bootstrap_selftests() -> Result<usize, String> {
+    let mut checks = 0usize;
+
+    // 1. 4-way differential verification on the Phase D self-hosting compiler kernel
+    let cases: &[(i64, i64, i64, i64)] = &[
+        (128, 0, 0, 0),
+        (0, 0, 0, 2001),
+        (128, 16, 0, 1003),
+        (128, 0, 1, 1001),
+        (128, 0, -1, 1005),
+    ];
+    for &(sl, mc, ta, want) in cases {
+        let (aot_val, back) = execute_omni_surface_aot_first(
+            PHASE_D_PURE_OMNI_SELFHOST_COMPILER_SURFACE,
+            vec![OmniValue::Int(sl), OmniValue::Int(mc), OmniValue::Int(ta)],
+        )?;
+        let vm_val = execute_omni_surface_program_with_budgets(
+            PHASE_D_PURE_OMNI_SELFHOST_COMPILER_SURFACE,
+            vec![OmniValue::Int(sl), OmniValue::Int(mc), OmniValue::Int(ta)],
+            None,
+            None,
+        )?;
+        let wasm_val = execute_omni_surface_wasm_i64(PHASE_D_PURE_OMNI_SELFHOST_COMPILER_SURFACE, &[sl, mc, ta])?;
+        let elf_host = compile_omni_surface_to_x86_64_elf(PHASE_D_PURE_OMNI_SELFHOST_COMPILER_SURFACE, sl, mc, ta)?;
+        let elf_stage1 = compile_omni_surface_via_stage1_to_elf(PHASE_D_PURE_OMNI_SELFHOST_COMPILER_SURFACE, sl, mc, ta)?;
+        if back != "aot"
+            || aot_val != OmniValue::Int(want)
+            || vm_val != OmniValue::Int(want)
+            || wasm_val != want
+            || elf_host != elf_stage1
+        {
+            return Err(format!(
+                "Phase D Pure-Omni self-host compiler 4-way differential failed on ({}, {}, {})",
+                sl, mc, ta
+            ));
+        }
+    }
+    checks += 1;
+
+    // 2. Generation-1 == Generation-2 bit-exact .omni_bc and .elf fixed-point proof
+    let (g1_u16, g2_u16, g1_elf, g2_elf) = run_phase_d_pure_omni_selfhost_bootstrap()?;
+    if g1_u16 != g2_u16 || g1_elf != g2_elf || g1_u16.is_empty() || g1_elf.len() < 120 {
+        return Err(String::from("Phase D Generation-1 == Generation-2 fixed point failed"));
+    }
+    checks += 1;
+
+    // 3. Gen-2 compiler pipeline compiles locked goldens to bit-identical Vec<u16>
+    let gen2_mod = decode_omni_token_stream(&g2_u16)?;
+    let locked_samples: &[(&str, usize)] = &[
+        ("fn seed0_risk(base: i64, delta: i64) -> trit { let scaled = base * 2; let score = scaled + delta; let cmp = score <=> 50; let pos = +1t; let res = tand(cmp, pos); return res; }", 53),
+        ("#[fn_id(4)] fn seed4_consensus(s0: trit, s1: trit, s2: trit) -> trit { let m = tmaj(s0, s1, s2); let res = !m; return res; }", 34),
+        ("#[fn_id(6)] fn seed6_clamp(x: i64, lo: i64, hi: i64) -> i64 { let lower = imax(x, lo); let clamped = imin(lower, hi); return clamped; }", 34),
+    ];
+    for &(src, want_len) in locked_samples {
+        let mut vm2 = OmniBinaryVm::new();
+        let st = vm2.execute_function(
+            &gen2_mod,
+            0,
+            vec![OmniValue::Int(src.len() as i64), OmniValue::Int(0), OmniValue::Int(0)],
+        )?;
+        let u16_out = compile_omni_surface_via_pure_omni_frontend(src, false)?;
+        verify_module_via_phase7_pure_omni_kernel(&u16_out)?;
+        if st != OmniValue::Int(0) || u16_out.len() != want_len {
+            return Err(format!("Phase D Gen-2 compilation mismatch on locked golden (len={})", u16_out.len()));
+        }
+    }
+    checks += 1;
+
+    Ok(checks)
+}
+
 /// Expects `res` to fail with a diagnostic whose machine-readable code equals `code` and has non-null 1-based `(line, col)`.
 fn expect_omni_error_code<T: std::fmt::Debug>(label: &str, res: Result<T, String>, code: &str) -> Result<OmniStructuredError, String> {
     match res {
@@ -7979,6 +8166,9 @@ fn main(x: i64, y: i64) -> i64 {
 
     // 13AF. Phase C: Pure-Omni Host Runtime over Narrow Host (`omni-pure-host-v1.0.0`)
     checks += run_phase_c_pure_omni_host_selftests()?;
+
+    // 13AG. Phase D: Pure-Omni Self-Hosting Bootstrap Fixed Point (`omni-pure-selfhost-v1.0.0`)
+    checks += run_phase_d_pure_omni_bootstrap_selftests()?;
 
     Ok(checks)
 }

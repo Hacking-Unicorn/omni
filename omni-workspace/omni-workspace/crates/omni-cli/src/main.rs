@@ -908,6 +908,9 @@ pub fn run_workspace_selftest() -> Result<usize, String> {
     if omni_lang::build_phase_c_pure_omni_host_stream()? != monolith::build_phase_c_pure_omni_host_stream()? {
         return Err("Monolith vs workspace build_phase_c_pure_omni_host_stream mismatch".into());
     }
+    if omni_lang::run_phase_d_pure_omni_selfhost_bootstrap()? != monolith::run_phase_d_pure_omni_selfhost_bootstrap()? {
+        return Err("Monolith vs workspace run_phase_d_pure_omni_selfhost_bootstrap mismatch".into());
+    }
     checks += ai_first_checks;
 
     // 7. Stage-1 == Stage-2 Self-Compilation Fixed Point
@@ -959,6 +962,9 @@ fn main() {
             }
             "pure-driver" | "--pure-driver" => {
                 std::process::exit(omni_lang::run_pure_omni_driver_cli(&args[2..]));
+            }
+            "pure-bootstrap" | "--pure-bootstrap" => {
+                std::process::exit(omni_lang::run_pure_omni_bootstrap_cli(&args[2..]));
             }
             "explain" | "--explain" if args.len() >= 3 => {
                 match explain_omni_error_code(&args[2]) {
