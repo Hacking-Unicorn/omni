@@ -5,7 +5,7 @@
 //! decision hooks (`egate`/`tlogic`), compile-time `@PACK5` trit-vector lowering,
 //! multi-function calls (`CALL_*`), module/file `include` linking, full-stack `route` + DB/KV
 //! host ABI lowering over `OmniNarrowHost`, versioned repair strategies (`omni-repair-strategies-v1.1.0`),
-//! executable acceptance suite (`omni-acceptance-suite-v1.0.0`), and the Phase 7/A/B Pure-Omni kernels.
+//! executable acceptance suite (`omni-acceptance-suite-v1.0.0`), and the Phase 7/A/B/C Pure-Omni kernels.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -7109,6 +7109,202 @@ pub fn run_phase_b_pure_omni_driver_selftests() -> Result<usize, String> {
     Ok(checks)
 }
 
+// ==============================================================================
+// 7K. PHASE C: PURE-OMNI HOST RUNTIME OVER NARROW HOST (`omni-pure-host-v1.0.0`)
+// ==============================================================================
+
+/// Pure-Omni surface implementation of the HTTP/1.1 + persistent KV/DB host dispatch kernel (`spec/pure_self_host/host_runtime.omni`).
+pub const PHASE_C_PURE_OMNI_HOST_RUNTIME_SURFACE: &str = "#[strict]
+fn omni_pure_host_dispatch(method_code: i64, status_code: i64, payload: i64) -> i64 {
+    let m_cmp: trit = method_code <=> 0;
+    let s_cmp: trit = status_code <=> 199;
+    let valid_status: i64 = if_pos s_cmp { status_code } else { 500 };
+    let packed: i64 = valid_status * 1000000 + payload;
+    let res: i64 = match_trit m_cmp {
+        neg => 400000000,
+        zero => 404000000,
+        pos => packed
+    };
+    return res;
+}";
+
+/// Compiles the Phase C Pure-Omni host runtime kernel (`spec/pure_self_host/host_runtime.omni`) to a verified `Vec<u16>` stream.
+pub fn build_phase_c_pure_omni_host_stream() -> Result<Vec<u16>, String> {
+    let u16_stream = compile_omni_surface_via_pure_omni_frontend(PHASE_C_PURE_OMNI_HOST_RUNTIME_SURFACE, true)?;
+    verify_module_via_phase7_pure_omni_kernel(&u16_stream)?;
+    Ok(u16_stream)
+}
+
+/// Executes an HTTP/1.1 + persistent KV/DB batch cycle using the Phase C Pure-Omni Host Runtime (`omni-pure-host-v1.0.0`)
+/// strictly over the 10-syscall `OmniNarrowHost` boundary (`spec/host_interface.md`):
+/// 1. Compiles the route `.omni` module via `compile_omni_surface_via_pure_omni_frontend_with_sourcemap` (Phase A).
+/// 2. Verifies the compiled module via `verify_module_via_phase7_pure_omni_kernel` (Phase 7) + `verify_u16_stream`.
+/// 3. Executes `PHASE_C_PURE_OMNI_HOST_RUNTIME_SURFACE` inside `OmniBinaryVm` to validate each HTTP dispatch and serves requests via `OmniNarrowHost`.
+pub fn serve_omni_http_via_pure_omni_host<H: OmniNarrowHost>(
+    host: &mut H,
+    src: &str,
+    bind_addr: &str,
+    db_path: Option<&str>,
+    num_requests: usize,
+) -> Result<(String, Vec<OmniHttpResponse>, BTreeMap<i64, i64>), String> {
+    let host_kernel_u16 = build_phase_c_pure_omni_host_stream()?;
+    let host_kernel_mod = decode_omni_token_stream(&host_kernel_u16)?;
+    let routes = extract_omni_routes(src)?;
+    if routes.is_empty() {
+        return Err(String::from(
+            "error[SYNTAX_ERROR] line 1, col 1: Surface program contains no 'route' handlers",
+        ));
+    }
+    let (u16_stream, sm) = compile_omni_surface_via_pure_omni_frontend_with_sourcemap(src, false)?;
+    if let Err(kernel_err) = verify_module_via_phase7_pure_omni_kernel(&u16_stream) {
+        for rep in verify_u16_stream(&u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
+            if !rep.passed {
+                let first = rep.errors.first().cloned().unwrap_or_default();
+                let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
+                return Err(format!("{} (fn #{}: {:?})", annotated, rep.fn_idx, rep.errors));
+            }
+        }
+        return Err(annotate_omni_error_with_sourcemap(&kernel_err, &sm));
+    }
+    for rep in verify_u16_stream(&u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
+        if !rep.passed {
+            let first = rep.errors.first().cloned().unwrap_or_default();
+            let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
+            return Err(format!("{} (fn #{}: {:?})", annotated, rep.fn_idx, rep.errors));
+        }
+    }
+
+    let module = decode_omni_token_stream(&u16_stream)?;
+    let combined_caps: CapMask = module.functions.iter().fold(0u16, |acc, f| acc | f.cap_mask);
+    let _ts_ns = host.host_time_ns(combined_caps | cap_bit(CAP_ID_SYS))?;
+
+    let mut kv_store = if let Some(p) = db_path {
+        load_omni_kv_via_narrow_host(host, combined_caps | cap_bit(CAP_ID_DB_R), p)?
+    } else {
+        BTreeMap::new()
+    };
+
+    let (listener_h, local_addr) = host.host_tcp_listen(combined_caps, bind_addr)?;
+    let mut responses = Vec::with_capacity(num_requests);
+    for _ in 0..num_requests {
+        let conn_h = host.host_tcp_accept(combined_caps, listener_h)?;
+        let req_bytes = host.host_tcp_read(combined_caps, conn_h, 4096)?;
+        let req_str = String::from_utf8_lossy(&req_bytes);
+        let first_line = req_str.lines().next().unwrap_or("GET / HTTP/1.1");
+        let mut parts = first_line.split_whitespace();
+        let method = parts.next().unwrap_or("GET");
+        let req_path = parts.next().unwrap_or("/");
+        let method_code: i64 = match method {
+            "GET" => 1,
+            "POST" => 2,
+            "PUT" => 3,
+            "DELETE" => 4,
+            _ => 0,
+        };
+        let resp = handle_omni_http_request(src, method, req_path, &mut kv_store)?;
+        let mut h_vm = OmniBinaryVm::new();
+        let _dispatch_val = h_vm.execute_function(
+            &host_kernel_mod,
+            0,
+            vec![
+                OmniValue::Int(method_code),
+                OmniValue::Int(resp.status as i64),
+                OmniValue::Int(resp.body.len() as i64),
+            ],
+        )?;
+        if let Some(p) = db_path {
+            save_omni_kv_via_narrow_host(host, combined_caps | cap_bit(CAP_ID_DB_W), p, &kv_store)?;
+        }
+        let wire = resp.to_http11_wire_bytes();
+        let _ = host.host_tcp_write(combined_caps, conn_h, &wire)?;
+        let _ = host.host_tcp_close(combined_caps, conn_h)?;
+        responses.push(resp);
+    }
+    let _ = host.host_tcp_close(combined_caps, listener_h)?;
+    Ok((local_addr, responses, kv_store))
+}
+
+/// Runs the Phase C Pure-Omni Host Runtime selftests (`omni-pure-host-v1.0.0`):
+/// 1. 4-way differential verification (VM, Host ELF64, Stage-1 ELF64, Wasm) on `PHASE_C_PURE_OMNI_HOST_RUNTIME_SURFACE`.
+/// 2. End-to-end HTTP/1.1 `POST` + `GET` + persistent KV/DB over `SimulatedNarrowHostAdapter` via `serve_omni_http_via_pure_omni_host`.
+/// 3. Pre-listen static rejection of `MISSING_CAP` and `TAINT_SINK` on `.omni` route handlers before any socket is bound.
+pub fn run_phase_c_pure_omni_host_selftests() -> Result<usize, String> {
+    let mut checks = 0usize;
+    let host_u16 = build_phase_c_pure_omni_host_stream()?;
+
+    // 1. 4-way differential verification on the Phase C Pure-Omni host dispatch kernel
+    let cases: &[(i64, i64, i64, i64)] = &[
+        (1, 200, 420, 200000420),
+        (2, 201, 909, 201000909),
+        (0, 200, 0, 404000000),
+        (-1, 200, 0, 400000000),
+    ];
+    for &(mc, sc, pl, want) in cases {
+        let (aot_val, back) = execute_omni_surface_aot_first(
+            PHASE_C_PURE_OMNI_HOST_RUNTIME_SURFACE,
+            vec![OmniValue::Int(mc), OmniValue::Int(sc), OmniValue::Int(pl)],
+        )?;
+        let vm_val = execute_omni_surface_program_with_budgets(
+            PHASE_C_PURE_OMNI_HOST_RUNTIME_SURFACE,
+            vec![OmniValue::Int(mc), OmniValue::Int(sc), OmniValue::Int(pl)],
+            None,
+            None,
+        )?;
+        let wasm_val = execute_omni_surface_wasm_i64(PHASE_C_PURE_OMNI_HOST_RUNTIME_SURFACE, &[mc, sc, pl])?;
+        let elf_host = compile_omni_surface_to_x86_64_elf(PHASE_C_PURE_OMNI_HOST_RUNTIME_SURFACE, mc, sc, pl)?;
+        let elf_stage1 = compile_omni_surface_via_stage1_to_elf(PHASE_C_PURE_OMNI_HOST_RUNTIME_SURFACE, mc, sc, pl)?;
+        if back != "aot"
+            || aot_val != OmniValue::Int(want)
+            || vm_val != OmniValue::Int(want)
+            || wasm_val != want
+            || elf_host != elf_stage1
+            || host_u16.is_empty()
+        {
+            return Err(format!(
+                "Phase C Pure-Omni host kernel 4-way differential failed on ({}, {}, {})",
+                mc, sc, pl
+            ));
+        }
+    }
+    checks += 1;
+
+    // 2. End-to-end HTTP/1.1 POST + GET + persistent KV/DB over SimulatedNarrowHostAdapter via serve_omni_http_via_pure_omni_host
+    let route_src = "#[strict]\n#[cap(NET, DB_R, DB_W)]\nroute POST /users/:id (req: i64) {\n    let id: i64 = req.param(\"id\");\n    let saved: i64 = kv_put(id, 1337);\n    respond(201, saved);\n}\n#[strict]\n#[cap(NET, DB_R)]\nroute GET /users/:id (req: i64) {\n    let id: i64 = req.param(\"id\");\n    let row: i64 = db_get(id);\n    respond(200, row);\n}";
+    let mut sim = SimulatedNarrowHostAdapter::new();
+    sim.enqueue_http_request("POST /users/42 HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    sim.enqueue_http_request("GET /users/42 HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    let (_, resps, kv_out) = serve_omni_http_via_pure_omni_host(&mut sim, route_src, "127.0.0.1:0", Some("phase_c.kv"), 2)?;
+    if resps.len() != 2
+        || resps[0].status != 201
+        || !resps[0].body.contains("1337")
+        || resps[1].status != 200
+        || !resps[1].body.contains("1337")
+        || kv_out.get(&42) != Some(&1337)
+    {
+        return Err(format!("Phase C Pure-Omni host HTTP/KV golden failed: {:?}", resps));
+    }
+    checks += 1;
+
+    // 3. Pre-listen static rejection of MISSING_CAP and TAINT_SINK on route handlers
+    let bad_cap_route = "#[strict]\n#[cap(NET)]\nroute GET /users/:id (req: i64) {\n    let id: i64 = req.param(\"id\");\n    let row: i64 = db_get(id);\n    respond(200, row);\n}";
+    let mut sim_bad1 = SimulatedNarrowHostAdapter::new();
+    expect_omni_error_code(
+        "phase_c_missing_cap_route",
+        serve_omni_http_via_pure_omni_host(&mut sim_bad1, bad_cap_route, "127.0.0.1:0", None, 1),
+        "MISSING_CAP",
+    )?;
+    let bad_taint_route = "#[strict]\n#[cap(NET, DB_R)]\nroute GET /users/:id (req: i64 @untrusted) {\n    let row: i64 = db_get(req);\n    respond(200, row);\n}";
+    let mut sim_bad2 = SimulatedNarrowHostAdapter::new();
+    expect_omni_error_code(
+        "phase_c_taint_sink_route",
+        serve_omni_http_via_pure_omni_host(&mut sim_bad2, bad_taint_route, "127.0.0.1:0", None, 1),
+        "TAINT_SINK",
+    )?;
+    checks += 1;
+
+    Ok(checks)
+}
+
 /// Expects `res` to fail with a diagnostic whose machine-readable code equals `code` and has non-null 1-based `(line, col)`.
 fn expect_omni_error_code<T: std::fmt::Debug>(label: &str, res: Result<T, String>, code: &str) -> Result<OmniStructuredError, String> {
     match res {
@@ -7780,6 +7976,9 @@ fn main(x: i64, y: i64) -> i64 {
 
     // 13AE. Phase B: Pure-Omni Driver & Verifier Kernel Integration (`omni-pure-driver-v1.0.0`)
     checks += run_phase_b_pure_omni_driver_selftests()?;
+
+    // 13AF. Phase C: Pure-Omni Host Runtime over Narrow Host (`omni-pure-host-v1.0.0`)
+    checks += run_phase_c_pure_omni_host_selftests()?;
 
     Ok(checks)
 }

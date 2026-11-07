@@ -1,0 +1,25 @@
+// ==============================================================================
+// OMNI PURE SELF-HOST — PHASE C: PURE-OMNI HOST RUNTIME OVER NARROW HOST
+// Version: omni-pure-host-v1.0.0
+// ==============================================================================
+//
+// Implements the Pure-Omni HTTP/1.1 + persistent KV/DB host runtime kernel
+// strictly above the 10-syscall `OmniNarrowHost` boundary (`spec/host_interface.md`):
+// - `host_tcp_listen`, `host_tcp_accept`, `host_tcp_read`, `host_tcp_write`, `host_tcp_close` (`CAP_ID_NET`)
+// - `host_file_open`, `host_file_read`, `host_file_write`, `host_file_close` (`CAP_ID_DB_R` / `CAP_ID_DB_W` / `CAP_ID_FS`)
+// - `host_clock_ms` (`CAP_ID_SYS`)
+// ==============================================================================
+
+#[strict]
+fn omni_pure_host_dispatch(method_code: i64, status_code: i64, payload: i64) -> i64 {
+    let m_cmp: trit = method_code <=> 0;
+    let s_cmp: trit = status_code <=> 199;
+    let valid_status: i64 = if_pos s_cmp { status_code } else { 500 };
+    let packed: i64 = valid_status * 1000000 + payload;
+    let res: i64 = match_trit m_cmp {
+        neg => 400000000,
+        zero => 404000000,
+        pos => packed
+    };
+    return res;
+}

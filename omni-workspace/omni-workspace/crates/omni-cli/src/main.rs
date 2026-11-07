@@ -905,6 +905,9 @@ pub fn run_workspace_selftest() -> Result<usize, String> {
     if omni_lang::build_phase_b_pure_omni_driver_stream()? != monolith::build_phase_b_pure_omni_driver_stream()? {
         return Err("Monolith vs workspace build_phase_b_pure_omni_driver_stream mismatch".into());
     }
+    if omni_lang::build_phase_c_pure_omni_host_stream()? != monolith::build_phase_c_pure_omni_host_stream()? {
+        return Err("Monolith vs workspace build_phase_c_pure_omni_host_stream mismatch".into());
+    }
     checks += ai_first_checks;
 
     // 7. Stage-1 == Stage-2 Self-Compilation Fixed Point
