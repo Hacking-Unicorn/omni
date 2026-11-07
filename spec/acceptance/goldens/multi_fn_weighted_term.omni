@@ -1,0 +1,13 @@
+#[strict]
+fn weighted_term(x: i64, w: i64) -> i64 {
+    let p: i64 = x * w;
+    let s: i64 = p + 5;
+    return s;
+}
+#[strict]
+fn main(a: i64, b: i64) -> i64 {
+    let left: i64 = weighted_term(a, 3);
+    let right: i64 = weighted_term(b, 2);
+    let total: i64 = left + right;
+    return total;
+}

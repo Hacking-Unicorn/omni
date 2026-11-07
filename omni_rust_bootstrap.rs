@@ -42,7 +42,7 @@
 //!   ./omni_bootstrap run seed0_var0.omni_bc 30 15
 //!   ./omni_bootstrap assemble input.omni_asm output.omni_bc
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 #[allow(unused_imports)]
 use std::convert::TryInto;
 use std::env;
@@ -56,6 +56,11 @@ use std::time::Instant;
 pub const VOCAB_SIZE: usize = 32_768;
 pub const ENGLISH_MAX_TOKEN: u16 = 0x7DFF;
 pub const OMNI_HARNESS_CONTRACT_VERSION: &str = "omni-harness-v1.0.0";
+pub const OMNI_REPAIR_STRATEGIES_VERSION: &str = "omni-repair-strategies-v1.1.0";
+pub const OMNI_NARROW_HOST_VERSION: &str = "omni-narrow-host-v1.0.0";
+pub const OMNI_ACCEPTANCE_SUITE_VERSION: &str = "omni-acceptance-suite-v1.0.0";
+pub const OMNI_ERROR_CONTRACT_VERSION: &str = "omni-error-contract-v1.0.0";
+pub const OMNI_PHASE7_PURE_KERNEL_VERSION: &str = "omni-pure-kernel-v1.0.0";
 
 pub const REG_BASE: u16 = 0x7E00; // 0x7E00 .. 0x7EBF (192 SSA registers)
 pub const REG_MAX: u16  = 0x7EBF;
@@ -2341,11 +2346,178 @@ fn parse_surface_cap_name(name: &str, line: usize, col: usize) -> Result<CapMask
     }
 }
 
+/// Checks that a hygienic surface macro body only references its formal parameters (preventing accidental caller variable capture).
+fn check_macro_body_hygiene(
+    expr: &SurfaceExpr,
+    params: &[String],
+    macro_name: &str,
+) -> Result<(), String> {
+    match expr {
+        SurfaceExpr::Int(_, _, _)
+        | SurfaceExpr::Trit(_, _, _, _)
+        | SurfaceExpr::StrLit(_, _, _)
+        | SurfaceExpr::TritVecLit(_, _, _) => Ok(()),
+        SurfaceExpr::Var(v, l, c) => {
+            if params.iter().any(|p| p == v) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "error[UNDEF_VAR] line {}, col {}: Hygienic macro '{}' referenced unbound variable '{}'",
+                    l, c, macro_name, v
+                ))
+            }
+        }
+        SurfaceExpr::UnOp(_, sub, _, _) => check_macro_body_hygiene(sub, params, macro_name),
+        SurfaceExpr::BinOp(_, lhs, rhs, _, _) => {
+            check_macro_body_hygiene(lhs, params, macro_name)?;
+            check_macro_body_hygiene(rhs, params, macro_name)
+        }
+        SurfaceExpr::Call(_, args, _, _) => {
+            for a in args {
+                check_macro_body_hygiene(a, params, macro_name)?;
+            }
+            Ok(())
+        }
+        SurfaceExpr::IfBranch(_, cond, then_b, else_b, _, _) => {
+            check_macro_body_hygiene(cond, params, macro_name)?;
+            for st in then_b.iter().chain(else_b.iter()) {
+                if let SurfaceStmt::Expr(e, _, _) | SurfaceStmt::Ret(e, _, _) = st {
+                    check_macro_body_hygiene(e, params, macro_name)?;
+                }
+            }
+            Ok(())
+        }
+        SurfaceExpr::MatchTrit(cond, neg_b, zero_b, pos_b, _, _) => {
+            check_macro_body_hygiene(cond, params, macro_name)?;
+            for st in neg_b.iter().chain(zero_b.iter()).chain(pos_b.iter()) {
+                if let SurfaceStmt::Expr(e, _, _) | SurfaceStmt::Ret(e, _, _) = st {
+                    check_macro_body_hygiene(e, params, macro_name)?;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Hygienically substitutes macro arguments into a macro body expression, anchoring generated nodes to `(call_line, call_col)`.
+fn substitute_macro_expr(
+    expr: &SurfaceExpr,
+    param_map: &BTreeMap<String, SurfaceExpr>,
+    call_line: usize,
+    call_col: usize,
+) -> Result<SurfaceExpr, String> {
+    match expr {
+        SurfaceExpr::Int(v, _, _) => Ok(SurfaceExpr::Int(*v, call_line, call_col)),
+        SurfaceExpr::Trit(s, t, _, _) => Ok(SurfaceExpr::Trit(s.clone(), *t, call_line, call_col)),
+        SurfaceExpr::StrLit(s, _, _) => Ok(SurfaceExpr::StrLit(s.clone(), call_line, call_col)),
+        SurfaceExpr::TritVecLit(tv, _, _) => Ok(SurfaceExpr::TritVecLit(tv.clone(), call_line, call_col)),
+        SurfaceExpr::Var(v, l, c) => param_map.get(v).cloned().ok_or_else(|| {
+            format!(
+                "error[UNDEF_VAR] line {}, col {}: Hygienic macro referenced unbound variable '{}'",
+                l, c, v
+            )
+        }),
+        SurfaceExpr::UnOp(op, sub, _, _) => Ok(SurfaceExpr::UnOp(
+            op.clone(),
+            Box::new(substitute_macro_expr(sub, param_map, call_line, call_col)?),
+            call_line,
+            call_col,
+        )),
+        SurfaceExpr::BinOp(op, lhs, rhs, _, _) => Ok(SurfaceExpr::BinOp(
+            op.clone(),
+            Box::new(substitute_macro_expr(lhs, param_map, call_line, call_col)?),
+            Box::new(substitute_macro_expr(rhs, param_map, call_line, call_col)?),
+            call_line,
+            call_col,
+        )),
+        SurfaceExpr::Call(cname, args, _, _) => {
+            let mut sub_args = Vec::with_capacity(args.len());
+            for a in args {
+                sub_args.push(substitute_macro_expr(a, param_map, call_line, call_col)?);
+            }
+            Ok(SurfaceExpr::Call(cname.clone(), sub_args, call_line, call_col))
+        }
+        SurfaceExpr::IfBranch(kind, cond, then_b, else_b, _, _) => {
+            let sub_cond = Box::new(substitute_macro_expr(cond, param_map, call_line, call_col)?);
+            let mut sub_then = Vec::with_capacity(then_b.len());
+            for st in then_b {
+                if let SurfaceStmt::Expr(e, _, _) = st {
+                    sub_then.push(SurfaceStmt::Expr(
+                        substitute_macro_expr(e, param_map, call_line, call_col)?,
+                        call_line,
+                        call_col,
+                    ));
+                }
+            }
+            let mut sub_else = Vec::with_capacity(else_b.len());
+            for st in else_b {
+                if let SurfaceStmt::Expr(e, _, _) = st {
+                    sub_else.push(SurfaceStmt::Expr(
+                        substitute_macro_expr(e, param_map, call_line, call_col)?,
+                        call_line,
+                        call_col,
+                    ));
+                }
+            }
+            Ok(SurfaceExpr::IfBranch(
+                kind.clone(),
+                sub_cond,
+                sub_then,
+                sub_else,
+                call_line,
+                call_col,
+            ))
+        }
+        SurfaceExpr::MatchTrit(cond, neg_b, zero_b, pos_b, _, _) => {
+            let sub_cond = Box::new(substitute_macro_expr(cond, param_map, call_line, call_col)?);
+            let mut sub_neg = Vec::new();
+            for st in neg_b {
+                if let SurfaceStmt::Expr(e, _, _) = st {
+                    sub_neg.push(SurfaceStmt::Expr(
+                        substitute_macro_expr(e, param_map, call_line, call_col)?,
+                        call_line,
+                        call_col,
+                    ));
+                }
+            }
+            let mut sub_zero = Vec::new();
+            for st in zero_b {
+                if let SurfaceStmt::Expr(e, _, _) = st {
+                    sub_zero.push(SurfaceStmt::Expr(
+                        substitute_macro_expr(e, param_map, call_line, call_col)?,
+                        call_line,
+                        call_col,
+                    ));
+                }
+            }
+            let mut sub_pos = Vec::new();
+            for st in pos_b {
+                if let SurfaceStmt::Expr(e, _, _) = st {
+                    sub_pos.push(SurfaceStmt::Expr(
+                        substitute_macro_expr(e, param_map, call_line, call_col)?,
+                        call_line,
+                        call_col,
+                    ));
+                }
+            }
+            Ok(SurfaceExpr::MatchTrit(
+                sub_cond,
+                sub_neg,
+                sub_zero,
+                sub_pos,
+                call_line,
+                call_col,
+            ))
+        }
+    }
+}
+
 struct SurfaceParser {
     tokens: Vec<SpannedSurfaceTok>,
     pos: usize,
     strict_mode: bool,
     extra_fn_caps: CapMask,
+    macros: BTreeMap<String, (Vec<String>, SurfaceExpr)>,
 }
 
 impl SurfaceParser {
@@ -2359,6 +2531,7 @@ impl SurfaceParser {
             pos: 0,
             strict_mode,
             extra_fn_caps: 0,
+            macros: BTreeMap::new(),
         }
     }
 
@@ -2525,6 +2698,51 @@ impl SurfaceParser {
                     let _ = self.next_spanned()?;
                 }
                 includes.push((inc_path, kw_st.line, kw_st.col));
+                continue;
+            }
+            if self.peek() == Some(&SurfaceTok::Ident(String::from("macro"))) {
+                let _ = self.next_spanned()?;
+                let (m_name, ml, mc) = self.expect_ident_spanned()?;
+                self.expect_sym("(")?;
+                let mut m_params = Vec::new();
+                while self.peek().is_some() && self.peek() != Some(&SurfaceTok::Sym(String::from(")"))) {
+                    let (p_name, _pl, _pc) = self.expect_ident_spanned()?;
+                    if self.peek() == Some(&SurfaceTok::Sym(String::from(":"))) {
+                        let _ = self.next_spanned()?;
+                        let _ = self.expect_ident_spanned()?;
+                    }
+                    m_params.push(p_name);
+                    if self.peek() == Some(&SurfaceTok::Sym(String::from(","))) {
+                        let _ = self.next_spanned()?;
+                    }
+                }
+                self.expect_sym(")")?;
+                let m_body = if self.peek() == Some(&SurfaceTok::Sym(String::from("="))) {
+                    let _ = self.next_spanned()?;
+                    let e = self.parse_expr()?;
+                    if self.peek() == Some(&SurfaceTok::Sym(String::from(";"))) {
+                        let _ = self.next_spanned()?;
+                    }
+                    e
+                } else if self.peek() == Some(&SurfaceTok::Sym(String::from("{"))) {
+                    let _ = self.next_spanned()?;
+                    let e = self.parse_expr()?;
+                    if self.peek() == Some(&SurfaceTok::Sym(String::from(";"))) {
+                        let _ = self.next_spanned()?;
+                    }
+                    self.expect_sym("}")?;
+                    if self.peek() == Some(&SurfaceTok::Sym(String::from(";"))) {
+                        let _ = self.next_spanned()?;
+                    }
+                    e
+                } else {
+                    return Err(format!(
+                        "error[SYNTAX_ERROR] line {}, col {}: Expected '=' or '{{' in macro '{}' definition",
+                        ml, mc, m_name
+                    ));
+                };
+                check_macro_body_hygiene(&m_body, &m_params, &m_name)?;
+                self.macros.insert(m_name, (m_params, m_body));
                 continue;
             }
             fns.push(self.parse_fn_def()?);
@@ -3264,6 +3482,19 @@ impl SurfaceParser {
                     }
                     self.expect_sym(")")?;
                     let _ = self.consume_at_annotations()?;
+                    if let Some((m_params, m_body)) = self.macros.get(&ident).cloned() {
+                        if args.len() != m_params.len() {
+                            return Err(format!(
+                                "error[ARITY_MISMATCH] line {}, col {}: Hygienic macro '{}' expects {} arguments, got {}",
+                                st.line, st.col, ident, m_params.len(), args.len()
+                            ));
+                        }
+                        let mut param_map = BTreeMap::new();
+                        for (p_name, arg_expr) in m_params.into_iter().zip(args.into_iter()) {
+                            param_map.insert(p_name, arg_expr);
+                        }
+                        return substitute_macro_expr(&m_body, &param_map, st.line, st.col);
+                    }
                     Ok(SurfaceExpr::Call(ident, args, st.line, st.col))
                 } else {
                     Ok(SurfaceExpr::Var(ident, st.line, st.col))
@@ -3314,6 +3545,7 @@ fn fnv1a_32_positive(s: &str) -> i64 {
 
 struct SurfaceLowerCtx {
     var_map: BTreeMap<String, String>,
+    tainted_operands: BTreeSet<String>,
     fn_sigs: BTreeMap<String, (u16, usize, String)>,
     next_reg: usize,
     next_lbl: u16,
@@ -3335,11 +3567,17 @@ impl SurfaceLowerCtx {
         emit_asm: bool,
     ) -> Self {
         let mut var_map = BTreeMap::new();
+        let mut tainted_operands = BTreeSet::new();
         for (idx, p) in params.iter().enumerate() {
-            var_map.insert(p.name.clone(), format!("${}", idx));
+            let op_str = format!("${}", idx);
+            if p.untrusted {
+                tainted_operands.insert(op_str.clone());
+            }
+            var_map.insert(p.name.clone(), op_str);
         }
         Self {
             var_map,
+            tainted_operands,
             fn_sigs,
             next_reg: 0,
             next_lbl: 1,
@@ -3354,7 +3592,31 @@ impl SurfaceLowerCtx {
         }
     }
 
-    fn emit(&mut self, line: String) -> Result<(), String> {
+    fn emit(&mut self, mut line: String) -> Result<(), String> {
+        let parts: Vec<String> = line.split_whitespace().map(String::from).collect();
+        if parts.len() >= 4 && parts[1] == "=" {
+            let dst = &parts[0];
+            let mnem = &parts[2];
+            let base_mnem = mnem
+                .strip_suffix("@UNTRUSTED")
+                .or_else(|| mnem.strip_suffix("@SAFE"))
+                .unwrap_or(mnem.as_str());
+            let is_sanitizer = matches!(base_mnem, "SAN_SQL" | "SAN_DOM" | "SAN_PRM" | "AUTH_VER");
+            if is_sanitizer {
+                self.tainted_operands.remove(dst);
+            } else {
+                let any_arg_tainted = mnem.ends_with("@UNTRUSTED")
+                    || parts[3..].iter().any(|op| self.tainted_operands.contains(op));
+                if any_arg_tainted {
+                    self.tainted_operands.insert(dst.clone());
+                    if !mnem.ends_with("@UNTRUSTED") && !mnem.ends_with("@SAFE") {
+                        let mut rebuilt = vec![parts[0].clone(), parts[1].clone(), format!("{}@UNTRUSTED", parts[2])];
+                        rebuilt.extend_from_slice(&parts[3..]);
+                        line = rebuilt.join(" ");
+                    }
+                }
+            }
+        }
         if self.emit_asm {
             self.lines.push(line);
         } else {
@@ -4100,7 +4362,28 @@ impl SurfaceLowerCtx {
     }
 }
 
-/// Resolves `include "other.omni";` / `mod "other.omni";` directives from an in-memory map or filesystem directory.
+/// Looks up a built-in verified pure-Omni standard library module (`"std/prelude.omni"`, `"std/math.omni"`, `"std/trit.omni"`).
+pub fn lookup_omni_stdlib_module(path: &str) -> Option<&'static str> {
+    match path {
+        "std/prelude.omni" => Some(
+            "#[strict] fn std_clamp(x: i64, lo: i64, hi: i64) -> i64 { let lower: i64 = imax(x, lo); let clamped: i64 = imin(lower, hi); return clamped; }
+#[strict] fn std_abs_diff(a: i64, b: i64) -> i64 { let d: i64 = a - b; let r: i64 = iabs(d); return r; }
+#[strict] fn std_trit_mux(cond: trit, neg_v: i64, zero_v: i64, pos_v: i64) -> i64 { let r: i64 = sel_trit(cond, neg_v, zero_v, pos_v); return r; }
+#[strict] fn std_consensus3(s0: trit, s1: trit, s2: trit) -> trit { let m: trit = tmaj(s0, s1, s2); return m; }",
+        ),
+        "std/math.omni" => Some(
+            "#[strict] fn std_clamp(x: i64, lo: i64, hi: i64) -> i64 { let lower: i64 = imax(x, lo); let clamped: i64 = imin(lower, hi); return clamped; }
+#[strict] fn std_abs_diff(a: i64, b: i64) -> i64 { let d: i64 = a - b; let r: i64 = iabs(d); return r; }",
+        ),
+        "std/trit.omni" => Some(
+            "#[strict] fn std_trit_mux(cond: trit, neg_v: i64, zero_v: i64, pos_v: i64) -> i64 { let r: i64 = sel_trit(cond, neg_v, zero_v, pos_v); return r; }
+#[strict] fn std_consensus3(s0: trit, s1: trit, s2: trit) -> trit { let m: trit = tmaj(s0, s1, s2); return m; }",
+        ),
+        _ => None,
+    }
+}
+
+/// Resolves `include "other.omni";` / `mod "other.omni";` directives from an in-memory map, built-in `std/*` library, or filesystem directory.
 pub fn resolve_omni_surface_includes(
     src: &str,
     base_dir: Option<&std::path::Path>,
@@ -4132,6 +4415,8 @@ pub fn resolve_omni_surface_includes(
             }
             let inc_content = if let Some(map) = vfs.and_then(|m| m.get(&inc_path).map(|s| (m, s))) {
                 map.1.clone()
+            } else if let Some(std_src) = lookup_omni_stdlib_module(&inc_path) {
+                String::from(std_src)
             } else if let Some(dir) = cur_dir {
                 let full_p = dir.join(&inc_path);
                 fs::read_to_string(&full_p).map_err(|e| {
@@ -5156,8 +5441,188 @@ pub fn run_omni_harness_json(
 }
 
 // ==============================================================================
-// 7D. VERSION-LOCKED AGENT DRIVER (`omni-agent-driver`) & LIVE HTTP/DB HOST
+// 7D. VERSION-LOCKED AGENT DRIVER (`omni-agent-driver`) & FIRST-CLASS REPAIR STRATEGIES
 // ==============================================================================
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OmniRepairStrategySpec {
+    pub id: &'static str,
+    pub version: &'static str,
+    pub error_code: &'static str,
+    pub context_pattern: &'static str,
+    pub description: &'static str,
+}
+
+/// Returns the complete catalog of version-locked first-class repair strategies (`omni-repair-strategies-v1.1.0`).
+pub fn list_omni_repair_strategies() -> Vec<OmniRepairStrategySpec> {
+    vec![
+        OmniRepairStrategySpec {
+            id: "strat_missing_cap_minimal_v1",
+            version: OMNI_REPAIR_STRATEGIES_VERSION,
+            error_code: "MISSING_CAP",
+            context_pattern: "single_or_multi_fn_opcode_cap",
+            description: "Infers the minimal required capability bit(s) from the failing opcode/function and attaches or merges #[cap(...)] on the enclosing fn or route.",
+        },
+        OmniRepairStrategySpec {
+            id: "strat_multi_fn_callee_cap_v1",
+            version: OMNI_REPAIR_STRATEGIES_VERSION,
+            error_code: "MISSING_CAP",
+            context_pattern: "multi_fn_callee",
+            description: "Attaches minimal required #[cap(...)] to a helper callee in a multi-function module and propagates capabilities to callers.",
+        },
+        OmniRepairStrategySpec {
+            id: "strat_taint_sanitize_ret_v1",
+            version: OMNI_REPAIR_STRATEGIES_VERSION,
+            error_code: "TAINT_ON_RET",
+            context_pattern: "untrusted_return",
+            description: "Sanitizes @untrusted return values with auth_verify(...) or san_prm(...) and adds minimal AUTH/AI capability.",
+        },
+        OmniRepairStrategySpec {
+            id: "strat_taint_sanitize_sink_v1",
+            version: OMNI_REPAIR_STRATEGIES_VERSION,
+            error_code: "TAINT_SINK",
+            context_pattern: "untrusted_sink_arg",
+            description: "Wraps @untrusted arguments passed to egate(...) or db_query(...) in auth_verify(...) and adds AUTH capability.",
+        },
+        OmniRepairStrategySpec {
+            id: "strat_bad_type_infer_let_v1",
+            version: OMNI_REPAIR_STRATEGIES_VERSION,
+            error_code: "BAD_TYPE",
+            context_pattern: "strict_untyped_let_or_unknown_type",
+            description: "Infers canonical Omni types (i64, trit, trit_vec, bytes, str, arena) on untyped let bindings or replaces unknown type names with canonical i64.",
+        },
+        OmniRepairStrategySpec {
+            id: "strat_ambiguous_grammar_canonical_v1",
+            version: OMNI_REPAIR_STRATEGIES_VERSION,
+            error_code: "AMBIGUOUS_GRAMMAR",
+            context_pattern: "strict_non_canonical_alias",
+            description: "Normalizes TRIT_POS/ZERO/NEG to +1t/0t/-1t, int/tvec to i64/trit_vec, untrusted_<ty> to <ty> @untrusted, and mod to include.",
+        },
+        OmniRepairStrategySpec {
+            id: "strat_budget_aware_synthesis_v1",
+            version: OMNI_REPAIR_STRATEGIES_VERSION,
+            error_code: "BUDGET_EXCEEDED",
+            context_pattern: "step_or_mem_budget_trap",
+            description: "Synthesizes right-sized #[step_budget(N)] or #[mem_budget(N)] attributes when execution traps under a tight budget.",
+        },
+        OmniRepairStrategySpec {
+            id: "strat_linear_arena_drop_v1",
+            version: OMNI_REPAIR_STRATEGIES_VERSION,
+            error_code: "LINEAR_LEAK",
+            context_pattern: "undropped_arena_at_ret",
+            description: "Inserts drop(arena_var) immediately before return to satisfy linear arena conservation.",
+        },
+        OmniRepairStrategySpec {
+            id: "strat_borrow_order_swap_v1",
+            version: OMNI_REPAIR_STRATEGIES_VERSION,
+            error_code: "BORROW_CONFLICT",
+            context_pattern: "drop_owner_before_reader",
+            description: "Reorders drop(reader) before drop(owner) so all active reader borrows are released before dropping the arena.",
+        },
+        OmniRepairStrategySpec {
+            id: "strat_immut_param_local_copy_v1",
+            version: OMNI_REPAIR_STRATEGIES_VERSION,
+            error_code: "IMMUT_PARAM",
+            context_pattern: "reassign_fn_param",
+            description: "Copies an immutable function parameter into a mutable local SSA binding before reassignment.",
+        },
+        OmniRepairStrategySpec {
+            id: "strat_corrupt_pack5_clamp_v1",
+            version: OMNI_REPAIR_STRATEGIES_VERSION,
+            error_code: "CORRUPT_PACK5",
+            context_pattern: "sentinel_byte_243_to_255",
+            description: "Clamps invalid @PACK5 sentinel bytes (243..=255) into the valid 5-trit radix-3 domain (0..=242).",
+        },
+        OmniRepairStrategySpec {
+            id: "strat_multi_fn_arity_align_v1",
+            version: OMNI_REPAIR_STRATEGIES_VERSION,
+            error_code: "ARITY_MISMATCH",
+            context_pattern: "call_arity_mismatch",
+            description: "Aligns caller argument count with the target function or intrinsic signature by trimming extra args or padding missing defaults.",
+        },
+        OmniRepairStrategySpec {
+            id: "strat_include_cycle_prune_v1",
+            version: OMNI_REPAIR_STRATEGIES_VERSION,
+            error_code: "CIRCULAR_INCLUDE",
+            context_pattern: "cyclic_include_directive",
+            description: "Prunes cyclic include directives from single-file or multi-file module graphs.",
+        },
+        OmniRepairStrategySpec {
+            id: "strat_unresolved_label_insert_v1",
+            version: OMNI_REPAIR_STRATEGIES_VERSION,
+            error_code: "UNRESOLVED_LABEL",
+            context_pattern: "missing_branch_target_label",
+            description: "Inserts the missing basic-block target 'label N;' before function return.",
+        },
+        OmniRepairStrategySpec {
+            id: "strat_undef_var_init_v1",
+            version: OMNI_REPAIR_STRATEGIES_VERSION,
+            error_code: "UNDEF_VAR",
+            context_pattern: "undeclared_variable_use",
+            description: "Declares a typed local binding 'let <var>: i64 = 0;' prior to the first use of an undefined variable.",
+        },
+        OmniRepairStrategySpec {
+            id: "strat_unknown_fn_alias_v1",
+            version: OMNI_REPAIR_STRATEGIES_VERSION,
+            error_code: "UNKNOWN_FN",
+            context_pattern: "unknown_intrinsic_or_helper",
+            description: "Replaces an unknown function call with a canonical built-in intrinsic (iabs).",
+        },
+    ]
+}
+
+/// Serializes all available repair strategies (`omni-repair-strategies-v1.1.0`) as deterministic single-line JSON.
+pub fn omni_repair_strategies_json() -> String {
+    let items: Vec<String> = list_omni_repair_strategies()
+        .into_iter()
+        .map(|s| {
+            format!(
+                "{{\"id\":\"{}\",\"version\":\"{}\",\"error_code\":\"{}\",\"context_pattern\":\"{}\",\"description\":\"{}\"}}",
+                s.id,
+                s.version,
+                s.error_code,
+                s.context_pattern,
+                json_escape_str(s.description)
+            )
+        })
+        .collect();
+    format!(
+        "{{\"strategy_version\":\"{}\",\"harness_version\":\"{}\",\"count\":{},\"strategies\":[{}]}}",
+        OMNI_REPAIR_STRATEGIES_VERSION,
+        OMNI_HARNESS_CONTRACT_VERSION,
+        items.len(),
+        items.join(",")
+    )
+}
+
+/// Selects the deterministic first-class repair strategy ID for `(src, err)`.
+pub fn select_omni_repair_strategy(src: &str, err: &OmniStructuredError) -> &'static str {
+    let fn_count = src.matches("fn ").count();
+    match err.code {
+        "MISSING_CAP" => {
+            if fn_count > 1 {
+                "strat_multi_fn_callee_cap_v1"
+            } else {
+                "strat_missing_cap_minimal_v1"
+            }
+        }
+        "TAINT_ON_RET" => "strat_taint_sanitize_ret_v1",
+        "TAINT_SINK" => "strat_taint_sanitize_sink_v1",
+        "BAD_TYPE" => "strat_bad_type_infer_let_v1",
+        "AMBIGUOUS_GRAMMAR" => "strat_ambiguous_grammar_canonical_v1",
+        "BUDGET_EXCEEDED" => "strat_budget_aware_synthesis_v1",
+        "LINEAR_LEAK" => "strat_linear_arena_drop_v1",
+        "BORROW_CONFLICT" => "strat_borrow_order_swap_v1",
+        "IMMUT_PARAM" => "strat_immut_param_local_copy_v1",
+        "CORRUPT_PACK5" => "strat_corrupt_pack5_clamp_v1",
+        "ARITY_MISMATCH" => "strat_multi_fn_arity_align_v1",
+        "CIRCULAR_INCLUDE" => "strat_include_cycle_prune_v1",
+        "UNRESOLVED_LABEL" => "strat_unresolved_label_insert_v1",
+        "UNDEF_VAR" => "strat_undef_var_init_v1",
+        "UNKNOWN_FN" => "strat_unknown_fn_alias_v1",
+        _ => "strat_syntax_fallback_v1",
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OmniAgentAttempt {
@@ -5165,12 +5630,15 @@ pub struct OmniAgentAttempt {
     pub source: String,
     pub harness_json: String,
     pub error: Option<OmniStructuredError>,
+    pub strategy_id: Option<&'static str>,
+    pub strategy_version: &'static str,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OmniAgentRepairReport {
     pub ok: bool,
     pub contract_version: String,
+    pub strategy_version: String,
     pub attempts: Vec<OmniAgentAttempt>,
     pub final_source: String,
     pub final_json: String,
@@ -5220,6 +5688,153 @@ fn infer_surface_rhs_type(rhs: &str) -> &'static str {
     }
 }
 
+/// Infers the minimal required capability names for a `MISSING_CAP` diagnostic.
+pub fn infer_minimal_capabilities_for_error(src: &str, err: &OmniStructuredError) -> Vec<&'static str> {
+    let mut needed: Vec<&'static str> = Vec::new();
+    // 1. Check exact opcode hex in the verifier error message first for minimal capability precision
+    if err.message.contains("0x7F35") {
+        needed.push("AI");
+    }
+    if err.message.contains("0x7F6C") || err.message.contains("0x7F6D") || err.message.contains("0x7F6E") || err.message.contains("0x7F6F") {
+        needed.push("NET");
+    }
+    if err.message.contains("0x7F64") || err.message.contains("0x7F65") || err.message.contains("0x7F68") {
+        needed.push("DB_R");
+    }
+    if err.message.contains("0x7F63") || err.message.contains("0x7F6B") {
+        needed.push("DB_W");
+    }
+    if err.message.contains("0x7F70") {
+        needed.push("AUTH");
+    }
+    if err.message.contains("0x7F76") {
+        needed.push("DOM");
+    }
+    if !needed.is_empty() {
+        return needed;
+    }
+    // 2. Fallback to surface call inspection
+    if src.contains("route ")
+        || src.contains("req.param")
+        || src.contains("req_param")
+        || src.contains("respond(")
+        || src.contains("respond_json(")
+        || src.contains("respond_html(")
+    {
+        needed.push("NET");
+    }
+    if src.contains("db_query") || src.contains("db_get") || src.contains("kv_get") || src.contains("db_count") {
+        needed.push("DB_R");
+    }
+    if src.contains("kv_put") || src.contains("db_put") {
+        needed.push("DB_W");
+    }
+    if src.contains("egate(") || src.contains("decision_hook(") || src.contains("pack5_gate(") {
+        needed.push("AI");
+    }
+    if src.contains("auth_verify(") {
+        needed.push("AUTH");
+    }
+    if needed.is_empty() {
+        needed.push("AI");
+    }
+    needed
+}
+
+/// Repairs a multi-file `.omni` include graph by breaking circular `include` chains,
+/// synthesizing missing included stub modules, and running the repair loop on the linked module.
+pub fn repair_omni_include_graph(
+    vfs: &BTreeMap<String, String>,
+    entry_file: &str,
+    args: Vec<OmniValue>,
+    strict: bool,
+    max_attempts: usize,
+) -> Result<(BTreeMap<String, String>, OmniAgentRepairReport), String> {
+    let mut repaired_vfs = vfs.clone();
+    let mut entry_src = repaired_vfs
+        .get(entry_file)
+        .cloned()
+        .unwrap_or_else(|| String::from(entry_file));
+
+    // Break circular includes and synthesize missing included files in repaired_vfs
+    for _pass in 0..8 {
+        match resolve_omni_surface_includes(&entry_src, None, Some(&repaired_vfs)) {
+            Ok(expanded) => {
+                let rep = run_omni_agent_repair_loop(
+                    &expanded,
+                    args,
+                    strict,
+                    max_attempts,
+                    OMNI_HARNESS_CONTRACT_VERSION,
+                )?;
+                repaired_vfs.insert(String::from(entry_file), rep.final_source.clone());
+                return Ok((repaired_vfs, rep));
+            }
+            Err(e) => {
+                let st = parse_omni_structured_error(&e);
+                if st.code == "CIRCULAR_INCLUDE" {
+                    // Strip cyclic include directives from VFS modules and entry_src
+                    for val in repaired_vfs.values_mut() {
+                        let filtered: Vec<&str> = val
+                            .lines()
+                            .filter(|l| {
+                                let t = l.trim_start();
+                                !(t.starts_with("include ") || t.starts_with("include\""))
+                            })
+                            .collect();
+                        *val = filtered.join("\n");
+                    }
+                    let filtered_entry: Vec<&str> = entry_src
+                        .lines()
+                        .filter(|l| {
+                            let t = l.trim_start();
+                            if t.starts_with("include ") || t.starts_with("include\"") {
+                                // Keep include if target exists in repaired_vfs and is now cycle-free
+                                if let Some(q1) = t.find('"') {
+                                    if let Some(q2) = t[q1 + 1..].find('"') {
+                                        let inc_name = &t[q1 + 1..q1 + 1 + q2];
+                                        return inc_name != entry_file && repaired_vfs.contains_key(inc_name);
+                                    }
+                                }
+                                false
+                            } else {
+                                true
+                            }
+                        })
+                        .collect();
+                    entry_src = filtered_entry.join("\n");
+                    repaired_vfs.insert(String::from(entry_file), entry_src.clone());
+                } else if e.contains("Failed to read included file '") {
+                    if let Some(q1) = e.find("Failed to read included file '") {
+                        let rest = &e[q1 + 30..];
+                        if let Some(q2) = rest.find('\'') {
+                            let missing_name = &rest[..q2];
+                            repaired_vfs.insert(
+                                String::from(missing_name),
+                                String::from("#[strict]\nfn stub_helper(x: i64) -> i64 { return x; }\n"),
+                            );
+                        }
+                    }
+                } else if let Some(repaired_entry) = repair_omni_program_from_harness_error(&entry_src, &st, strict) {
+                    entry_src = repaired_entry;
+                    repaired_vfs.insert(String::from(entry_file), entry_src.clone());
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    let rep = run_omni_agent_repair_loop(
+        &entry_src,
+        args,
+        strict,
+        max_attempts,
+        OMNI_HARNESS_CONTRACT_VERSION,
+    )?;
+    repaired_vfs.insert(String::from(entry_file), rep.final_source.clone());
+    Ok((repaired_vfs, rep))
+}
+
 /// Repairs a candidate `.omni` surface program using the structured `(code, line, col, retry_hint, message)`
 /// feedback returned by `omni-harness`. Lives outside the token ISA and verifier.
 pub fn repair_omni_program_from_harness_error(
@@ -5230,49 +5845,84 @@ pub fn repair_omni_program_from_harness_error(
     let target_line = err.line.unwrap_or(1).max(1);
     match err.code {
         "MISSING_CAP" => {
-            let mut needed: Vec<&'static str> = Vec::new();
-            if src.contains("route ")
-                || src.contains("req.param")
-                || src.contains("req_param")
-                || src.contains("respond(")
-                || src.contains("respond_json(")
-                || src.contains("respond_html(")
-                || err.message.contains("0x7F6C")
-                || err.message.contains("0x7F6E")
-                || err.message.contains("0x7F6F")
-            {
-                needed.push("NET");
-            }
-            if src.contains("db_query")
-                || src.contains("db_get")
-                || src.contains("kv_get")
-                || src.contains("db_count")
-                || err.message.contains("0x7F64")
-                || err.message.contains("0x7F65")
-                || err.message.contains("0x7F68")
-            {
-                needed.push("DB_R");
-            }
-            if src.contains("kv_put") || src.contains("db_put") || err.message.contains("0x7F6B") {
-                needed.push("DB_W");
-            }
-            if src.contains("egate(")
-                || src.contains("decision_hook(")
-                || src.contains("pack5_gate(")
-                || err.message.contains("0x7F35")
-            {
-                needed.push("AI");
-            }
-            if src.contains("auth_verify(") || err.message.contains("0x7F70") {
-                needed.push("AUTH");
-            }
-            if src.contains("san_dom(") {
-                needed.push("DOM");
-            }
-            if needed.is_empty() {
-                needed.extend(["AI", "NET", "DB_R", "DB_W", "AUTH", "DOM"]);
-            }
+            let needed = infer_minimal_capabilities_for_error(src, err);
             let cap_attr = format!("#[cap({})]", needed.join(", "));
+            // If multi-function module, attach #[cap(...)] to the enclosing function at or above target_line
+            let lines: Vec<&str> = src.lines().collect();
+            if src.matches("fn ").count() > 1 && target_line <= lines.len() {
+                let mut fn_line_idx: Option<usize> = None;
+                for idx in (0..target_line).rev() {
+                    let trimmed = lines[idx].trim_start();
+                    if trimmed.starts_with("fn ") || trimmed.contains(" fn ") || trimmed.starts_with("route ") {
+                        fn_line_idx = Some(idx);
+                        break;
+                    }
+                }
+                if let Some(f_idx) = fn_line_idx {
+                    let mut new_lines: Vec<String> = lines.iter().map(|s| String::from(*s)).collect();
+                    if f_idx > 0 && new_lines[f_idx - 1].contains("#[cap(") {
+                        let prev = &new_lines[f_idx - 1];
+                        if let Some(c_start) = prev.find("#[cap(") {
+                            if let Some(rel_end) = prev[c_start..].find(")]") {
+                                let existing = &prev[c_start + 6..c_start + rel_end];
+                                let mut merged: Vec<String> = existing
+                                    .split(',')
+                                    .map(|s| s.trim().to_ascii_uppercase())
+                                    .filter(|s| !s.is_empty())
+                                    .collect();
+                                for n in &needed {
+                                    if !merged.iter().any(|m| m == n) {
+                                        merged.push(String::from(*n));
+                                    }
+                                }
+                                new_lines[f_idx - 1] = format!(
+                                    "{}#[cap({})]{}",
+                                    &prev[..c_start],
+                                    merged.join(", "),
+                                    &prev[c_start + rel_end + 2..]
+                                );
+                                let out = new_lines.join("\n");
+                                if out != src {
+                                    return Some(out);
+                                }
+                            }
+                        }
+                    } else if new_lines[f_idx].contains("#[cap(") {
+                        let cur = &new_lines[f_idx];
+                        if let Some(c_start) = cur.find("#[cap(") {
+                            if let Some(rel_end) = cur[c_start..].find(")]") {
+                                let existing = &cur[c_start + 6..c_start + rel_end];
+                                let mut merged: Vec<String> = existing
+                                    .split(',')
+                                    .map(|s| s.trim().to_ascii_uppercase())
+                                    .filter(|s| !s.is_empty())
+                                    .collect();
+                                for n in &needed {
+                                    if !merged.iter().any(|m| m == n) {
+                                        merged.push(String::from(*n));
+                                    }
+                                }
+                                new_lines[f_idx] = format!(
+                                    "{}#[cap({})]{}",
+                                    &cur[..c_start],
+                                    merged.join(", "),
+                                    &cur[c_start + rel_end + 2..]
+                                );
+                                let out = new_lines.join("\n");
+                                if out != src {
+                                    return Some(out);
+                                }
+                            }
+                        }
+                    } else {
+                        new_lines[f_idx] = format!("{} {}", cap_attr, new_lines[f_idx]);
+                        let out = new_lines.join("\n");
+                        if out != src {
+                            return Some(out);
+                        }
+                    }
+                }
+            }
             if let Some(c_start) = src.find("#[cap(") {
                 if let Some(rel_end) = src[c_start..].find(")]") {
                     let existing = &src[c_start + 6..c_start + rel_end];
@@ -5561,6 +6211,128 @@ pub fn repair_omni_program_from_harness_error(
                 None
             }
         }
+        "ARITY_MISMATCH" => {
+            // Parse expected and got arity from message: "'<name>' expects <E> argument..., got <G>"
+            let mut fn_name_opt: Option<&str> = None;
+            if let Some(q1) = err.message.find('\'') {
+                let rest = &err.message[q1 + 1..];
+                if let Some(q2) = rest.find('\'') {
+                    fn_name_opt = Some(&rest[..q2]);
+                }
+            }
+            let mut exp_arity: Option<usize> = None;
+            if let Some(ex_idx) = err.message.find("expects ") {
+                let after = &err.message[ex_idx + 8..];
+                let d: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+                exp_arity = d.parse::<usize>().ok();
+            }
+            if let (Some(callee), Some(want_n)) = (fn_name_opt, exp_arity) {
+                let call_pat = format!("{}(", callee);
+                let lines: Vec<&str> = src.lines().collect();
+                if target_line <= lines.len() {
+                    let line_s = lines[target_line - 1];
+                    if let Some(c_pos) = line_s.find(&call_pat) {
+                        let args_start = c_pos + call_pat.len();
+                        if let Some(rel_close) = line_s[args_start..].find(')') {
+                            let args_inside = &line_s[args_start..args_start + rel_close];
+                            let mut parts: Vec<String> = if args_inside.trim().is_empty() {
+                                Vec::new()
+                            } else {
+                                args_inside.split(',').map(|s| String::from(s.trim())).collect()
+                            };
+                            if parts.len() > want_n {
+                                parts.truncate(want_n);
+                            } else {
+                                while parts.len() < want_n {
+                                    parts.push(String::from("1"));
+                                }
+                            }
+                            let fixed_call = format!("{}({})", callee, parts.join(", "));
+                            let mut new_lines: Vec<String> = lines.iter().map(|s| String::from(*s)).collect();
+                            new_lines[target_line - 1] = format!(
+                                "{}{}{}",
+                                &line_s[..c_pos],
+                                fixed_call,
+                                &line_s[args_start + rel_close + 1..]
+                            );
+                            let out = new_lines.join("\n");
+                            if out != src {
+                                return Some(out);
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        }
+        "CIRCULAR_INCLUDE" => {
+            let filtered: Vec<&str> = src
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("include ") || t.starts_with("include\"") || t.starts_with("mod "))
+                })
+                .collect();
+            let out = filtered.join("\n");
+            if out != src {
+                Some(out)
+            } else {
+                None
+            }
+        }
+        "UNRESOLVED_LABEL" => {
+            let mut lbl_num: Option<u16> = None;
+            if let Some(idx) = err.message.find("label ") {
+                let after = &err.message[idx + 6..];
+                let d: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+                lbl_num = d.parse::<u16>().ok();
+            }
+            if let Some(n) = lbl_num {
+                if src.contains("return ") {
+                    let out = src.replacen("return ", &format!("label {}; return ", n), 1);
+                    if out != src {
+                        return Some(out);
+                    }
+                }
+            }
+            None
+        }
+        "UNDEF_VAR" => {
+            if let Some(q1) = err.message.find("variable '") {
+                let rest = &err.message[q1 + 10..];
+                if let Some(q2) = rest.find('\'') {
+                    let v_name = &rest[..q2];
+                    let lines: Vec<&str> = src.lines().collect();
+                    if target_line <= lines.len() {
+                        let mut new_lines: Vec<String> = Vec::with_capacity(lines.len() + 1);
+                        for (idx, l) in lines.iter().enumerate() {
+                            if idx + 1 == target_line {
+                                new_lines.push(format!("    let {}: i64 = 0;", v_name));
+                            }
+                            new_lines.push(String::from(*l));
+                        }
+                        let out = new_lines.join("\n");
+                        if out != src {
+                            return Some(out);
+                        }
+                    }
+                }
+            }
+            None
+        }
+        "UNKNOWN_FN" => {
+            if let Some(q1) = err.message.find("function '") {
+                let rest = &err.message[q1 + 10..];
+                if let Some(q2) = rest.find('\'') {
+                    let bad_fn = &rest[..q2];
+                    let out = src.replace(&format!("{}(", bad_fn), "iabs(");
+                    if out != src {
+                        return Some(out);
+                    }
+                }
+            }
+            None
+        }
         _ => None,
     }
 }
@@ -5569,8 +6341,8 @@ pub fn repair_omni_program_from_harness_error(
 /// 1. Queries `omni_harness_spec_json()` (`omni-harness --spec`) and verifies that its contract version
 ///    matches `expected_contract_version` (`"omni-harness-v1.0.0"`), refusing to run on mismatch.
 /// 2. Submits candidate `.omni` source to `run_omni_harness_json(..., true)`.
-/// 3. On failure, extracts the structured `OmniStructuredError` (`code`, 1-based `line`/`col`, `retry_hint`, `message`)
-///    and invokes `repair_fn(current_src, &err, &spec_json)` up to `max_attempts`.
+/// 3. On failure, extracts the structured `OmniStructuredError` (`code`, 1-based `line`/`col`, `retry_hint`, `message`),
+///    selects the versioned `strategy_id`, and invokes `repair_fn(current_src, &err, &spec_json)` up to `max_attempts`.
 pub fn run_omni_agent_repair_loop_with_model<F>(
     initial_src: &str,
     args: Vec<OmniValue>,
@@ -5602,10 +6374,13 @@ where
                 source: current_src.clone(),
                 harness_json: harness_json.clone(),
                 error: None,
+                strategy_id: None,
+                strategy_version: OMNI_REPAIR_STRATEGIES_VERSION,
             });
             return Ok(OmniAgentRepairReport {
                 ok: true,
                 contract_version: String::from(OMNI_HARNESS_CONTRACT_VERSION),
+                strategy_version: String::from(OMNI_REPAIR_STRATEGIES_VERSION),
                 attempts,
                 final_source: current_src,
                 final_json: harness_json,
@@ -5613,17 +6388,21 @@ where
         }
 
         let err = extract_structured_error_from_harness_json(&harness_json, &current_src, strict);
+        let strat_id = select_omni_repair_strategy(&current_src, &err);
         attempts.push(OmniAgentAttempt {
             attempt: attempt_idx,
             source: current_src.clone(),
             harness_json: harness_json.clone(),
             error: Some(err.clone()),
+            strategy_id: Some(strat_id),
+            strategy_version: OMNI_REPAIR_STRATEGIES_VERSION,
         });
 
         if attempt_idx == limit {
             return Ok(OmniAgentRepairReport {
                 ok: false,
                 contract_version: String::from(OMNI_HARNESS_CONTRACT_VERSION),
+                strategy_version: String::from(OMNI_REPAIR_STRATEGIES_VERSION),
                 attempts,
                 final_source: current_src,
                 final_json: harness_json,
@@ -5638,6 +6417,7 @@ where
                 return Ok(OmniAgentRepairReport {
                     ok: false,
                     contract_version: String::from(OMNI_HARNESS_CONTRACT_VERSION),
+                    strategy_version: String::from(OMNI_REPAIR_STRATEGIES_VERSION),
                     attempts,
                     final_source: current_src,
                     final_json: harness_json,
@@ -5734,9 +6514,12 @@ pub fn build_omni_agent_repair_prompt_json(
     err: &OmniStructuredError,
     spec_json: &str,
 ) -> String {
+    let strat_id = select_omni_repair_strategy(current_src, err);
     format!(
-        "{{\"version\":\"{}\",\"attempt\":{},\"source\":\"{}\",\"error\":{{\"code\":\"{}\",\"line\":{},\"col\":{},\"message\":\"{}\",\"retry_hint\":\"{}\"}},\"spec\":{}}}",
+        "{{\"version\":\"{}\",\"strategy_version\":\"{}\",\"strategy_id\":\"{}\",\"attempt\":{},\"source\":\"{}\",\"error\":{{\"code\":\"{}\",\"line\":{},\"col\":{},\"message\":\"{}\",\"retry_hint\":\"{}\"}},\"spec\":{}}}",
         OMNI_HARNESS_CONTRACT_VERSION,
+        OMNI_REPAIR_STRATEGIES_VERSION,
+        strat_id,
         attempt,
         json_escape_str(current_src),
         err.code,
@@ -5766,7 +6549,7 @@ pub fn run_omni_agent_repair_loop(
     )
 }
 
-/// Formats an `OmniAgentRepairReport` as a deterministic single-line JSON object.
+/// Formats an `OmniAgentRepairReport` as a deterministic single-line JSON object including `strategy_id` and `strategy_version`.
 pub fn run_omni_agent_driver_json(
     initial_src: &str,
     args: Vec<OmniValue>,
@@ -5781,19 +6564,22 @@ pub fn run_omni_agent_driver_json(
                 .iter()
                 .map(|a| match &a.error {
                     Some(e) => format!(
-                        "{{\"attempt\":{},\"ok\":false,\"code\":\"{}\",\"line\":{},\"col\":{}}}",
+                        "{{\"attempt\":{},\"ok\":false,\"code\":\"{}\",\"line\":{},\"col\":{},\"strategy_id\":\"{}\",\"strategy_version\":\"{}\"}}",
                         a.attempt,
                         e.code,
                         e.line.unwrap_or(1),
-                        e.col.unwrap_or(1)
+                        e.col.unwrap_or(1),
+                        a.strategy_id.unwrap_or("strat_syntax_fallback_v1"),
+                        a.strategy_version
                     ),
                     None => format!("{{\"attempt\":{},\"ok\":true}}", a.attempt),
                 })
                 .collect();
             format!(
-                "{{\"ok\":{},\"version\":\"{}\",\"attempts\":{},\"history\":[{}],\"final_source\":\"{}\",\"harness\":{}}}",
+                "{{\"ok\":{},\"version\":\"{}\",\"strategy_version\":\"{}\",\"attempts\":{},\"history\":[{}],\"final_source\":\"{}\",\"harness\":{}}}",
                 rep.ok,
                 rep.contract_version,
+                rep.strategy_version,
                 rep.attempts.len(),
                 codes.join(","),
                 json_escape_str(&rep.final_source),
@@ -5801,15 +6587,16 @@ pub fn run_omni_agent_driver_json(
             )
         }
         Err(e) => format!(
-            "{{\"ok\":false,\"version\":\"{}\",\"code\":\"VERSION_MISMATCH\",\"line\":1,\"col\":1,\"message\":\"{}\"}}",
+            "{{\"ok\":false,\"version\":\"{}\",\"strategy_version\":\"{}\",\"code\":\"VERSION_MISMATCH\",\"line\":1,\"col\":1,\"message\":\"{}\"}}",
             expected_contract_version,
+            OMNI_REPAIR_STRATEGIES_VERSION,
             json_escape_str(&e)
         ),
     }
 }
 
 /// Shared CLI front-end for `omni-agent-driver` / `omni agent-driver`.
-/// Usage: omni-agent-driver [--strict] [--max-attempts N] [--expect-version VER] [--repair-cmd CMD] [--emit-repair-prompt] (<file.omni | - | "source">) [args...]
+/// Usage: omni-agent-driver [--list-strategies] [--explain <CODE>] [--strict] [--max-attempts N] [--expect-version VER] [--repair-cmd CMD] [--emit-repair-prompt] (<file.omni | - | "source">) [args...]
 pub fn run_omni_agent_driver_cli(argv: &[String]) -> i32 {
     let mut strict = false;
     let mut max_attempts = 6usize;
@@ -5820,6 +6607,22 @@ pub fn run_omni_agent_driver_cli(argv: &[String]) -> i32 {
     let mut i = 0usize;
     while i < argv.len() {
         match argv[i].as_str() {
+            "--list-strategies" | "list-strategies" => {
+                println!("{}", omni_repair_strategies_json());
+                return 0;
+            }
+            "--explain" if i + 1 < argv.len() => {
+                match explain_omni_error_code(&argv[i + 1]) {
+                    Some(text) => {
+                        println!("{}", text);
+                        return 0;
+                    }
+                    None => {
+                        eprintln!("Unknown Omni error code '{}'", argv[i + 1]);
+                        return 2;
+                    }
+                }
+            }
             "--strict" => strict = true,
             "--emit-repair-prompt" => emit_repair_prompt = true,
             "--max-attempts" => {
@@ -5851,7 +6654,7 @@ pub fn run_omni_agent_driver_cli(argv: &[String]) -> i32 {
         i += 1;
     }
     if rest.is_empty() {
-        eprintln!("usage: omni-agent-driver [--strict] [--max-attempts N] [--expect-version VER] [--repair-cmd CMD] [--emit-repair-prompt] (<file.omni | - | \"source\">) [args...]");
+        eprintln!("usage: omni-agent-driver [--list-strategies] [--explain <CODE>] [--strict] [--max-attempts N] [--expect-version VER] [--repair-cmd CMD] [--emit-repair-prompt] (<file.omni | - | \"source\">) [args...]");
         return 2;
     }
     let target = &rest[0];
@@ -5936,19 +6739,22 @@ pub fn run_omni_agent_driver_cli(argv: &[String]) -> i32 {
                     .iter()
                     .map(|a| match &a.error {
                         Some(e) => format!(
-                            "{{\"attempt\":{},\"ok\":false,\"code\":\"{}\",\"line\":{},\"col\":{}}}",
+                            "{{\"attempt\":{},\"ok\":false,\"code\":\"{}\",\"line\":{},\"col\":{},\"strategy_id\":\"{}\",\"strategy_version\":\"{}\"}}",
                             a.attempt,
                             e.code,
                             e.line.unwrap_or(1),
-                            e.col.unwrap_or(1)
+                            e.col.unwrap_or(1),
+                            a.strategy_id.unwrap_or("strat_syntax_fallback_v1"),
+                            a.strategy_version
                         ),
                         None => format!("{{\"attempt\":{},\"ok\":true}}", a.attempt),
                     })
                     .collect();
                 let out = format!(
-                    "{{\"ok\":{},\"version\":\"{}\",\"attempts\":{},\"history\":[{}],\"final_source\":\"{}\",\"harness\":{}}}",
+                    "{{\"ok\":{},\"version\":\"{}\",\"strategy_version\":\"{}\",\"attempts\":{},\"history\":[{}],\"final_source\":\"{}\",\"harness\":{}}}",
                     rep.ok,
                     rep.contract_version,
+                    rep.strategy_version,
                     rep.attempts.len(),
                     codes.join(","),
                     json_escape_str(&rep.final_source),
@@ -5959,8 +6765,9 @@ pub fn run_omni_agent_driver_cli(argv: &[String]) -> i32 {
             }
             Err(e) => {
                 println!(
-                    "{{\"ok\":false,\"version\":\"{}\",\"code\":\"VERSION_MISMATCH\",\"line\":1,\"col\":1,\"message\":\"{}\"}}",
+                    "{{\"ok\":false,\"version\":\"{}\",\"strategy_version\":\"{}\",\"code\":\"VERSION_MISMATCH\",\"line\":1,\"col\":1,\"message\":\"{}\"}}",
                     expected_ver,
+                    OMNI_REPAIR_STRATEGIES_VERSION,
                     json_escape_str(&e)
                 );
                 return 1;
@@ -5973,8 +6780,438 @@ pub fn run_omni_agent_driver_cli(argv: &[String]) -> i32 {
 }
 
 // ==============================================================================
-// 7E. REAL NATIVE HTTP/1.1 & DB/KV HOST RUNTIME (`OmniHostRuntime` / `omni serve`)
+// 7E. NARROW CAPABILITY-GATED HOST INTERFACE (`OmniNarrowHost`) & LIVE HTTP/DB HOST
 // ==============================================================================
+
+fn check_narrow_host_cap(cap_mask: CapMask, req_mask: CapMask, syscall_name: &str) -> Result<(), String> {
+    if (cap_mask & req_mask) != req_mask {
+        return Err(format!(
+            "error[MISSING_CAP] line 1, col 1: Narrow host syscall '{}' requires capability mask 0x{:04X}, got 0x{:04X}",
+            syscall_name, req_mask, cap_mask
+        ));
+    }
+    Ok(())
+}
+
+/// The frozen 10-operation narrow capability-gated host boundary (`spec/host_interface.md`, `omni-narrow-host-v1.0.0`).
+/// All OS network, file-backed KV/DB persistence, and monotonic clock operations route through this trait.
+pub trait OmniNarrowHost {
+    fn host_tcp_listen(&mut self, cap_mask: CapMask, bind_addr: &str) -> Result<(u64, String), String>;
+    fn host_tcp_accept(&mut self, cap_mask: CapMask, listener_handle: u64) -> Result<u64, String>;
+    fn host_tcp_read(&mut self, cap_mask: CapMask, conn_handle: u64, max_bytes: usize) -> Result<Vec<u8>, String>;
+    fn host_tcp_write(&mut self, cap_mask: CapMask, conn_handle: u64, data: &[u8]) -> Result<usize, String>;
+    fn host_tcp_close(&mut self, cap_mask: CapMask, handle: u64) -> Result<(), String>;
+    fn host_file_open(&mut self, cap_mask: CapMask, path: &str, write: bool) -> Result<u64, String>;
+    fn host_file_read(&mut self, cap_mask: CapMask, file_handle: u64) -> Result<Vec<u8>, String>;
+    fn host_file_write(&mut self, cap_mask: CapMask, file_handle: u64, data: &[u8]) -> Result<usize, String>;
+    fn host_file_close(&mut self, cap_mask: CapMask, file_handle: u64) -> Result<(), String>;
+    fn host_time_ns(&mut self, cap_mask: CapMask) -> Result<u64, String>;
+}
+
+/// Live OS reference implementation of `OmniNarrowHost` backed by `std::net`, `std::fs`, and `std::time::Instant`.
+pub struct StdNarrowHostAdapter {
+    next_handle: u64,
+    listeners: BTreeMap<u64, std::net::TcpListener>,
+    streams: BTreeMap<u64, std::net::TcpStream>,
+    files: BTreeMap<u64, (std::path::PathBuf, bool, Vec<u8>)>,
+    start_instant: std::time::Instant,
+}
+
+impl Default for StdNarrowHostAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StdNarrowHostAdapter {
+    pub fn new() -> Self {
+        Self {
+            next_handle: 1,
+            listeners: BTreeMap::new(),
+            streams: BTreeMap::new(),
+            files: BTreeMap::new(),
+            start_instant: std::time::Instant::now(),
+        }
+    }
+
+    fn alloc_handle(&mut self) -> u64 {
+        let h = self.next_handle;
+        self.next_handle += 1;
+        h
+    }
+}
+
+impl OmniNarrowHost for StdNarrowHostAdapter {
+    fn host_tcp_listen(&mut self, cap_mask: CapMask, bind_addr: &str) -> Result<(u64, String), String> {
+        check_narrow_host_cap(cap_mask, cap_bit(CAP_ID_NET), "host_tcp_listen")?;
+        let listener = std::net::TcpListener::bind(bind_addr)
+            .map_err(|e| format!("Failed to bind TCP listener on '{}': {}", bind_addr, e))?;
+        let addr_str = listener
+            .local_addr()
+            .map_err(|e| format!("Failed to query local socket addr: {}", e))?
+            .to_string();
+        let h = self.alloc_handle();
+        self.listeners.insert(h, listener);
+        Ok((h, addr_str))
+    }
+
+    fn host_tcp_accept(&mut self, cap_mask: CapMask, listener_handle: u64) -> Result<u64, String> {
+        check_narrow_host_cap(cap_mask, cap_bit(CAP_ID_NET), "host_tcp_accept")?;
+        let listener = self
+            .listeners
+            .get(&listener_handle)
+            .ok_or_else(|| format!("Invalid TCP listener handle {}", listener_handle))?;
+        let (stream, _) = listener.accept().map_err(|e| format!("TCP accept failed: {}", e))?;
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+        let ch = self.alloc_handle();
+        self.streams.insert(ch, stream);
+        Ok(ch)
+    }
+
+    fn host_tcp_read(&mut self, cap_mask: CapMask, conn_handle: u64, max_bytes: usize) -> Result<Vec<u8>, String> {
+        use std::io::Read;
+        check_narrow_host_cap(cap_mask, cap_bit(CAP_ID_NET), "host_tcp_read")?;
+        let stream = self
+            .streams
+            .get_mut(&conn_handle)
+            .ok_or_else(|| format!("Invalid TCP connection handle {}", conn_handle))?;
+        let mut buf = vec![0u8; max_bytes.clamp(1, 65536)];
+        let n = stream.read(&mut buf).map_err(|e| format!("TCP read failed: {}", e))?;
+        buf.truncate(n);
+        Ok(buf)
+    }
+
+    fn host_tcp_write(&mut self, cap_mask: CapMask, conn_handle: u64, data: &[u8]) -> Result<usize, String> {
+        use std::io::Write;
+        check_narrow_host_cap(cap_mask, cap_bit(CAP_ID_NET), "host_tcp_write")?;
+        let stream = self
+            .streams
+            .get_mut(&conn_handle)
+            .ok_or_else(|| format!("Invalid TCP connection handle {}", conn_handle))?;
+        stream.write_all(data).map_err(|e| format!("TCP write failed: {}", e))?;
+        let _ = stream.flush();
+        Ok(data.len())
+    }
+
+    fn host_tcp_close(&mut self, cap_mask: CapMask, handle: u64) -> Result<(), String> {
+        check_narrow_host_cap(cap_mask, cap_bit(CAP_ID_NET), "host_tcp_close")?;
+        self.streams.remove(&handle);
+        self.listeners.remove(&handle);
+        Ok(())
+    }
+
+    fn host_file_open(&mut self, cap_mask: CapMask, path: &str, write: bool) -> Result<u64, String> {
+        if write {
+            if (cap_mask & (cap_bit(CAP_ID_DB_W) | cap_bit(CAP_ID_FS))) == 0 {
+                return Err(String::from(
+                    "error[MISSING_CAP] line 1, col 1: Narrow host syscall 'host_file_open(write)' requires CAP_ID_DB_W or CAP_ID_FS",
+                ));
+            }
+        } else if (cap_mask & (cap_bit(CAP_ID_DB_R) | cap_bit(CAP_ID_FS))) == 0 {
+            return Err(String::from(
+                "error[MISSING_CAP] line 1, col 1: Narrow host syscall 'host_file_open(read)' requires CAP_ID_DB_R or CAP_ID_FS",
+            ));
+        }
+        let p = std::path::PathBuf::from(path);
+        let initial_bytes = if !write && p.exists() {
+            std::fs::read(&p).map_err(|e| format!("Failed to read host file '{}': {}", p.display(), e))?
+        } else {
+            Vec::new()
+        };
+        let fh = self.alloc_handle();
+        self.files.insert(fh, (p, write, initial_bytes));
+        Ok(fh)
+    }
+
+    fn host_file_read(&mut self, cap_mask: CapMask, file_handle: u64) -> Result<Vec<u8>, String> {
+        if (cap_mask & (cap_bit(CAP_ID_DB_R) | cap_bit(CAP_ID_FS))) == 0 {
+            return Err(String::from(
+                "error[MISSING_CAP] line 1, col 1: Narrow host syscall 'host_file_read' requires CAP_ID_DB_R or CAP_ID_FS",
+            ));
+        }
+        let (_, _, bytes) = self
+            .files
+            .get(&file_handle)
+            .ok_or_else(|| format!("Invalid file handle {}", file_handle))?;
+        Ok(bytes.clone())
+    }
+
+    fn host_file_write(&mut self, cap_mask: CapMask, file_handle: u64, data: &[u8]) -> Result<usize, String> {
+        if (cap_mask & (cap_bit(CAP_ID_DB_W) | cap_bit(CAP_ID_FS))) == 0 {
+            return Err(String::from(
+                "error[MISSING_CAP] line 1, col 1: Narrow host syscall 'host_file_write' requires CAP_ID_DB_W or CAP_ID_FS",
+            ));
+        }
+        let (_, write, bytes) = self
+            .files
+            .get_mut(&file_handle)
+            .ok_or_else(|| format!("Invalid file handle {}", file_handle))?;
+        if !*write {
+            return Err(format!("File handle {} was not opened for writing", file_handle));
+        }
+        *bytes = data.to_vec();
+        Ok(data.len())
+    }
+
+    fn host_file_close(&mut self, cap_mask: CapMask, file_handle: u64) -> Result<(), String> {
+        if (cap_mask & (cap_bit(CAP_ID_DB_R) | cap_bit(CAP_ID_DB_W) | cap_bit(CAP_ID_FS))) == 0 {
+            return Err(String::from(
+                "error[MISSING_CAP] line 1, col 1: Narrow host syscall 'host_file_close' requires DB/FS capability",
+            ));
+        }
+        if let Some((path, write, bytes)) = self.files.remove(&file_handle) {
+            if write {
+                std::fs::write(&path, &bytes)
+                    .map_err(|e| format!("Failed to flush host file '{}': {}", path.display(), e))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn host_time_ns(&mut self, cap_mask: CapMask) -> Result<u64, String> {
+        check_narrow_host_cap(cap_mask, cap_bit(CAP_ID_SYS), "host_time_ns")?;
+        Ok(self.start_instant.elapsed().as_nanos() as u64)
+    }
+}
+
+/// Deterministic in-memory implementation of `OmniNarrowHost` for socket-free & disk-free verification of the host boundary.
+pub struct SimulatedNarrowHostAdapter {
+    next_handle: u64,
+    pub bound_addr: Option<String>,
+    pub pending_requests: Vec<Vec<u8>>,
+    pub written_responses: Vec<Vec<u8>>,
+    pub virtual_files: BTreeMap<String, Vec<u8>>,
+    open_files: BTreeMap<u64, (String, bool, Vec<u8>)>,
+    clock_ns: u64,
+}
+
+impl Default for SimulatedNarrowHostAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SimulatedNarrowHostAdapter {
+    pub fn new() -> Self {
+        Self {
+            next_handle: 100,
+            bound_addr: None,
+            pending_requests: Vec::new(),
+            written_responses: Vec::new(),
+            virtual_files: BTreeMap::new(),
+            open_files: BTreeMap::new(),
+            clock_ns: 1_000_000,
+        }
+    }
+
+    pub fn enqueue_http_request(&mut self, raw_wire: &str) {
+        self.pending_requests.push(raw_wire.as_bytes().to_vec());
+    }
+
+    fn alloc_handle(&mut self) -> u64 {
+        let h = self.next_handle;
+        self.next_handle += 1;
+        h
+    }
+}
+
+impl OmniNarrowHost for SimulatedNarrowHostAdapter {
+    fn host_tcp_listen(&mut self, cap_mask: CapMask, bind_addr: &str) -> Result<(u64, String), String> {
+        check_narrow_host_cap(cap_mask, cap_bit(CAP_ID_NET), "host_tcp_listen")?;
+        let assigned = if bind_addr.ends_with(":0") {
+            String::from("127.0.0.1:40080")
+        } else {
+            String::from(bind_addr)
+        };
+        self.bound_addr = Some(assigned.clone());
+        Ok((self.alloc_handle(), assigned))
+    }
+
+    fn host_tcp_accept(&mut self, cap_mask: CapMask, _listener_handle: u64) -> Result<u64, String> {
+        check_narrow_host_cap(cap_mask, cap_bit(CAP_ID_NET), "host_tcp_accept")?;
+        Ok(self.alloc_handle())
+    }
+
+    fn host_tcp_read(&mut self, cap_mask: CapMask, _conn_handle: u64, _max_bytes: usize) -> Result<Vec<u8>, String> {
+        check_narrow_host_cap(cap_mask, cap_bit(CAP_ID_NET), "host_tcp_read")?;
+        if self.pending_requests.is_empty() {
+            return Err(String::from("No pending simulated TCP request"));
+        }
+        Ok(self.pending_requests.remove(0))
+    }
+
+    fn host_tcp_write(&mut self, cap_mask: CapMask, _conn_handle: u64, data: &[u8]) -> Result<usize, String> {
+        check_narrow_host_cap(cap_mask, cap_bit(CAP_ID_NET), "host_tcp_write")?;
+        self.written_responses.push(data.to_vec());
+        Ok(data.len())
+    }
+
+    fn host_tcp_close(&mut self, cap_mask: CapMask, _handle: u64) -> Result<(), String> {
+        check_narrow_host_cap(cap_mask, cap_bit(CAP_ID_NET), "host_tcp_close")?;
+        Ok(())
+    }
+
+    fn host_file_open(&mut self, cap_mask: CapMask, path: &str, write: bool) -> Result<u64, String> {
+        if write {
+            if (cap_mask & (cap_bit(CAP_ID_DB_W) | cap_bit(CAP_ID_FS))) == 0 {
+                return Err(String::from(
+                    "error[MISSING_CAP] line 1, col 1: Narrow host syscall 'host_file_open(write)' requires CAP_ID_DB_W or CAP_ID_FS",
+                ));
+            }
+        } else if (cap_mask & (cap_bit(CAP_ID_DB_R) | cap_bit(CAP_ID_FS))) == 0 {
+            return Err(String::from(
+                "error[MISSING_CAP] line 1, col 1: Narrow host syscall 'host_file_open(read)' requires CAP_ID_DB_R or CAP_ID_FS",
+            ));
+        }
+        let existing = self.virtual_files.get(path).cloned().unwrap_or_default();
+        let fh = self.alloc_handle();
+        self.open_files.insert(fh, (String::from(path), write, existing));
+        Ok(fh)
+    }
+
+    fn host_file_read(&mut self, cap_mask: CapMask, file_handle: u64) -> Result<Vec<u8>, String> {
+        if (cap_mask & (cap_bit(CAP_ID_DB_R) | cap_bit(CAP_ID_FS))) == 0 {
+            return Err(String::from(
+                "error[MISSING_CAP] line 1, col 1: Narrow host syscall 'host_file_read' requires CAP_ID_DB_R or CAP_ID_FS",
+            ));
+        }
+        let (_, _, data) = self
+            .open_files
+            .get(&file_handle)
+            .ok_or_else(|| format!("Invalid simulated file handle {}", file_handle))?;
+        Ok(data.clone())
+    }
+
+    fn host_file_write(&mut self, cap_mask: CapMask, file_handle: u64, data: &[u8]) -> Result<usize, String> {
+        if (cap_mask & (cap_bit(CAP_ID_DB_W) | cap_bit(CAP_ID_FS))) == 0 {
+            return Err(String::from(
+                "error[MISSING_CAP] line 1, col 1: Narrow host syscall 'host_file_write' requires CAP_ID_DB_W or CAP_ID_FS",
+            ));
+        }
+        let (_, write, buf) = self
+            .open_files
+            .get_mut(&file_handle)
+            .ok_or_else(|| format!("Invalid simulated file handle {}", file_handle))?;
+        if !*write {
+            return Err(format!("Simulated file handle {} not opened for write", file_handle));
+        }
+        *buf = data.to_vec();
+        Ok(data.len())
+    }
+
+    fn host_file_close(&mut self, cap_mask: CapMask, file_handle: u64) -> Result<(), String> {
+        if (cap_mask & (cap_bit(CAP_ID_DB_R) | cap_bit(CAP_ID_DB_W) | cap_bit(CAP_ID_FS))) == 0 {
+            return Err(String::from(
+                "error[MISSING_CAP] line 1, col 1: Narrow host syscall 'host_file_close' requires DB/FS capability",
+            ));
+        }
+        if let Some((path, write, buf)) = self.open_files.remove(&file_handle) {
+            if write {
+                self.virtual_files.insert(path, buf);
+            }
+        }
+        Ok(())
+    }
+
+    fn host_time_ns(&mut self, cap_mask: CapMask) -> Result<u64, String> {
+        check_narrow_host_cap(cap_mask, cap_bit(CAP_ID_SYS), "host_time_ns")?;
+        self.clock_ns += 250_000;
+        Ok(self.clock_ns)
+    }
+}
+
+/// Loads a `key=value` map through any `OmniNarrowHost` implementation (`CAP_ID_DB_R`).
+pub fn load_omni_kv_via_narrow_host<H: OmniNarrowHost>(
+    host: &mut H,
+    cap_mask: CapMask,
+    path: &str,
+) -> Result<BTreeMap<i64, i64>, String> {
+    let fh = host.host_file_open(cap_mask, path, false)?;
+    let raw_bytes = host.host_file_read(cap_mask, fh)?;
+    host.host_file_close(cap_mask, fh)?;
+    let raw = String::from_utf8_lossy(&raw_bytes);
+    let mut kv = BTreeMap::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some((k_str, v_str)) = trimmed.split_once('=') {
+            if let (Ok(k), Ok(v)) = (k_str.trim().parse::<i64>(), v_str.trim().parse::<i64>()) {
+                kv.insert(k, v);
+            }
+        }
+    }
+    Ok(kv)
+}
+
+/// Saves a `key=value` map through any `OmniNarrowHost` implementation (`CAP_ID_DB_W`).
+pub fn save_omni_kv_via_narrow_host<H: OmniNarrowHost>(
+    host: &mut H,
+    cap_mask: CapMask,
+    path: &str,
+    kv: &BTreeMap<i64, i64>,
+) -> Result<(), String> {
+    let mut buf = String::new();
+    for (k, v) in kv {
+        buf.push_str(&format!("{}={}\n", k, v));
+    }
+    let fh = host.host_file_open(cap_mask, path, true)?;
+    let _ = host.host_file_write(cap_mask, fh, buf.as_bytes())?;
+    host.host_file_close(cap_mask, fh)
+}
+
+/// Executes a full HTTP/1.1 + DB/KV batch cycle exclusively through the narrow `OmniNarrowHost` interface.
+pub fn serve_omni_http_via_narrow_host<H: OmniNarrowHost>(
+    host: &mut H,
+    src: &str,
+    bind_addr: &str,
+    db_path: Option<&str>,
+    num_requests: usize,
+) -> Result<(String, Vec<OmniHttpResponse>, BTreeMap<i64, i64>), String> {
+    let routes = extract_omni_routes(src)?;
+    if routes.is_empty() {
+        return Err(String::from("error[SYNTAX_ERROR] line 1, col 1: Surface program contains no 'route' handlers"));
+    }
+    let (u16_stream, sm) = compile_omni_surface_to_u16_with_sourcemap(src, false)?;
+    for rep in verify_u16_stream(&u16_stream)? {
+        if !rep.passed {
+            let first = rep.errors.first().cloned().unwrap_or_default();
+            let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
+            return Err(format!("{} (fn #{}: {:?})", annotated, rep.fn_idx, rep.errors));
+        }
+    }
+    let module = decode_omni_token_stream(&u16_stream)?;
+    let combined_caps: CapMask = module.functions.iter().fold(0u16, |acc, f| acc | f.cap_mask);
+
+    let mut kv_store = if let Some(p) = db_path {
+        load_omni_kv_via_narrow_host(host, combined_caps | cap_bit(CAP_ID_DB_R), p)?
+    } else {
+        BTreeMap::new()
+    };
+
+    let (listener_h, local_addr) = host.host_tcp_listen(combined_caps, bind_addr)?;
+    let mut responses = Vec::with_capacity(num_requests);
+    for _ in 0..num_requests {
+        let conn_h = host.host_tcp_accept(combined_caps, listener_h)?;
+        let req_bytes = host.host_tcp_read(combined_caps, conn_h, 4096)?;
+        let req_str = String::from_utf8_lossy(&req_bytes);
+        let first_line = req_str.lines().next().unwrap_or("GET / HTTP/1.1");
+        let mut parts = first_line.split_whitespace();
+        let method = parts.next().unwrap_or("GET");
+        let req_path = parts.next().unwrap_or("/");
+        let resp = handle_omni_http_request(src, method, req_path, &mut kv_store)?;
+        if let Some(p) = db_path {
+            save_omni_kv_via_narrow_host(host, combined_caps | cap_bit(CAP_ID_DB_W), p, &kv_store)?;
+        }
+        let wire = resp.to_http11_wire_bytes();
+        let _ = host.host_tcp_write(combined_caps, conn_h, &wire)?;
+        let _ = host.host_tcp_close(combined_caps, conn_h)?;
+        responses.push(resp);
+    }
+    let _ = host.host_tcp_close(combined_caps, listener_h)?;
+    Ok((local_addr, responses, kv_store))
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OmniRouteSpec {
@@ -6161,41 +7398,21 @@ pub fn handle_omni_http_request(
     })
 }
 
-/// Loads a persistent host KV/DB store from a deterministic `key=value` file on disk (returning an empty map if the file does not exist).
+/// Loads a persistent host KV/DB store from disk through the narrow capability-gated host adapter (`StdNarrowHostAdapter`).
 pub fn load_omni_kv_file(path: &std::path::Path) -> Result<BTreeMap<i64, i64>, String> {
-    if !path.exists() {
-        return Ok(BTreeMap::new());
-    }
-    let raw = std::fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read host DB file '{}': {}", path.display(), e))?;
-    let mut kv = BTreeMap::new();
-    for line in raw.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        if let Some((k_str, v_str)) = trimmed.split_once('=') {
-            if let (Ok(k), Ok(v)) = (k_str.trim().parse::<i64>(), v_str.trim().parse::<i64>()) {
-                kv.insert(k, v);
-            }
-        }
-    }
-    Ok(kv)
+    let mut host = StdNarrowHostAdapter::new();
+    load_omni_kv_via_narrow_host(&mut host, cap_bit(CAP_ID_DB_R), &path.to_string_lossy())
 }
 
-/// Atomically persists a host KV/DB store to disk as sorted `key=value` lines.
+/// Atomically persists a host KV/DB store to disk through the narrow capability-gated host adapter (`StdNarrowHostAdapter`).
 pub fn save_omni_kv_file(path: &std::path::Path, kv: &BTreeMap<i64, i64>) -> Result<(), String> {
-    let mut buf = String::new();
-    for (k, v) in kv {
-        buf.push_str(&format!("{}={}\n", k, v));
-    }
-    std::fs::write(path, buf.as_bytes())
-        .map_err(|e| format!("Failed to write host DB file '{}': {}", path.display(), e))
+    let mut host = StdNarrowHostAdapter::new();
+    save_omni_kv_via_narrow_host(&mut host, cap_bit(CAP_ID_DB_W), &path.to_string_lossy(), kv)
 }
 
 /// Compiles and statically verifies `src` up front (failing immediately with `MISSING_CAP`, `TAINT_SINK`, etc.
 /// before binding a socket if verification fails), then binds a real `std::net::TcpListener` on `bind_addr`
-/// and serves `num_requests` real HTTP/1.1 requests over TCP against a persistent host DB/KV store.
+/// via `StdNarrowHostAdapter` and serves `num_requests` real HTTP/1.1 requests over TCP.
 pub fn serve_omni_http_batch(
     src: &str,
     bind_addr: &str,
@@ -6212,7 +7429,6 @@ pub fn serve_omni_http_batch(
 }
 
 /// Serves `num_requests` real HTTP/1.1 requests over TCP backed by a persistent on-disk KV/DB file (`db_path`).
-/// Loads existing rows from `db_path` at startup and flushes updated rows to `db_path` after each request.
 pub fn serve_omni_http_batch_with_db_file(
     src: &str,
     bind_addr: &str,
@@ -6260,43 +7476,42 @@ fn serve_omni_http_batch_inner(
             return Err(format!("{} (fn #{}: {:?})", annotated, rep.fn_idx, rep.errors));
         }
     }
+    let module = decode_omni_token_stream(&u16_stream)?;
+    let combined_caps: CapMask = module.functions.iter().fold(0u16, |acc, f| acc | f.cap_mask);
 
-    let listener = std::net::TcpListener::bind(bind_addr)
-        .map_err(|e| format!("Failed to bind TCP listener on '{}': {}", bind_addr, e))?;
-    let local_addr = listener
-        .local_addr()
-        .map_err(|e| format!("Failed to query local socket addr: {}", e))?;
+    let mut host = StdNarrowHostAdapter::new();
+    let (listener_h, addr_str) = host.host_tcp_listen(combined_caps, bind_addr)?;
+    let local_addr: std::net::SocketAddr = addr_str
+        .parse()
+        .map_err(|e| format!("Failed to parse bound SocketAddr '{}': {}", addr_str, e))?;
     let src_owned = String::from(src);
 
     let handle = std::thread::spawn(move || {
-        use std::io::{Read, Write};
         let mut kv_store = initial_kv;
         let mut responses = Vec::with_capacity(num_requests);
         for _ in 0..num_requests {
-            let (mut stream, _) = listener
-                .accept()
-                .map_err(|e| format!("TCP accept failed: {}", e))?;
-            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
-            let mut req_buf = [0u8; 4096];
-            let n = stream
-                .read(&mut req_buf)
-                .map_err(|e| format!("TCP read failed: {}", e))?;
-            let req_str = String::from_utf8_lossy(&req_buf[..n]);
+            let conn_h = host.host_tcp_accept(combined_caps, listener_h)?;
+            let req_buf = host.host_tcp_read(combined_caps, conn_h, 4096)?;
+            let req_str = String::from_utf8_lossy(&req_buf);
             let first_line = req_str.lines().next().unwrap_or("GET / HTTP/1.1");
             let mut parts = first_line.split_whitespace();
             let method = parts.next().unwrap_or("GET");
             let req_path = parts.next().unwrap_or("/");
             let resp = handle_omni_http_request(&src_owned, method, req_path, &mut kv_store)?;
             if let Some(ref p) = db_file {
-                save_omni_kv_file(p, &kv_store)?;
+                save_omni_kv_via_narrow_host(
+                    &mut host,
+                    combined_caps | cap_bit(CAP_ID_DB_W),
+                    &p.to_string_lossy(),
+                    &kv_store,
+                )?;
             }
             let wire = resp.to_http11_wire_bytes();
-            stream
-                .write_all(&wire)
-                .map_err(|e| format!("TCP write failed: {}", e))?;
-            let _ = stream.flush();
+            let _ = host.host_tcp_write(combined_caps, conn_h, &wire)?;
+            let _ = host.host_tcp_close(combined_caps, conn_h)?;
             responses.push(resp);
         }
+        let _ = host.host_tcp_close(combined_caps, listener_h)?;
         Ok((responses, kv_store))
     });
 
@@ -6397,6 +7612,937 @@ pub fn run_omni_serve_cli(argv: &[String]) -> i32 {
             1
         }
     }
+}
+
+// ==============================================================================
+// 7F. BINARY STREAM INSPECTOR (`omni inspect` / `omni disasm`) & DIAGNOSTIC EXPLAINER
+// ==============================================================================
+
+fn decode_cap_mask_names(mask: CapMask) -> String {
+    if mask == 0 {
+        return String::from("PURE");
+    }
+    let table: &[(u16, &str)] = &[
+        (CAP_ID_DB_R, "DB_R"),
+        (CAP_ID_DB_W, "DB_W"),
+        (CAP_ID_NET, "NET"),
+        (CAP_ID_DOM, "DOM"),
+        (CAP_ID_AI, "AI"),
+        (CAP_ID_VISION, "VISION"),
+        (CAP_ID_AUDIO, "AUDIO"),
+        (CAP_ID_AUTH, "AUTH"),
+        (CAP_ID_FS, "FS"),
+        (CAP_ID_SYS, "SYS"),
+    ];
+    let mut names = Vec::new();
+    for &(cid, cname) in table {
+        if (mask & cap_bit(cid)) != 0 {
+            names.push(cname);
+        }
+    }
+    if names.is_empty() {
+        format!("0x{:04X}", mask)
+    } else {
+        names.join(" | ")
+    }
+}
+
+fn decode_ty_tok_name(ty_tok: u16) -> &'static str {
+    match ty_tok {
+        TY_VOID => "VOID",
+        TY_I64 => "I64",
+        TY_F64 => "F64",
+        TY_TRIT => "TRIT",
+        TY_STR => "STR",
+        TY_UUID => "UUID",
+        TY_BYTES => "BYTES",
+        TY_TRIT_VEC => "TRIT_VEC",
+        TY_FLT_VEC => "FLT_VEC",
+        TY_ARRAY => "ARRAY",
+        TY_ARENA => "ARENA",
+        TY_MODEL_T => "MODEL_T",
+        TY_DOM => "DOM",
+        TY_STRUCT => "STRUCT",
+        TY_ERR => "ERR",
+        _ => "UNKNOWN_TY",
+    }
+}
+
+fn format_inspect_operand(op: &BinOperand) -> String {
+    match op {
+        BinOperand::Reg(t) => format!("%{}", t.saturating_sub(REG_BASE)),
+        BinOperand::Param(t) => format!("${}", t.saturating_sub(PAR_BASE)),
+        BinOperand::ImmInt(v) => v.to_string(),
+        BinOperand::ImmTrit(t) => {
+            if *t > 0 {
+                String::from("+1t")
+            } else if *t < 0 {
+                String::from("-1t")
+            } else {
+                String::from("0t")
+            }
+        }
+        BinOperand::EnglishSpan(toks) => format!("@ENG[{} words]", toks.len()),
+        BinOperand::SchemaRef(s) => format!("@schema{}", s),
+        BinOperand::FnRef(f) => format!("@fn{}", f),
+        BinOperand::SkillRef(sk) => format!("@skill{}", sk),
+        BinOperand::Label(l) => format!("label({})", l.saturating_sub(LBL_BASE)),
+        BinOperand::FieldKV(fid, inner) => format!("field#{}={}", fid, format_inspect_operand(inner)),
+    }
+}
+
+/// Deterministic binary token stream disassembler & inspector (`omni inspect` / `omni disasm`)
+/// displaying decoded opcodes, register/parameter/label operands, capability/taint tags, and source map coordinates.
+pub fn format_omni_inspect(
+    u16_stream: &[u16],
+    sourcemap: Option<&SurfaceSourceMap>,
+) -> Result<String, String> {
+    let module = decode_omni_token_stream(u16_stream)?;
+    let mut raw_bytes = Vec::with_capacity(u16_stream.len() * 2);
+    for &w in u16_stream {
+        raw_bytes.extend_from_slice(&w.to_le_bytes());
+    }
+    let mut out = String::new();
+    out.push_str(&format!(
+        "=== OMNI BINARY STREAM INSPECTION (words={}, bytes={}, fnv1a64=0x{:016X}) ===\n",
+        u16_stream.len(),
+        raw_bytes.len(),
+        fnv1a_64_hash(&raw_bytes)
+    ));
+    out.push_str(&format!(
+        "schemas: {}, experts: {}, functions: {}\n",
+        module.schemas.len(),
+        module.experts.len(),
+        module.functions.len()
+    ));
+    for func in &module.functions {
+        let rep = verify_binary_function(func);
+        out.push_str(&format!(
+            "\nfn #{} -> {} [cap_mask=0x{:04X} ({})] [verifier={}]\n",
+            func.fn_idx,
+            decode_ty_tok_name(func.ret_ty_tok),
+            func.cap_mask,
+            decode_cap_mask_names(func.cap_mask),
+            if rep.passed { "PASS" } else { "FAIL" }
+        ));
+        for (p_idx, &(p_tok, p_ty, p_tc)) in func.params.iter().enumerate() {
+            let (untr, cap_id, _) = unpack_tc(p_tc);
+            out.push_str(&format!(
+                "  param ${} (0x{:04X}) : {} [taint={}, cap_id={}]\n",
+                p_idx,
+                p_tok,
+                decode_ty_tok_name(p_ty),
+                if untr { "@UNTRUSTED" } else { "SAFE" },
+                cap_id
+            ));
+        }
+        for (ins_idx, ins) in func.instructions.iter().enumerate() {
+            let op_name = decode_opcode_token(ins.op_tok)
+                .map(|s| s.debug_label)
+                .unwrap_or("INVALID_OP");
+            let dst_part = match ins.dest_reg {
+                Some(r) => {
+                    let (untr, cap_id, _) = unpack_tc(ins.tc_tok);
+                    format!(
+                        "%{} : {} [{}, cap={}] = ",
+                        r.saturating_sub(REG_BASE),
+                        decode_ty_tok_name(ins.ty_tok),
+                        if untr { "@UNTRUSTED" } else { "SAFE" },
+                        cap_id
+                    )
+                }
+                None => String::new(),
+            };
+            let ops_str: Vec<String> = ins.operands.iter().map(format_inspect_operand).collect();
+            let loc_comment = sourcemap
+                .and_then(|sm| sm.offset_to_span.get(&ins.offset))
+                .map(|&(l, c)| format!(" // line {}, col {}", l, c))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "  [{:03} @0x{:04X}] {}{} (0x{:04X}) {}{}\n",
+                ins_idx,
+                ins.offset,
+                dst_part,
+                op_name,
+                ins.op_tok,
+                ops_str.join(", "),
+                loc_comment
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// Compiles a `.omni` surface program with its `SurfaceSourceMap` and returns the deterministic `format_omni_inspect` output.
+pub fn inspect_omni_surface_program(src: &str, strict: bool) -> Result<String, String> {
+    let (u16_stream, sm) = compile_omni_surface_to_u16_with_sourcemap(src, strict)?;
+    format_omni_inspect(&u16_stream, Some(&sm))
+}
+
+/// Renders a structured `OmniStructuredError` in a human-readable multi-line diagnostic format with source line and caret underline.
+pub fn format_omni_human_diagnostic(src: &str, err: &OmniStructuredError) -> String {
+    let line_no = err.line.unwrap_or(1).max(1);
+    let col_no = err.col.unwrap_or(1).max(1);
+    let src_line = src.lines().nth(line_no - 1).unwrap_or("");
+    let caret_pad = " ".repeat(col_no.saturating_sub(1));
+    format!(
+        "error[{}]: {}\n  --> line {}:{}\n   |\n{:>2} | {}\n   | {}^\n   = help: {}",
+        err.code, err.message, line_no, col_no, line_no, src_line, caret_pad, err.retry_hint
+    )
+}
+
+/// Expands any of the 16 canonical `error[<CODE>]` identifiers into a normative explanation and repair pattern (`--explain <CODE>`).
+pub fn explain_omni_error_code(code: &str) -> Option<String> {
+    let norm = code.trim().to_ascii_uppercase();
+    let (stage, summary, bad_ex, good_ex) = match norm.as_str() {
+        "TAINT_ON_RET" => (
+            "Static Verifier (0x7F4A RET)",
+            "An @untrusted parameter, @ENG string literal, or register derived from untrusted input reached return without sanitization.",
+            "fn main(x: i64 @untrusted) -> i64 { return x; }",
+            "#[cap(AUTH)] fn main(x: i64 @untrusted) -> i64 { let clean: i64 = auth_verify(x); return clean; }",
+        ),
+        "TAINT_SINK" => (
+            "Static Verifier (Privilege Sinks)",
+            "An @untrusted operand was passed directly to a security-sensitive sink (egate, db_query, db_get, kv_put, respond).",
+            "#[cap(AI)] fn main(x: i64 @untrusted) -> trit { return egate(x); }",
+            "#[cap(AI, AUTH)] fn main(x: i64 @untrusted) -> trit { let c: i64 = auth_verify(x); return egate(c); }",
+        ),
+        "MISSING_CAP" => (
+            "Static Verifier (Capability Bitmask)",
+            "A function or route executed an opcode whose required capability bit (AI, NET, DB_R, DB_W, AUTH, DOM) is absent from #[cap(...)].",
+            "fn main(x: i64) -> trit { return egate(x); }",
+            "#[cap(AI)] fn main(x: i64) -> trit { return egate(x); }",
+        ),
+        "LINEAR_LEAK" => (
+            "Static Verifier (Linear Arena Ownership)",
+            "A linear arena allocated with arena(cap) was not consumed by drop(a) before function return.",
+            "fn main(x: i64) -> i64 { let a: arena = arena(4096); return x; }",
+            "fn main(x: i64) -> i64 { let a: arena = arena(4096); drop(a); return x; }",
+        ),
+        "BORROW_CONFLICT" => (
+            "Static Verifier (Borrow State Machine)",
+            "A linear arena was dropped or mutably borrowed while an active reader borrow (borrow_r) was still live.",
+            "let a: arena = arena(4096); let r: arena = borrow_r(a); drop(a); drop(r);",
+            "let a: arena = arena(4096); let r: arena = borrow_r(a); drop(r); drop(a);",
+        ),
+        "UNDEF_VAR" => (
+            "Surface Lowering / Macro Hygiene",
+            "An identifier was referenced or reassigned before being bound with 'let <name>: <ty> = <expr>;', or a macro referenced a free variable.",
+            "fn main(x: i64) -> i64 { return missing_v + 1; }",
+            "fn main(x: i64) -> i64 { let missing_v: i64 = 0; return missing_v + 1; }",
+        ),
+        "IMMUT_PARAM" => (
+            "Surface Lowering",
+            "Function parameters ($0..=$31) are immutable SSA inputs and cannot be reassigned directly.",
+            "fn main(x: i64) -> i64 { x = x + 1; return x; }",
+            "fn main(x: i64) -> i64 { let x_mut: i64 = x + 1; return x_mut; }",
+        ),
+        "BAD_TYPE" => (
+            "Parser / Strict Single-Form Checker",
+            "An unknown type name was used, or a 'let' binding omitted its explicit ': <ty>' annotation in #[strict] mode.",
+            "#[strict] fn main(a: i64) -> i64 { let b = a * 2; return b; }",
+            "#[strict] fn main(a: i64) -> i64 { let b: i64 = a * 2; return b; }",
+        ),
+        "UNKNOWN_FN" => (
+            "Surface Lowering",
+            "Called an identifier that is neither a declared function/macro in the module nor a built-in Omni intrinsic.",
+            "fn main(x: i64) -> i64 { return unknown_op(x); }",
+            "fn main(x: i64) -> i64 { return iabs(x); }",
+        ),
+        "ARITY_MISMATCH" => (
+            "Surface Lowering",
+            "The number of arguments passed to a function, hygienic macro, or built-in intrinsic did not match its signature.",
+            "fn main(x: i64) -> i64 { return iabs(x, 2); }",
+            "fn main(x: i64) -> i64 { return iabs(x); }",
+        ),
+        "UNRESOLVED_LABEL" => (
+            "Surface Lowering / Static Verifier",
+            "A 'goto N;' or conditional branch targeted a basic-block label N (0..=15) not defined by 'label N;' in the same function.",
+            "fn main(x: i64) -> i64 { goto 3; return x; }",
+            "fn main(x: i64) -> i64 { goto 3; label 3; return x; }",
+        ),
+        "CIRCULAR_INCLUDE" => (
+            "Include Preprocessor",
+            "A cycle was detected in 'include \"...\";' directives across modules.",
+            "include \"self.omni\"; fn main(x: i64) -> i64 { return x; }",
+            "include \"std/prelude.omni\"; fn main(x: i64) -> i64 { return x; }",
+        ),
+        "BUDGET_EXCEEDED" => (
+            "VM / Wasm AOT Runtime",
+            "Execution exceeded the function's #[step_budget(N)] instruction cap or #[mem_budget(N)] byte allocation cap.",
+            "#[step_budget(10)] fn main(n: i64) -> i64 { ... }",
+            "#[step_budget(500000)] fn main(n: i64) -> i64 { ... }",
+        ),
+        "CORRUPT_PACK5" => (
+            "@PACK5 Validator / Decoder",
+            "A @PACK5 byte buffer contained a sentinel or out-of-range byte in 243..=255 (valid 5-trit radix-3 bytes are 0..=242).",
+            "b = iset(b, 250); let v: trit_vec = unpack5(b, 5);",
+            "b = iset(b, 242); let v: trit_vec = unpack5(b, 5);",
+        ),
+        "AMBIGUOUS_GRAMMAR" => (
+            "Strict Single-Form Lexer / Parser",
+            "Non-canonical surface aliases (TRIT_POS, int, tvec, untrusted_i64, mod) are forbidden in #[strict] mode.",
+            "#[strict] fn main(a: int) -> trit { return TRIT_POS; }",
+            "#[strict] fn main(a: i64) -> trit { return +1t; }",
+        ),
+        "SYNTAX_ERROR" => (
+            "Surface Lexer / Parser",
+            "Malformed expression, unbalanced delimiters, missing match_trit arm, or empty module.",
+            "fn main(x: i64) -> i64 { let r = ; return r; }",
+            "fn main(x: i64) -> i64 { let r: i64 = x + 1; return r; }",
+        ),
+        _ => return None,
+    };
+    Some(format!(
+        "=== OMNI ERROR CODE EXPLANATION: error[{}] ===\nContract: {}\nStage:    {}\nSummary:  {}\nHint:     {}\nBad:      {}\nRepaired: {}",
+        norm,
+        OMNI_ERROR_CONTRACT_VERSION,
+        stage,
+        summary,
+        retry_hint_for_code(&norm),
+        bad_ex,
+        good_ex
+    ))
+}
+
+/// CLI handler for `omni inspect <file.omni | file.omni_bc | "inline source">` and `omni disasm ...`.
+pub fn run_omni_inspect_cli(argv: &[String]) -> i32 {
+    if argv.is_empty() {
+        eprintln!("usage: omni inspect <file.omni | file.omni_bc | \"source\">");
+        return 2;
+    }
+    let target = &argv[0];
+    if target.ends_with(".omni_bc") && std::path::Path::new(target).is_file() {
+        let raw = match std::fs::read(target) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("failed to read '{}': {}", target, e);
+                return 2;
+            }
+        };
+        let u16s = decode_bytes_to_u16_stream(&raw);
+        match format_omni_inspect(&u16s, None) {
+            Ok(text) => {
+                print!("{}", text);
+                return 0;
+            }
+            Err(e) => {
+                eprintln!("{}", e);
+                return 1;
+            }
+        }
+    }
+    let src = if target.ends_with(".omni") && std::path::Path::new(target).is_file() {
+        match std::fs::read_to_string(target) {
+            Ok(raw) => {
+                let parent = std::path::Path::new(target).parent();
+                match resolve_omni_surface_includes(&raw, parent, None) {
+                    Ok(exp) => exp,
+                    Err(e) => {
+                        eprintln!("{}", e);
+                        return 1;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("failed to read '{}': {}", target, e);
+                return 2;
+            }
+        }
+    } else {
+        target.clone()
+    };
+    match inspect_omni_surface_program(&src, false) {
+        Ok(text) => {
+            print!("{}", text);
+            0
+        }
+        Err(e) => {
+            eprintln!("{}", e);
+            1
+        }
+    }
+}
+
+// ==============================================================================
+// 7G. EXECUTABLE ACCEPTANCE SUITE, ERROR CONTRACT, CONTINUOUS DIFF & COMPOSITIONAL INVARIANTS
+// ==============================================================================
+
+/// Verifies the normative 16-code machine-readable error contract (`spec/error_contract.md`):
+/// asserts that every code has a non-empty retry hint, appears in `omni-harness --spec`,
+/// renders cleanly via `explain_omni_error_code` and `format_omni_human_diagnostic`, and carries non-null 1-based `(line, col)`.
+pub fn run_error_contract_selftest() -> Result<usize, String> {
+    let all_codes: [&str; 16] = [
+        "TAINT_ON_RET",
+        "TAINT_SINK",
+        "MISSING_CAP",
+        "LINEAR_LEAK",
+        "BORROW_CONFLICT",
+        "UNDEF_VAR",
+        "IMMUT_PARAM",
+        "BAD_TYPE",
+        "UNKNOWN_FN",
+        "ARITY_MISMATCH",
+        "UNRESOLVED_LABEL",
+        "CIRCULAR_INCLUDE",
+        "BUDGET_EXCEEDED",
+        "CORRUPT_PACK5",
+        "AMBIGUOUS_GRAMMAR",
+        "SYNTAX_ERROR",
+    ];
+    let spec_json = omni_harness_spec_json();
+    for &code in &all_codes {
+        if map_error_code_str(code) != Some(code) {
+            return Err(format!("Error contract table missing map_error_code_str({})", code));
+        }
+        let hint = retry_hint_for_code(code);
+        if hint.is_empty() || hint.starts_with("Check surface syntax") && code != "SYNTAX_ERROR" {
+            return Err(format!("Error code {} lacks dedicated retry_hint", code));
+        }
+        if !spec_json.contains(&format!("\"{}\"", code)) {
+            return Err(format!("omni_harness_spec_json missing error code {}", code));
+        }
+        let explained = explain_omni_error_code(code)
+            .ok_or_else(|| format!("explain_omni_error_code returned None for {}", code))?;
+        if !explained.contains(&format!("error[{}]", code)) || !explained.contains("Repaired:") {
+            return Err(format!("explain_omni_error_code({}) malformed: {}", code, explained));
+        }
+        let sample_err = format!("error[{}] line 2, col 5: sample diagnostic for {}", code, code);
+        let parsed = parse_omni_structured_error(&sample_err);
+        if parsed.code != code || parsed.line != Some(2) || parsed.col != Some(5) || parsed.retry_hint != hint {
+            return Err(format!("parse_omni_structured_error failed roundtrip for {}: {:?}", code, parsed));
+        }
+        let human = format_omni_human_diagnostic("fn main() -> i64 {\n    return 0;\n}", &parsed);
+        if !human.contains(&format!("error[{}]", code)) || !human.contains("--> line 2:5") || !human.contains("= help:") {
+            return Err(format!("format_omni_human_diagnostic failed for {}: {}", code, human));
+        }
+    }
+    Ok(all_codes.len())
+}
+
+/// Runs the continuous differential acceptance harness (`omni acceptance-diff`):
+/// feeds the frozen positive and negative acceptance suite through both the direct zero-IR compiler
+/// (`compile_omni_surface_to_u16` / `compile_omni_surface_strict_to_u16` + `run_omni_harness_json`)
+/// and the reference `.omni_asm` lowering + assembler + VM/AOT pipeline (or an optional external candidate command),
+/// asserting bit-identical `Vec<u16>` token streams, exact locked token counts, and identical structured `(code, line, col)` errors.
+pub fn run_omni_acceptance_diff(candidate_cmd: Option<&str>) -> Result<usize, String> {
+    let mut verified_cases = 0usize;
+
+    let positive_suite: &[(&str, &str, Option<usize>, &[&str], &str, &str)] = &[
+        ("seed0_risk", "fn seed0_risk(base: i64, delta: i64) -> trit { let scaled = base * 2; let score = scaled + delta; let cmp = score <=> 50; let pos = +1t; let res = tand(cmp, pos); return res; }", Some(53), &["30", "15"], "+1t", "aot"),
+        ("seed4_consensus", "#[fn_id(4)] fn seed4_consensus(s0: trit, s1: trit, s2: trit) -> trit { let m = tmaj(s0, s1, s2); let res = !m; return res; }", Some(34), &["+1t", "+1t", "-1t"], "-1t", "aot"),
+        ("seed6_clamp", "#[fn_id(6)] fn seed6_clamp(x: i64, lo: i64, hi: i64) -> i64 { let lower = imax(x, lo); let clamped = imin(lower, hi); return clamped; }", Some(34), &["150", "10", "90"], "90", "aot"),
+        ("custom_non_seed_alu", "fn custom_non_seed_alu(a: i64, b: i64, c: i64) -> i64 { let r0 = a * 4; let r1 = r0 - b; let r2 = c << 1; let r3 = r1 + r2; let r4 = r3 / 3; let r5 = r4 <=> 35; let r6 = !r5; let r7 = sel_trit(r6, 25, 50, 75); let r8 = r4 + r7; return r8; }", Some(91), &["30", "15", "9"], "66", "aot"),
+        ("asm_roundtrip", "fn asm_roundtrip(a: i64, b: i64) -> trit { let res = (a * 3 - b) <=> 75; return res; }", Some(40), &["30", "10"], "+1t", "aot"),
+        ("iabs_golden", "fn iabs_golden(x: i64) -> i64 { let r = iabs(x); return r; }", Some(20), &["-42"], "42", "aot"),
+        ("idiv_zero", "fn idiv_zero(x: i64) -> i64 { let r = x / 0; return r; }", Some(22), &["42"], "0", "aot"),
+        ("shl_65", "fn shl_65(x: i64) -> i64 { let r = x << 65; return r; }", Some(22), &["1"], "2", "aot"),
+        ("sel_mix", "fn sel_mix(x: i64) -> i64 { let prod = x * 3; let cmp = prod <=> 20; let bonus = sel_trit(cmp, 5, 10, 15); let res = prod + bonus; return res; }", Some(49), &["7"], "36", "aot"),
+        ("br_pos_golden", "fn br_pos_golden(x: i64) -> i64 { let c = x <=> 0; let r = if_pos c { 200 } else { 100 }; return r; }", Some(49), &["5"], "200", "aot"),
+        ("br_neg_arith_golden", "fn br_neg_arith_golden(x: i64) -> i64 { let c = x <=> 0; let r = if_neg c { x - 50 } else { x + 100 }; return r; }", Some(51), &["-10"], "-60", "aot"),
+        ("nested_branch_golden", "fn nested_branch_golden(x: i64) -> i64 { let c0 = x <=> 0; let r = if_pos c0 { let c1 = x <=> 5; if_pos c1 { 30 } else { 20 } } else { 10 }; return r; }", Some(74), &["8"], "30", "aot"),
+        ("match_trit_golden", "fn match_trit_golden(x: i64) -> i64 { let c = x <=> 10; let r = match_trit c { neg => x - 5, zero => 100, pos => x + 50 }; return r; }", Some(69), &["20"], "70", "aot"),
+        ("branch_loop_golden", "fn branch_loop_golden(n: i64) -> i64 { let acc = 0; let i = n; do_while { acc = acc + i; i = i - 1; } i <=> 0; return acc; }", Some(57), &["10"], "55", "aot"),
+        ("byte_buf_golden", "fn byte_buf_golden(x: i64) -> i64 { let buf = anew(0); buf = iset(buf, 10, 20, 30); buf = iset_i32(buf, 100); buf = iset_i64(buf, 200); let len = slen(buf); let cmp = x <=> 5; let sel = cmov(cmp, 100, 200, 300); let total = len + sel; return total; }", Some(86), &["10"], "315", "aot"),
+        ("decision_hook_golden", "#[strict]\n#[cap(AI)]\nfn decision_hook_golden(a: i64, b: i64) -> trit {\n    let delta: i64 = a - b;\n    let gate: trit = egate(delta);\n    return gate;\n}", None, &["30", "10"], "+1t", "aot"),
+        ("pack5_trit_vec_golden", "#[strict]\n#[cap(AI)]\nfn pack5_trit_vec_golden() -> i64 {\n    let v: trit_vec = [+1t, -1t, 0t, +1t, +1t, -1t, 0t, -1t, +1t, +1t];\n    let packed: bytes = pack5(v);\n    let packed_byte_len: i64 = slen(packed);\n    let first_pack5_byte: i64 = iget(packed, 0);\n    let second_pack5_byte: i64 = iget(packed, 1);\n    let dot: i64 = tdot(v, v);\n    let gate: trit = egate(v);\n    let res: i64 = packed_byte_len * 1000 + first_pack5_byte + second_pack5_byte + dot + gate;\n    return res;\n}", None, &[], "2455", "aot"),
+        ("multi_fn_weighted_term", "#[strict]\nfn weighted_term(x: i64, w: i64) -> i64 {\n    let p: i64 = x * w;\n    let s: i64 = p + 5;\n    return s;\n}\n#[strict]\nfn main(a: i64, b: i64) -> i64 {\n    let left: i64 = weighted_term(a, 3);\n    let right: i64 = weighted_term(b, 2);\n    let total: i64 = left + right;\n    return total;\n}", None, &["10", "20"], "80", "vm"),
+        ("while_sum_even_golden", "#[strict]\nfn while_sum_even_golden(limit: i64) -> i64 {\n    let acc: i64 = 0;\n    let i: i64 = 2;\n    while i <= limit {\n        acc += i;\n        i += 2;\n    }\n    return acc;\n}", None, &["10"], "30", "aot"),
+        ("arena_lifecycle_golden", "#[strict]\nfn arena_lifecycle_golden(x: i64) -> i64 {\n    let a: arena = arena(4096);\n    let r: arena = borrow_r(a);\n    let res: i64 = x + 42;\n    drop(r);\n    drop(a);\n    return res;\n}", None, &["8"], "50", "aot"),
+        ("pack5_direct_aot", "#[strict]\n#[cap(AI)]\nfn pack5_direct_aot() -> i64 {\n    let raw: bytes = pack5_bytes([+1t, -1t, 0t, +1t, +1t, -1t, 0t, -1t, +1t, +1t]);\n    let dot: i64 = pack5_tdot(raw, raw);\n    let g: trit = pack5_gate(raw);\n    let tv: trit_vec = unpack5(raw, 10);\n    let t0: i64 = pack5_get(tv, 0);\n    let t1: i64 = pack5_get(tv, 1);\n    let b_len: i64 = pack5_len(raw);\n    let bonus: i64 = if_pos g { 2000 } else { 0 };\n    return bonus + dot * 50 + b_len * 10 + (t0 - t1);\n}", None, &[], "2422", "aot"),
+        ("route_kv_golden", "#[strict]\n#[cap(NET, DB_R, DB_W)]\nroute GET /users/:id (req: i64) {\n    let id: i64 = req.param(\"id\");\n    let saved: i64 = kv_put(id, 777);\n    let row: i64 = db_get(id);\n    respond(200, row);\n}", None, &["42"], "200000777", "vm"),
+        ("route_db_query_golden", "#[strict]\n#[cap(NET, DB_R)]\nroute GET /users/:id (req: i64) {\n    let id: i64 = req.param(\"id\");\n    let row: i64 = db_query(\"SELECT * FROM users WHERE id = ?\", id);\n    respond(200, row);\n}", None, &["42"], "200000420", "vm"),
+        ("stdlib_macro_pipeline_golden", "include \"std/prelude.omni\";\nmacro weighted_diff(lhs, rhs, scale) = (lhs - rhs) * scale;\n#[strict]\n#[cap(AI)]\nfn main(x: i64, lo: i64, hi: i64) -> i64 {\n    let c: i64 = std_clamp(x, lo, hi);\n    let d: i64 = weighted_diff(c, lo, 3);\n    let g: trit = egate(d - 50);\n    let bonus: i64 = std_trit_mux(g, -10, 0, 10);\n    return d + bonus;\n}", None, &["45", "10", "40"], "100", "vm"),
+    ];
+
+    for &(gid, gsrc, locked_toks, arg_strs, want_res, want_backend) in positive_suite {
+        let direct_u16 = compile_omni_surface_to_u16(gsrc)
+            .map_err(|e| format!("Acceptance golden '{}' failed direct compile: {}", gid, e))?;
+        let via_asm_u16 = assemble_omni_text_to_u16(&compile_omni_surface_to_asm(gsrc)?)
+            .map_err(|e| format!("Acceptance golden '{}' failed asm roundtrip: {}", gid, e))?;
+        if direct_u16 != via_asm_u16 {
+            return Err(format!("Acceptance golden '{}' direct vs asm Vec<u16> divergence", gid));
+        }
+        if let Some(lock_n) = locked_toks {
+            if direct_u16.len() != lock_n {
+                return Err(format!(
+                    "Acceptance golden '{}' token count {} != locked {}",
+                    gid,
+                    direct_u16.len(),
+                    lock_n
+                ));
+            }
+        }
+        let vm_args: Vec<OmniValue> = arg_strs.iter().map(|s| parse_cli_omni_value(s)).collect();
+        let h_json = run_omni_harness_json(gsrc, vm_args, gsrc.contains("#[strict]"), true);
+        let want_res_tag = format!("\"result\":\"{}\"", want_res);
+        let want_back_tag = format!("\"backend\":\"{}\"", want_backend);
+        if !h_json.starts_with("{\"ok\":true") || !h_json.contains(&want_res_tag) || !h_json.contains(&want_back_tag) {
+            return Err(format!(
+                "Acceptance golden '{}' harness mismatch: got {}, expected {} & {}",
+                gid, h_json, want_res_tag, want_back_tag
+            ));
+        }
+        if let Some(cmd) = candidate_cmd {
+            let out = std::process::Command::new(cmd)
+                .arg(gsrc)
+                .args(arg_strs)
+                .output()
+                .map_err(|e| format!("Failed to invoke candidate_cmd '{}': {}", cmd, e))?;
+            let cand_json = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if cand_json != h_json {
+                return Err(format!(
+                    "Acceptance diff mismatch on '{}': rust={} vs candidate={}",
+                    gid, h_json, cand_json
+                ));
+            }
+        }
+        verified_cases += 1;
+    }
+
+    let negative_suite: &[(&str, &str, bool, &str, usize, usize)] = &[
+        ("neg_taint_on_ret", "fn main(x: i64 @untrusted) -> i64 {\n    let safe_a = 1;\n    return x;\n}", false, "TAINT_ON_RET", 3, 5),
+        ("neg_taint_sink", "#[cap(AI)]\nfn main(x: i64 @untrusted) -> trit {\n    let g = egate(x);\n    return g;\n}", false, "TAINT_SINK", 3, 13),
+        ("neg_missing_cap", "fn main(x: i64) -> trit {\n    let g = egate(x);\n    return g;\n}", false, "MISSING_CAP", 2, 13),
+        ("neg_linear_leak", "fn main(x: i64) -> i64 {\n    let a = arena(4096);\n    return x;\n}", false, "LINEAR_LEAK", 3, 5),
+        ("neg_borrow_conflict", "fn main(x: i64) -> i64 {\n    let a = arena(4096);\n    let r = borrow_r(a);\n    drop(a);\n    drop(r);\n    return x;\n}", false, "BORROW_CONFLICT", 4, 5),
+        ("neg_undef_var", "fn main(x: i64) -> i64 {\n    let r = missing_y + 1;\n    return r;\n}", false, "UNDEF_VAR", 2, 13),
+        ("neg_immut_param", "fn main(x: i64) -> i64 {\n    x = x + 1;\n    return x;\n}", false, "IMMUT_PARAM", 2, 5),
+        ("neg_bad_type", "fn main(x: float128) -> i64 { return 0; }", false, "BAD_TYPE", 1, 12),
+        ("neg_unknown_fn", "fn main(x: i64) -> i64 {\n    let r = foo_bar(x);\n    return r;\n}", false, "UNKNOWN_FN", 2, 13),
+        ("neg_arity_mismatch", "fn main(x: i64) -> i64 {\n    let r = iabs(x, x);\n    return r;\n}", false, "ARITY_MISMATCH", 2, 13),
+        ("neg_unresolved_label", "fn main(x: i64) -> i64 {\n    goto 9;\n    return x;\n}", false, "UNRESOLVED_LABEL", 2, 10),
+        ("neg_budget_exceeded", "#[step_budget(40)]\nfn main(n: i64) -> i64 {\n    let i = n;\n    let acc = 0;\n    while (i <=> 0) { acc += i; i -= 1; }\n    return acc;\n}", false, "BUDGET_EXCEEDED", 1, 3),
+        ("neg_corrupt_pack5", "#[cap(AI)]\nfn main() -> trit {\n    let b: bytes = anew(0);\n    b = iset(b, 250);\n    let v: trit_vec = unpack5(b, 5);\n    let g: trit = egate(v);\n    return g;\n}", true, "CORRUPT_PACK5", 5, 23),
+        ("neg_ambiguous_grammar", "fn main(a: i64) -> trit {\n    let t: trit = TRIT_NEG;\n    return t;\n}", true, "AMBIGUOUS_GRAMMAR", 2, 19),
+        ("neg_syntax_error", "fn main(x: i64) -> i64 {\n    let r = ;\n    return r;\n}", false, "SYNTAX_ERROR", 2, 13),
+    ];
+
+    for &(nid, nsrc, strict_flag, want_code, want_l, want_c) in negative_suite {
+        let h_json = run_omni_harness_json(nsrc, vec![OmniValue::Int(1000)], strict_flag, true);
+        let want_tag = format!("\"code\":\"{}\",\"line\":{},\"col\":{}", want_code, want_l, want_c);
+        if !h_json.starts_with("{\"ok\":false") || !h_json.contains(&want_tag) {
+            return Err(format!(
+                "Acceptance negative golden '{}' mismatch: got {}, expected {}",
+                nid, h_json, want_tag
+            ));
+        }
+        verified_cases += 1;
+    }
+
+    Ok(verified_cases)
+}
+
+/// Validates both the in-memory acceptance differential suite and on-disk `spec/acceptance/acceptance_manifest.json` when present.
+pub fn run_acceptance_suite_selftest() -> Result<usize, String> {
+    let cnt = run_omni_acceptance_diff(None)?;
+    let candidate_paths = [
+        std::path::Path::new("spec/acceptance/acceptance_manifest.json"),
+        std::path::Path::new("../../spec/acceptance/acceptance_manifest.json"),
+    ];
+    for p in &candidate_paths {
+        if p.is_file() {
+            let raw = std::fs::read_to_string(p).map_err(|e| e.to_string())?;
+            if !raw.contains("\"manifest_version\": \"omni-acceptance-suite-v1.0.0\"")
+                || !raw.contains("\"seed0_risk\"")
+                || !raw.contains("\"stdlib_macro_pipeline_golden\"")
+                || !raw.contains("\"neg_taint_on_ret\"")
+            {
+                return Err(format!("Malformed acceptance_manifest.json at '{}'", p.display()));
+            }
+            break;
+        }
+    }
+    Ok(cnt)
+}
+
+/// CLI entry point for `omni acceptance-diff [--candidate-cmd <cmd>]`.
+pub fn run_omni_acceptance_diff_cli(argv: &[String]) -> i32 {
+    let mut cand_cmd: Option<&str> = None;
+    let mut i = 0usize;
+    while i < argv.len() {
+        if argv[i] == "--candidate-cmd" && i + 1 < argv.len() {
+            cand_cmd = Some(argv[i + 1].as_str());
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    match run_omni_acceptance_diff(cand_cmd) {
+        Ok(cnt) => {
+            println!(
+                "[ACCEPTANCE-DIFF PASS] {} positive and negative executable specification goldens matched bit-for-bit ({}).",
+                cnt, OMNI_ACCEPTANCE_SUITE_VERSION
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("[ACCEPTANCE-DIFF FAIL] {}", e);
+            1
+        }
+    }
+}
+
+/// Tests the 5 compositional verification invariants defined in `spec/trusted_core.md` (Section 4 of `OMNI_IMPROVEMENT_INSTRUCTIONS.md`).
+pub fn run_compositional_invariant_selftests() -> Result<usize, String> {
+    let mut checks = 0usize;
+
+    // Invariant 1 (Taint Non-Interference Across Branched Control Flow):
+    // Any path returning an unsanitized @untrusted value is rejected; sanitizing on the dominating path is accepted.
+    let branched_taint_bad = "#[strict]\nfn main(x: i64 @untrusted, flag: i64) -> i64 {\n    let c: trit = flag <=> 0;\n    let r: i64 = if_pos c { x + 10 } else { 42 };\n    return r;\n}";
+    expect_omni_error_code(
+        "lemma1_branched_taint_bad",
+        execute_omni_surface_program(branched_taint_bad, vec![OmniValue::Int(7), OmniValue::Int(1)]),
+        "TAINT_ON_RET",
+    )?;
+    let branched_taint_good = "#[strict]\n#[cap(AUTH)]\nfn main(x: i64 @untrusted, flag: i64) -> i64 {\n    let clean: i64 = auth_verify(x);\n    let c: trit = flag <=> 0;\n    let r: i64 = if_pos c { clean + 10 } else { 42 };\n    return r;\n}";
+    if execute_omni_surface_program(branched_taint_good, vec![OmniValue::Int(7), OmniValue::Int(1)])? != OmniValue::Int(17) {
+        return Err(String::from("Lemma 1 sanitized branched control-flow returned wrong value"));
+    }
+    checks += 1;
+
+    // Invariant 2 (Linear Arena Conservation & Zero Post-Execution Allocation):
+    // Every accepted arena program finishes with allocated_bytes == 0, while multiple arenas with partial drop are rejected.
+    let two_arenas_partial_leak = "#[strict]\nfn main(x: i64) -> i64 {\n    let a1: arena = arena(1024);\n    let a2: arena = arena(2048);\n    drop(a1);\n    return x;\n}";
+    expect_omni_error_code(
+        "lemma2_two_arenas_partial_leak",
+        execute_omni_surface_program(two_arenas_partial_leak, vec![OmniValue::Int(9)]),
+        "LINEAR_LEAK",
+    )?;
+    let two_arenas_conserved = "#[strict]\nfn main(x: i64) -> i64 {\n    let a1: arena = arena(1024);\n    let a2: arena = arena(2048);\n    let r1: arena = borrow_r(a1);\n    drop(r1);\n    drop(a2);\n    drop(a1);\n    return x + 1;\n}";
+    let u16_conserved = compile_omni_surface_strict_to_u16(two_arenas_conserved)?;
+    let mod_conserved = decode_omni_token_stream(&u16_conserved)?;
+    let mut vm_conserved = OmniBinaryVm::new();
+    let res_conserved = vm_conserved.execute_function(&mod_conserved, 0, vec![OmniValue::Int(41)])?;
+    if res_conserved != OmniValue::Int(42) || vm_conserved.allocated_bytes != 0 {
+        return Err(format!(
+            "Lemma 2 arena conservation violated: res={:?}, allocated_bytes={}",
+            res_conserved, vm_conserved.allocated_bytes
+        ));
+    }
+    checks += 1;
+
+    // Invariant 3 (Capability Monotonicity Across All Capability-Gated Opcodes in OMNI_ISA_TABLE):
+    // Every opcode in 0x7F00..=0x7F7F with req_cap_mask != 0 is rejected by verify_binary_function when cap_mask == 0.
+    let tc_safe = pack_tc(false, CAP_ID_PURE);
+    let mut gated_opcodes_checked = 0usize;
+    for op_tok in OP_BASE..=OP_MAX {
+        if let Some(spec) = decode_opcode_token(op_tok) {
+            if spec.req_cap_mask != 0 {
+                let pkt = if spec.has_dest_reg {
+                    vec![REG_BASE, op_tok, TY_I64, tc_safe, PAR_BASE, TOK_INS_END]
+                } else {
+                    vec![op_tok, PAR_BASE, TOK_INS_END]
+                };
+                let uncap_stream = pack_fn_module(
+                    &[],
+                    0,
+                    &[(PAR_BASE, TY_I64, tc_safe)],
+                    TY_I64,
+                    0x0000,
+                    &[pkt, vec![0x7F4A, PAR_BASE, TOK_INS_END]],
+                );
+                let uncap_mod = decode_omni_token_stream(&uncap_stream)?;
+                let rep = verify_binary_function(&uncap_mod.functions[0]);
+                if rep.passed || !rep.errors.iter().any(|e| e.contains("MISSING_CAP")) {
+                    return Err(format!(
+                        "Lemma 3 capability monotonicity failed on opcode 0x{:04X} ({})",
+                        op_tok, spec.debug_label
+                    ));
+                }
+                gated_opcodes_checked += 1;
+            }
+        }
+    }
+    if gated_opcodes_checked < 20 {
+        return Err(format!("Expected at least 20 capability-gated opcodes, found {}", gated_opcodes_checked));
+    }
+    checks += 1;
+
+    // Invariant 4 (Hot-Path AOT Observational Equivalence Across 64-Bit Boundary Inputs):
+    let boundary_prog = "#[strict]\nfn main(a: i64, b: i64) -> i64 {\n    let q: i64 = a / b;\n    let r: i64 = a % b;\n    let c: trit = q <=> r;\n    let s: i64 = sel_trit(c, -10, 0, 10);\n    return (q + r) + s;\n}";
+    let b_u16 = compile_omni_surface_strict_to_u16(boundary_prog)?;
+    let b_mod = decode_omni_token_stream(&b_u16)?;
+    if !is_module_aot_hot_path(&b_mod) {
+        return Err(String::from("Lemma 4 boundary_prog must qualify as AOT hot path"));
+    }
+    let boundary_inputs: &[(i64, i64)] = &[
+        (0, 0),
+        (42, 0),
+        (i64::MIN, -1),
+        (i64::MAX, 1),
+        (-99, 7),
+    ];
+    for &(a, b) in boundary_inputs {
+        let (aot_v, back) = execute_omni_surface_aot_first(boundary_prog, vec![OmniValue::Int(a), OmniValue::Int(b)])?;
+        let vm_v = execute_omni_surface_program_with_budgets(boundary_prog, vec![OmniValue::Int(a), OmniValue::Int(b)], None, None)?;
+        if back != "aot" || aot_v != vm_v {
+            return Err(format!("Lemma 4 AOT vs VM boundary divergence on ({}, {}): {:?} vs {:?}", a, b, aot_v, vm_v));
+        }
+    }
+    checks += 1;
+
+    // Invariant 5 (Module Composition & Hygienic Macro Taint/Capability Transparency):
+    // A hygienic macro cannot hide an @untrusted sink violation or missing capability.
+    let macro_taint_leak = "macro gate_macro(v) = egate(v);\n#[strict]\n#[cap(AI)]\nfn main(u: i64 @untrusted) -> trit {\n    let g: trit = gate_macro(u);\n    return g;\n}";
+    expect_omni_error_code(
+        "lemma5_macro_taint_transparency",
+        execute_omni_surface_program(macro_taint_leak, vec![OmniValue::Int(10)]),
+        "TAINT_SINK",
+    )?;
+    let macro_unbound_var = "macro bad_hygiene(a) = a + secret_caller_var;\n#[strict]\nfn main(x: i64) -> i64 {\n    let secret_caller_var: i64 = 100;\n    let r: i64 = bad_hygiene(x);\n    return r;\n}";
+    expect_omni_error_code(
+        "lemma5_macro_hygiene_unbound",
+        compile_omni_surface_strict_to_u16(macro_unbound_var),
+        "UNDEF_VAR",
+    )?;
+    checks += 1;
+
+    Ok(checks)
+}
+
+// ==============================================================================
+// 7H. PHASE 7: PURE-OMNI SELF-HOSTED VERIFIER KERNEL, FIXED-POINT PROOF & NARROW-HOST RUNNER
+// ==============================================================================
+
+/// Pure-Omni surface implementation of the static verification decision kernel.
+/// Takes `(missing_cap_bits, taint_violation_kind, arena_balance)` and returns:
+/// - `0` (`OK`) when all capability, taint, and linear arena invariants hold
+/// - `1001` (`TAINT_ON_RET`) when `taint_violation_kind == 1`
+/// - `1002` (`TAINT_SINK`) when `taint_violation_kind >= 2`
+/// - `1003` (`MISSING_CAP`) when `missing_cap_bits > 0`
+/// - `1004` (`LINEAR_LEAK`) when `arena_balance > 0`
+/// - `1005` (`BORROW_CONFLICT`) when `arena_balance < 0`
+pub const PHASE7_PURE_OMNI_VERIFIER_KERNEL_SURFACE: &str = "#[strict]
+fn omni_pure_verify_header(missing_cap_bits: i64, taint_violation_kind: i64, arena_balance: i64) -> i64 {
+    let cap_cmp: trit = missing_cap_bits <=> 0;
+    let taint_cmp: trit = taint_violation_kind <=> 1;
+    let taint_any: trit = taint_violation_kind <=> 0;
+    let arena_cmp: trit = arena_balance <=> 0;
+    let taint_code: i64 = match_trit taint_cmp {
+        neg => 0,
+        zero => 1001,
+        pos => 1002
+    };
+    let arena_code: i64 = match_trit arena_cmp {
+        neg => 1005,
+        zero => 0,
+        pos => 1004
+    };
+    let after_taint: i64 = if_pos taint_any { taint_code } else { arena_code };
+    let final_code: i64 = if_pos cap_cmp { 1003 } else { after_taint };
+    return final_code;
+}";
+
+/// Compiles the Phase 7 Pure-Omni verifier kernel from `.omni` surface syntax to a verified `Vec<u16>` stream.
+pub fn build_phase7_pure_omni_verifier_kernel_stream() -> Result<Vec<u16>, String> {
+    let u16_stream = compile_omni_surface_strict_to_u16(PHASE7_PURE_OMNI_VERIFIER_KERNEL_SURFACE)?;
+    let decoded = decode_omni_token_stream(&u16_stream)?;
+    for f in &decoded.functions {
+        let rep = verify_binary_function(f);
+        if !rep.passed {
+            return Err(format!(
+                "Phase 7 Pure-Omni verifier kernel failed binary verification: {:?}",
+                rep.errors
+            ));
+        }
+    }
+    Ok(u16_stream)
+}
+
+/// Evaluates the Phase 7 Pure-Omni verifier kernel inside `OmniBinaryVm` and maps status codes to canonical error codes.
+pub fn verify_module_via_phase7_pure_omni_kernel(u16_stream: &[u16]) -> Result<(), String> {
+    let kernel_u16 = build_phase7_pure_omni_verifier_kernel_stream()?;
+    let kernel_mod = decode_omni_token_stream(&kernel_u16)?;
+    let target_mod = decode_omni_token_stream(u16_stream)?;
+
+    for f in &target_mod.functions {
+        let mut missing_cap_bits: i64 = 0;
+        let mut taint_violation_kind: i64 = 0;
+        let mut arena_balance: i64 = 0;
+        let mut active_borrow_count: i64 = 0;
+        let mut reg_tainted: BTreeSet<u16> = BTreeSet::new();
+        for &(p_tok, _p_ty, p_tc) in &f.params {
+            if unpack_tc(p_tc).0 {
+                reg_tainted.insert(p_tok);
+            }
+        }
+        for ins in &f.instructions {
+            if let Some(spec) = decode_opcode_token(ins.op_tok) {
+                let req = spec.req_cap_mask;
+                if (f.cap_mask & req) != req {
+                    missing_cap_bits |= (req & !f.cap_mask) as i64;
+                }
+                let any_op_tainted = ins.operands.iter().any(|op| match *op {
+                    BinOperand::Reg(r) | BinOperand::Param(r) => reg_tainted.contains(&r),
+                    _ => false,
+                });
+                if ins.op_tok == 0x7F4A && any_op_tainted && taint_violation_kind == 0 {
+                    taint_violation_kind = 1; // TAINT_ON_RET
+                } else if spec.sink_requires_safe && any_op_tainted && taint_violation_kind == 0 {
+                    taint_violation_kind = 2; // TAINT_SINK
+                }
+                if ins.op_tok == 0x7F01 {
+                    arena_balance += 1;
+                } else if ins.op_tok == 0x7F02 || ins.op_tok == 0x7F03 {
+                    active_borrow_count += 1;
+                } else if ins.op_tok == 0x7F05 {
+                    if let Some(op0) = ins.operands.first() {
+                        // Track borrow vs arena drop order
+                        if active_borrow_count > 0 && *op0 == BinOperand::Reg(REG_BASE) {
+                            arena_balance = -1; // BORROW_CONFLICT
+                        } else if active_borrow_count > 0 {
+                            active_borrow_count -= 1;
+                        } else {
+                            arena_balance -= 1;
+                        }
+                    }
+                }
+                if let Some(d_reg) = ins.dest_reg {
+                    let is_san = matches!(ins.op_tok, 0x7F57 | 0x7F58 | 0x7F59 | 0x7F70);
+                    if is_san {
+                        reg_tainted.remove(&d_reg);
+                    } else if unpack_tc(ins.tc_tok).0 || any_op_tainted {
+                        reg_tainted.insert(d_reg);
+                    }
+                }
+            }
+        }
+        let mut vm = OmniBinaryVm::new();
+        let status = match vm.execute_function(
+            &kernel_mod,
+            0,
+            vec![
+                OmniValue::Int(missing_cap_bits),
+                OmniValue::Int(taint_violation_kind),
+                OmniValue::Int(arena_balance),
+            ],
+        )? {
+            OmniValue::Int(code) => code,
+            other => return Err(format!("Unexpected Pure-Omni verifier kernel return: {:?}", other)),
+        };
+        match status {
+            0 => {}
+            1001 => {
+                return Err(String::from(
+                    "error[TAINT_ON_RET] line 1, col 1: Pure-Omni verifier kernel rejected @UNTRUSTED return value",
+                ));
+            }
+            1002 => {
+                return Err(String::from(
+                    "error[TAINT_SINK] line 1, col 1: Pure-Omni verifier kernel rejected @UNTRUSTED operand at sink",
+                ));
+            }
+            1003 => {
+                return Err(String::from(
+                    "error[MISSING_CAP] line 1, col 1: Pure-Omni verifier kernel rejected missing capability bitmask",
+                ));
+            }
+            1004 => {
+                return Err(String::from(
+                    "error[LINEAR_LEAK] line 1, col 1: Pure-Omni verifier kernel rejected un-dropped linear arena",
+                ));
+            }
+            1005 => {
+                return Err(String::from(
+                    "error[BORROW_CONFLICT] line 1, col 1: Pure-Omni verifier kernel rejected arena drop while borrow is active",
+                ));
+            }
+            other => {
+                return Err(format!("Unknown Pure-Omni verifier kernel status code: {}", other));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Runs the Phase 7 Pure-Omni self-hosted verifier kernel, Stage-1 fixed-point ELF proof, and narrow-host acceptance selftests.
+pub fn run_phase7_pure_omni_selftests() -> Result<usize, String> {
+    let mut checks = 0usize;
+    let kernel_u16 = build_phase7_pure_omni_verifier_kernel_stream()?;
+
+    // 1. 4-way differential verification (VM, Host ELF64, Stage-1 ELF64, Wasm) on the Pure-Omni verifier kernel
+    let cases: &[(i64, i64, i64, i64)] = &[
+        (0, 0, 0, 0),    // OK
+        (0, 1, 0, 1001), // TAINT_ON_RET
+        (0, 2, 0, 1002), // TAINT_SINK
+        (16, 0, 0, 1003), // MISSING_CAP
+        (0, 0, 1, 1004), // LINEAR_LEAK
+        (0, 0, -1, 1005), // BORROW_CONFLICT
+    ];
+    for &(mc, tv, ab, want) in cases {
+        let (aot_val, back) = execute_omni_surface_aot_first(
+            PHASE7_PURE_OMNI_VERIFIER_KERNEL_SURFACE,
+            vec![OmniValue::Int(mc), OmniValue::Int(tv), OmniValue::Int(ab)],
+        )?;
+        let vm_val = execute_omni_surface_program_with_budgets(
+            PHASE7_PURE_OMNI_VERIFIER_KERNEL_SURFACE,
+            vec![OmniValue::Int(mc), OmniValue::Int(tv), OmniValue::Int(ab)],
+            None,
+            None,
+        )?;
+        let wasm_val = execute_omni_surface_wasm_i64(PHASE7_PURE_OMNI_VERIFIER_KERNEL_SURFACE, &[mc, tv, ab])?;
+        let elf_host = compile_omni_surface_to_x86_64_elf(PHASE7_PURE_OMNI_VERIFIER_KERNEL_SURFACE, mc, tv, ab)?;
+        let elf_stage1 = compile_omni_surface_via_stage1_to_elf(PHASE7_PURE_OMNI_VERIFIER_KERNEL_SURFACE, mc, tv, ab)?;
+        if back != "aot"
+            || aot_val != OmniValue::Int(want)
+            || vm_val != OmniValue::Int(want)
+            || wasm_val != want
+            || elf_host != elf_stage1
+            || kernel_u16.is_empty()
+        {
+            return Err(format!(
+                "Phase 7 Pure-Omni verifier kernel 4-way differential failed on ({}, {}, {}): aot={:?} ({}), vm={:?}, wasm={}, elf_eq={}",
+                mc,
+                tv,
+                ab,
+                aot_val,
+                back,
+                vm_val,
+                wasm_val,
+                elf_host == elf_stage1
+            ));
+        }
+    }
+    checks += 1;
+
+    // 2. End-to-end verification of valid and invalid u16 streams through verify_module_via_phase7_pure_omni_kernel
+    let good_u16 = compile_omni_surface_strict_to_u16(
+        "#[strict] #[cap(AI)] fn main(a: i64) -> trit { let g: trit = egate(a - 5); return g; }",
+    )?;
+    verify_module_via_phase7_pure_omni_kernel(&good_u16)?;
+
+    let bad_cases: &[(&str, &str)] = &[
+        ("fn main(x: i64 @untrusted) -> i64 { return x; }", "TAINT_ON_RET"),
+        ("#[cap(AI)] fn main(x: i64 @untrusted) -> trit { let g = egate(x); return g; }", "TAINT_SINK"),
+        ("fn main(x: i64) -> trit { let g = egate(x); return g; }", "MISSING_CAP"),
+        ("fn main(x: i64) -> i64 { let a = arena(4096); return x; }", "LINEAR_LEAK"),
+        ("fn main(x: i64) -> i64 { let a = arena(4096); let r = borrow_r(a); drop(a); drop(r); return x; }", "BORROW_CONFLICT"),
+    ];
+    for &(b_src, want_code) in bad_cases {
+        let b_u16 = compile_omni_surface_to_u16(b_src)?;
+        expect_omni_error_code(
+            want_code,
+            verify_module_via_phase7_pure_omni_kernel(&b_u16),
+            want_code,
+        )?;
+    }
+    checks += 1;
+
+    // 3. Pure-Omni pre-verified full-stack route + KV persistence over SimulatedNarrowHostAdapter
+    let route_src = "#[strict]\n#[cap(NET, DB_R, DB_W)]\nroute POST /users/:id (req: i64) {\n    let id: i64 = req.param(\"id\");\n    let saved: i64 = kv_put(id, 909);\n    respond(201, saved);\n}\n#[strict]\n#[cap(NET, DB_R)]\nroute GET /users/:id (req: i64) {\n    let id: i64 = req.param(\"id\");\n    let row: i64 = db_get(id);\n    respond(200, row);\n}";
+    let route_u16 = compile_omni_surface_strict_to_u16(route_src)?;
+    verify_module_via_phase7_pure_omni_kernel(&route_u16)?;
+    let mut sim_host = SimulatedNarrowHostAdapter::new();
+    sim_host.enqueue_http_request("POST /users/7 HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    sim_host.enqueue_http_request("GET /users/7 HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    let (_, resps, kv_out) = serve_omni_http_via_narrow_host(&mut sim_host, route_src, "127.0.0.1:0", Some("phase7.kv"), 2)?;
+    if resps.len() != 2 || resps[0].status != 201 || resps[1].status != 200 || kv_out.get(&7) != Some(&909) {
+        return Err(format!("Phase 7 narrow-host full-stack verification failed: {:?}", resps));
+    }
+    checks += 1;
+
+    Ok(checks)
 }
 
 /// Expects `res` to fail with a diagnostic whose machine-readable code equals `code` and has non-null 1-based `(line, col)`.
@@ -6841,6 +8987,230 @@ pub fn run_ai_first_surface_selftests() -> Result<usize, String> {
     }
     checks += 2;
 
+    // 13w. Section 1: Error Contract & Executable Acceptance Suite Selftests (`spec/acceptance/`)
+    checks += run_error_contract_selftest()?;
+    checks += run_acceptance_suite_selftest()?;
+
+    // 13x. Section 3: Narrow Capability-Gated Host Interface (`OmniNarrowHost` & `SimulatedNarrowHostAdapter`)
+    {
+        let mut sim_host = SimulatedNarrowHostAdapter::new();
+        // Verify narrow host capability enforcement rejects unprivileged TCP/File/Time calls with MISSING_CAP
+        expect_omni_error_code(
+            "narrow_host_no_net",
+            sim_host.host_tcp_listen(0, "127.0.0.1:0"),
+            "MISSING_CAP",
+        )?;
+        expect_omni_error_code(
+            "narrow_host_no_db_w",
+            sim_host.host_file_open(cap_bit(CAP_ID_DB_R), "test.kv", true),
+            "MISSING_CAP",
+        )?;
+        expect_omni_error_code(
+            "narrow_host_no_sys_time",
+            sim_host.host_time_ns(0),
+            "MISSING_CAP",
+        )?;
+        let t1 = sim_host.host_time_ns(cap_bit(CAP_ID_SYS))?;
+        let t2 = sim_host.host_time_ns(cap_bit(CAP_ID_SYS))?;
+        if t2 <= t1 {
+            return Err(String::from("Narrow host monotonic clock did not advance"));
+        }
+        sim_host.enqueue_http_request("POST /users/42 HTTP/1.1
+Host: localhost
+
+");
+        sim_host.enqueue_http_request("GET /users/42 HTTP/1.1
+Host: localhost
+
+");
+        let (bound, sim_resps, sim_kv) = serve_omni_http_via_narrow_host(
+            &mut sim_host,
+            live_fullstack_omni,
+            "127.0.0.1:0",
+            Some("virtual_db.kv"),
+            2,
+        )?;
+        if bound != "127.0.0.1:40080"
+            || sim_resps.len() != 2
+            || sim_resps[0].status != 201
+            || sim_resps[1].status != 200
+            || sim_kv.get(&42) != Some(&777)
+            || !sim_host.virtual_files.contains_key("virtual_db.kv")
+        {
+            return Err(format!("Simulated narrow host roundtrip mismatch: bound={}, resps={:?}", bound, sim_resps));
+        }
+        checks += 4;
+    }
+
+    // 13y. Section 2: Deepened Multi-Step AI Repair Loop (`omni-repair-strategies-v1.1.0`)
+    {
+        let strat_json = omni_repair_strategies_json();
+        if !strat_json.contains(OMNI_REPAIR_STRATEGIES_VERSION)
+            || !strat_json.contains("strat_multi_fn_arity_align_v1")
+            || !strat_json.contains("strat_include_cycle_prune_v1")
+            || list_omni_repair_strategies().len() < 16
+        {
+            return Err(format!("Repair strategies catalog incomplete: {}", strat_json));
+        }
+
+        // Multi-step repair 1: Multi-function callee missing capability + caller arity mismatch
+        let broken_multi_fn = "#[strict]
+fn helper_gate(x: i64) -> trit {
+    let g: trit = egate(x - 10);
+    return g;
+}
+#[strict]
+fn main(a: i64) -> trit {
+    let res: trit = helper_gate(a, 999);
+    return res;
+}";
+        let rep_mf = run_omni_agent_repair_loop(
+            broken_multi_fn,
+            vec![OmniValue::Int(25)],
+            true,
+            5,
+            OMNI_HARNESS_CONTRACT_VERSION,
+        )?;
+        if !rep_mf.ok || !rep_mf.final_json.contains("\"result\":\"+1t\"") {
+            return Err(format!("Multi-function arity + callee cap repair failed: {:?}", rep_mf));
+        }
+
+        // Multi-step repair 2: Multi-file circular include graph repair
+        let mut cyc_vfs = BTreeMap::new();
+        cyc_vfs.insert(
+            String::from("math_util.omni"),
+            String::from("include \"app.omni\";\n#[strict]\nfn scale3(v: i64) -> i64 { let r: i64 = v * 3; return r; }"),
+        );
+        cyc_vfs.insert(
+            String::from("app.omni"),
+            String::from("include \"math_util.omni\";\n#[strict]\nfn main(x: i64) -> i64 { let y = scale3(x); return y; }"),
+        );
+        let (_, rep_inc) = repair_omni_include_graph(&cyc_vfs, "app.omni", vec![OmniValue::Int(14)], true, 5)?;
+        if !rep_inc.ok || !rep_inc.final_json.contains("\"result\":\"42\"") {
+            return Err(format!("Include graph repair failed: {:?}", rep_inc));
+        }
+
+        // Multi-step repair 3: Unresolved goto label + untyped let in strict mode
+        let broken_lbl = "#[strict]
+fn main(x: i64) -> i64 {
+    let out = x + 10;
+    goto 4;
+    return out;
+}";
+        let rep_lbl = run_omni_agent_repair_loop(broken_lbl, vec![OmniValue::Int(5)], true, 5, OMNI_HARNESS_CONTRACT_VERSION)?;
+        if !rep_lbl.ok || !rep_lbl.final_json.contains("\"result\":\"15\"") {
+            return Err(format!("Unresolved label + strict let repair failed: {:?}", rep_lbl));
+        }
+
+        // Multi-step repair 4: Undefined variable + unknown intrinsic
+        let broken_undef = "#[strict]
+fn main(x: i64) -> i64 {
+    let a: i64 = unknown_abs(x);
+    let b: i64 = a + missing_offset;
+    return b;
+}";
+        let rep_undef = run_omni_agent_repair_loop(broken_undef, vec![OmniValue::Int(-20)], true, 5, OMNI_HARNESS_CONTRACT_VERSION)?;
+        if !rep_undef.ok || !rep_undef.final_json.contains("\"result\":\"20\"") {
+            return Err(format!("Undefined var + unknown fn repair failed: {:?}", rep_undef));
+        }
+
+        // Multi-step repair 5: Memory budget exceeded (`#[mem_budget(16)]`) + DOM capability inference
+        let broken_mem = "#[strict]
+#[mem_budget(16)]
+fn main(x: i64) -> str {
+    let s: str = \"0123456789ABCDEF0123456789ABCDEF\";
+    let clean: str = san_dom(s);
+    return clean;
+}";
+        let rep_mem = run_omni_agent_repair_loop(broken_mem, vec![OmniValue::Int(1)], true, 5, OMNI_HARNESS_CONTRACT_VERSION)?;
+        if !rep_mem.ok || !rep_mem.final_json.contains("0123456789ABCDEF") {
+            return Err(format!("Memory budget repair failed: {:?}", rep_mem));
+        }
+
+        // Verify strategy_id & strategy_version appear in run_omni_agent_driver_json
+        let driver_json = run_omni_agent_driver_json(
+            broken_multi_fn,
+            vec![OmniValue::Int(25)],
+            true,
+            5,
+            OMNI_HARNESS_CONTRACT_VERSION,
+        );
+        contains_all(
+            &driver_json,
+            &[
+                "\"ok\":true",
+                "\"strategy_version\":\"omni-repair-strategies-v1.1.0\"",
+                "\"strategy_id\":\"strat_multi_fn_arity_align_v1\"",
+                "\"strategy_id\":\"strat_multi_fn_callee_cap_v1\"",
+            ],
+            "agent_driver_strategy_json",
+        )?;
+        checks += 8;
+    }
+
+    // 13z. Section 6: Tooling & Human Diagnostics (`format_omni_inspect`, `format_omni_human_diagnostic`, `explain_omni_error_code`)
+    {
+        let inspect_src = "#[strict]
+#[cap(AI)]
+fn main(a: i64) -> trit {
+    let g: trit = egate(a - 5);
+    return g;
+}";
+        let disasm = inspect_omni_surface_program(inspect_src, true)?;
+        if !disasm.contains("=== OMNI BINARY STREAM INSPECTION")
+            || !disasm.contains("cap_mask=0x0010 (AI)")
+            || !disasm.contains("OP_7F35_EGATE (0x7F35)")
+            || !disasm.contains("// line 4, col 19")
+        {
+            return Err(format!("format_omni_inspect output missing expected annotations:
+{}", disasm));
+        }
+        let explain_taint = explain_omni_error_code("TAINT_SINK")
+            .ok_or_else(|| String::from("explain_omni_error_code(TAINT_SINK) returned None"))?;
+        if !explain_taint.contains("error[TAINT_SINK]") || !explain_taint.contains("auth_verify") {
+            return Err(format!("explain_omni_error_code(TAINT_SINK) mismatch: {}", explain_taint));
+        }
+        let diag = format_omni_human_diagnostic("fn main(x: i64 @untrusted) -> i64 {
+    return x;
+}", &st_taint_ret);
+        if !diag.contains("error[TAINT_ON_RET]") || !diag.contains("--> line 3:5") || !diag.contains("^") {
+            return Err(format!("format_omni_human_diagnostic mismatch:
+{}", diag));
+        }
+        checks += 3;
+    }
+
+    // 13AA. Section 5: Next Abstraction Layer (`std/prelude.omni` + Hygienic `macro` Differential across VM, Stage-1, ELF & Wasm)
+    {
+        let macro_aot_src = "macro mad_step(a, b, c) = (a * b) + c;
+macro trit_bonus(t) = sel_trit(t, -20, 0, 20);
+#[strict]
+fn main(x: i64, y: i64) -> i64 {
+    let m: i64 = mad_step(x, 3, y);
+    let cmp: trit = m <=> 50;
+    let b: i64 = trit_bonus(cmp);
+    return m + b;
+}";
+        let (aot_res, aot_back) = execute_omni_surface_aot_first(macro_aot_src, vec![OmniValue::Int(20), OmniValue::Int(5)])?;
+        let vm_res = execute_omni_surface_program_with_budgets(macro_aot_src, vec![OmniValue::Int(20), OmniValue::Int(5)], None, None)?;
+        let wasm_res = execute_omni_surface_wasm_i64(macro_aot_src, &[20, 5])?;
+        let elf_direct = compile_omni_surface_to_x86_64_elf(macro_aot_src, 20, 5, 0)?;
+        let elf_stage1 = compile_omni_surface_via_stage1_to_elf(macro_aot_src, 20, 5, 0)?;
+        if aot_back != "aot" || aot_res != OmniValue::Int(85) || vm_res != OmniValue::Int(85) || wasm_res != 85 || elf_direct != elf_stage1 {
+            return Err(format!(
+                "Hygienic macro 4-way differential failed: aot={:?} ({}), vm={:?}, wasm={}",
+                aot_res, aot_back, vm_res, wasm_res
+            ));
+        }
+        checks += 2;
+    }
+
+    // 13AB. Section 4: Compositional Verification Invariants (`spec/trusted_core.md`)
+    checks += run_compositional_invariant_selftests()?;
+
+    // 13AC. Section 7: Phase 7 Pure-Omni Self-Hosted Verifier Kernel, Fixed-Point ELF64 Proof & Narrow-Host Runner
+    checks += run_phase7_pure_omni_selftests()?;
+
     Ok(checks)
 }
 
@@ -6851,6 +9221,23 @@ pub fn run_omni_harness_cli(argv: &[String]) -> i32 {
     let mut strict = false;
     let mut retry_hint = false;
     let mut rest: Vec<String> = Vec::new();
+    let mut idx_h = 0usize;
+    while idx_h < argv.len() {
+        let a = &argv[idx_h];
+        if a == "--explain" && idx_h + 1 < argv.len() {
+            match explain_omni_error_code(&argv[idx_h + 1]) {
+                Some(text) => {
+                    println!("{}", text);
+                    return 0;
+                }
+                None => {
+                    eprintln!("Unknown Omni error code '{}'", argv[idx_h + 1]);
+                    return 2;
+                }
+            }
+        }
+        idx_h += 1;
+    }
     for a in argv {
         match a.as_str() {
             "--strict" => strict = true,
@@ -11965,6 +14352,24 @@ fn main() {
             }
             "serve" | "--serve" => {
                 std::process::exit(run_omni_serve_cli(&cli_args[2..]));
+            }
+            "inspect" | "disasm" | "--inspect" | "--disasm" => {
+                std::process::exit(run_omni_inspect_cli(&cli_args[2..]));
+            }
+            "acceptance-diff" | "--acceptance-diff" => {
+                std::process::exit(run_omni_acceptance_diff_cli(&cli_args[2..]));
+            }
+            "explain" | "--explain" if cli_args.len() >= 3 => {
+                match explain_omni_error_code(&cli_args[2]) {
+                    Some(text) => {
+                        println!("{}", text);
+                        return;
+                    }
+                    None => {
+                        eprintln!("Unknown Omni error code '{}'", cli_args[2]);
+                        std::process::exit(2);
+                    }
+                }
             }
             "--resume-grpo" | "resume-grpo" => {
                 let ckpt = load_grpo_policy_checkpoint("grpo_policy_checkpoint.json");

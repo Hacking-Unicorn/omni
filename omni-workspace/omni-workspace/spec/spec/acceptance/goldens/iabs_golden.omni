@@ -1,0 +1,1 @@
+fn iabs_golden(x: i64) -> i64 { let r = iabs(x); return r; }

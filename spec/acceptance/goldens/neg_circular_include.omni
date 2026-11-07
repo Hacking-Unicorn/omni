@@ -1,0 +1,2 @@
+include "neg_circular_include.omni";
+fn main(x: i64) -> i64 { return x; }

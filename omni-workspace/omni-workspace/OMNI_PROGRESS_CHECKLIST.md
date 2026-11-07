@@ -96,6 +96,21 @@
   - Added `OMNI_HARNESS_CONTRACT_VERSION = "omni-harness-v1.0.0"`, `run_omni_harness_json`, `omni_harness_spec_json`, `omni harness`, and the standalone `omni-harness` binary target (`13t` / `6u`).
   - Added `omni-agent-driver` (`run_omni_agent_repair_loop_with_model`, `run_omni_agent_repair_loop`, `build_omni_agent_repair_prompt_json`, `run_omni_agent_driver_json`, `run_omni_agent_driver_cli` with `--repair-cmd` and `--emit-repair-prompt`) beside `omni-harness` with strict contract version lock (`VERSION_MISMATCH`) and multi-step emit-and-repair loops verified across 9 error categories (`13u` / `6v`, `253` monolith checks / `214` Windows & `215` Linux workspace differential checks passing with `0` warnings).
 
-## Phase 7: Future Long-Term Milestone (Not Started — Deferred per Roadmap)
-- [ ] **Pure Omni Self-Hosting of Surface Compiler & Host Runtime (No Rust)**:
-  - Note: Stage-1/Stage-2 (`omni_self_compiler.omni_bc`) self-hosts the binary token-to-ELF64 backend; rewriting the `.omni` surface lexer/parser/verifier/host in pure Omni is intentionally deferred until after the AI emit-and-repair loop and host ABI milestones above.
+## Phase 7: Executable Spec, Narrow Host, Deepened Repair, Compositional Verification & Pure-Omni Verifier Kernel (Complete — `333` Monolith / `294` Windows & `295` Linux Workspace Checks)
+- [x] **Section 1 — Executable Acceptance Suite (`spec/acceptance/`) + Error Contract (`spec/error_contract.md`) + `omni acceptance-diff`**:
+  - Extracted `24` positive goldens and `16` negative goldens into `spec/acceptance/goldens/` with `spec/acceptance/acceptance_manifest.json` (`omni-acceptance-suite-v1.0.0`) and `spec/acceptance/error_contract.json` (`omni-error-contract-v1.0.0`).
+  - Added `run_error_contract_selftest()`, `run_acceptance_suite_selftest()`, and `omni acceptance-diff`.
+- [x] **Section 3 — Narrow Capability-Gated Host Interface (`spec/host_interface.md` + `OmniNarrowHost`)**:
+  - Defined the 10-syscall `OmniNarrowHost` trait (`omni-narrow-host-v1.0.0`) with `StdNarrowHostAdapter` and `SimulatedNarrowHostAdapter` and routed host TCP/File/Time calls through the narrow adapter.
+- [x] **Section 2 — Deepen the AI Repair Loop (`omni-repair-strategies-v1.1.0`)**:
+  - Added 16 first-class versioned `OmniRepairStrategySpec` strategies (`--list-strategies`), `strategy_id` and `strategy_version` in harness/driver JSON, `repair_omni_include_graph`, and 8 multi-step repair selftests.
+- [x] **Section 6 — Tooling & Human Diagnostics (`omni inspect` / `omni disasm` + `--explain <CODE>`)**:
+  - Added `format_omni_inspect`, `inspect_omni_surface_program`, `format_omni_human_diagnostic`, and `explain_omni_error_code` with 3 selftests.
+- [x] **Section 5 — Next Abstraction Layer (`spec/next_abstraction.md` + Hygienic `macro` + `std/prelude.omni`)**:
+  - Added hygienic surface macros and built-in verified `std/prelude.omni` with zero new opcodes, verified across the 4-way VM/Stage-1/ELF/Wasm differential.
+- [x] **Section 4 — Compositional Verification Increments (`spec/trusted_core.md` + `spec/mechanized_proof_plan.md`)**:
+  - Documented the Trusted Computing Base, CompCert/Iris mechanization plan, and 5 compositional soundness invariant selftests (`run_compositional_invariant_selftests`), including surface lowering taint propagation across branched expressions.
+- [x] **Section 7 — Heterogeneous Execution Design (`spec/heterogeneous_design.md`)**:
+  - Authored `spec/heterogeneous_design.md` covering CPU/GPU/NPU memory models, linear device arenas, capability/taint tracking, placement attributes, backend fences, budgets, and non-goals.
+- [x] **Section 8 — Phase 7 Pure-Omni Self-Hosted Verifier Kernel & Narrow-Host Execution (`omni-pure-kernel-v1.0.0`, `13AC` / `6AD`)**:
+  - Implemented `PHASE7_PURE_OMNI_VERIFIER_KERNEL_SURFACE` (`omni_pure_verify_header`), `build_phase7_pure_omni_verifier_kernel_stream()`, `verify_module_via_phase7_pure_omni_kernel()`, and `run_phase7_pure_omni_selftests()` proving 4-way differential equivalence (`OmniBinaryVm` == Host `x86-64` ELF64 == Stage-1 `.omni_bc` ELF64 bit-exact fixed point == 64-bit Wasm) and full-stack execution over `OmniNarrowHost`.

@@ -1,0 +1,9 @@
+#[strict]
+fn arena_lifecycle_golden(x: i64) -> i64 {
+    let a: arena = arena(4096);
+    let r: arena = borrow_r(a);
+    let res: i64 = x + 42;
+    drop(r);
+    drop(a);
+    return res;
+}

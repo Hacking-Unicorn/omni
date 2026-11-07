@@ -1,0 +1,4 @@
+fn main(x: i64) -> trit {
+    let g = egate(x);
+    return g;
+}

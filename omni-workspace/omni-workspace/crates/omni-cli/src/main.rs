@@ -20,14 +20,16 @@ use omni_ir::{
 };
 use omni_isa::*;
 use omni_lang::{
-    compile_omni_surface_file_to_u16, compile_omni_surface_strict_to_u16,
-    compile_omni_surface_to_asm, compile_omni_surface_to_u16, compile_omni_surface_to_wasm,
-    compile_omni_surface_to_x86_64_elf, compile_omni_surface_via_stage1_to_elf,
-    execute_omni_surface_aot_first, execute_omni_surface_program,
-    execute_omni_surface_program_with_budgets, execute_omni_surface_wasm_i64,
-    omni_harness_spec_json, parse_cli_omni_value, resolve_omni_surface_includes,
-    run_ai_first_surface_selftests, run_omni_agent_driver_cli, run_omni_agent_driver_json,
-    run_omni_harness_cli, run_omni_harness_json, run_omni_serve_cli,
+    build_phase7_pure_omni_verifier_kernel_stream, compile_omni_surface_file_to_u16,
+    compile_omni_surface_strict_to_u16, compile_omni_surface_to_asm, compile_omni_surface_to_u16,
+    compile_omni_surface_to_wasm, compile_omni_surface_to_x86_64_elf,
+    compile_omni_surface_via_stage1_to_elf, execute_omni_surface_aot_first,
+    execute_omni_surface_program, execute_omni_surface_program_with_budgets,
+    execute_omni_surface_wasm_i64, explain_omni_error_code, inspect_omni_surface_program,
+    omni_harness_spec_json, omni_repair_strategies_json, parse_cli_omni_value,
+    resolve_omni_surface_includes, run_ai_first_surface_selftests, run_omni_acceptance_diff_cli,
+    run_omni_agent_driver_cli, run_omni_agent_driver_json, run_omni_harness_cli,
+    run_omni_harness_json, run_omni_inspect_cli, run_omni_serve_cli,
 };
 use omni_verifier::{format_debug_lens, verify_binary_function, verify_u16_stream};
 use omni_vm::{OmniBinaryVm, OmniValue};
@@ -888,6 +890,15 @@ pub fn run_workspace_selftest() -> Result<usize, String> {
     if ad_ws != ad_m || !ad_ws.starts_with("{\"ok\":true") {
         return Err(format!("Monolith vs workspace run_omni_agent_driver_json mismatch: {} != {}", ad_m, ad_ws));
     }
+    if omni_repair_strategies_json() != monolith::omni_repair_strategies_json() {
+        return Err("Monolith vs workspace omni_repair_strategies_json mismatch".into());
+    }
+    if inspect_omni_surface_program(strict_prog, true)? != monolith::inspect_omni_surface_program(strict_prog, true)? {
+        return Err("Monolith vs workspace inspect_omni_surface_program mismatch".into());
+    }
+    if build_phase7_pure_omni_verifier_kernel_stream()? != monolith::build_phase7_pure_omni_verifier_kernel_stream()? {
+        return Err("Monolith vs workspace build_phase7_pure_omni_verifier_kernel_stream mismatch".into());
+    }
     checks += ai_first_checks;
 
     // 7. Stage-1 == Stage-2 Self-Compilation Fixed Point
@@ -930,6 +941,24 @@ fn main() {
             }
             "serve" | "--serve" => {
                 std::process::exit(run_omni_serve_cli(&args[2..]));
+            }
+            "inspect" | "disasm" | "--inspect" | "--disasm" => {
+                std::process::exit(run_omni_inspect_cli(&args[2..]));
+            }
+            "acceptance-diff" | "--acceptance-diff" => {
+                std::process::exit(run_omni_acceptance_diff_cli(&args[2..]));
+            }
+            "explain" | "--explain" if args.len() >= 3 => {
+                match explain_omni_error_code(&args[2]) {
+                    Some(text) => {
+                        println!("{}", text);
+                        return;
+                    }
+                    None => {
+                        eprintln!("Unknown Omni error code '{}'", args[2]);
+                        std::process::exit(2);
+                    }
+                }
             }
             "selftest" => {
                 match run_workspace_selftest() {

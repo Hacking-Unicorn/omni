@@ -1,0 +1,4 @@
+fn main(a: i64) -> trit {
+    let t: trit = TRIT_NEG;
+    return t;
+}

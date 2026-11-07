@@ -1,0 +1,13 @@
+#[strict]
+#[cap(AI)]
+fn pack5_direct_aot() -> i64 {
+    let raw: bytes = pack5_bytes([+1t, -1t, 0t, +1t, +1t, -1t, 0t, -1t, +1t, +1t]);
+    let dot: i64 = pack5_tdot(raw, raw);
+    let g: trit = pack5_gate(raw);
+    let tv: trit_vec = unpack5(raw, 10);
+    let t0: i64 = pack5_get(tv, 0);
+    let t1: i64 = pack5_get(tv, 1);
+    let b_len: i64 = pack5_len(raw);
+    let bonus: i64 = if_pos g { 2000 } else { 0 };
+    return bonus + dot * 50 + b_len * 10 + (t0 - t1);
+}

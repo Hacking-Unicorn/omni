@@ -6,38 +6,42 @@ Zero-dependency Rust implementation of the **Omni** 16-bit binary token ISA (`0x
 
 > **Scope & Honesty Note:**
 > - **AOT Backends (`x86-64` ELF64 & 64-bit Wasm)** cover the verified numeric, ternary, control-flow, byte-buffer, `@PACK5`, and linear arena subset; host opcodes (`0x7F64..=0x7F7F`) are explicitly rejected by standalone AOT (`SPEC.md` Section 6).
-> - **Host ABI (`route` / DB / KV)** has two explicit modes (`SPEC.md` Section 7.9): (1) **in-VM host contract simulation** (`execute_omni_surface_program` returning `Int(status * 1_000_000 + body)` for socket-free unit tests) and (2) **live native TCP HTTP/1.1 + file-backed DB/KV host** (`omni serve <file.omni> [addr] [--db <path>]`).
-> - **Pure Omni (non-Rust surface compiler/runtime)**: Stage-1/Stage-2 self-hosts the binary token-to-ELF64 backend (`omni_self_compiler.omni_bc`); rewriting the surface `.omni` parser/verifier/host in pure Omni is not started and deferred per the AI-first roadmap.
+> - **Host ABI (`route` / DB / KV)** has two explicit modes (`SPEC.md` Section 7.9 & `spec/host_interface.md`): (1) **in-VM host contract simulation** (`execute_omni_surface_program` returning `Int(status * 1_000_000 + body)` for socket-free unit tests) and (2) **live native TCP HTTP/1.1 + file-backed DB/KV host** (`omni serve <file.omni> [addr] [--db <path>]`) built over the 10-syscall `OmniNarrowHost` capability-gated interface (`omni-narrow-host-v1.0.0`).
+> - **Pure Omni Self-Hosting (`omni-pure-kernel-v1.0.0`)**: Stage-1/Stage-2 self-hosts the binary token-to-ELF64 backend (`omni_self_compiler.omni_bc`), and the Phase 7 Pure-Omni static verifier kernel (`PHASE7_PURE_OMNI_VERIFIER_KERNEL_SURFACE` / `omni_pure_verify_header`) is verified across the 4-way VM/Host-ELF64/Stage-1-ELF64/Wasm differential and `OmniNarrowHost`.
 
 ## Repository Layout
 
-- [`omni_rust_bootstrap.rs`](./omni_rust_bootstrap.rs) — Standalone single-file reference monolith (`253` self-test checks, `0` warnings).
-- [`omni-workspace/omni-workspace/`](./omni-workspace/omni-workspace/) — 8-crate Cargo workspace (`214` Windows / `215` Linux `x86-64` monolith-vs-workspace differential checks, `0` warnings):
-  - `crates/omni-isa` — 128-opcode table (`0x7F00..=0x7F7F`), token ranges, `OMNI_HARNESS_CONTRACT_VERSION`, zero-allocation `@PACK5` (`5 trits/byte`) codec & direct ops, FNV-1a64 hashing.
+- [`omni_rust_bootstrap.rs`](./omni_rust_bootstrap.rs) — Standalone single-file reference monolith (`333` self-test checks, `0` warnings).
+- [`omni-workspace/omni-workspace/`](./omni-workspace/omni-workspace/) — 8-crate Cargo workspace (`294` Windows / `295` Linux `x86-64` monolith-vs-workspace differential checks, `0` warnings):
+  - `crates/omni-isa` — 128-opcode table (`0x7F00..=0x7F7F`), token ranges, contract version constants (`OMNI_HARNESS_CONTRACT_VERSION`, `OMNI_REPAIR_STRATEGIES_VERSION`, `OMNI_NARROW_HOST_VERSION`, `OMNI_ACCEPTANCE_SUITE_VERSION`, `OMNI_ERROR_CONTRACT_VERSION`, `OMNI_PHASE7_PURE_KERNEL_VERSION`), zero-allocation `@PACK5` (`5 trits/byte`) codec & direct ops, FNV-1a64 hashing.
   - `crates/omni-ir` — Binary token stream decoder (`decode_omni_token_stream`) and IR types.
   - `crates/omni-verifier` — Static capability bitmask, linear ownership/borrow/arena state machine, SSA, and `@UNTRUSTED` taint verifier (`verify_binary_function`, `verify_u16_stream`) emitting machine-readable `error[<CODE>]` diagnostics.
   - `crates/omni-vm` — Deterministic execution engine (`OmniBinaryVm`) with explicit step/fuel and memory budgets and full-stack host ABI execution (`0x7F64..=0x7F70`).
   - `crates/omni-assembler` — Direct binary instruction packet encoder (`encode_asm_ins_packet_u16`) and `.omni_asm` text assembler (`assemble_omni_text_to_u16`).
-  - `crates/omni-lang` — `.omni` surface language lexer, parser, strict single-form mode (`#[strict]` / `compile_omni_surface_strict_to_u16`), binary offset sourcemap (`SurfaceSourceMap`), full-stack `route` + DB/KV lowering and live TCP HTTP/1.1 + file-backed DB/KV server (`serve_omni_http_once`, `serve_omni_http_batch`, `serve_omni_http_batch_with_db_file`), multi-file `include` linker, direct zero-IR `Vec<u16>` emitter (`compile_omni_surface_to_u16`), `#[step_budget(N)]`/`#[mem_budget(N)]` attributes, AOT-first dispatcher (`execute_omni_surface_aot_first`), version-locked JSON harness (`run_omni_harness_json`), and emit-and-repair driver (`run_omni_agent_repair_loop`, `build_omni_agent_repair_prompt_json`).
+  - `crates/omni-lang` — `.omni` surface language lexer, parser, strict single-form mode (`#[strict]` / `compile_omni_surface_strict_to_u16`), hygienic expression macros (`macro`), built-in verified stdlib prelude (`include "std/prelude.omni";`), binary offset sourcemap (`SurfaceSourceMap`), `OmniNarrowHost` 10-syscall boundary, live TCP HTTP/1.1 + file-backed DB/KV server (`serve_omni_http_once`, `serve_omni_http_batch`, `serve_omni_http_batch_with_db_file`, `serve_omni_http_via_narrow_host`), versioned repair strategies (`omni-repair-strategies-v1.1.0`), executable acceptance runner (`run_omni_acceptance_diff`), binary stream inspector (`format_omni_inspect`), and Phase 7 Pure-Omni verifier kernel (`verify_module_via_phase7_pure_omni_kernel`).
   - `crates/omni-aot` — Two-pass `x86-64` Linux ELF64 compiler, 64-bit WebAssembly (`\0asm`) compiler & budgeted evaluator (`execute_wasm_module_i64_with_budgets`), and Stage-1/Stage-2 self-compiler (`omni_self_compiler.omni_bc`).
-  - `crates/omni-cli` — CLI runner (`omnic`: `selftest`, `run`, `eval`, `repl`, `harness`, `agent-driver`, `serve`, `compile-surface`, `surface-to-asm`, `compile-elf`, `compile-stage1`, `compile-wasm`, `run-wasm`) and standalone `omni-harness` and `omni-agent-driver` binary targets.
+  - `crates/omni-cli` — CLI runner (`omnic`: `selftest`, `run`, `eval`, `repl`, `harness`, `agent-driver`, `serve`, `inspect`/`disasm`, `acceptance-diff`, `--explain`, `compile-surface`, `surface-to-asm`, `compile-elf`, `compile-stage1`, `compile-wasm`, `run-wasm`) and standalone `omni-harness` and `omni-agent-driver` binary targets.
+- [`spec/`](./spec/) — Executable acceptance suite (`spec/acceptance/acceptance_manifest.json` + 40 `.omni` goldens), `spec/IMPROVEMENT_ROADMAP.md`, `spec/error_contract.md`, `spec/host_interface.md`, `spec/next_abstraction.md`, `spec/trusted_core.md`, `spec/mechanized_proof_plan.md`, and `spec/heterogeneous_design.md`.
 - [`spec.md`](./spec.md) — Normative specification (`SPEC.md`).
 - [`omni_full_status_audit.md`](./omni_full_status_audit.md) — Full architectural and verification status audit.
-- [`omni_progress_checklist.md`](./omni_progress_checklist.md) — Phase 1–6 progress checklist.
+- [`omni_progress_checklist.md`](./omni_progress_checklist.md) — Phase 1–7 progress checklist.
 
 ## Quick Start
 
-### 1. Run the 8-Crate Workspace Selftest (`214` / `215` Checks)
+### 1. Run the 8-Crate Workspace Selftest (`294` / `295` Checks)
 ```powershell
 cd omni-workspace/omni-workspace
 $env:CARGO_INCREMENTAL=0; cargo build --workspace
 cargo run -p omni-cli -- selftest
 ```
 
-### 2. Run the Standalone Monolith Selftest (`253` Checks)
+### 2. Run the Standalone Monolith Selftest (`333` Checks) & Acceptance Differential Suite
 ```powershell
 rustc -O omni_rust_bootstrap.rs -o omni.exe
 .\omni.exe selftest
+.\omni.exe acceptance-diff
+.\omni.exe inspect spec/acceptance/goldens/decision_hook_golden.omni
+.\omni.exe --explain TAINT_SINK
 ```
 
 ### 3. Run the Version-Locked Model Harness (`omni-harness`) & Agent Driver (`omni-agent-driver`)

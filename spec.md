@@ -1,6 +1,6 @@
 # Omni Binary Token-Stream ISA, Verifier, VM & AOT Normative Specification (`SPEC.md`)
 
-**Contract Status:** Normative — every behavior asserted by `./omni selftest` (`237` checks in `omni_rust_bootstrap.rs`) and `cargo run -p omni-cli -- selftest` (`198`/`199` differential checks across the 8-crate Cargo workspace) is specified below. Features not yet implemented in standalone AOT are explicitly listed in Section 6.
+**Contract Status:** Normative — every behavior asserted by `./omni selftest` (`330` checks in `omni_rust_bootstrap.rs`) and `cargo run -p omni-cli -- selftest` (`291`/`292` differential checks across the 8-crate Cargo workspace) is specified below. Features not yet implemented in standalone AOT are explicitly listed in Section 6.
 
 ## 1. 16-Bit Binary Token Partition (`0x0000..=0x7FFF`)
 
@@ -160,3 +160,27 @@ The following high-level runtime opcodes (used in Corpus Seeds `1, 2, 3, 5, 7`) 
 10. **Version-Locked Model Harness (`omni-harness`) & Agent Emit-and-Repair Driver (`omni-agent-driver`, `13t`, `13u`)**:
     - `run_omni_harness_json` and the `omni-harness` / `omni harness` CLI emit a single-line JSON object locked to `"version":"omni-harness-v1.0.0"`: `{"ok":true,"version":"omni-harness-v1.0.0","result":"...","tokens":N,"backend":"aot"|"vm"}` on success, or `{"ok":false,"version":"omni-harness-v1.0.0","code":"<CODE>","line":L,"col":C,"message":"...","tokens":...}` (plus `"retry_hint":"..."` when `--retry-hint` is passed) on failure, and `--spec` outputs the machine-readable grammar, capability, and error-code contract.
     - `omni-agent-driver` (`run_omni_agent_repair_loop_with_model`, `run_omni_agent_repair_loop`, `build_omni_agent_repair_prompt_json`, `run_omni_agent_driver_json`, `run_omni_agent_driver_cli`) is a thin external tool beside `omni-harness` (outside the token ISA and verifier) that loads `omni-harness --spec`, enforces version lock `version == "omni-harness-v1.0.0"` (refusing to run with `VERSION_MISMATCH` on mismatch), calls `run_omni_harness_json`, and feeds `(code, line, col, retry_hint, message)` into iterative candidate repair (via built-in deterministic repair or an external `--repair-cmd <cmd>`) up to `max_attempts` until `"ok":true`.
+
+## 8. Phase 7 Contracts, Narrow Host Boundary, Repair Strategies, Pure-Omni Kernel & Heterogeneous Design
+
+All normative companion specifications live under [`./spec/`](./spec/):
+
+1. **Executable Acceptance Suite ([`spec/acceptance/acceptance_manifest.json`](./spec/acceptance/acceptance_manifest.json) & [`spec/acceptance/goldens/`](./spec/acceptance/goldens/))**:
+   - Freezes `24` positive goldens (`15` original `SPEC.md` goldens with locked `u16` token counts `[53, 34, 34, 91, 40, 20, 22, 22, 49, 49, 51, 74, 69, 57, 86]` + `9` Phase 3–7 surface/PACK5/arena/host/macro-stdlib goldens) and `16` negative structured-error goldens.
+   - Verified continuously by `run_acceptance_suite_selftest()` and `omni acceptance-diff [--candidate-cmd <cmd>]` (`OMNI_ACCEPTANCE_SUITE_VERSION = "omni-acceptance-suite-v1.0.0"`).
+2. **Machine-Readable Error Contract ([`spec/error_contract.md`](./spec/error_contract.md) & [`spec/acceptance/error_contract.json`](./spec/acceptance/error_contract.json))**:
+   - Locks all 16 `error[<CODE>]` diagnostics (`TAINT_ON_RET` through `SYNTAX_ERROR`) with guaranteed non-null 1-based `(line, col)` spans and deterministic retry hints (`OMNI_ERROR_CONTRACT_VERSION = "omni-error-contract-v1.0.0"`), verified by `run_error_contract_selftest()`.
+3. **Narrow Capability-Gated Host Interface ([`spec/host_interface.md`](./spec/host_interface.md))**:
+   - Freezes the 10-operation `OmniNarrowHost` trait (`host_tcp_listen`, `host_tcp_accept`, `host_tcp_read`, `host_tcp_write`, `host_tcp_close`, `host_file_open`, `host_file_read`, `host_file_write`, `host_file_close`, `host_time_ns`; `OMNI_NARROW_HOST_VERSION = "omni-narrow-host-v1.0.0"`), implemented by `StdNarrowHostAdapter` (live OS) and `SimulatedNarrowHostAdapter` (deterministic in-memory verification).
+4. **First-Class Versioned Repair Strategies (`omni-repair-strategies-v1.1.0`)**:
+   - `list_omni_repair_strategies()`, `omni_repair_strategies_json()` (`omni-agent-driver --list-strategies`), and `repair_omni_include_graph()` provide 16 versioned multi-step repair strategies covering multi-function modules (`strat_multi_fn_arity_align_v1`, `strat_multi_fn_callee_cap_v1`), circular/multi-file include graphs (`strat_include_cycle_prune_v1`), minimal capability inference (`strat_missing_cap_minimal_v1`), step/memory budget synthesis (`strat_budget_aware_synthesis_v1`), unresolved labels, and undefined variables. Every `omni-agent-driver` JSON output records `strategy_version` and per-attempt `strategy_id`.
+5. **Next Abstraction Layer ([`spec/next_abstraction.md`](./spec/next_abstraction.md))**:
+   - Hygienic surface expression macros (`macro <name>(<p0>, ...) = <expr>;`) and the built-in verified pure-Omni standard library prelude (`include "std/prelude.omni";` -> `std_clamp`, `std_abs_diff`, `std_trit_mux`, `std_consensus3`) expand before verification and lower to the existing 128-opcode ISA with **zero new opcodes**.
+6. **Trusted Core, Compositional Invariants & Mechanized Proof Plan ([`spec/trusted_core.md`](./spec/trusted_core.md) & [`spec/mechanized_proof_plan.md`](./spec/mechanized_proof_plan.md))**:
+   - Documents the Trusted Computing Base (TCB) and continuously tests 5 compositional soundness invariants (`run_compositional_invariant_selftests`: taint non-interference across branches, linear arena conservation, capability monotonicity across all capability-gated opcodes, hot-path AOT boundary equivalence, and macro taint/hygiene transparency).
+7. **Tooling & Human Diagnostics (`omni inspect` / `omni disasm` & `--explain <CODE>`)**:
+   - `format_omni_inspect` disassembles `.omni` and `.omni_bc` streams with opcode names, registers/parameters/labels, capability/taint tags, and 1-based source map coordinates; `format_omni_human_diagnostic` and `explain_omni_error_code` (`--explain <CODE>`) provide human-readable multi-line diagnostics without altering single-line `omni-harness` JSON.
+8. **Heterogeneous Execution Design ([`spec/heterogeneous_design.md`](./spec/heterogeneous_design.md))**:
+   - Normative design specification for CPU/GPU/NPU execution, linear device arena ownership, `@PACK5` DMA transfers, static backend opcode fences, and cross-device budgets.
+9. **Phase 7 Pure-Omni Self-Hosted Verifier Kernel (`omni-pure-kernel-v1.0.0`, [`spec/IMPROVEMENT_ROADMAP.md`](./spec/IMPROVEMENT_ROADMAP.md))**:
+   - `PHASE7_PURE_OMNI_VERIFIER_KERNEL_SURFACE` (`omni_pure_verify_header`), `build_phase7_pure_omni_verifier_kernel_stream()`, and `verify_module_via_phase7_pure_omni_kernel()` execute static verification (`OK=0`, `TAINT_ON_RET=1001`, `TAINT_SINK=1002`, `MISSING_CAP=1003`, `LINEAR_LEAK=1004`, `BORROW_CONFLICT=1005`) as a verified `.omni` binary module across `OmniBinaryVm`, Host `x86-64` ELF64, Stage-1 `.omni_bc` ELF64 (bit-identical fixed point), and 64-bit WebAssembly AOT (`run_phase7_pure_omni_selftests()`, `13AC`).

@@ -1,0 +1,7 @@
+#[strict]
+#[cap(AI)]
+fn decision_hook_golden(a: i64, b: i64) -> trit {
+    let delta: i64 = a - b;
+    let gate: trit = egate(delta);
+    return gate;
+}
