@@ -1,6 +1,6 @@
 // ==============================================================================
 // OMNI PURE CORE — `pure/tooling.omni`
-// Version: omni-pure-tooling-v1.1.0
+// Version: omni-pure-tooling-v1.2.0
 // ==============================================================================
 //
 // Pure-Omni implementations of the core tooling decision kernels:
@@ -18,6 +18,11 @@
 // 5. `pure_bootstrap_fixed_point_check`: Validates Generation-1 == Generation-2
 //    self-hosting fixed-point invariants on `.omni_bc` word counts, `.elf` byte
 //    lengths, and FNV-1a64 hashes (`0=OK`, `5001=BC_DIFF`, `5002=ELF_DIFF`).
+// 6. `pure_inspect_module_metrics`: Computes a deterministic module structural
+//    digest across function count, total `u16` word count, and union capability mask.
+// 7. `pure_multi_step_repair_budget`: Computes remaining repair budget and returns
+//    `0` when convergence is reached (`remaining_errors == 0`) or `4002` when
+//    `attempt > max_attempts`.
 // ==============================================================================
 
 #[strict]
@@ -72,4 +77,23 @@ fn pure_bootstrap_fixed_point_check(gen1_words: i64, gen2_words: i64, elf_hash_d
     let elf_status: i64 = if_pos e_cmp { 5002 } else { 0 };
     let final_status: i64 = if_pos w_cmp { 5001 } else { elf_status };
     return final_status;
+}
+
+#[strict]
+fn pure_inspect_module_metrics(fn_count: i64, total_words: i64, union_cap_mask: i64) -> i64 {
+    let f_ok: trit = fn_count > 0;
+    let w_ok: trit = total_words > 0;
+    let valid: trit = tand(f_ok, w_ok);
+    let score: i64 = (fn_count * 100000) + (total_words * 10) + (union_cap_mask & 1023);
+    let out: i64 = if_pos valid { score } else { -1 };
+    return out;
+}
+
+#[strict]
+fn pure_multi_step_repair_budget(attempt: i64, max_attempts: i64, remaining_errors: i64) -> i64 {
+    let err_cmp: trit = remaining_errors <=> 0;
+    let budget_cmp: trit = attempt <=> max_attempts;
+    let exhausted_or_step: i64 = if_pos budget_cmp { 4002 } else { remaining_errors };
+    let status: i64 = if_pos err_cmp { exhausted_or_step } else { 0 };
+    return status;
 }

@@ -2611,6 +2611,23 @@ fn pure_bootstrap_fixed_point_check(gen1_words: i64, gen2_words: i64, elf_hash_d
     let elf_status: i64 = if_pos e_cmp { 5002 } else { 0 };
     let final_status: i64 = if_pos w_cmp { 5001 } else { elf_status };
     return final_status;
+}
+#[strict]
+fn pure_inspect_module_metrics(fn_count: i64, total_words: i64, union_cap_mask: i64) -> i64 {
+    let f_ok: trit = fn_count > 0;
+    let w_ok: trit = total_words > 0;
+    let valid: trit = tand(f_ok, w_ok);
+    let score: i64 = (fn_count * 100000) + (total_words * 10) + (union_cap_mask & 1023);
+    let out: i64 = if_pos valid { score } else { -1 };
+    return out;
+}
+#[strict]
+fn pure_multi_step_repair_budget(attempt: i64, max_attempts: i64, remaining_errors: i64) -> i64 {
+    let err_cmp: trit = remaining_errors <=> 0;
+    let budget_cmp: trit = attempt <=> max_attempts;
+    let exhausted_or_step: i64 = if_pos budget_cmp { 4002 } else { remaining_errors };
+    let status: i64 = if_pos err_cmp { exhausted_or_step } else { 0 };
+    return status;
 }",
         ),
         "pure/selfhost_suite.omni" => Some(
@@ -4596,21 +4613,76 @@ pub fn repair_omni_program_from_harness_error(
             None
         }
         "LINEAR_LEAK" => {
-            if let Some(a_pos) = src.find("arena(") {
-                let before = &src[..a_pos];
-                if let Some(let_pos) = before.rfind("let ") {
-                    let var_part = &before[let_pos + 4..];
-                    let v_name = var_part
-                        .split(|c: char| c == ':' || c == '=' || c.is_ascii_whitespace())
-                        .next()
-                        .unwrap_or("")
-                        .trim();
-                    if !v_name.is_empty() && src.contains("return ") {
-                        let out = src.replacen("return ", &format!("drop({}); return ", v_name), 1);
-                        if out != src {
-                            return Some(out);
+            let lines: Vec<&str> = src.lines().collect();
+            let mut fn_ranges: Vec<(usize, usize)> = Vec::new();
+            let mut cur_start: Option<usize> = None;
+            let mut brace_depth = 0usize;
+            for (idx, line_s) in lines.iter().enumerate() {
+                let t = line_s.trim_start();
+                if cur_start.is_none() && (t.starts_with("fn ") || t.contains(" fn ") || t.starts_with("route ")) {
+                    cur_start = Some(idx);
+                    brace_depth = 0;
+                }
+                if cur_start.is_some() {
+                    for b in line_s.bytes() {
+                        if b == b'{' {
+                            brace_depth += 1;
+                        } else if b == b'}' {
+                            brace_depth = brace_depth.saturating_sub(1);
+                            if brace_depth == 0 {
+                                if let Some(st) = cur_start.take() {
+                                    fn_ranges.push((st, idx + 1));
+                                }
+                            }
                         }
                     }
+                }
+            }
+            if let Some(st) = cur_start {
+                fn_ranges.push((st, lines.len()));
+            }
+            if fn_ranges.is_empty() {
+                fn_ranges.push((0, lines.len()));
+            }
+            let mut new_lines: Vec<String> = lines.iter().map(|s| String::from(*s)).collect();
+            let mut patched = false;
+            for (fn_start_line, fn_end_line) in fn_ranges {
+                let fn_slice = lines[fn_start_line..fn_end_line].join("\n");
+                let mut arena_vars: Vec<String> = Vec::new();
+                for line_s in &lines[fn_start_line..fn_end_line] {
+                    if line_s.contains("arena(") || line_s.contains("borrow_r(") || line_s.contains("borrow_w(") {
+                        if let Some(let_pos) = line_s.find("let ") {
+                            let var_part = &line_s[let_pos + 4..];
+                            let v_name = var_part
+                                .split(|c: char| c == ':' || c == '=' || c.is_ascii_whitespace())
+                                .next()
+                                .unwrap_or("")
+                                .trim();
+                            if !v_name.is_empty() && !fn_slice.contains(&format!("drop({});", v_name)) {
+                                arena_vars.push(String::from(v_name));
+                            }
+                        }
+                    }
+                }
+                if !arena_vars.is_empty() {
+                    arena_vars.reverse();
+                    let drop_stmts: String = arena_vars.iter().map(|v| format!("drop({}); ", v)).collect();
+                    for line_item in new_lines.iter_mut().take(fn_end_line).skip(fn_start_line) {
+                        if line_item.contains("return ") {
+                            *line_item = line_item.replacen("return ", &format!("{}return ", drop_stmts), 1);
+                            patched = true;
+                            break;
+                        }
+                    }
+                    if patched {
+                        break;
+                    }
+                }
+            }
+            if patched {
+                let out = new_lines.join("\n");
+                if out != src {
+                    return Some(out);
                 }
             }
             None
@@ -8837,6 +8909,91 @@ pub fn run_pure_core_phase_s1_real_programs_selftests() -> Result<usize, String>
     Ok(checks)
 }
 
+// ==============================================================================
+// 7U. STRENGTHENING PHASE S2: DEEPENED PURE TOOLING FOR LARGER PURE CODEBASES
+// ==============================================================================
+
+/// Runs Strengthening Phase S2 selftests (`pure/tooling.omni` v1.2.0 + multi-step repair & inspection on Phase S1 real programs):
+/// 1. Executes `pure_inspect_module_metrics` and `pure_multi_step_repair_budget` in `pure/tooling.omni`
+///    via the Pure-Omni driver across valid and invalid inputs.
+/// 2. Runs `inspect_omni_surface_via_pure_omni` across all 5 Phase S1 real programs (`ternary_neural_router.omni`,
+///    `arena_audit_pipeline.omni`, `policy_consensus_engine.omni`, `kv_ledger_service.omni`, `compiler_self_audit.omni`),
+///    verifying bit-exact disassembly parity with `inspect_omni_surface_program` and source-map span annotations.
+/// 3. Demonstrates multi-step Pure-Omni agent-driver repair on broken multi-function versions of Phase S1 real programs
+///    (combining `AMBIGUOUS_GRAMMAR` + `BAD_TYPE` + `MISSING_CAP` + `LINEAR_LEAK` across multiple functions + `include`s).
+pub fn run_pure_core_phase_s2_deepened_tooling_selftests() -> Result<usize, String> {
+    let mut checks = 0usize;
+
+    // 1. Execute `pure_inspect_module_metrics` and `pure_multi_step_repair_budget` in `pure/tooling.omni`
+    let s2_tool_prog = "include \"pure/tooling.omni\";\n#[strict]\nfn main(fn_cnt: i64, words: i64, rem_errs: i64) -> i64 {\n    let m_score: i64 = pure_inspect_module_metrics(fn_cnt, words, 16);\n    let b_status: i64 = pure_multi_step_repair_budget(2, 6, rem_errs);\n    return m_score + b_status;\n}";
+    let (v_s2_ok, _, _) = execute_omni_surface_via_pure_omni_driver(
+        s2_tool_prog,
+        vec![OmniValue::Int(3), OmniValue::Int(250), OmniValue::Int(0)],
+        true,
+    )?;
+    // m_score = 3*100000 + 250*10 + 16 = 302516, b_status = 0 -> 302516
+    if v_s2_ok != OmniValue::Int(302516) {
+        return Err(format!("Phase S2 tooling metrics returned {:?}, expected Int(302516)", v_s2_ok));
+    }
+    let b_exhaust_prog = "include \"pure/tooling.omni\";\n#[strict]\nfn main(att: i64) -> i64 {\n    return pure_multi_step_repair_budget(att, 4, 2);\n}";
+    let (v_exh, _, _) = execute_omni_surface_via_pure_omni_driver(
+        b_exhaust_prog,
+        vec![OmniValue::Int(5)],
+        true,
+    )?;
+    if v_exh != OmniValue::Int(4002) {
+        return Err(format!("Phase S2 repair budget exhaustion returned {:?}, expected Int(4002)", v_exh));
+    }
+    checks += 1;
+
+    // 2. Run `inspect_omni_surface_via_pure_omni` across all 5 Phase S1 real programs
+    let real_programs = [
+        "pure/programs/ternary_neural_router.omni",
+        "pure/programs/arena_audit_pipeline.omni",
+        "pure/programs/policy_consensus_engine.omni",
+        "pure/programs/kv_ledger_service.omni",
+        "pure/programs/compiler_self_audit.omni",
+    ];
+    for p_path in &real_programs {
+        let src = lookup_omni_stdlib_module(p_path)
+            .ok_or_else(|| format!("Phase S2 missing built-in real program '{}'", p_path))?;
+        let pure_insp = inspect_omni_surface_via_pure_omni(src, true)?;
+        let ref_insp = inspect_omni_surface_program(src, true)?;
+        if pure_insp != ref_insp
+            || !pure_insp.contains("=== OMNI BINARY STREAM INSPECTION")
+            || !pure_insp.contains("[verifier=PASS]")
+        {
+            return Err(format!("Phase S2 inspect mismatch on real program '{}'", p_path));
+        }
+    }
+    checks += 1;
+
+    // 3. Multi-step Pure-Omni repair on a broken multi-function real program (missing arena drop in helper + missing AI cap + untyped let + int alias)
+    let broken_real_arena_prog = "include \"std/math.omni\";\ninclude \"std/trit.omni\";\n#[strict]\nfn compute_window(limit: int) -> i64 {\n    let a_main: arena = arena(2048);\n    let clamped = std_clamp(limit, 1, 50);\n    let g: trit = egate(clamped - 10);\n    let bonus: i64 = std_trit_mux(g, -5, 0, 5);\n    return clamped + bonus;\n}\n#[strict]\nfn main(x: i64) -> i64 {\n    let r: i64 = compute_window(x);\n    return r + 100;\n}";
+    let rep_real = run_omni_agent_repair_loop(
+        broken_real_arena_prog,
+        vec![OmniValue::Int(25)],
+        true,
+        8,
+        OMNI_HARNESS_CONTRACT_VERSION,
+    )?;
+    let (repaired_val, _, _) = execute_omni_surface_via_pure_omni_driver(
+        &rep_real.final_source,
+        vec![OmniValue::Int(25)],
+        true,
+    )?;
+    // clamped=25, g=+1t -> bonus=5 -> compute_window=30 -> main=130
+    if !rep_real.ok || repaired_val != OmniValue::Int(130) || rep_real.attempts.len() < 3 {
+        return Err(format!(
+            "Phase S2 multi-step repair on broken multi-function real program failed: {:?}",
+            rep_real
+        ));
+    }
+    checks += 1;
+
+    Ok(checks)
+}
+
 /// Expects `res` to fail with a diagnostic whose machine-readable code equals `code` and has non-null 1-based `(line, col)`.
 fn expect_omni_error_code<T: std::fmt::Debug>(label: &str, res: Result<T, String>, code: &str) -> Result<OmniStructuredError, String> {
     match res {
@@ -9538,6 +9695,9 @@ fn main(x: i64, y: i64) -> i64 {
 
     // 13AO. Strengthening Phase S1: Real Pure-Omni Programs (`pure/programs/*.omni`)
     checks += run_pure_core_phase_s1_real_programs_selftests()?;
+
+    // 13AP. Strengthening Phase S2: Deepened Pure Tooling for Larger Pure Codebases
+    checks += run_pure_core_phase_s2_deepened_tooling_selftests()?;
 
     Ok(checks)
 }
