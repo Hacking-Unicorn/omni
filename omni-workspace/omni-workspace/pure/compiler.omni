@@ -1,18 +1,25 @@
 // ==============================================================================
 // OMNI PURE CORE — `pure/compiler.omni`
-// Version: omni-pure-selfhost-v1.1.0
+// Version: omni-pure-selfhost-v1.2.0
 // ==============================================================================
 //
 // Primary Pure-Omni surface compiler & static verifier pipeline:
 // 1. `pure_lex_classify_token`: Classifies surface tokens, trits (`-1t`, `0t`, `+1t`),
 //    type tags (`i64`, `trit`, `bytes`, `trit_vec`, `str`, `arena`), and `#[strict]`
 //    aliases (`AMBIGUOUS_GRAMMAR = 2002`, `BAD_TYPE = 2003`, `SYNTAX_ERROR = 2001`).
-// 2. `pure_verify_function_invariants`: Static capability bitmask (`MISSING_CAP = 1003`),
+// 2. `pure_check_include_graph`: Validates `include "..."` graph depth and cycle flags
+//    (`CIRCULAR_INCLUDE = 2008`, `SYNTAX_ERROR = 2001`).
+// 3. `pure_check_macro_hygiene`: Validates hygienic `macro` arity and free-variable isolation
+//    (`ARITY_MISMATCH = 2006`, `UNDEF_VAR = 2004`).
+// 4. `pure_check_call_and_label`: Validates function call resolution, parameter mutability,
+//    and basic-block `label` / `goto` resolution (`IMMUT_PARAM = 2005`, `UNKNOWN_FN = 2007`,
+//    `UNRESOLVED_LABEL = 2009`).
+// 5. `pure_verify_function_invariants`: Static capability bitmask (`MISSING_CAP = 1003`),
 //    `@UNTRUSTED` taint lattice (`TAINT_ON_RET = 1001`, `TAINT_SINK = 1002`), and
 //    linear arena / borrow state machine (`LINEAR_LEAK = 1004`, `BORROW_CONFLICT = 1005`).
-// 3. `pure_lower_instruction_budget`: Computes binary `u16` word budgets and `@PACK5`
-//    compression ratios (`5 trits per byte`, `0..=242`; rejects `243..=255` with `CORRUPT_PACK5 = 3002`).
-// 4. `pure_compiler_pipeline_main`: End-to-end Pure-Omni compiler & verifier entrypoint.
+// 6. `pure_lower_pack5_density`: Computes `@PACK5` byte lengths (`5 trits per byte`, `0..=242`;
+//    rejects `243..=255` with `CORRUPT_PACK5 = 3002`).
+// 7. `pure_compiler_pipeline_main`: End-to-end Pure-Omni compiler & verifier entrypoint.
 // ==============================================================================
 
 #[strict]
@@ -34,6 +41,37 @@ fn pure_lex_classify_token(src_len: i64, strict_violation_code: i64, syntax_err_
         pos => after_syn
     };
     return final_code;
+}
+
+#[strict]
+fn pure_check_include_graph(include_depth: i64, has_cycle: i64, max_depth: i64) -> i64 {
+    let cyc_cmp: trit = has_cycle <=> 0;
+    let dep_cmp: trit = include_depth <=> max_depth;
+    let dep_err: i64 = if_pos dep_cmp { 2008 } else { 0 };
+    let res: i64 = if_pos cyc_cmp { 2008 } else { dep_err };
+    return res;
+}
+
+#[strict]
+fn pure_check_macro_hygiene(decl_arity: i64, call_arity: i64, unbound_free_vars: i64) -> i64 {
+    let raw_diff: i64 = decl_arity - call_arity;
+    let ar_diff: i64 = iabs(raw_diff);
+    let ar_cmp: trit = ar_diff <=> 0;
+    let fv_cmp: trit = unbound_free_vars <=> 0;
+    let fv_err: i64 = if_pos fv_cmp { 2004 } else { 0 };
+    let res: i64 = if_pos ar_cmp { 2006 } else { fv_err };
+    return res;
+}
+
+#[strict]
+fn pure_check_call_and_label(unknown_fn_flag: i64, immut_param_flag: i64, unresolved_lbl_flag: i64) -> i64 {
+    let fn_cmp: trit = unknown_fn_flag <=> 0;
+    let im_cmp: trit = immut_param_flag <=> 0;
+    let lb_cmp: trit = unresolved_lbl_flag <=> 0;
+    let lb_err: i64 = if_pos lb_cmp { 2009 } else { 0 };
+    let im_or_lb: i64 = if_pos im_cmp { 2005 } else { lb_err };
+    let res: i64 = if_pos fn_cmp { 2007 } else { im_or_lb };
+    return res;
 }
 
 #[strict]
@@ -68,8 +106,12 @@ fn pure_lower_pack5_density(trit_count: i64, max_byte_val: i64) -> i64 {
 #[strict]
 fn pure_compiler_pipeline_main(src_len: i64, missing_cap_bits: i64, taint_or_arena_err: i64) -> i64 {
     let fe_code: i64 = pure_lex_classify_token(src_len, 0, 0);
-    let fe_bad: trit = fe_code <=> 0;
+    let inc_code: i64 = pure_check_include_graph(1, 0, 16);
+    let mac_code: i64 = pure_check_macro_hygiene(2, 2, 0);
+    let sem_code: i64 = pure_check_call_and_label(0, 0, 0);
+    let fe_total: i64 = fe_code + inc_code + mac_code + sem_code;
+    let fe_bad: trit = fe_total <=> 0;
     let ver_code: i64 = pure_verify_function_invariants(missing_cap_bits, taint_or_arena_err, 0);
-    let final_code: i64 = if_pos fe_bad { fe_code } else { ver_code };
+    let final_code: i64 = if_pos fe_bad { fe_total } else { ver_code };
     return final_code;
 }
