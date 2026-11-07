@@ -33,7 +33,7 @@ Reproducible command:
 rustc -O omni_rust_bootstrap.rs -o omni && ./omni selftest
 ```
 
-Verified coverage (`366` non-vacuous checks = `148` core bootstrap checks + `218` `omni-lang` surface language, Phase 5, deep-audit, Phase 6, Phase 7, Phases A–E & Pure-Core Completion Phases 1–5 checks, `0` compiler warnings):
+Verified coverage (`378` non-vacuous checks = `148` core bootstrap checks + `230` `omni-lang` surface language, Phase 5, deep-audit, Phase 6, Phase 7, Phases A–E & Pure-Core Completion Phases 1–5 & Strengthening Phases S1–S4 checks, `0` compiler warnings):
 - **Full Golden Differential (`OmniBinaryVm` == `Stage-1` == `x86-64` ELF == `execute_wasm_module_i64`)**: `compile_pure_u16_to_wasm` and `execute_wasm_module_i64` lower `LABEL (0x7F40)`, `JMP (0x7F41)`, `BR_TRIT (0x7F42)`, `BR_POS (0x7F43)`, `BR_NEG (0x7F44)`, `ANEW (0x7F0D)`, `IGET (0x7F0E)`, `ISET (0x7F0F)`, `SLEN (0x7F50)`, `ARENA (0x7F01)`, `DROP (0x7F05)`, `PACK5 (0x7F30)`, `UNPACK5 (0x7F31)`, `TDOT (0x7F34)`, `EGATE (0x7F35)`, and `TLOGIC (0x7F3F)` in addition to all numeric/bitwise/ternary opcodes. Every golden covered by the `x86-64` path is verified through `execute_wasm_module_i64` and `OmniBinaryVm` on both Windows and Linux.
 - **Explicit Standalone AOT Rejection (Check 6)**: Both `compile_pure_u16_to_x86_64_elf` and `compile_pure_u16_to_wasm` reject high-level VM-only runtime seeds (`1, 2, 3, 5, 7`) with `Err(...)`.
 
@@ -57,7 +57,7 @@ CARGO_INCREMENTAL=0 cargo build --workspace
 cargo run -p omni-cli -- selftest
 ```
 
-Verified workspace build & differential results (`327` checks on Windows, `328` checks on Linux `x86-64`, `0` compiler warnings):
+Verified workspace build & differential results (`339` checks on Windows, `340` checks on Linux `x86-64`, `0` compiler warnings):
 - **8-Crate Workspace (`omni-isa`, `omni-ir`, `omni-verifier`, `omni-vm`, `omni-assembler`, `omni-lang`, `omni-aot`, `omni-cli`)**: Compiles cleanly with zero external dependencies and runs `assert_verifier_clone_eq`, `assert_golden_monolith_vs_workspace`, all 64 corpus samples, and all 220 surface-language, Phase 5, deep-audit, Phase 6, Phase 7, Phases A–E & Pure-Core Completion Phases 1–5 differential checks against `mod monolith`.
 
 ## 4. Usable Omni Surface Language (`omni-lang`) — Properties & Goldens
@@ -127,3 +127,7 @@ Verified surface language properties, full-stack host ABI, live TCP HTTP/1.1 + f
 | **39. Pure-Core Completion Phase 3: Primary Pure-Omni Host Runtime (`13AL` / `6AM`)** | `pure/host_runtime.omni` (`omni_pure_host_check_route_caps`, `omni_pure_host_check_taint_sink`, `omni_pure_host_kv_apply`, `omni_pure_host_dispatch`), `run_pure_core_phase3_host_runtime_selftests` | Verifies all 4 Pure-Omni host runtime kernels, differential parity between `serve_omni_http_via_pure_omni_host` and `serve_omni_http_via_narrow_host` across `POST`/`GET`/`db_query`/`auth_verify`, and pre-listen `MISSING_CAP` span parity (`3` checks) |
 | **40. Pure-Core Completion Phase 4: Expanded `6,115`-Word Self-Host Fixed Point (`13AM` / `6AN`)** | `pure/selfhost_suite.omni` (`pure_selfhost_verify_fixed_point`), `build_pure_omni_core_suite_stream`, `run_pure_core_phase4_selfhost_fixed_point_selftests` | Proves bit-exact `Gen-1 == Gen-2` equality across the closed set of all 9 Pure-Omni core modules (`6,115` words, `FNV-1a64 = 0x65005EAAEA44E1CE`), `159`-word / `824`-byte ELF64 kernel, and `19,731`-word Stage-1 compiler (`3` checks) |
 | **41. Pure-Core Completion Phase 5: Pure-Omni Default Workflows (`13AN` / `6AO`)** | `execute_omni_surface_program`, `compile_omni_surface_file_to_u16`, `link_omni_surface_modules`, `run_omni_harness_cli`, `run_pure_core_phase5_default_workflow_selftests` | Verifies Pure-Omni default routing across compilation, verification, execution, harness, and repair, plus bit-exact equivalence against the `--legacy-rust` bootstrap reference (`3` checks) |
+| **42. Strengthening Phase S1: Real Pure-Omni Programs (`13AO` / `6AP`)** | `pure/programs/*.omni`, `run_pure_core_phase_s1_real_programs_selftests` | 5 real programs verified across Pure-Omni driver and VM (`574`, `210`, `200_000_220`, `kv_ledger` `850`/`1700`, `10771`) |
+| **43. Strengthening Phase S2: Deepened Pure Tooling (`13AP` / `6AQ`)** | `pure/tooling.omni` v1.2.0 (`pure_inspect_module_metrics`, `pure_multi_step_repair_budget`), multi-function `LINEAR_LEAK` repair | Bit-exact `inspect` parity on all real programs; multi-step repair of a broken multi-function `include` program to `Int(130)` (`3` checks) |
+| **44. Strengthening Phase S3: Unique Primitives (`13AQ` / `6AR`)** | `std/pack5.omni`, `std/decision.omni`, `std/resource.omni`, `pure/programs/pack5_decision_controller.omni` | `Gen-1 == Gen-2` on all 3 modules; controller returns `Int(419)` on driver and VM; `MISSING_CAP` and `LINEAR_LEAK` rejection (`3` checks) |
+| **45. Strengthening Phase S4: Hardening & Metrics (`13AR` / `6AS`)** | `PURE_OMNI_CORE_SUITE_MODULES`, `pure_omni_suite_module_counts`, expanded `TAINT_SINK` / `MISSING_CAP` repair | 18-module suite locked at `14,559` words; module counts `(7, 5, 6, 18)`; `tlogic`/`db_get` taint auto-repair; `pure-omni-diff` >= 47 (`3` checks) |
