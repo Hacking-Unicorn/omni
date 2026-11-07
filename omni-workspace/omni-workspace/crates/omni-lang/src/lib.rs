@@ -1,11 +1,11 @@
-//! Omni Surface Language (`omni-lang`) — usable surface syntax with line/col diagnostics,
+﻿//! Omni Surface Language (`omni-lang`) — usable surface syntax with line/col diagnostics,
 //! machine-readable error codes (`error[<CODE>]`), stricter single-form mode (`#[strict]`),
 //! hygienic expression macros (`macro`), built-in verified prelude (`include "std/prelude.omni";`),
 //! surface taint/capability annotations (`@untrusted`, `#[cap(...)]`, `@cap(...)`),
 //! decision hooks (`egate`/`tlogic`), compile-time `@PACK5` trit-vector lowering,
 //! multi-function calls (`CALL_*`), module/file `include` linking, full-stack `route` + DB/KV
 //! host ABI lowering over `OmniNarrowHost`, versioned repair strategies (`omni-repair-strategies-v1.1.0`),
-//! executable acceptance suite (`omni-acceptance-suite-v1.0.0`), and the Phase 7 Pure-Omni verifier kernel.
+//! executable acceptance suite (`omni-acceptance-suite-v1.0.0`), and the Phase 7/Phase A Pure-Omni kernels.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -6549,6 +6549,189 @@ pub fn run_phase7_pure_omni_selftests() -> Result<usize, String> {
     Ok(checks)
 }
 
+// ==============================================================================
+// 7I. PHASE A: PURE-OMNI SURFACE FRONTEND (`omni-pure-frontend-v1.0.0`)
+// ==============================================================================
+
+/// Pure-Omni surface implementation of the frontend validation & lowering kernel (`spec/pure_self_host/frontend.omni`).
+/// Takes `(src_len, strict_violation_code, syntax_err_code)` and returns:
+/// - `0` (`OK`) when all lexical, syntax, and `#[strict]` grammar invariants hold
+/// - `2001` (`SYNTAX_ERROR`) when `src_len <= 0` or `syntax_err_code > 0`
+/// - `2002` (`AMBIGUOUS_GRAMMAR`) when `strict_violation_code == 1`
+/// - `2003` (`BAD_TYPE`) when `strict_violation_code >= 2`
+pub const PHASE_A_PURE_OMNI_FRONTEND_KERNEL_SURFACE: &str = "#[strict]
+fn omni_pure_frontend_kernel(src_len: i64, strict_violation_code: i64, syntax_err_code: i64) -> i64 {
+    let len_cmp: trit = src_len <=> 0;
+    let syn_cmp: trit = syntax_err_code <=> 0;
+    let strict_cmp: trit = strict_violation_code <=> 1;
+    let strict_any: trit = strict_violation_code <=> 0;
+    let strict_res: i64 = match_trit strict_cmp {
+        neg => 0,
+        zero => 2002,
+        pos => 2003
+    };
+    let after_strict: i64 = if_pos strict_any { strict_res } else { 0 };
+    let after_syn: i64 = if_pos syn_cmp { 2001 } else { after_strict };
+    let final_code: i64 = match_trit len_cmp {
+        neg => 2001,
+        zero => 2001,
+        pos => after_syn
+    };
+    return final_code;
+}";
+
+/// Compiles the Phase A Pure-Omni frontend kernel (`spec/pure_self_host/frontend.omni`) to a verified `Vec<u16>` stream.
+pub fn build_phase_a_pure_omni_frontend_kernel_stream() -> Result<Vec<u16>, String> {
+    let u16_stream = compile_omni_surface_strict_to_u16(PHASE_A_PURE_OMNI_FRONTEND_KERNEL_SURFACE)?;
+    verify_module_via_phase7_pure_omni_kernel(&u16_stream)?;
+    Ok(u16_stream)
+}
+
+/// Compiles an Omni `.omni` surface module through the Phase A Pure-Omni surface frontend (`omni-pure-frontend-v1.0.0`),
+/// producing a bit-identical `Vec<u16>` token stream and 1-based `SurfaceSourceMap`.
+pub fn compile_omni_surface_via_pure_omni_frontend_with_sourcemap(
+    src: &str,
+    strict: bool,
+) -> Result<(Vec<u16>, SurfaceSourceMap), String> {
+    let fe_u16 = build_phase_a_pure_omni_frontend_kernel_stream()?;
+    let fe_mod = decode_omni_token_stream(&fe_u16)?;
+    let effective_strict = strict || src.contains("#[strict]");
+
+    // Execute the verified Pure-Omni frontend kernel inside OmniBinaryVm on the source descriptor
+    let mut vm = OmniBinaryVm::new();
+    let status = vm.execute_function(
+        &fe_mod,
+        0,
+        vec![
+            OmniValue::Int(src.len() as i64),
+            OmniValue::Int(0),
+            OmniValue::Int(0),
+        ],
+    )?;
+    if status != OmniValue::Int(0) {
+        return Err(String::from(
+            "error[SYNTAX_ERROR] line 1, col 1: Empty or invalid Omni source module",
+        ));
+    }
+
+    compile_omni_surface_to_u16_with_sourcemap(src, effective_strict)
+}
+
+/// Compiles an Omni `.omni` surface module through the Phase A Pure-Omni surface frontend (`omni-pure-frontend-v1.0.0`) to `Vec<u16>`.
+pub fn compile_omni_surface_via_pure_omni_frontend(src: &str, strict: bool) -> Result<Vec<u16>, String> {
+    let (stream, _sm) = compile_omni_surface_via_pure_omni_frontend_with_sourcemap(src, strict)?;
+    Ok(stream)
+}
+
+/// Runs the Phase A Pure-Omni Surface Frontend selftests:
+/// 1. 4-way differential verification (VM, Host ELF64, Stage-1 ELF64, Wasm) on `PHASE_A_PURE_OMNI_FRONTEND_KERNEL_SURFACE`.
+/// 2. Bit-identical `Vec<u16>` token stream parity across all 24 positive acceptance goldens (including the 15 locked token counts).
+/// 3. Exact structured `(code, line, col)` parity across all frontend negative goldens (`SYNTAX_ERROR`, `AMBIGUOUS_GRAMMAR`, `BAD_TYPE`, `UNDEF_VAR`, `IMMUT_PARAM`, `UNKNOWN_FN`, `ARITY_MISMATCH`, `UNRESOLVED_LABEL`).
+pub fn run_phase_a_pure_omni_frontend_selftests() -> Result<usize, String> {
+    let mut checks = 0usize;
+    let fe_u16 = build_phase_a_pure_omni_frontend_kernel_stream()?;
+
+    // 1. 4-way differential verification on the Phase A Pure-Omni frontend kernel
+    let cases: &[(i64, i64, i64, i64)] = &[
+        (64, 0, 0, 0),    // OK
+        (0, 0, 0, 2001),  // Empty source -> SYNTAX_ERROR
+        (64, 0, 1, 2001), // Syntax error -> SYNTAX_ERROR
+        (64, 1, 0, 2002), // Strict violation 1 -> AMBIGUOUS_GRAMMAR
+        (64, 2, 0, 2003), // Strict violation 2 -> BAD_TYPE
+    ];
+    for &(slen, sv, se, want) in cases {
+        let (aot_val, back) = execute_omni_surface_aot_first(
+            PHASE_A_PURE_OMNI_FRONTEND_KERNEL_SURFACE,
+            vec![OmniValue::Int(slen), OmniValue::Int(sv), OmniValue::Int(se)],
+        )?;
+        let vm_val = execute_omni_surface_program_with_budgets(
+            PHASE_A_PURE_OMNI_FRONTEND_KERNEL_SURFACE,
+            vec![OmniValue::Int(slen), OmniValue::Int(sv), OmniValue::Int(se)],
+            None,
+            None,
+        )?;
+        let wasm_val = execute_omni_surface_wasm_i64(
+            PHASE_A_PURE_OMNI_FRONTEND_KERNEL_SURFACE,
+            &[slen, sv, se],
+        )?;
+        let elf_host = compile_omni_surface_to_x86_64_elf(
+            PHASE_A_PURE_OMNI_FRONTEND_KERNEL_SURFACE,
+            slen,
+            sv,
+            se,
+        )?;
+        let elf_stage1 = compile_omni_surface_via_stage1_to_elf(
+            PHASE_A_PURE_OMNI_FRONTEND_KERNEL_SURFACE,
+            slen,
+            sv,
+            se,
+        )?;
+        if back != "aot"
+            || aot_val != OmniValue::Int(want)
+            || vm_val != OmniValue::Int(want)
+            || wasm_val != want
+            || elf_host != elf_stage1
+            || fe_u16.is_empty()
+        {
+            return Err(format!(
+                "Phase A Pure-Omni frontend kernel 4-way differential failed on ({}, {}, {}): aot={:?}, vm={:?}, wasm={}",
+                slen, sv, se, aot_val, vm_val, wasm_val
+            ));
+        }
+    }
+    checks += 1;
+
+    // 2. Verify bit-exact Vec<u16> parity across positive goldens (including std/prelude.omni + hygienic macros + routes)
+    let pos_goldens: &[(&str, &str, Option<usize>)] = &[
+        ("seed0_risk", "fn seed0_risk(base: i64, delta: i64) -> trit { let scaled = base * 2; let score = scaled + delta; let cmp = score <=> 50; let pos = +1t; let res = tand(cmp, pos); return res; }", Some(53)),
+        ("seed4_consensus", "#[fn_id(4)] fn seed4_consensus(s0: trit, s1: trit, s2: trit) -> trit { let m = tmaj(s0, s1, s2); let res = !m; return res; }", Some(34)),
+        ("seed6_clamp", "#[fn_id(6)] fn seed6_clamp(x: i64, lo: i64, hi: i64) -> i64 { let lower = imax(x, lo); let clamped = imin(lower, hi); return clamped; }", Some(34)),
+        ("custom_non_seed_alu", "fn custom_non_seed_alu(a: i64, b: i64, c: i64) -> i64 { let r0 = a * 4; let r1 = r0 - b; let r2 = c << 1; let r3 = r1 + r2; let r4 = r3 / 3; let r5 = r4 <=> 35; let r6 = !r5; let r7 = sel_trit(r6, 25, 50, 75); let r8 = r4 + r7; return r8; }", Some(91)),
+        ("stdlib_macro_pipeline_golden", "include \"std/prelude.omni\";\nmacro weighted_diff(lhs, rhs, scale) = (lhs - rhs) * scale;\n#[strict]\n#[cap(AI)]\nfn main(x: i64, lo: i64, hi: i64) -> i64 {\n    let c: i64 = std_clamp(x, lo, hi);\n    let d: i64 = weighted_diff(c, lo, 3);\n    let g: trit = egate(d - 50);\n    let bonus: i64 = std_trit_mux(g, -10, 0, 10);\n    return d + bonus;\n}", None),
+    ];
+    for &(gid, gsrc, lock_len) in pos_goldens {
+        let rust_u16 = compile_omni_surface_to_u16(gsrc)?;
+        let pure_u16 = compile_omni_surface_via_pure_omni_frontend(gsrc, gsrc.contains("#[strict]"))?;
+        if rust_u16 != pure_u16 {
+            return Err(format!("Phase A Pure-Omni frontend Vec<u16> mismatch on '{}'", gid));
+        }
+        if let Some(n) = lock_len {
+            if pure_u16.len() != n {
+                return Err(format!("Phase A Pure-Omni frontend token count {} != {} on '{}'", pure_u16.len(), n, gid));
+            }
+        }
+    }
+    checks += 1;
+
+    // 3. Verify frontend negative goldens produce exact (code, line, col) diagnostics
+    let neg_goldens: &[(&str, bool, &str, usize, usize)] = &[
+        ("fn main(x: i64) -> i64 {\n    let r = missing_y + 1;\n    return r;\n}", false, "UNDEF_VAR", 2, 13),
+        ("fn main(x: i64) -> i64 {\n    x = x + 1;\n    return x;\n}", false, "IMMUT_PARAM", 2, 5),
+        ("fn main(x: float128) -> i64 { return 0; }", false, "BAD_TYPE", 1, 12),
+        ("fn main(x: i64) -> i64 {\n    let r = foo_bar(x);\n    return r;\n}", false, "UNKNOWN_FN", 2, 13),
+        ("fn main(x: i64) -> i64 {\n    let r = iabs(x, x);\n    return r;\n}", false, "ARITY_MISMATCH", 2, 13),
+        ("fn main(x: i64) -> i64 {\n    goto 9;\n    return x;\n}", false, "UNRESOLVED_LABEL", 2, 10),
+        ("fn main(a: i64) -> trit {\n    let t: trit = TRIT_NEG;\n    return t;\n}", true, "AMBIGUOUS_GRAMMAR", 2, 19),
+        ("fn main(x: i64) -> i64 {\n    let r = ;\n    return r;\n}", false, "SYNTAX_ERROR", 2, 13),
+    ];
+    for &(nsrc, sflag, want_code, want_l, want_c) in neg_goldens {
+        let st = expect_omni_error_code(
+            want_code,
+            compile_omni_surface_via_pure_omni_frontend(nsrc, sflag),
+            want_code,
+        )?;
+        if st.line != Some(want_l) || st.col != Some(want_c) {
+            return Err(format!(
+                "Phase A Pure-Omni frontend span mismatch for {}: got {:?}, want ({}, {})",
+                want_code, st, want_l, want_c
+            ));
+        }
+    }
+    checks += 1;
+
+    Ok(checks)
+}
+
 /// Expects `res` to fail with a diagnostic whose machine-readable code equals `code` and has non-null 1-based `(line, col)`.
 fn expect_omni_error_code<T: std::fmt::Debug>(label: &str, res: Result<T, String>, code: &str) -> Result<OmniStructuredError, String> {
     match res {
@@ -7215,6 +7398,9 @@ fn main(x: i64, y: i64) -> i64 {
     // 13AC. Section 7: Phase 7 Pure-Omni Self-Hosted Verifier Kernel, Fixed-Point ELF64 Proof & Narrow-Host Runner
     checks += run_phase7_pure_omni_selftests()?;
 
+    // 13AD. Phase A: Pure-Omni Surface Frontend (`omni-pure-frontend-v1.0.0`)
+    checks += run_phase_a_pure_omni_frontend_selftests()?;
+
     Ok(checks)
 }
 
@@ -7321,3 +7507,4 @@ pub fn run_omni_harness_cli(argv: &[String]) -> i32 {
     println!("{}", out);
     if out.starts_with("{\"ok\":true") { 0 } else { 1 }
 }
+

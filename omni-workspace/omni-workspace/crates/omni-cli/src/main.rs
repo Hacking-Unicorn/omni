@@ -899,6 +899,9 @@ pub fn run_workspace_selftest() -> Result<usize, String> {
     if build_phase7_pure_omni_verifier_kernel_stream()? != monolith::build_phase7_pure_omni_verifier_kernel_stream()? {
         return Err("Monolith vs workspace build_phase7_pure_omni_verifier_kernel_stream mismatch".into());
     }
+    if omni_lang::build_phase_a_pure_omni_frontend_kernel_stream()? != monolith::build_phase_a_pure_omni_frontend_kernel_stream()? {
+        return Err("Monolith vs workspace build_phase_a_pure_omni_frontend_kernel_stream mismatch".into());
+    }
     checks += ai_first_checks;
 
     // 7. Stage-1 == Stage-2 Self-Compilation Fixed Point
