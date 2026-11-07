@@ -1,6 +1,6 @@
 # Omni Binary Token-Stream ISA, Verifier, VM & AOT Normative Specification (`SPEC.md`)
 
-**Contract Status:** Normative — every behavior asserted by `./omni selftest` (`348` checks in `omni_rust_bootstrap.rs`) and `cargo run -p omni-cli -- selftest` (`309` Windows / `310` Linux differential checks across the 8-crate Cargo workspace) is specified below. Features not yet implemented in standalone AOT are explicitly listed in Section 6.
+**Contract Status:** Normative — every behavior asserted by `./omni selftest` (`351` checks in `omni_rust_bootstrap.rs`) and `cargo run -p omni-cli -- selftest` (`312` Windows / `313` Linux differential checks across the 8-crate Cargo workspace) is specified below. Features not yet implemented in standalone AOT are explicitly listed in Section 6.
 
 ## 1. 16-Bit Binary Token Partition (`0x0000..=0x7FFF`)
 

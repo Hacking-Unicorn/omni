@@ -115,7 +115,7 @@
 - [x] **Section 8 — Phase 7 Pure-Omni Self-Hosted Verifier Kernel & Narrow-Host Execution (`omni-pure-kernel-v1.0.0`, `13AC` / `6AD`)**:
   - Implemented `PHASE7_PURE_OMNI_VERIFIER_KERNEL_SURFACE` (`omni_pure_verify_header`), `build_phase7_pure_omni_verifier_kernel_stream()`, `verify_module_via_phase7_pure_omni_kernel()`, and `run_phase7_pure_omni_selftests()` proving 4-way differential equivalence (`OmniBinaryVm` == Host `x86-64` ELF64 == Stage-1 `.omni_bc` ELF64 bit-exact fixed point == 64-bit Wasm) and full-stack execution over `OmniNarrowHost`.
 
-## Phases A–E: Pure-Omni Surface Frontend, Driver, Narrow-Host Runtime, Self-Hosting Bootstrap & Full Differential Lock (Complete — `348` Monolith / `309` Windows & `310` Linux Workspace Checks)
+## Phases A–E & Pure-Omni Core Strengthening: Pure-Omni Surface Frontend, Driver, Narrow-Host Runtime, Self-Hosting Bootstrap, Full Differential Lock & Core Codebase (`pure/*.omni` + `std/*.omni`) (Complete — `351` Monolith / `312` Windows & `313` Linux Workspace Checks)
 - [x] **Phase A — Pure-Omni Surface Frontend (`omni-pure-frontend-v1.0.0`, `13AD` / `6AE`)**:
   - Added [`spec/pure_self_host/frontend.omni`](./spec/pure_self_host/frontend.omni), `PHASE_A_PURE_OMNI_FRONTEND_KERNEL_SURFACE`, `compile_omni_surface_via_pure_omni_frontend_with_sourcemap()`, and `run_phase_a_pure_omni_frontend_selftests()`.
 - [x] **Phase B — Pure-Omni Driver & Verifier Kernel Integration (`omni-pure-driver-v1.0.0`, `13AE` / `6AF`)**:
@@ -126,3 +126,6 @@
   - Added [`spec/pure_self_host/omni_selfhost_compiler.omni`](./spec/pure_self_host/omni_selfhost_compiler.omni), `PHASE_D_PURE_OMNI_SELFHOST_COMPILER_SURFACE`, `run_phase_d_pure_omni_selfhost_bootstrap()`, and `omni pure-bootstrap`, proving bit-exact Generation-1 == Generation-2 equality (`159` `u16` words `0x23B8D17257CCA9C4`; `824` ELF64 bytes `0xE221085777B8AC47`).
 - [x] **Phase E — Full Pure-Omni Differential Lock (`pure-omni-diff`, `13AH` / `6AI`)**:
   - Added `run_pure_omni_acceptance_diff()`, `omni pure-omni-diff`, `omni-harness --pure-omni`, and [`spec/PURE_SELF_HOST_ROADMAP.md`](./spec/PURE_SELF_HOST_ROADMAP.md).
+- [x] **Pure-Omni Core Codebase (`pure/*.omni`), Standard Library (`std/*.omni`), Primary Default Execution Path & `.gitattributes` (`13AI` / `6AJ`)**:
+  - Added [`pure/compiler.omni`](./pure/compiler.omni), [`pure/verifier.omni`](./pure/verifier.omni), [`pure/host_runtime.omni`](./pure/host_runtime.omni), [`pure/tooling.omni`](./pure/tooling.omni), [`pure/selfhost_suite.omni`](./pure/selfhost_suite.omni), [`std/prelude.omni`](./std/prelude.omni), [`std/math.omni`](./std/math.omni), [`std/trit.omni`](./std/trit.omni), [`std/http.omni`](./std/http.omni), and [`.gitattributes`](./.gitattributes) (`*.omni linguist-language=Omni`).
+  - Routed `run`, `eval`, `repl`, and `serve` (`serve_omni_http_batch_inner`) through `execute_omni_surface_via_pure_omni_driver` and `serve_omni_http_via_pure_omni_host` by default, and verified `1,412` `u16` words (`FNV-1a64 = 0x187D5EDEDC2F4E37`) with `Gen-1 == Gen-2` bit-exact fixed-point parity.

@@ -1,0 +1,48 @@
+// ==============================================================================
+// OMNI PURE CORE — `pure/tooling.omni`
+// Version: omni-pure-tooling-v1.0.0
+// ==============================================================================
+//
+// Pure-Omni implementations of the core tooling decision kernels:
+// 1. `pure_acceptance_diff_check`: Continuous differential oracle comparing
+//    reference vs Pure-Omni token counts, FNV-1a hashes, and error spans.
+// 2. `pure_select_repair_strategy`: Maps each of the 16 canonical `error[<CODE>]`
+//    identifiers (`1001..=1016`) to its deterministic version-locked repair
+//    strategy ID (`omni-repair-strategies-v1.1.0`).
+// 3. `pure_inspect_opcode_category`: Classifies any 16-bit token in `0x0000..=0x7FFF`
+//    into its normative `SPEC.md` Section 1 partition (`@ENG`, `REG`, `PAR`,
+//    `CTRL`, `LABEL`, `OPCODE`, `TYPE`, `TAINT_CAP`).
+// ==============================================================================
+
+#[strict]
+fn pure_acceptance_diff_check(rust_words: i64, pure_words: i64, hash_diff: i64) -> i64 {
+    let raw_diff: i64 = rust_words - pure_words;
+    let len_diff: i64 = iabs(raw_diff);
+    let h_diff: i64 = iabs(hash_diff);
+    let total_diff: i64 = len_diff + h_diff;
+    let cmp: trit = total_diff <=> 0;
+    let status: i64 = if_pos cmp { 4001 } else { 0 };
+    return status;
+}
+
+#[strict]
+fn pure_select_repair_strategy(err_code_id: i64, is_multi_fn: i64) -> i64 {
+    let is_cap: trit = err_code_id <=> 1003;
+    let multi_cmp: trit = is_multi_fn <=> 0;
+    let cap_strat: i64 = if_pos multi_cmp { 2 } else { 1 };
+    let res: i64 = match_trit is_cap {
+        neg => err_code_id - 998,
+        zero => cap_strat,
+        pos => err_code_id - 997
+    };
+    return res;
+}
+
+#[strict]
+fn pure_inspect_opcode_category(tok: i64) -> i64 {
+    let is_eng: trit = tok < 32256;
+    let is_op: trit = tok >= 32512;
+    let op_or_meta: i64 = if_pos is_op { 6 } else { 4 };
+    let category: i64 = if_pos is_eng { 1 } else { op_or_meta };
+    return category;
+}

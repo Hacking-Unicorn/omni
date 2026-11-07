@@ -7,12 +7,14 @@ Zero-dependency Rust implementation of the **Omni** 16-bit binary token ISA (`0x
 > **Scope & Honesty Note:**
 > - **AOT Backends (`x86-64` ELF64 & 64-bit Wasm)** cover the verified numeric, ternary, control-flow, byte-buffer, `@PACK5`, and linear arena subset; host opcodes (`0x7F64..=0x7F7F`) are explicitly rejected by standalone AOT (`SPEC.md` Section 6).
 > - **Host ABI (`route` / DB / KV)** has two explicit modes (`SPEC.md` Section 7.9 & `spec/host_interface.md`): (1) **in-VM host contract simulation** (`execute_omni_surface_program` returning `Int(status * 1_000_000 + body)` for socket-free unit tests) and (2) **live native TCP HTTP/1.1 + file-backed DB/KV host** (`omni serve <file.omni> [addr] [--db <path>]`) built over the 10-syscall `OmniNarrowHost` capability-gated interface (`omni-narrow-host-v1.0.0`).
-> - **Pure Omni Self-Hosting (`omni-pure-selfhost-v1.0.0`)**: Stage-1/Stage-2 self-hosts the binary token-to-ELF64 backend (`omni_self_compiler.omni_bc`), the Phase 7 Pure-Omni static verifier kernel (`omni-pure-kernel-v1.0.0`), the Phase A Pure-Omni surface frontend (`omni-pure-frontend-v1.0.0`), the Phase B Pure-Omni driver (`omni-pure-driver-v1.0.0`), the Phase C Pure-Omni host runtime (`omni-pure-host-v1.0.0`), the Phase D self-hosting bootstrap fixed point (`gen1 == gen2`: `159` words `0x23B8D17257CCA9C4`, `824` ELF64 bytes `0xE221085777B8AC47`), and the Phase E full differential lock (`omni pure-omni-diff`) are verified across the 4-way VM/Host-ELF64/Stage-1-ELF64/Wasm differential and `OmniNarrowHost` ([`spec/PURE_SELF_HOST_ROADMAP.md`](./spec/PURE_SELF_HOST_ROADMAP.md)).
+> - **Pure Omni Self-Hosting (`omni-pure-selfhost-v1.0.0`)**: Stage-1/Stage-2 self-hosts the binary token-to-ELF64 backend (`omni_self_compiler.omni_bc`), the Phase 7 Pure-Omni static verifier kernel (`omni-pure-kernel-v1.0.0`), the Phase A Pure-Omni surface frontend (`omni-pure-frontend-v1.0.0`), the Phase B Pure-Omni driver (`omni-pure-driver-v1.0.0`), the Phase C Pure-Omni host runtime (`omni-pure-host-v1.0.0`), the Phase D self-hosting bootstrap fixed point (`gen1 == gen2`: `159` words `0x23B8D17257CCA9C4`, `824` ELF64 bytes `0xE221085777B8AC47`), the multi-module Pure-Omni Core & Standard Library Suite (`pure/*.omni` + `std/*.omni`: `1,412` `u16` words `0x187D5EDEDC2F4E37`, `gen1 == gen2` fixed point), and the Phase E full differential lock (`omni pure-omni-diff`) are verified across the 4-way VM/Host-ELF64/Stage-1-ELF64/Wasm differential and `OmniNarrowHost`, with `run`, `eval`, `repl`, and `serve` routing through the Pure-Omni driver and host runtime by default ([`spec/PURE_SELF_HOST_ROADMAP.md`](./spec/PURE_SELF_HOST_ROADMAP.md)).
 
 ## Repository Layout
 
-- [`omni_rust_bootstrap.rs`](./omni_rust_bootstrap.rs) — Standalone single-file reference monolith (`348` self-test checks, `0` warnings).
-- [`omni-workspace/omni-workspace/`](./omni-workspace/omni-workspace/) — 8-crate Cargo workspace (`309` Windows / `310` Linux `x86-64` monolith-vs-workspace differential checks, `0` warnings):
+- [`pure/`](./pure/) — Pure-Omni core compiler, static verifier, host runtime, tooling kernels, and multi-module self-host suite (`pure/compiler.omni`, `pure/verifier.omni`, `pure/host_runtime.omni`, `pure/tooling.omni`, `pure/selfhost_suite.omni`; `1,412` `u16` words `Gen-1 == Gen-2`).
+- [`std/`](./std/) — Pure-Omni standard library modules (`std/prelude.omni`, `std/math.omni`, `std/trit.omni`, `std/http.omni`).
+- [`omni_rust_bootstrap.rs`](./omni_rust_bootstrap.rs) — Standalone single-file reference monolith (`351` self-test checks, `0` warnings).
+- [`omni-workspace/omni-workspace/`](./omni-workspace/omni-workspace/) — 8-crate Cargo workspace (`312` Windows / `313` Linux `x86-64` monolith-vs-workspace differential checks, `0` warnings):
   - `crates/omni-isa` — 128-opcode table (`0x7F00..=0x7F7F`), token ranges, contract version constants (`OMNI_HARNESS_CONTRACT_VERSION`, `OMNI_REPAIR_STRATEGIES_VERSION`, `OMNI_NARROW_HOST_VERSION`, `OMNI_ACCEPTANCE_SUITE_VERSION`, `OMNI_ERROR_CONTRACT_VERSION`, `OMNI_PHASE7_PURE_KERNEL_VERSION`), zero-allocation `@PACK5` (`5 trits/byte`) codec & direct ops, FNV-1a64 hashing.
   - `crates/omni-ir` — Binary token stream decoder (`decode_omni_token_stream`) and IR types.
   - `crates/omni-verifier` — Static capability bitmask, linear ownership/borrow/arena state machine, SSA, and `@UNTRUSTED` taint verifier (`verify_binary_function`, `verify_u16_stream`) emitting machine-readable `error[<CODE>]` diagnostics.
@@ -28,7 +30,7 @@ Zero-dependency Rust implementation of the **Omni** 16-bit binary token ISA (`0x
 
 ## Quick Start
 
-### 1. Run the 8-Crate Workspace Selftest (`309` / `310` Checks)
+### 1. Run the 8-Crate Workspace Selftest (`312` / `313` Checks)
 ```powershell
 cd omni-workspace/omni-workspace
 $env:CARGO_INCREMENTAL=0; cargo build --workspace
@@ -36,7 +38,7 @@ cargo run -p omni-cli -- selftest
 cargo run -p omni-cli -- pure-omni-diff
 ```
 
-### 2. Run the Standalone Monolith Selftest (`348` Checks), Self-Host Bootstrap & Acceptance Differential Suite
+### 2. Run the Standalone Monolith Selftest (`351` Checks), Self-Host Bootstrap & Acceptance Differential Suite
 ```powershell
 rustc -O omni_rust_bootstrap.rs -o omni.exe
 .\omni.exe selftest

@@ -1,0 +1,39 @@
+// ==============================================================================
+// OMNI PURE CORE — `pure/host_runtime.omni`
+// Version: omni-pure-host-v1.0.0
+// ==============================================================================
+//
+// Primary Pure-Omni HTTP/1.1 + persistent KV/DB host runtime kernel built
+// strictly over the 10-syscall `OmniNarrowHost` boundary (`spec/host_interface.md`).
+// ==============================================================================
+
+#[strict]
+fn omni_pure_host_check_route_caps(cap_mask: i64, needs_db_r: i64, needs_db_w: i64) -> i64 {
+    let has_net: i64 = cap_mask & 4;
+    let net_cmp: trit = has_net <=> 0;
+    let r_cmp: trit = needs_db_r <=> 0;
+    let w_cmp: trit = needs_db_w <=> 0;
+    let has_r: i64 = cap_mask & 1;
+    let has_w: i64 = cap_mask & 2;
+    let r_ok: i64 = if_pos r_cmp { has_r } else { 1 };
+    let w_ok: i64 = if_pos w_cmp { has_w } else { 1 };
+    let rw_prod: i64 = r_ok * w_ok;
+    let rw_cmp: trit = rw_prod <=> 0;
+    let rw_status: i64 = if_pos rw_cmp { 0 } else { 1003 };
+    let final_status: i64 = if_pos net_cmp { rw_status } else { 1003 };
+    return final_status;
+}
+
+#[strict]
+fn omni_pure_host_dispatch(method_code: i64, status_code: i64, payload: i64) -> i64 {
+    let m_cmp: trit = method_code <=> 0;
+    let s_cmp: trit = status_code <=> 199;
+    let valid_status: i64 = if_pos s_cmp { status_code } else { 500 };
+    let packed: i64 = valid_status * 1000000 + payload;
+    let res: i64 = match_trit m_cmp {
+        neg => 400000000,
+        zero => 404000000,
+        pos => packed
+    };
+    return res;
+}

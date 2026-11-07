@@ -1,0 +1,38 @@
+// ==============================================================================
+// OMNI PURE CORE — `pure/selfhost_suite.omni`
+// Version: omni-pure-selfhost-v1.1.0
+// ==============================================================================
+//
+// Unified multi-module Pure-Omni self-hosting suite linking:
+// - `std/prelude.omni` (standard library clamping, abs_diff, trit_mux, consensus3)
+// - `pure/compiler.omni` (lexer classification, verifier invariants, PACK5 density)
+// - `pure/tooling.omni` (acceptance-diff oracle, repair strategy selector, inspector)
+// - `pure/host_runtime.omni` (route capability verifier, HTTP/1.1 + KV/DB dispatcher)
+// ==============================================================================
+
+include "std/prelude.omni";
+include "pure/compiler.omni";
+include "pure/tooling.omni";
+include "pure/host_runtime.omni";
+
+macro pure_stage_gate(code) = sel_trit(code <=> 0, 1, 0, 1);
+
+#[strict]
+#[cap(AI)]
+fn pure_selfhost_suite_entry(src_len: i64, cap_mask: i64, payload: i64) -> i64 {
+    let clamped_len: i64 = std_clamp(src_len, 1, 65536);
+    let comp_status: i64 = pure_compiler_pipeline_main(clamped_len, 0, 0);
+    let host_cap_status: i64 = omni_pure_host_check_route_caps(cap_mask, 1, 1);
+    let diff_status: i64 = pure_acceptance_diff_check(clamped_len, clamped_len, 0);
+    let strat_id: i64 = pure_select_repair_strategy(1003, 1);
+    let op_cat: i64 = pure_inspect_opcode_category(32565);
+    let http_packed: i64 = omni_pure_host_dispatch(1, 200, payload);
+    let delta: i64 = http_packed - 200000000;
+    let gate: trit = egate(delta);
+    let bonus: i64 = std_trit_mux(gate, -10, 0, 10);
+    let errs: i64 = comp_status + host_cap_status + diff_status;
+    let err_cmp: trit = errs <=> 0;
+    let ok_val: i64 = http_packed + strat_id + op_cat + bonus;
+    let res: i64 = if_pos err_cmp { errs } else { ok_val };
+    return res;
+}

@@ -914,6 +914,9 @@ pub fn run_workspace_selftest() -> Result<usize, String> {
     if omni_lang::run_pure_omni_acceptance_diff()? != monolith::run_pure_omni_acceptance_diff()? {
         return Err("Monolith vs workspace run_pure_omni_acceptance_diff mismatch".into());
     }
+    if omni_lang::build_pure_omni_core_suite_stream()? != monolith::build_pure_omni_core_suite_stream()? {
+        return Err("Monolith vs workspace build_pure_omni_core_suite_stream mismatch".into());
+    }
     checks += ai_first_checks;
 
     // 7. Stage-1 == Stage-2 Self-Compilation Fixed Point
@@ -1124,8 +1127,8 @@ fn main() {
                             std::process::exit(1);
                         }
                     };
-                    match execute_omni_surface_program(&merged, vm_args) {
-                        Ok(res) => println!("{:?}", res),
+                    match omni_lang::execute_omni_surface_via_pure_omni_driver(&merged, vm_args, merged.contains("#[strict]")) {
+                        Ok((res, _, _)) => println!("{:?}", res),
                         Err(e) => {
                             eprintln!("[OMNIC EXECUTION ERROR] {}", e);
                             std::process::exit(1);
@@ -1159,8 +1162,8 @@ fn main() {
                 for a in &args[3..] {
                     vm_args.push(parse_cli_omni_value(a));
                 }
-                match execute_omni_surface_program(snippet, vm_args) {
-                    Ok(val) => println!("{:?}", val),
+                match omni_lang::execute_omni_surface_via_pure_omni_driver(snippet, vm_args, snippet.contains("#[strict]")) {
+                    Ok((val, _, _)) => println!("{:?}", val),
                     Err(e) => {
                         eprintln!("[OMNIC EVAL ERROR] {}", e);
                         std::process::exit(1);
@@ -1186,8 +1189,8 @@ fn main() {
                     if trimmed == "quit" || trimmed == "exit" || trimmed == ":q" {
                         break;
                     }
-                    match execute_omni_surface_program(trimmed, Vec::new()) {
-                        Ok(v) => println!("=> {:?}", v),
+                    match omni_lang::execute_omni_surface_via_pure_omni_driver(trimmed, Vec::new(), trimmed.contains("#[strict]")) {
+                        Ok((v, _, _)) => println!("=> {:?}", v),
                         Err(e) => println!("! {}", e),
                     }
                 }

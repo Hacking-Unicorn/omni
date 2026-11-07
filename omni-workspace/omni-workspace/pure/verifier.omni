@@ -1,0 +1,51 @@
+// ==============================================================================
+// OMNI PURE CORE — `pure/verifier.omni`
+// Version: omni-pure-kernel-v1.0.0
+// ==============================================================================
+//
+// Pure-Omni static verification engine enforcing:
+// 1. Capability Bitmask Monotonicity (`CAP_ID_DB_R..=CAP_ID_SYS`, `MISSING_CAP = 1003`)
+// 2. `@UNTRUSTED` Taint Lattice & Sanitizer Dominance (`TAINT_ON_RET = 1001`, `TAINT_SINK = 1002`)
+// 3. Linear Arena Conservation & Borrow State Machine (`LINEAR_LEAK = 1004`, `BORROW_CONFLICT = 1005`)
+// ==============================================================================
+
+#[strict]
+fn omni_pure_verify_opcode_cap(fn_cap_mask: i64, req_cap_mask: i64) -> i64 {
+    let covered: i64 = fn_cap_mask & req_cap_mask;
+    let diff: i64 = req_cap_mask - covered;
+    let cmp: trit = diff <=> 0;
+    let res: i64 = if_pos cmp { 1003 } else { 0 };
+    return res;
+}
+
+#[strict]
+fn omni_pure_verify_taint_flow(is_ret: i64, is_sink: i64, operand_tainted: i64) -> i64 {
+    let t_cmp: trit = operand_tainted <=> 0;
+    let r_cmp: trit = is_ret <=> 0;
+    let s_cmp: trit = is_sink <=> 0;
+    let sink_err: i64 = if_pos s_cmp { 1002 } else { 0 };
+    let ret_or_sink: i64 = if_pos r_cmp { 1001 } else { sink_err };
+    let out: i64 = if_pos t_cmp { ret_or_sink } else { 0 };
+    return out;
+}
+
+#[strict]
+fn omni_pure_verify_header(missing_cap_bits: i64, taint_violation_kind: i64, arena_balance: i64) -> i64 {
+    let cap_cmp: trit = missing_cap_bits <=> 0;
+    let taint_cmp: trit = taint_violation_kind <=> 1;
+    let taint_any: trit = taint_violation_kind <=> 0;
+    let arena_cmp: trit = arena_balance <=> 0;
+    let taint_code: i64 = match_trit taint_cmp {
+        neg => 0,
+        zero => 1001,
+        pos => 1002
+    };
+    let arena_code: i64 = match_trit arena_cmp {
+        neg => 1005,
+        zero => 0,
+        pos => 1004
+    };
+    let after_taint: i64 = if_pos taint_any { taint_code } else { arena_code };
+    let final_code: i64 = if_pos cap_cmp { 1003 } else { after_taint };
+    return final_code;
+}

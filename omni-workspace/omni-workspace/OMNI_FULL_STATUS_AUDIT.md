@@ -33,7 +33,7 @@ Reproducible command:
 rustc -O omni_rust_bootstrap.rs -o omni && ./omni selftest
 ```
 
-Verified coverage (`348` non-vacuous checks = `148` core bootstrap checks + `200` `omni-lang` surface language, Phase 5, deep-audit, Phase 6, Phase 7 & Phases A–E Pure-Omni self-hosting checks, `0` compiler warnings):
+Verified coverage (`351` non-vacuous checks = `148` core bootstrap checks + `203` `omni-lang` surface language, Phase 5, deep-audit, Phase 6, Phase 7 & Phases A–E Pure-Omni self-hosting & core codebase checks, `0` compiler warnings):
 - **Full Golden Differential (`OmniBinaryVm` == `Stage-1` == `x86-64` ELF == `execute_wasm_module_i64`)**: `compile_pure_u16_to_wasm` and `execute_wasm_module_i64` lower `LABEL (0x7F40)`, `JMP (0x7F41)`, `BR_TRIT (0x7F42)`, `BR_POS (0x7F43)`, `BR_NEG (0x7F44)`, `ANEW (0x7F0D)`, `IGET (0x7F0E)`, `ISET (0x7F0F)`, `SLEN (0x7F50)`, `ARENA (0x7F01)`, `DROP (0x7F05)`, `PACK5 (0x7F30)`, `UNPACK5 (0x7F31)`, `TDOT (0x7F34)`, `EGATE (0x7F35)`, and `TLOGIC (0x7F3F)` in addition to all numeric/bitwise/ternary opcodes. Every golden covered by the `x86-64` path is verified through `execute_wasm_module_i64` and `OmniBinaryVm` on both Windows and Linux.
 - **Explicit Standalone AOT Rejection (Check 6)**: Both `compile_pure_u16_to_x86_64_elf` and `compile_pure_u16_to_wasm` reject high-level VM-only runtime seeds (`1, 2, 3, 5, 7`) with `Err(...)`.
 
@@ -57,8 +57,8 @@ CARGO_INCREMENTAL=0 cargo build --workspace
 cargo run -p omni-cli -- selftest
 ```
 
-Verified workspace build & differential results (`309` checks on Windows, `310` checks on Linux `x86-64`, `0` compiler warnings):
-- **8-Crate Workspace (`omni-isa`, `omni-ir`, `omni-verifier`, `omni-vm`, `omni-assembler`, `omni-lang`, `omni-aot`, `omni-cli`)**: Compiles cleanly with zero external dependencies and runs `assert_verifier_clone_eq`, `assert_golden_monolith_vs_workspace`, all 64 corpus samples, and all 202 surface-language, Phase 5, deep-audit, Phase 6, Phase 7 & Phases A–E Pure-Omni self-hosting differential checks against `mod monolith`.
+Verified workspace build & differential results (`312` checks on Windows, `313` checks on Linux `x86-64`, `0` compiler warnings):
+- **8-Crate Workspace (`omni-isa`, `omni-ir`, `omni-verifier`, `omni-vm`, `omni-assembler`, `omni-lang`, `omni-aot`, `omni-cli`)**: Compiles cleanly with zero external dependencies and runs `assert_verifier_clone_eq`, `assert_golden_monolith_vs_workspace`, all 64 corpus samples, and all 205 surface-language, Phase 5, deep-audit, Phase 6, Phase 7 & Phases A–E Pure-Omni self-hosting differential checks against `mod monolith`.
 
 ## 4. Usable Omni Surface Language (`omni-lang`) — Properties & Goldens
 
@@ -121,3 +121,4 @@ Verified surface language properties, full-stack host ABI, live TCP HTTP/1.1 + f
 | **33. Phase C Pure-Omni Host Runtime (`13AF` / `6AG`)** | `omni-pure-host-v1.0.0`, `spec/pure_self_host/host_runtime.omni`, `serve_omni_http_via_pure_omni_host` over `OmniNarrowHost` | Verifies 4-way equivalence on the host dispatch kernel, live HTTP/1.1 `POST` + `GET` + persistent KV/DB over `OmniNarrowHost`, and pre-listen `MISSING_CAP` / `TAINT_SINK` rejection (`3` checks) |
 | **34. Phase D Self-Hosting Bootstrap Fixed Point (`13AG` / `6AH`)** | `omni-pure-selfhost-v1.0.0`, `spec/pure_self_host/omni_selfhost_compiler.omni`, `run_phase_d_pure_omni_selfhost_bootstrap` (`omni pure-bootstrap`) | Proves bit-exact Generation-1 == Generation-2 equality on both `.omni_bc` (`159` words, `0x23B8D17257CCA9C4`) and `.elf` (`824` bytes, `0xE221085777B8AC47`, `3` checks) |
 | **35. Phase E Full Pure-Omni Differential Lock (`13AH` / `6AI`)** | `run_pure_omni_acceptance_diff` (`omni pure-omni-diff`), `omni-harness --pure-omni` | Verifies 100% differential parity across all positive/negative acceptance goldens, Generation-1 == Generation-2 self-host fixed point, and `omni-agent-driver` repair (`3` checks) |
+| **36. Pure-Omni Core Codebase (`pure/*.omni`) & Standard Library (`std/*.omni`, `13AI` / `6AJ`)** | `pure/compiler.omni`, `pure/verifier.omni`, `pure/host_runtime.omni`, `pure/tooling.omni`, `pure/selfhost_suite.omni`, `std/prelude.omni`, `std/math.omni`, `std/trit.omni`, `std/http.omni`, `build_pure_omni_core_suite_stream`, `run_pure_omni_core_suite_selftests` | Compiles and verifies all 9 `std/*` + `pure/*` modules (`1,412` `u16` words, `FNV-1a64 = 0x187D5EDEDC2F4E37`) with `Gen-1 == Gen-2` bit-exact parity, routes `run`/`eval`/`repl`/`serve` through Pure-Omni by default, and executes `pure/selfhost_suite.omni` (`Int(200_000_438)`) and multi-module `std/*` (`Int(200_000_320)`, `3` checks) |
