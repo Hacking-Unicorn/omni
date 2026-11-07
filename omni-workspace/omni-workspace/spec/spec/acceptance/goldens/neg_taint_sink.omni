@@ -1,5 +1,0 @@
-#[cap(AI)]
-fn main(x: i64 @untrusted) -> trit {
-    let g = egate(x);
-    return g;
-}
