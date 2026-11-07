@@ -1,0 +1,21 @@
+// ==============================================================================
+// OMNI PURE SELF-HOST — PHASE B: PURE-OMNI DRIVER & VERIFIER KERNEL INTEGRATION
+// Version: omni-pure-driver-v1.0.0
+// ==============================================================================
+//
+// Coordinates the Phase A Pure-Omni Surface Frontend (`omni-pure-frontend-v1.0.0`)
+// with the Phase 7 Pure-Omni Verifier Kernel (`omni-pure-kernel-v1.0.0`),
+// propagating 1-based `(line, col)` spans through `SurfaceSourceMap` and returning
+// structured single-line JSON compatible with `omni-harness-v1.0.0`.
+// ==============================================================================
+
+#[strict]
+fn omni_pure_driver_kernel(frontend_status: i64, verifier_status: i64, exec_status: i64) -> i64 {
+    let fe_cmp: trit = frontend_status <=> 0;
+    let ver_cmp: trit = verifier_status <=> 0;
+    let ex_cmp: trit = exec_status <=> 0;
+    let after_exec: i64 = if_pos ex_cmp { exec_status } else { 0 };
+    let after_ver: i64 = if_pos ver_cmp { verifier_status } else { after_exec };
+    let final_status: i64 = if_pos fe_cmp { frontend_status } else { after_ver };
+    return final_status;
+}

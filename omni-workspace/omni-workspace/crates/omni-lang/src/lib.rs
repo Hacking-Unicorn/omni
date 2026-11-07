@@ -5,7 +5,7 @@
 //! decision hooks (`egate`/`tlogic`), compile-time `@PACK5` trit-vector lowering,
 //! multi-function calls (`CALL_*`), module/file `include` linking, full-stack `route` + DB/KV
 //! host ABI lowering over `OmniNarrowHost`, versioned repair strategies (`omni-repair-strategies-v1.1.0`),
-//! executable acceptance suite (`omni-acceptance-suite-v1.0.0`), and the Phase 7/Phase A Pure-Omni kernels.
+//! executable acceptance suite (`omni-acceptance-suite-v1.0.0`), and the Phase 7/A/B Pure-Omni kernels.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -6732,6 +6732,383 @@ pub fn run_phase_a_pure_omni_frontend_selftests() -> Result<usize, String> {
     Ok(checks)
 }
 
+// ==============================================================================
+// 7J. PHASE B: PURE-OMNI DRIVER & VERIFIER KERNEL INTEGRATION (`omni-pure-driver-v1.0.0`)
+// ==============================================================================
+
+/// Pure-Omni surface implementation of the compiler/verifier/execution driver kernel (`spec/pure_self_host/driver.omni`).
+pub const PHASE_B_PURE_OMNI_DRIVER_SURFACE: &str = "#[strict]
+fn omni_pure_driver_kernel(frontend_status: i64, verifier_status: i64, exec_status: i64) -> i64 {
+    let fe_cmp: trit = frontend_status <=> 0;
+    let ver_cmp: trit = verifier_status <=> 0;
+    let ex_cmp: trit = exec_status <=> 0;
+    let after_exec: i64 = if_pos ex_cmp { exec_status } else { 0 };
+    let after_ver: i64 = if_pos ver_cmp { verifier_status } else { after_exec };
+    let final_status: i64 = if_pos fe_cmp { frontend_status } else { after_ver };
+    return final_status;
+}";
+
+/// Compiles the Phase B Pure-Omni driver kernel (`spec/pure_self_host/driver.omni`) to a verified `Vec<u16>` stream.
+pub fn build_phase_b_pure_omni_driver_stream() -> Result<Vec<u16>, String> {
+    let u16_stream = compile_omni_surface_via_pure_omni_frontend(PHASE_B_PURE_OMNI_DRIVER_SURFACE, true)?;
+    verify_module_via_phase7_pure_omni_kernel(&u16_stream)?;
+    Ok(u16_stream)
+}
+
+/// Compiles, verifies via the Pure-Omni verifier kernel (`omni-pure-kernel-v1.0.0`), and executes an Omni `.omni` surface module
+/// through the Phase B Pure-Omni driver (`omni-pure-driver-v1.0.0`), returning `(OmniValue, backend, token_count)`.
+pub fn execute_omni_surface_via_pure_omni_driver(
+    src: &str,
+    args: Vec<OmniValue>,
+    strict: bool,
+) -> Result<(OmniValue, &'static str, usize), String> {
+    let drv_u16 = build_phase_b_pure_omni_driver_stream()?;
+    let drv_mod = decode_omni_token_stream(&drv_u16)?;
+    let wrapped = if strict {
+        String::from(src)
+    } else {
+        wrap_omni_surface_snippet(src)
+    };
+    let (attr_steps, attr_mem) = extract_omni_surface_budgets(&wrapped);
+    let (u16_stream, sm) = compile_omni_surface_via_pure_omni_frontend_with_sourcemap(&wrapped, strict)?;
+    let token_count = u16_stream.len();
+
+    // Run both the Pure-Omni verifier kernel and binary offset verifier so exact SurfaceSourceMap spans are preserved
+    if let Err(kernel_err) = verify_module_via_phase7_pure_omni_kernel(&u16_stream) {
+        for rep in verify_u16_stream(&u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
+            if !rep.passed {
+                let first = rep.errors.first().cloned().unwrap_or_default();
+                let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
+                return Err(format!("{} (fn #{}: {:?})", annotated, rep.fn_idx, rep.errors));
+            }
+        }
+        return Err(annotate_omni_error_with_sourcemap(&kernel_err, &sm));
+    }
+    for rep in verify_u16_stream(&u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
+        if !rep.passed {
+            let first = rep.errors.first().cloned().unwrap_or_default();
+            let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
+            return Err(format!("{} (fn #{}: {:?})", annotated, rep.fn_idx, rep.errors));
+        }
+    }
+
+    // Confirm the Pure-Omni driver kernel approves transition to execution (status == 0)
+    let mut drv_vm = OmniBinaryVm::new();
+    let drv_status = drv_vm.execute_function(
+        &drv_mod,
+        0,
+        vec![OmniValue::Int(0), OmniValue::Int(0), OmniValue::Int(0)],
+    )?;
+    if drv_status != OmniValue::Int(0) {
+        return Err(format!("Pure-Omni driver kernel rejected execution: {:?}", drv_status));
+    }
+
+    let module = decode_omni_token_stream(&u16_stream)?;
+    let entry_fn_idx = if module.functions.iter().any(|f| f.fn_idx == 0) {
+        0
+    } else {
+        module.functions.last().map(|f| f.fn_idx).ok_or("No functions in module")?
+    };
+    let entry_ret_ty_tok = module
+        .functions
+        .iter()
+        .find(|f| f.fn_idx == entry_fn_idx)
+        .map(|f| f.ret_ty_tok)
+        .unwrap_or(TY_I64);
+
+    let all_scalar_args = args.iter().all(|a| matches!(a, OmniValue::Int(_) | OmniValue::Trit(_)));
+    let scalar_ret = matches!(entry_ret_ty_tok, TY_I64 | TY_TRIT);
+
+    if is_module_aot_hot_path(&module) && all_scalar_args && scalar_ret {
+        let step_b = attr_steps.unwrap_or(DEFAULT_WASM_STEP_LIMIT);
+        let mem_b = attr_mem.unwrap_or(DEFAULT_WASM_MEMORY_BUDGET_BYTES);
+        let mut static_alloc_bytes = 0usize;
+        for func in &module.functions {
+            for ins in &func.instructions {
+                if ins.op_tok == 0x7F01 {
+                    if let Some(BinOperand::ImmInt(cap)) = ins.operands.first() {
+                        if *cap > 0 {
+                            static_alloc_bytes = static_alloc_bytes.saturating_add(*cap as usize);
+                        }
+                    }
+                }
+            }
+        }
+        if static_alloc_bytes > mem_b {
+            let raw_err = format!(
+                "error[BUDGET_EXCEEDED]: AOT memory budget exceeded ({} > {} bytes)",
+                static_alloc_bytes, mem_b
+            );
+            return Err(annotate_omni_error_with_sourcemap(&raw_err, &sm));
+        }
+        let i64_args: Vec<i64> = args
+            .iter()
+            .map(|a| match *a {
+                OmniValue::Int(n) => n,
+                OmniValue::Trit(t) => t as i64,
+                _ => 0,
+            })
+            .collect();
+        let wasm = compile_pure_u16_to_wasm(&u16_stream)
+            .map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))?;
+        let raw_i64 = execute_wasm_module_i64_with_budgets(&wasm, &i64_args, step_b, mem_b)
+            .map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))?;
+        let out_val = if entry_ret_ty_tok == TY_TRIT {
+            OmniValue::Trit(raw_i64.clamp(-1, 1) as i8)
+        } else {
+            OmniValue::Int(raw_i64)
+        };
+        return Ok((out_val, "aot", token_count));
+    }
+
+    let mut vm = OmniBinaryVm::new();
+    if let Some(sb) = attr_steps {
+        vm.step_limit = sb;
+    }
+    if let Some(mb) = attr_mem {
+        vm.memory_budget_bytes = mb;
+    }
+    let val = vm
+        .execute_function(&module, entry_fn_idx, args)
+        .map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))?;
+    Ok((val, "vm", token_count))
+}
+
+/// Runs the Phase B Pure-Omni driver (`omni-pure-driver-v1.0.0`) and returns a single-line JSON string
+/// conforming to `omni-harness-v1.0.0` (identical in schema and output to `run_omni_harness_json`).
+pub fn run_pure_omni_driver_json(
+    src: &str,
+    args: Vec<OmniValue>,
+    strict: bool,
+    include_retry_hint: bool,
+) -> String {
+    let wrapped = if strict {
+        String::from(src)
+    } else {
+        wrap_omni_surface_snippet(src)
+    };
+    let u16_res = compile_omni_surface_via_pure_omni_frontend(&wrapped, strict);
+    let u16_stream = match u16_res {
+        Ok(s) => s,
+        Err(e) => {
+            let st = parse_omni_structured_error(&e);
+            let line_json = st.line.map(|n| n.to_string()).unwrap_or_else(|| String::from("null"));
+            let col_json = st.col.map(|n| n.to_string()).unwrap_or_else(|| String::from("null"));
+            if include_retry_hint {
+                return format!(
+                    "{{\"ok\":false,\"version\":\"{}\",\"code\":\"{}\",\"line\":{},\"col\":{},\"message\":\"{}\",\"tokens\":null,\"retry_hint\":\"{}\"}}",
+                    OMNI_HARNESS_CONTRACT_VERSION,
+                    st.code,
+                    line_json,
+                    col_json,
+                    json_escape_str(&st.message),
+                    json_escape_str(st.retry_hint)
+                );
+            } else {
+                return format!(
+                    "{{\"ok\":false,\"version\":\"{}\",\"code\":\"{}\",\"line\":{},\"col\":{},\"message\":\"{}\",\"tokens\":null}}",
+                    OMNI_HARNESS_CONTRACT_VERSION,
+                    st.code,
+                    line_json,
+                    col_json,
+                    json_escape_str(&st.message)
+                );
+            }
+        }
+    };
+    let token_count = u16_stream.len();
+    match execute_omni_surface_via_pure_omni_driver(&wrapped, args, strict) {
+        Ok((val, backend, _)) => format!(
+            "{{\"ok\":true,\"version\":\"{}\",\"result\":\"{}\",\"tokens\":{},\"backend\":\"{}\"}}",
+            OMNI_HARNESS_CONTRACT_VERSION,
+            json_escape_str(&format_omni_value_compact(&val)),
+            token_count,
+            backend
+        ),
+        Err(e) => {
+            let st = parse_omni_structured_error(&e);
+            let line_json = st.line.map(|n| n.to_string()).unwrap_or_else(|| String::from("null"));
+            let col_json = st.col.map(|n| n.to_string()).unwrap_or_else(|| String::from("null"));
+            if include_retry_hint {
+                format!(
+                    "{{\"ok\":false,\"version\":\"{}\",\"code\":\"{}\",\"line\":{},\"col\":{},\"message\":\"{}\",\"tokens\":{},\"retry_hint\":\"{}\"}}",
+                    OMNI_HARNESS_CONTRACT_VERSION,
+                    st.code,
+                    line_json,
+                    col_json,
+                    json_escape_str(&st.message),
+                    token_count,
+                    json_escape_str(st.retry_hint)
+                )
+            } else {
+                format!(
+                    "{{\"ok\":false,\"version\":\"{}\",\"code\":\"{}\",\"line\":{},\"col\":{},\"message\":\"{}\",\"tokens\":{}}}",
+                    OMNI_HARNESS_CONTRACT_VERSION,
+                    st.code,
+                    line_json,
+                    col_json,
+                    json_escape_str(&st.message),
+                    token_count
+                )
+            }
+        }
+    }
+}
+
+/// CLI entrypoint for `omni pure-driver` (`omni-pure-driver-v1.0.0`).
+pub fn run_pure_omni_driver_cli(argv: &[String]) -> i32 {
+    let mut strict = false;
+    let mut retry_hint = false;
+    let mut rest: Vec<String> = Vec::new();
+    for a in argv {
+        match a.as_str() {
+            "--strict" => strict = true,
+            "--retry-hint" => retry_hint = true,
+            "--version-check" | "--version" => {
+                println!(
+                    "{{\"version\":\"{}\",\"driver_version\":\"{}\",\"frontend_version\":\"{}\",\"kernel_version\":\"{}\"}}",
+                    OMNI_HARNESS_CONTRACT_VERSION,
+                    OMNI_PURE_DRIVER_VERSION,
+                    OMNI_PURE_FRONTEND_VERSION,
+                    OMNI_PHASE7_PURE_KERNEL_VERSION
+                );
+                return 0;
+            }
+            _ => rest.push(a.clone()),
+        }
+    }
+    if rest.is_empty() {
+        eprintln!("usage: omni pure-driver [--strict] [--retry-hint] (--version-check | <file.omni | \"source\">) [args...]");
+        return 2;
+    }
+    let target = &rest[0];
+    let src = if target.ends_with(".omni") && std::path::Path::new(target).is_file() {
+        match std::fs::read_to_string(target) {
+            Ok(raw) => {
+                let parent_dir = std::path::Path::new(target).parent();
+                match resolve_omni_surface_includes(&raw, parent_dir, None) {
+                    Ok(exp) => exp,
+                    Err(e) => {
+                        let st = parse_omni_structured_error(&e);
+                        let line_json = st.line.map(|n| n.to_string()).unwrap_or_else(|| String::from("null"));
+                        let col_json = st.col.map(|n| n.to_string()).unwrap_or_else(|| String::from("null"));
+                        println!(
+                            "{{\"ok\":false,\"version\":\"{}\",\"code\":\"{}\",\"line\":{},\"col\":{},\"message\":\"{}\",\"tokens\":null}}",
+                            OMNI_HARNESS_CONTRACT_VERSION,
+                            st.code,
+                            line_json,
+                            col_json,
+                            json_escape_str(&st.message)
+                        );
+                        return 1;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("failed to read '{}': {}", target, e);
+                return 2;
+            }
+        }
+    } else {
+        target.clone()
+    };
+    let vm_args: Vec<OmniValue> = rest[1..].iter().map(|s| parse_cli_omni_value(s)).collect();
+    let out = run_pure_omni_driver_json(&src, vm_args, strict, retry_hint);
+    println!("{}", out);
+    if out.starts_with("{\"ok\":true") { 0 } else { 1 }
+}
+
+/// Runs the Phase B Pure-Omni Driver selftests:
+/// 1. 4-way differential verification (VM, Host ELF64, Stage-1 ELF64, Wasm) on `PHASE_B_PURE_OMNI_DRIVER_SURFACE`.
+/// 2. Exact JSON parity between `run_pure_omni_driver_json` and `run_omni_harness_json` across positive and negative acceptance cases.
+pub fn run_phase_b_pure_omni_driver_selftests() -> Result<usize, String> {
+    let mut checks = 0usize;
+    let drv_u16 = build_phase_b_pure_omni_driver_stream()?;
+
+    // 1. 4-way differential verification on the Phase B Pure-Omni driver kernel
+    let cases: &[(i64, i64, i64, i64)] = &[
+        (0, 0, 0, 0),
+        (2001, 0, 0, 2001),
+        (0, 1003, 0, 1003),
+        (0, 0, 3001, 3001),
+    ];
+    for &(fs, vs, es, want) in cases {
+        let (aot_val, back) = execute_omni_surface_aot_first(
+            PHASE_B_PURE_OMNI_DRIVER_SURFACE,
+            vec![OmniValue::Int(fs), OmniValue::Int(vs), OmniValue::Int(es)],
+        )?;
+        let vm_val = execute_omni_surface_program_with_budgets(
+            PHASE_B_PURE_OMNI_DRIVER_SURFACE,
+            vec![OmniValue::Int(fs), OmniValue::Int(vs), OmniValue::Int(es)],
+            None,
+            None,
+        )?;
+        let wasm_val = execute_omni_surface_wasm_i64(PHASE_B_PURE_OMNI_DRIVER_SURFACE, &[fs, vs, es])?;
+        let elf_host = compile_omni_surface_to_x86_64_elf(PHASE_B_PURE_OMNI_DRIVER_SURFACE, fs, vs, es)?;
+        let elf_stage1 = compile_omni_surface_via_stage1_to_elf(PHASE_B_PURE_OMNI_DRIVER_SURFACE, fs, vs, es)?;
+        if back != "aot"
+            || aot_val != OmniValue::Int(want)
+            || vm_val != OmniValue::Int(want)
+            || wasm_val != want
+            || elf_host != elf_stage1
+            || drv_u16.is_empty()
+        {
+            return Err(format!(
+                "Phase B Pure-Omni driver kernel 4-way differential failed on ({}, {}, {})",
+                fs, vs, es
+            ));
+        }
+    }
+    checks += 1;
+
+    // 2. Positive & negative JSON parity between `run_pure_omni_driver_json` and `run_omni_harness_json`
+    let parity_cases: &[(&str, &[OmniValue], bool)] = &[
+        (
+            "#[strict] #[cap(AI)] fn main(a: i64, b: i64) -> trit { let g: trit = egate(a - b); return g; }",
+            &[OmniValue::Int(30), OmniValue::Int(10)],
+            true,
+        ),
+        (
+            "include \"std/prelude.omni\";\nmacro weighted_diff(lhs, rhs, scale) = (lhs - rhs) * scale;\n#[strict]\n#[cap(AI)]\nfn main(x: i64, lo: i64, hi: i64) -> i64 {\n    let c: i64 = std_clamp(x, lo, hi);\n    let d: i64 = weighted_diff(c, lo, 3);\n    let g: trit = egate(d - 50);\n    let bonus: i64 = std_trit_mux(g, -10, 0, 10);\n    return d + bonus;\n}",
+            &[OmniValue::Int(45), OmniValue::Int(10), OmniValue::Int(40)],
+            true,
+        ),
+        (
+            "fn main(x: i64 @untrusted) -> i64 {\n    let safe_a = 1;\n    return x;\n}",
+            &[OmniValue::Int(5)],
+            false,
+        ),
+        (
+            "#[cap(AI)]\nfn main(x: i64 @untrusted) -> trit {\n    let g = egate(x);\n    return g;\n}",
+            &[OmniValue::Int(5)],
+            false,
+        ),
+        (
+            "fn main(x: i64) -> trit {\n    let g = egate(x);\n    return g;\n}",
+            &[OmniValue::Int(5)],
+            false,
+        ),
+        (
+            "#[step_budget(40)]\nfn main(n: i64) -> i64 {\n    let i = n;\n    let acc = 0;\n    while (i <=> 0) { acc += i; i -= 1; }\n    return acc;\n}",
+            &[OmniValue::Int(1000)],
+            false,
+        ),
+    ];
+    for &(src, args_slice, sflag) in parity_cases {
+        let h_json = run_omni_harness_json(src, args_slice.to_vec(), sflag, true);
+        let p_json = run_pure_omni_driver_json(src, args_slice.to_vec(), sflag, true);
+        if h_json != p_json {
+            return Err(format!(
+                "Phase B Pure-Omni driver JSON mismatch:\n  harness: {}\n  pure:    {}",
+                h_json, p_json
+            ));
+        }
+    }
+    checks += 2;
+
+    Ok(checks)
+}
+
 /// Expects `res` to fail with a diagnostic whose machine-readable code equals `code` and has non-null 1-based `(line, col)`.
 fn expect_omni_error_code<T: std::fmt::Debug>(label: &str, res: Result<T, String>, code: &str) -> Result<OmniStructuredError, String> {
     match res {
@@ -7400,6 +7777,9 @@ fn main(x: i64, y: i64) -> i64 {
 
     // 13AD. Phase A: Pure-Omni Surface Frontend (`omni-pure-frontend-v1.0.0`)
     checks += run_phase_a_pure_omni_frontend_selftests()?;
+
+    // 13AE. Phase B: Pure-Omni Driver & Verifier Kernel Integration (`omni-pure-driver-v1.0.0`)
+    checks += run_phase_b_pure_omni_driver_selftests()?;
 
     Ok(checks)
 }

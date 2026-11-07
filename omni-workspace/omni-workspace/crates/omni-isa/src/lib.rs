@@ -13,6 +13,7 @@ pub const OMNI_ACCEPTANCE_SUITE_VERSION: &str = "omni-acceptance-suite-v1.0.0";
 pub const OMNI_ERROR_CONTRACT_VERSION: &str = "omni-error-contract-v1.0.0";
 pub const OMNI_PHASE7_PURE_KERNEL_VERSION: &str = "omni-pure-kernel-v1.0.0";
 pub const OMNI_PURE_FRONTEND_VERSION: &str = "omni-pure-frontend-v1.0.0";
+pub const OMNI_PURE_DRIVER_VERSION: &str = "omni-pure-driver-v1.0.0";
 
 pub const REG_BASE: u16 = 0x7E00; // 0x7E00 .. 0x7EBF (192 SSA registers)
 pub const REG_MAX: u16  = 0x7EBF;
