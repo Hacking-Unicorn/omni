@@ -1,0 +1,43 @@
+// ==============================================================================
+// STDLIB MODULE: `std/pack5.omni` — Verified 5-Trits-per-Byte (`@PACK5`) & Density Helpers
+// ==============================================================================
+// High-level pure-Omni helpers for `@PACK5` vector packing density, valid byte range
+// verification (`0..=242`, since `3^5 - 1 = 242`), and ternary dot-product gating.
+
+#[strict]
+fn std_pack5_bytes_needed(trit_count: i64) -> i64 {
+    let valid_cmp: trit = trit_count <=> 0;
+    let padded: i64 = trit_count + 4;
+    let bytes: i64 = padded / 5;
+    let out: i64 = if_pos valid_cmp { bytes } else { 0 };
+    return out;
+}
+
+#[strict]
+fn std_pack5_is_valid_byte(byte_val: i64) -> trit {
+    let ge_zero: trit = byte_val >= 0;
+    let le_max: trit = byte_val <= 242;
+    let ok: trit = tand(ge_zero, le_max);
+    return ok;
+}
+
+#[strict]
+fn std_pack5_dot10_score(dot_raw: i64, scale: i64, threshold: i64) -> i64 {
+    let scaled: i64 = dot_raw * scale;
+    let cmp: trit = scaled <=> threshold;
+    let bonus: i64 = match_trit cmp {
+        neg => -50,
+        zero => 0,
+        pos => 50
+    };
+    return scaled + bonus;
+}
+
+#[strict]
+fn std_pack5_cosine_gate(dot_raw: i64, norm_bound: i64) -> trit {
+    let hi_cmp: trit = dot_raw <=> norm_bound;
+    let neg_bound: i64 = 0 - norm_bound;
+    let lo_cmp: trit = dot_raw <=> neg_bound;
+    let gate: trit = tmaj(hi_cmp, lo_cmp, 0t);
+    return gate;
+}

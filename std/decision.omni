@@ -1,0 +1,57 @@
+// ==============================================================================
+// STDLIB MODULE: `std/decision.omni` — Verified Decision Hooks (`egate`, `tlogic`) & Hysteresis
+// ==============================================================================
+// High-level pure-Omni helpers for balanced-ternary hysteresis bands, capability-checked
+// AI decision hooks (`#[cap(AI)]`), and multi-signal ternary quorum scoring.
+
+#[strict]
+fn std_decision_band(signal: i64, lo_thresh: i64, hi_thresh: i64) -> trit {
+    let above_hi: trit = signal <=> hi_thresh;
+    let below_lo: trit = signal <=> lo_thresh;
+    let is_high: trit = tand(above_hi, +1t);
+    let is_low: trit = tor(below_lo, -1t);
+    let out: trit = match_trit above_hi {
+        neg => is_low,
+        zero => 0t,
+        pos => is_high
+    };
+    return out;
+}
+
+#[strict]
+fn std_decision_hysteresis(prev_state: trit, signal: i64, margin: i64) -> trit {
+    let neg_margin: i64 = 0 - margin;
+    let hi_cmp: trit = signal <=> margin;
+    let lo_cmp: trit = signal <=> neg_margin;
+    let next_state: trit = match_trit hi_cmp {
+        neg => match_trit lo_cmp {
+            neg => -1t,
+            zero => prev_state,
+            pos => prev_state
+        },
+        zero => prev_state,
+        pos => +1t
+    };
+    return next_state;
+}
+
+#[strict]
+#[cap(AI)]
+fn std_decision_weighted_hook(signal: i64, bias: i64, neg_out: i64, zero_out: i64, pos_out: i64) -> i64 {
+    let net: i64 = signal + bias;
+    let g: trit = egate(net);
+    let l: trit = tlogic(net);
+    let combined: trit = tmaj(g, l, g);
+    let res: i64 = sel_trit(combined, neg_out, zero_out, pos_out);
+    return res;
+}
+
+#[strict]
+#[cap(AI)]
+fn std_decision_quorum_hook(s0: i64, s1: i64, s2: i64, threshold: i64) -> trit {
+    let g0: trit = egate(s0 - threshold);
+    let g1: trit = egate(s1 - threshold);
+    let g2: trit = egate(s2 - threshold);
+    let q: trit = tmaj(g0, g1, g2);
+    return q;
+}

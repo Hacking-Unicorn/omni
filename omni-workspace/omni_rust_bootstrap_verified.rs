@@ -4393,6 +4393,24 @@ pub fn lookup_omni_stdlib_module(path: &str) -> Option<&'static str> {
 #[strict] fn std_http_pack_response(status: i64, payload: i64) -> i64 { let valid_cmp: trit = status >= 100; let code: i64 = if_pos valid_cmp { status } else { 500 }; return code * 1000000 + payload; }
 #[strict] fn std_http_route_score(method_code: i64, param_id: i64) -> i64 { let m_cmp: trit = method_code <=> 1; let method_bonus: i64 = match_trit m_cmp { neg => 400, zero => 200, pos => 201 }; return method_bonus * 1000000 + param_id; }",
         ),
+        "std/pack5.omni" => Some(
+            "#[strict] fn std_pack5_bytes_needed(trit_count: i64) -> i64 { let valid_cmp: trit = trit_count <=> 0; let padded: i64 = trit_count + 4; let bytes: i64 = padded / 5; let out: i64 = if_pos valid_cmp { bytes } else { 0 }; return out; }
+#[strict] fn std_pack5_is_valid_byte(byte_val: i64) -> trit { let ge_zero: trit = byte_val >= 0; let le_max: trit = byte_val <= 242; let ok: trit = tand(ge_zero, le_max); return ok; }
+#[strict] fn std_pack5_dot10_score(dot_raw: i64, scale: i64, threshold: i64) -> i64 { let scaled: i64 = dot_raw * scale; let cmp: trit = scaled <=> threshold; let bonus: i64 = match_trit cmp { neg => -50, zero => 0, pos => 50 }; return scaled + bonus; }
+#[strict] fn std_pack5_cosine_gate(dot_raw: i64, norm_bound: i64) -> trit { let hi_cmp: trit = dot_raw <=> norm_bound; let neg_bound: i64 = 0 - norm_bound; let lo_cmp: trit = dot_raw <=> neg_bound; let gate: trit = tmaj(hi_cmp, lo_cmp, 0t); return gate; }",
+        ),
+        "std/decision.omni" => Some(
+            "#[strict] fn std_decision_band(signal: i64, lo_thresh: i64, hi_thresh: i64) -> trit { let above_hi: trit = signal <=> hi_thresh; let below_lo: trit = signal <=> lo_thresh; let is_high: trit = tand(above_hi, +1t); let is_low: trit = tor(below_lo, -1t); let out: trit = match_trit above_hi { neg => is_low, zero => 0t, pos => is_high }; return out; }
+#[strict] fn std_decision_hysteresis(prev_state: trit, signal: i64, margin: i64) -> trit { let neg_margin: i64 = 0 - margin; let hi_cmp: trit = signal <=> margin; let lo_cmp: trit = signal <=> neg_margin; let next_state: trit = match_trit hi_cmp { neg => match_trit lo_cmp { neg => -1t, zero => prev_state, pos => prev_state }, zero => prev_state, pos => +1t }; return next_state; }
+#[strict] #[cap(AI)] fn std_decision_weighted_hook(signal: i64, bias: i64, neg_out: i64, zero_out: i64, pos_out: i64) -> i64 { let net: i64 = signal + bias; let g: trit = egate(net); let l: trit = tlogic(net); let combined: trit = tmaj(g, l, g); let res: i64 = sel_trit(combined, neg_out, zero_out, pos_out); return res; }
+#[strict] #[cap(AI)] fn std_decision_quorum_hook(s0: i64, s1: i64, s2: i64, threshold: i64) -> trit { let g0: trit = egate(s0 - threshold); let g1: trit = egate(s1 - threshold); let g2: trit = egate(s2 - threshold); let q: trit = tmaj(g0, g1, g2); return q; }",
+        ),
+        "std/resource.omni" => Some(
+            "#[strict] fn std_arena_scoped_score(base: i64, weight: i64, offset: i64) -> i64 { let a_scope: arena = arena(1024); let r_view: i64 = borrow_r(a_scope); let prod: i64 = base * weight; let total: i64 = prod + offset + (r_view * 0); drop(r_view); drop(a_scope); return total; }
+#[strict] fn std_budget_headroom(used_units: i64, limit_units: i64) -> i64 { let raw_rem: i64 = limit_units - used_units; let clamped: i64 = imax(raw_rem, 0); return clamped; }
+#[strict] fn std_budget_is_within(used_units: i64, limit_units: i64, safety_margin: i64) -> trit { let effective_used: i64 = used_units + safety_margin; let cmp: trit = effective_used <= limit_units; return cmp; }
+#[strict] fn std_arena_chunk_capacity(total_bytes: i64, chunk_size: i64) -> i64 { let valid_chunk: i64 = imax(chunk_size, 64); let chunks: i64 = total_bytes / valid_chunk; let clamped: i64 = imax(chunks, 1); return clamped; }",
+        ),
         "pure/compiler.omni" | "spec/pure_self_host/omni_selfhost_compiler.omni" => Some(
             "#[strict]
 fn pure_lex_classify_token(src_len: i64, strict_violation_code: i64, syntax_err_code: i64) -> i64 {
@@ -4871,6 +4889,37 @@ fn main(src_words: i64, trit_len: i64, err_probe: i64) -> i64 {
     let digest: i64 = (p5_bytes * 1000) + (strat * 100) + (cat * 10) + stg + kv_val + g_bonus;
     let out: i64 = if_pos err_cmp { err_total } else { digest };
     return out;
+}",
+        ),
+        "pure/programs/pack5_decision_controller.omni" => Some(
+            "include \"std/pack5.omni\";
+include \"std/decision.omni\";
+include \"std/resource.omni\";
+#[strict]
+#[cap(AI)]
+#[step_budget(24000)]
+#[mem_budget(8192)]
+fn main(signal_a: i64, signal_b: i64, used_steps: i64) -> i64 {
+    let w_vec: bytes = pack5_bytes([+1t, +1t, 0t, +1t, -1t, +1t, +1t, 0t, +1t, +1t]);
+    let w_dot: i64 = pack5_tdot(w_vec, w_vec);
+    let p_bytes: i64 = std_pack5_bytes_needed(50);
+    let b_ok: trit = std_pack5_is_valid_byte(215);
+    let dot_sc: i64 = std_pack5_dot10_score(w_dot, 2, 10);
+    let cos_g: trit = std_pack5_cosine_gate(w_dot, 5);
+    let band_t: trit = std_decision_band(signal_a, 10, 30);
+    let hyst_t: trit = std_decision_hysteresis(band_t, signal_b, 15);
+    let hook_val: i64 = std_decision_weighted_hook(signal_a + signal_b, -20, -100, 0, 100);
+    let quorum_t: trit = std_decision_quorum_hook(signal_a, signal_b, signal_a + 10, 20);
+    let arena_sc: i64 = std_arena_scoped_score(p_bytes, 10, hook_val);
+    let headroom: i64 = std_budget_headroom(used_steps, 1000);
+    let budget_ok: trit = std_budget_is_within(used_steps, 1000, 50);
+    let chunks: i64 = std_arena_chunk_capacity(4096, 512);
+    let gate_all: trit = tmaj(b_ok, cos_g, quorum_t);
+    let hyst_bonus: i64 = sel_trit(hyst_t, -25, 0, 25);
+    let gate_bonus: i64 = sel_trit(gate_all, -10, 0, 40);
+    let total: i64 = dot_sc + arena_sc + (headroom / 10) + chunks + hyst_bonus + gate_bonus;
+    let final_out: i64 = if_pos budget_ok { total } else { -1 };
+    return final_out;
 }",
         ),
         _ => None,
@@ -6626,57 +6675,75 @@ pub fn repair_omni_program_from_harness_error(
         }
         "LINEAR_LEAK" => {
             let lines: Vec<&str> = src.lines().collect();
-            let search_end = target_line.min(lines.len());
-            let mut fn_start_line = 0usize;
-            for idx in (0..search_end).rev() {
-                let t = lines[idx].trim_start();
-                if t.starts_with("fn ") || t.contains(" fn ") || t.starts_with("route ") {
-                    fn_start_line = idx;
-                    break;
-                }
-            }
-            let mut fn_end_line = lines.len();
-            for (idx, line_s) in lines.iter().enumerate().skip(fn_start_line + 1) {
+            let mut fn_ranges: Vec<(usize, usize)> = Vec::new();
+            let mut cur_start: Option<usize> = None;
+            let mut brace_depth = 0usize;
+            for (idx, line_s) in lines.iter().enumerate() {
                 let t = line_s.trim_start();
-                if t.starts_with("fn ") || t.contains(" fn ") || t.starts_with("route ") || t.starts_with("#[") {
-                    fn_end_line = idx;
-                    break;
+                if cur_start.is_none() && (t.starts_with("fn ") || t.contains(" fn ") || t.starts_with("route ")) {
+                    cur_start = Some(idx);
+                    brace_depth = 0;
                 }
-            }
-            let fn_slice = lines[fn_start_line..fn_end_line].join("\n");
-            let mut arena_vars: Vec<String> = Vec::new();
-            for line_s in &lines[fn_start_line..fn_end_line] {
-                if line_s.contains("arena(") || line_s.contains("borrow_r(") || line_s.contains("borrow_w(") {
-                    if let Some(let_pos) = line_s.find("let ") {
-                        let var_part = &line_s[let_pos + 4..];
-                        let v_name = var_part
-                            .split(|c: char| c == ':' || c == '=' || c.is_ascii_whitespace())
-                            .next()
-                            .unwrap_or("")
-                            .trim();
-                        if !v_name.is_empty() && !fn_slice.contains(&format!("drop({});", v_name)) {
-                            arena_vars.push(String::from(v_name));
+                if cur_start.is_some() {
+                    for b in line_s.bytes() {
+                        if b == b'{' {
+                            brace_depth += 1;
+                        } else if b == b'}' {
+                            brace_depth = brace_depth.saturating_sub(1);
+                            if brace_depth == 0 {
+                                if let Some(st) = cur_start.take() {
+                                    fn_ranges.push((st, idx + 1));
+                                }
+                            }
                         }
                     }
                 }
             }
-            if !arena_vars.is_empty() {
-                arena_vars.reverse();
-                let drop_stmts: String = arena_vars.iter().map(|v| format!("drop({}); ", v)).collect();
-                let mut new_lines: Vec<String> = lines.iter().map(|s| String::from(*s)).collect();
-                let mut patched = false;
-                for line_item in new_lines.iter_mut().take(fn_end_line).skip(fn_start_line) {
-                    if line_item.contains("return ") {
-                        *line_item = line_item.replacen("return ", &format!("{}return ", drop_stmts), 1);
-                        patched = true;
+            if let Some(st) = cur_start {
+                fn_ranges.push((st, lines.len()));
+            }
+            if fn_ranges.is_empty() {
+                fn_ranges.push((0, lines.len()));
+            }
+            let mut new_lines: Vec<String> = lines.iter().map(|s| String::from(*s)).collect();
+            let mut patched = false;
+            for (fn_start_line, fn_end_line) in fn_ranges {
+                let fn_slice = lines[fn_start_line..fn_end_line].join("\n");
+                let mut arena_vars: Vec<String> = Vec::new();
+                for line_s in &lines[fn_start_line..fn_end_line] {
+                    if line_s.contains("arena(") || line_s.contains("borrow_r(") || line_s.contains("borrow_w(") {
+                        if let Some(let_pos) = line_s.find("let ") {
+                            let var_part = &line_s[let_pos + 4..];
+                            let v_name = var_part
+                                .split(|c: char| c == ':' || c == '=' || c.is_ascii_whitespace())
+                                .next()
+                                .unwrap_or("")
+                                .trim();
+                            if !v_name.is_empty() && !fn_slice.contains(&format!("drop({});", v_name)) {
+                                arena_vars.push(String::from(v_name));
+                            }
+                        }
+                    }
+                }
+                if !arena_vars.is_empty() {
+                    arena_vars.reverse();
+                    let drop_stmts: String = arena_vars.iter().map(|v| format!("drop({}); ", v)).collect();
+                    for line_item in new_lines.iter_mut().take(fn_end_line).skip(fn_start_line) {
+                        if line_item.contains("return ") {
+                            *line_item = line_item.replacen("return ", &format!("{}return ", drop_stmts), 1);
+                            patched = true;
+                            break;
+                        }
+                    }
+                    if patched {
                         break;
                     }
                 }
-                if patched {
-                    let out = new_lines.join("\n");
-                    if out != src {
-                        return Some(out);
-                    }
+            }
+            if patched {
+                let out = new_lines.join("\n");
+                if out != src {
+                    return Some(out);
                 }
             }
             None
@@ -10133,13 +10200,14 @@ pub fn run_pure_omni_acceptance_diff() -> Result<usize, String> {
     }
     total_verified += 1;
 
-    // Verify all 5 Phase S1 real Pure-Omni programs (`pure/programs/*.omni`) under differential lock
+    // Verify all 6 Phase S1..S3 real Pure-Omni programs (`pure/programs/*.omni`) under differential lock
     let real_programs = [
         "pure/programs/ternary_neural_router.omni",
         "pure/programs/arena_audit_pipeline.omni",
         "pure/programs/policy_consensus_engine.omni",
         "pure/programs/kv_ledger_service.omni",
         "pure/programs/compiler_self_audit.omni",
+        "pure/programs/pack5_decision_controller.omni",
     ];
     for p_path in &real_programs {
         let src = lookup_omni_stdlib_module(p_path)
@@ -10195,10 +10263,11 @@ pub fn run_phase_e_pure_omni_diff_selftests() -> Result<usize, String> {
 // 7N. PURE-OMNI CORE CODEBASE (`pure/*.omni` + `std/*.omni`) & PRIMARY EXECUTION PATH
 // ==============================================================================
 
-/// Compiles and verifies the complete closed set of 9 Pure-Omni core modules (`std/prelude.omni`, `std/math.omni`,
-/// `std/trit.omni`, `std/http.omni`, `pure/compiler.omni`, `pure/verifier.omni`, `pure/host_runtime.omni`,
-/// `pure/tooling.omni`, and `pure/selfhost_suite.omni`) through both Generation-1 (`compile_omni_surface_via_pure_omni_frontend`)
-/// and Generation-2 (`compile_omni_surface_strict_to_u16`) and verifies every module with `verify_module_via_phase7_pure_omni_kernel`,
+/// Compiles and verifies the complete closed set of 18 Pure-Omni core & program modules (`std/prelude.omni`, `std/math.omni`,
+/// `std/trit.omni`, `std/http.omni`, `std/pack5.omni`, `std/decision.omni`, `std/resource.omni`, `pure/compiler.omni`,
+/// `pure/verifier.omni`, `pure/host_runtime.omni`, `pure/tooling.omni`, `pure/selfhost_suite.omni`, and all 6 `pure/programs/*.omni`)
+/// through both Generation-1 (`compile_omni_surface_via_pure_omni_frontend`) and Generation-2 (`compile_omni_surface_strict_to_u16`)
+/// and verifies every module with `verify_module_via_phase7_pure_omni_kernel`,
 /// returning the concatenated `Vec<u16>` self-host core suite stream once bit-exact `Gen-1 == Gen-2` equality is proven.
 pub fn build_pure_omni_core_suite_stream() -> Result<Vec<u16>, String> {
     let closed_modules = [
@@ -10206,6 +10275,9 @@ pub fn build_pure_omni_core_suite_stream() -> Result<Vec<u16>, String> {
         "std/math.omni",
         "std/trit.omni",
         "std/http.omni",
+        "std/pack5.omni",
+        "std/decision.omni",
+        "std/resource.omni",
         "pure/compiler.omni",
         "pure/verifier.omni",
         "pure/host_runtime.omni",
@@ -10216,6 +10288,7 @@ pub fn build_pure_omni_core_suite_stream() -> Result<Vec<u16>, String> {
         "pure/programs/policy_consensus_engine.omni",
         "pure/programs/kv_ledger_service.omni",
         "pure/programs/compiler_self_audit.omni",
+        "pure/programs/pack5_decision_controller.omni",
     ];
     let mut gen1_concat: Vec<u16> = Vec::new();
     let mut gen2_concat: Vec<u16> = Vec::new();
@@ -10988,6 +11061,73 @@ pub fn run_pure_core_phase_s2_deepened_tooling_selftests() -> Result<usize, Stri
     Ok(checks)
 }
 
+// ==============================================================================
+// 7V. STRENGTHENING PHASE S3: UNIQUE PRIMITIVES & PURE HELPERS (`std/pack5.omni`, `std/decision.omni`, `std/resource.omni`)
+// ==============================================================================
+
+/// Runs Strengthening Phase S3 selftests:
+/// 1. Compiles and verifies the 3 new Pure-Omni stdlib helper modules (`std/pack5.omni`, `std/decision.omni`,
+///    `std/resource.omni`) via `compile_omni_surface_via_pure_omni_frontend` and `verify_module_via_phase7_pure_omni_kernel`,
+///    proving bit-exact `Gen-1 == Gen-2` equality and exercising each helper via the Pure-Omni driver.
+/// 2. Compiles and executes Real Program 6 (`pure/programs/pack5_decision_controller.omni`) across the Pure-Omni
+///    driver (`execute_omni_surface_via_pure_omni_driver`), `OmniBinaryVm`, and `run_pure_omni_driver_json`.
+/// 3. Verifies static capability enforcement (`MISSING_CAP` when `#[cap(AI)]` is omitted from callers of
+///    `std_decision_weighted_hook` / `std_decision_quorum_hook`) and linear arena safety (`std_arena_scoped_score`).
+pub fn run_pure_core_phase_s3_unique_primitives_selftests() -> Result<usize, String> {
+    let mut checks = 0usize;
+
+    // 1. Verify compilation & execution of `std/pack5.omni`, `std/decision.omni`, and `std/resource.omni`
+    let s3_std_modules = ["std/pack5.omni", "std/decision.omni", "std/resource.omni"];
+    for m_path in &s3_std_modules {
+        let src = lookup_omni_stdlib_module(m_path)
+            .ok_or_else(|| format!("Phase S3 missing built-in stdlib module '{}'", m_path))?;
+        let p_u16 = compile_omni_surface_via_pure_omni_frontend(src, true)?;
+        let r_u16 = compile_omni_surface_strict_to_u16(src)?;
+        verify_module_via_phase7_pure_omni_kernel(&p_u16)?;
+        if p_u16 != r_u16 || p_u16.len() < 150 {
+            return Err(format!("Phase S3 stdlib module '{}' Gen-1 != Gen-2 divergence", m_path));
+        }
+    }
+    checks += 1;
+
+    // 2. Execute Real Program 6 (`pure/programs/pack5_decision_controller.omni`) via Pure-Omni driver & VM
+    let src_ctrl = lookup_omni_stdlib_module("pure/programs/pack5_decision_controller.omni")
+        .ok_or_else(|| String::from("Phase S3 missing pure/programs/pack5_decision_controller.omni"))?;
+    let args_ctrl = vec![OmniValue::Int(35), OmniValue::Int(20), OmniValue::Int(200)];
+    let (v_ctrl, _, words_ctrl) = execute_omni_surface_via_pure_omni_driver(src_ctrl, args_ctrl.clone(), true)?;
+    let v_ctrl_vm = execute_omni_surface_program_with_budgets(src_ctrl, args_ctrl.clone(), None, None)?;
+    // w_dot = 8; p_bytes = 10; b_ok = +1t; dot_sc = 8*2 + 50 = 66; cos_g = +1t
+    // band_t(35, 10, 30) = +1t; hyst_t(+1t, 20, 15) = +1t; hook_val(55, -20) -> net=35 -> +1t -> 100
+    // quorum_t(35, 20, 45, 20) -> (+1t, 0t, +1t) -> +1t
+    // arena_sc(10, 10, 100) = 200; headroom(200, 1000) = 800; budget_ok = +1t; chunks(4096, 512) = 8
+    // gate_all = +1t; hyst_bonus = 25; gate_bonus = 40
+    // total = 66 + 200 + 80 + 8 + 25 + 40 = 419
+    if v_ctrl != OmniValue::Int(419) || v_ctrl_vm != OmniValue::Int(419) || words_ctrl < 500 {
+        return Err(format!(
+            "Phase S3 pack5_decision_controller returned {:?} (vm={:?}, words={}), expected Int(419)",
+            v_ctrl, v_ctrl_vm, words_ctrl
+        ));
+    }
+    checks += 1;
+
+    // 3. Verify static capability enforcement (`MISSING_CAP`) & linear arena leak enforcement (`LINEAR_LEAK`) on Phase S3 primitives
+    let missing_ai_prog = "include \"std/decision.omni\";\n#[strict]\nfn main(x: i64) -> i64 {\n    let g: trit = egate(x);\n    let b: trit = std_decision_band(x, -10, 10);\n    let m: trit = tmaj(g, b, g);\n    return sel_trit(m, -10, 0, 10);\n}";
+    expect_omni_error_code(
+        "s3_decision_hook_missing_cap",
+        execute_omni_surface_via_pure_omni_driver(missing_ai_prog, vec![OmniValue::Int(15)], true),
+        "MISSING_CAP",
+    )?;
+    let leak_resource_prog = "include \"std/resource.omni\";\n#[strict]\nfn main(x: i64) -> i64 {\n    let a_bad: arena = arena(512);\n    let h: i64 = std_budget_headroom(x, 1000);\n    return h;\n}";
+    expect_omni_error_code(
+        "s3_resource_arena_leak",
+        execute_omni_surface_via_pure_omni_driver(leak_resource_prog, vec![OmniValue::Int(100)], true),
+        "LINEAR_LEAK",
+    )?;
+    checks += 1;
+
+    Ok(checks)
+}
+
 /// Expects `res` to fail with a diagnostic whose machine-readable code equals `code` and has non-null 1-based `(line, col)`.
 fn expect_omni_error_code<T: std::fmt::Debug>(label: &str, res: Result<T, String>, code: &str) -> Result<OmniStructuredError, String> {
     match res {
@@ -11692,6 +11832,9 @@ fn main(x: i64, y: i64) -> i64 {
 
     // 13AP. Strengthening Phase S2: Deepened Pure Tooling for Larger Pure Codebases
     checks += run_pure_core_phase_s2_deepened_tooling_selftests()?;
+
+    // 13AQ. Strengthening Phase S3: Unique Primitives & Pure Helpers (`std/pack5.omni`, `std/decision.omni`, `std/resource.omni`)
+    checks += run_pure_core_phase_s3_unique_primitives_selftests()?;
 
     Ok(checks)
 }
