@@ -3071,18 +3071,23 @@ pub fn extract_omni_surface_budgets(src: &str) -> (Option<u64>, Option<usize>) {
     (step_b, mem_b)
 }
 
-/// Compiles a `.omni` file from disk, resolving any relative `include "..."` directives.
+/// Compiles a `.omni` file from disk, resolving any relative `include "..."` directives,
+/// through the primary Pure-Omni surface frontend (`compile_omni_surface_via_pure_omni_frontend`)
+/// and verifies the emitted `Vec<u16>` stream with `verify_module_via_phase7_pure_omni_kernel`.
 pub fn compile_omni_surface_file_to_u16(path: &str) -> Result<Vec<u16>, String> {
     let raw_src = fs::read_to_string(path).map_err(|e| format!("Failed to read '{}': {}", path, e))?;
     let parent_dir = std::path::Path::new(path).parent();
     let expanded = resolve_omni_surface_includes(&raw_src, parent_dir, None)?;
-    compile_omni_surface_to_u16(&expanded)
+    let u16_stream = compile_omni_surface_via_pure_omni_frontend(&expanded, expanded.contains("#[strict]"))?;
+    verify_module_via_phase7_pure_omni_kernel(&u16_stream)?;
+    Ok(u16_stream)
 }
 
-/// Links multiple in-memory `.omni` surface modules and compiles them into a single `Vec<u16>` token stream.
+/// Links multiple in-memory `.omni` surface modules and compiles them into a single `Vec<u16>` token stream
+/// via the primary Pure-Omni surface frontend.
 pub fn link_omni_surface_modules(modules: &[&str]) -> Result<Vec<u16>, String> {
     let joined = modules.join("\n");
-    compile_omni_surface_to_u16(&joined)
+    compile_omni_surface_via_pure_omni_frontend(&joined, joined.contains("#[strict]"))
 }
 
 /// Parses a CLI string argument into an `OmniValue` (`+1t`/`0t`/`-1t` -> `Trit`, integer -> `Int`, else `Str`).
@@ -3240,13 +3245,16 @@ pub fn execute_omni_surface_program_with_budgets(
         (None, Some(b)) => Some(b),
         (None, None) => None,
     };
-    let (u16_stream, sm) = compile_omni_surface_to_u16_with_sourcemap(&wrapped, false)?;
+    let (u16_stream, sm) = compile_omni_surface_via_pure_omni_frontend_with_sourcemap(&wrapped, false)?;
     for rep in verify_u16_stream(&u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
         if !rep.passed {
             let first = rep.errors.first().cloned().unwrap_or_default();
             let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
             return Err(format!("{} (fn #{}: {:?})", annotated, rep.fn_idx, rep.errors));
         }
+    }
+    if let Err(kernel_err) = verify_module_via_phase7_pure_omni_kernel(&u16_stream) {
+        return Err(annotate_omni_error_with_sourcemap(&kernel_err, &sm));
     }
     let module = decode_omni_token_stream(&u16_stream)?;
     let entry_fn_idx = if module.functions.iter().any(|f| f.fn_idx == 0) {
@@ -3276,13 +3284,16 @@ pub fn execute_omni_surface_aot_first(
 ) -> Result<(OmniValue, &'static str), String> {
     let wrapped = wrap_omni_surface_snippet(src);
     let (attr_steps, attr_mem) = extract_omni_surface_budgets(&wrapped);
-    let (u16_stream, sm) = compile_omni_surface_to_u16_with_sourcemap(&wrapped, false)?;
+    let (u16_stream, sm) = compile_omni_surface_via_pure_omni_frontend_with_sourcemap(&wrapped, false)?;
     for rep in verify_u16_stream(&u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
         if !rep.passed {
             let first = rep.errors.first().cloned().unwrap_or_default();
             let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
             return Err(format!("{} (fn #{}: {:?})", annotated, rep.fn_idx, rep.errors));
         }
+    }
+    if let Err(kernel_err) = verify_module_via_phase7_pure_omni_kernel(&u16_stream) {
+        return Err(annotate_omni_error_with_sourcemap(&kernel_err, &sm));
     }
     let module = decode_omni_token_stream(&u16_stream)?;
     for func in &module.functions {
@@ -8403,6 +8414,80 @@ pub fn run_pure_core_phase4_selfhost_fixed_point_selftests() -> Result<usize, St
     Ok(checks)
 }
 
+// ==============================================================================
+// 7S. PURE-CORE COMPLETION PHASE 5: PURE-OMNI DEFAULT WORKFLOWS & LEGACY-RUST DIFFERENTIAL
+// ==============================================================================
+
+/// Runs Pure-Core Completion Phase 5 selftests:
+/// 1. Verifies that the default execution and compilation workflows (`execute_omni_surface_program`,
+///    `execute_omni_surface_aot_first`, `execute_omni_surface_program_with_budgets`, `link_omni_surface_modules`,
+///    `inspect_omni_surface_program`, `run_omni_harness_cli`, and `run_omni_agent_driver_json`)
+///    route through the Pure-Omni frontend (`compile_omni_surface_via_pure_omni_frontend_with_sourcemap`),
+///    Pure-Omni verifier kernel (`verify_module_via_phase7_pure_omni_kernel`), and Pure-Omni driver by default.
+/// 2. Verifies bit-exact equivalence between the default Pure-Omni workflow and the quarantined
+///    `--legacy-rust` bootstrap reference (`run_omni_harness_json`, `compile_omni_surface_to_u16_with_sourcemap`).
+/// 3. Verifies end-to-end Pure-Omni workflow across `std/*` + `pure/*` + `route` + repair loop in a single pipeline.
+pub fn run_pure_core_phase5_default_workflow_selftests() -> Result<usize, String> {
+    let mut checks = 0usize;
+
+    // 1. Default workflow execution & linking route through Pure-Omni frontend + verifier kernel
+    let mod_a = "#[strict]\nfn helper_double(x: i64) -> i64 {\n    return x * 2;\n}";
+    let mod_b = "#[strict]\n#[cap(AI)]\nfn main(a: i64) -> i64 {\n    let d: i64 = helper_double(a);\n    let g: trit = egate(d - 10);\n    let bonus: i64 = sel_trit(g, -5, 0, 5);\n    return d + bonus;\n}";
+    let linked_u16 = link_omni_surface_modules(&[mod_a, mod_b])?;
+    verify_module_via_phase7_pure_omni_kernel(&linked_u16)?;
+    let combined_src = format!("{}\n{}", mod_a, mod_b);
+    let def_val = execute_omni_surface_program(&combined_src, vec![OmniValue::Int(20)])?;
+    let (pure_val, _, pure_len) = execute_omni_surface_via_pure_omni_driver(&combined_src, vec![OmniValue::Int(20)], true)?;
+    if def_val != OmniValue::Int(45) || pure_val != OmniValue::Int(45) || linked_u16.len() != pure_len {
+        return Err(format!(
+            "Phase 5 default Pure-Omni workflow mismatch: def={:?}, pure={:?}, len={} vs {}",
+            def_val,
+            pure_val,
+            linked_u16.len(),
+            pure_len
+        ));
+    }
+    checks += 1;
+
+    // 2. Default Pure-Omni driver vs quarantined `--legacy-rust` reference equivalence on positive and negative cases
+    let pos_prog = "include \"std/math.omni\";\n#[strict]\nfn main(x: i64) -> i64 {\n    let c: i64 = std_clamp(x, 0, 50);\n    return c + 7;\n}";
+    let default_json = run_pure_omni_driver_json(pos_prog, vec![OmniValue::Int(100)], true, true);
+    let legacy_json = run_omni_harness_json(pos_prog, vec![OmniValue::Int(100)], true, true);
+    if default_json != legacy_json || !default_json.contains("\"result\":\"57\"") {
+        return Err(format!(
+            "Phase 5 default vs legacy-rust positive JSON mismatch: {} vs {}",
+            default_json, legacy_json
+        ));
+    }
+    let neg_prog = "#[strict]\nfn main(x: i64 @untrusted) -> i64 {\n    let y: i64 = x + 1;\n    return y;\n}";
+    let default_neg = run_pure_omni_driver_json(neg_prog, vec![OmniValue::Int(1)], true, true);
+    let legacy_neg = run_omni_harness_json(neg_prog, vec![OmniValue::Int(1)], true, true);
+    if default_neg != legacy_neg || !default_neg.contains("\"code\":\"TAINT_ON_RET\"") {
+        return Err(format!(
+            "Phase 5 default vs legacy-rust negative JSON mismatch: {} vs {}",
+            default_neg, legacy_neg
+        ));
+    }
+    checks += 1;
+
+    // 3. End-to-end Pure-Omni workflow: std/* + pure/* + agent-driver repair -> verified execution
+    let broken_workflow_src = "include \"std/prelude.omni\";\nfn main(a: int, b: i64) -> trit {\n    let c = std_clamp(a, 0, 100);\n    let g = egate(c - b);\n    return g;\n}";
+    let rep = run_omni_agent_repair_loop(
+        broken_workflow_src,
+        vec![OmniValue::Int(80), OmniValue::Int(20)],
+        true,
+        6,
+        OMNI_HARNESS_CONTRACT_VERSION,
+    )?;
+    let final_val = execute_omni_surface_program(&rep.final_source, vec![OmniValue::Int(80), OmniValue::Int(20)])?;
+    if !rep.ok || final_val != OmniValue::Trit(1) {
+        return Err(format!("Phase 5 end-to-end Pure-Omni repair + execution failed: {:?}", rep));
+    }
+    checks += 1;
+
+    Ok(checks)
+}
+
 /// Expects `res` to fail with a diagnostic whose machine-readable code equals `code` and has non-null 1-based `(line, col)`.
 fn expect_omni_error_code<T: std::fmt::Debug>(label: &str, res: Result<T, String>, code: &str) -> Result<OmniStructuredError, String> {
     match res {
@@ -9098,6 +9183,9 @@ fn main(x: i64, y: i64) -> i64 {
 
     // 13AM. Pure-Core Completion Phase 4: Expand Pure Self-Host Compiler & Lock the Larger Fixed Point
     checks += run_pure_core_phase4_selfhost_fixed_point_selftests()?;
+
+    // 13AN. Pure-Core Completion Phase 5: Pure-Omni Default Workflows & Legacy-Rust Differential
+    checks += run_pure_core_phase5_default_workflow_selftests()?;
 
     Ok(checks)
 }
