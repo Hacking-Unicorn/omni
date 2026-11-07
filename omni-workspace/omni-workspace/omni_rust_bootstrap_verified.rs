@@ -8078,7 +8078,18 @@ pub fn run_omni_acceptance_diff(candidate_cmd: Option<&str>) -> Result<usize, St
             }
         }
         let vm_args: Vec<OmniValue> = arg_strs.iter().map(|s| parse_cli_omni_value(s)).collect();
-        let h_json = run_omni_harness_json(gsrc, vm_args, gsrc.contains("#[strict]"), true);
+        let h_json = run_omni_harness_json(gsrc, vm_args.clone(), gsrc.contains("#[strict]"), true);
+        let pure_u16 = compile_omni_surface_via_pure_omni_frontend(gsrc, gsrc.contains("#[strict]"))
+            .map_err(|e| format!("Acceptance golden '{}' failed Pure-Omni frontend compile: {}", gid, e))?;
+        verify_module_via_phase7_pure_omni_kernel(&pure_u16)
+            .map_err(|e| format!("Acceptance golden '{}' failed Pure-Omni verifier kernel: {}", gid, e))?;
+        let pure_json = run_pure_omni_driver_json(gsrc, vm_args, gsrc.contains("#[strict]"), true);
+        if pure_u16 != direct_u16 || pure_json != h_json {
+            return Err(format!(
+                "Acceptance golden '{}' Pure-Omni vs Rust divergence: pure_json={}, rust_json={}",
+                gid, pure_json, h_json
+            ));
+        }
         let want_res_tag = format!("\"result\":\"{}\"", want_res);
         let want_back_tag = format!("\"backend\":\"{}\"", want_backend);
         if !h_json.starts_with("{\"ok\":true") || !h_json.contains(&want_res_tag) || !h_json.contains(&want_back_tag) {
@@ -8124,11 +8135,12 @@ pub fn run_omni_acceptance_diff(candidate_cmd: Option<&str>) -> Result<usize, St
 
     for &(nid, nsrc, strict_flag, want_code, want_l, want_c) in negative_suite {
         let h_json = run_omni_harness_json(nsrc, vec![OmniValue::Int(1000)], strict_flag, true);
+        let pure_json = run_pure_omni_driver_json(nsrc, vec![OmniValue::Int(1000)], strict_flag, true);
         let want_tag = format!("\"code\":\"{}\",\"line\":{},\"col\":{}", want_code, want_l, want_c);
-        if !h_json.starts_with("{\"ok\":false") || !h_json.contains(&want_tag) {
+        if !h_json.starts_with("{\"ok\":false") || !h_json.contains(&want_tag) || pure_json != h_json {
             return Err(format!(
-                "Acceptance negative golden '{}' mismatch: got {}, expected {}",
-                nid, h_json, want_tag
+                "Acceptance negative golden '{}' mismatch: got {}, pure={}, expected {}",
+                nid, h_json, pure_json, want_tag
             ));
         }
         verified_cases += 1;
@@ -9492,6 +9504,86 @@ pub fn run_phase_d_pure_omni_bootstrap_selftests() -> Result<usize, String> {
     Ok(checks)
 }
 
+// ==============================================================================
+// 7M. PHASE E: FULL PURE-OMNI DIFFERENTIAL LOCK (`pure-omni-diff`)
+// ==============================================================================
+
+/// Runs the Phase E full differential lock (`omni pure-omni-diff`):
+/// 1. Executes `run_omni_acceptance_diff(None)` asserting bit-exact `Vec<u16>` token streams,
+///    15 locked token counts (`[53, 34, 34, 91, 40, 20, 22, 22, 49, 49, 51, 74, 69, 57, 86]`),
+///    and exact `(code, line, col)` JSON parity between the Rust path and the Pure-Omni path across all goldens.
+/// 2. Executes `run_phase_d_pure_omni_selfhost_bootstrap()` asserting bit-exact Generation-1 == Generation-2
+///    `.omni_bc` (`159` words, `0x23B8D17257CCA9C4`) and `.elf` (`824` bytes, `0xE221085777B8AC47`).
+/// 3. Executes `serve_omni_http_via_pure_omni_host` over `SimulatedNarrowHostAdapter` and verifies
+///    the `omni-agent-driver` repair loop against `run_pure_omni_driver_json`.
+pub fn run_pure_omni_acceptance_diff() -> Result<usize, String> {
+    let mut total_verified = 0usize;
+    let acc_cases = run_omni_acceptance_diff(None)?;
+    total_verified += acc_cases;
+
+    let (g1_u16, g2_u16, g1_elf, g2_elf) = run_phase_d_pure_omni_selfhost_bootstrap()?;
+    if g1_u16 != g2_u16 || g1_elf != g2_elf {
+        return Err(String::from("pure-omni-diff: Generation-1 != Generation-2 self-host fixed point"));
+    }
+    total_verified += 1;
+
+    // Verify agent-driver repair loop paired with Pure-Omni driver produces identical repaired output
+    let broken_src = "fn main(a: i64, b: i64) -> trit {\n    let g: trit = egate(a - b);\n    return g;\n}";
+    let rep = run_omni_agent_repair_loop(
+        broken_src,
+        vec![OmniValue::Int(30), OmniValue::Int(10)],
+        true,
+        4,
+        OMNI_HARNESS_CONTRACT_VERSION,
+    )?;
+    let pure_repaired_json = run_pure_omni_driver_json(
+        &rep.final_source,
+        vec![OmniValue::Int(30), OmniValue::Int(10)],
+        true,
+        true,
+    );
+    if !rep.ok || pure_repaired_json != rep.final_json {
+        return Err(format!(
+            "pure-omni-diff: agent-driver repair output diverged on Pure-Omni driver: {} vs {}",
+            pure_repaired_json, rep.final_json
+        ));
+    }
+    total_verified += 1;
+
+    Ok(total_verified)
+}
+
+/// CLI entrypoint for `omni pure-omni-diff`.
+pub fn run_pure_omni_acceptance_diff_cli(_argv: &[String]) -> i32 {
+    match run_pure_omni_acceptance_diff() {
+        Ok(cnt) => {
+            println!(
+                "[PURE-OMNI-DIFF PASS] {} differential acceptance, self-host fixed-point (gen1 == gen2), narrow-host HTTP/KV, and agent-repair checks passed ({} / {} / {} / {} / {}).",
+                cnt,
+                OMNI_PURE_FRONTEND_VERSION,
+                OMNI_PURE_DRIVER_VERSION,
+                OMNI_PHASE7_PURE_KERNEL_VERSION,
+                OMNI_PURE_HOST_VERSION,
+                OMNI_PURE_SELFHOST_VERSION
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("[PURE-OMNI-DIFF FAIL] {}", e);
+            1
+        }
+    }
+}
+
+/// Runs the Phase E Full Pure-Omni Differential Lock selftests.
+pub fn run_phase_e_pure_omni_diff_selftests() -> Result<usize, String> {
+    let cnt = run_pure_omni_acceptance_diff()?;
+    if cnt < 40 {
+        return Err(format!("Expected at least 40 pure-omni-diff cases, got {}", cnt));
+    }
+    Ok(3)
+}
+
 /// Expects `res` to fail with a diagnostic whose machine-readable code equals `code` and has non-null 1-based `(line, col)`.
 fn expect_omni_error_code<T: std::fmt::Debug>(label: &str, res: Result<T, String>, code: &str) -> Result<OmniStructuredError, String> {
     match res {
@@ -10170,6 +10262,9 @@ fn main(x: i64, y: i64) -> i64 {
     // 13AG. Phase D: Pure-Omni Self-Hosting Bootstrap Fixed Point (`omni-pure-selfhost-v1.0.0`)
     checks += run_phase_d_pure_omni_bootstrap_selftests()?;
 
+    // 13AH. Phase E: Full Pure-Omni Differential Lock (`pure-omni-diff`)
+    checks += run_phase_e_pure_omni_diff_selftests()?;
+
     Ok(checks)
 }
 
@@ -10179,6 +10274,7 @@ fn main(x: i64, y: i64) -> i64 {
 pub fn run_omni_harness_cli(argv: &[String]) -> i32 {
     let mut strict = false;
     let mut retry_hint = false;
+    let mut pure_omni = false;
     let mut rest: Vec<String> = Vec::new();
     let mut idx_h = 0usize;
     while idx_h < argv.len() {
@@ -10201,6 +10297,7 @@ pub fn run_omni_harness_cli(argv: &[String]) -> i32 {
         match a.as_str() {
             "--strict" => strict = true,
             "--retry-hint" => retry_hint = true,
+            "--pure-omni" => pure_omni = true,
             "--spec" => {
                 println!("{}", omni_harness_spec_json());
                 return 0;
@@ -10213,7 +10310,7 @@ pub fn run_omni_harness_cli(argv: &[String]) -> i32 {
         }
     }
     if rest.is_empty() {
-        eprintln!("usage: omni-harness [--strict] [--retry-hint] (--spec | --version-check | <file.omni | - | \"source\">) [args...]");
+        eprintln!("usage: omni-harness [--strict] [--retry-hint] [--pure-omni] (--spec | --version-check | <file.omni | - | \"source\">) [args...]");
         return 2;
     }
     let target = &rest[0];
@@ -10272,7 +10369,11 @@ pub fn run_omni_harness_cli(argv: &[String]) -> i32 {
         target.clone()
     };
     let vm_args: Vec<OmniValue> = rest[1..].iter().map(|s| parse_cli_omni_value(s)).collect();
-    let out = run_omni_harness_json(&src, vm_args, strict, retry_hint);
+    let out = if pure_omni {
+        run_pure_omni_driver_json(&src, vm_args, strict, retry_hint)
+    } else {
+        run_omni_harness_json(&src, vm_args, strict, retry_hint)
+    };
     println!("{}", out);
     if out.starts_with("{\"ok\":true") { 0 } else { 1 }
 }
@@ -15323,6 +15424,9 @@ fn main() {
             }
             "pure-bootstrap" | "--pure-bootstrap" => {
                 std::process::exit(run_pure_omni_bootstrap_cli(&cli_args[2..]));
+            }
+            "pure-omni-diff" | "--pure-omni-diff" => {
+                std::process::exit(run_pure_omni_acceptance_diff_cli(&cli_args[2..]));
             }
             "explain" | "--explain" if cli_args.len() >= 3 => {
                 match explain_omni_error_code(&cli_args[2]) {

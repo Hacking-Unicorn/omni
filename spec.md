@@ -1,6 +1,6 @@
 # Omni Binary Token-Stream ISA, Verifier, VM & AOT Normative Specification (`SPEC.md`)
 
-**Contract Status:** Normative — every behavior asserted by `./omni selftest` (`330` checks in `omni_rust_bootstrap.rs`) and `cargo run -p omni-cli -- selftest` (`291`/`292` differential checks across the 8-crate Cargo workspace) is specified below. Features not yet implemented in standalone AOT are explicitly listed in Section 6.
+**Contract Status:** Normative — every behavior asserted by `./omni selftest` (`348` checks in `omni_rust_bootstrap.rs`) and `cargo run -p omni-cli -- selftest` (`309` Windows / `310` Linux differential checks across the 8-crate Cargo workspace) is specified below. Features not yet implemented in standalone AOT are explicitly listed in Section 6.
 
 ## 1. 16-Bit Binary Token Partition (`0x0000..=0x7FFF`)
 
@@ -184,3 +184,9 @@ All normative companion specifications live under [`./spec/`](./spec/):
    - Normative design specification for CPU/GPU/NPU execution, linear device arena ownership, `@PACK5` DMA transfers, static backend opcode fences, and cross-device budgets.
 9. **Phase 7 Pure-Omni Self-Hosted Verifier Kernel (`omni-pure-kernel-v1.0.0`, [`spec/IMPROVEMENT_ROADMAP.md`](./spec/IMPROVEMENT_ROADMAP.md))**:
    - `PHASE7_PURE_OMNI_VERIFIER_KERNEL_SURFACE` (`omni_pure_verify_header`), `build_phase7_pure_omni_verifier_kernel_stream()`, and `verify_module_via_phase7_pure_omni_kernel()` execute static verification (`OK=0`, `TAINT_ON_RET=1001`, `TAINT_SINK=1002`, `MISSING_CAP=1003`, `LINEAR_LEAK=1004`, `BORROW_CONFLICT=1005`) as a verified `.omni` binary module across `OmniBinaryVm`, Host `x86-64` ELF64, Stage-1 `.omni_bc` ELF64 (bit-identical fixed point), and 64-bit WebAssembly AOT (`run_phase7_pure_omni_selftests()`, `13AC`).
+10. **Phases A–E: Pure-Omni Surface Frontend, Driver, Narrow-Host Runtime, Self-Hosting Bootstrap Fixed Point & Differential Lock ([`spec/PURE_SELF_HOST_ROADMAP.md`](./spec/PURE_SELF_HOST_ROADMAP.md))**:
+    - **Phase A (`omni-pure-frontend-v1.0.0`)**: [`spec/pure_self_host/frontend.omni`](./spec/pure_self_host/frontend.omni), `PHASE_A_PURE_OMNI_FRONTEND_KERNEL_SURFACE`, `compile_omni_surface_via_pure_omni_frontend_with_sourcemap()`, and `compile_omni_surface_via_pure_omni_frontend()` (`13AD`).
+    - **Phase B (`omni-pure-driver-v1.0.0`)**: [`spec/pure_self_host/driver.omni`](./spec/pure_self_host/driver.omni), `PHASE_B_PURE_OMNI_DRIVER_SURFACE`, `execute_omni_surface_via_pure_omni_driver()`, `run_pure_omni_driver_json()`, and `omni pure-driver` (`13AE`).
+    - **Phase C (`omni-pure-host-v1.0.0`)**: [`spec/pure_self_host/host_runtime.omni`](./spec/pure_self_host/host_runtime.omni), `PHASE_C_PURE_OMNI_HOST_RUNTIME_SURFACE`, and `serve_omni_http_via_pure_omni_host()` over the 10-syscall `OmniNarrowHost` boundary (`13AF`).
+    - **Phase D (`omni-pure-selfhost-v1.0.0`)**: [`spec/pure_self_host/omni_selfhost_compiler.omni`](./spec/pure_self_host/omni_selfhost_compiler.omni), `PHASE_D_PURE_OMNI_SELFHOST_COMPILER_SURFACE`, and `run_phase_d_pure_omni_selfhost_bootstrap()` (`omni pure-bootstrap`), proving bit-exact Generation-1 == Generation-2 equality on both `.omni_bc` (`159` words, `FNV-1a64 = 0x23B8D17257CCA9C4`) and `.elf` (`824` bytes, `FNV-1a64 = 0xE221085777B8AC47`, `13AG`).
+    - **Phase E (`pure-omni-diff`)**: `run_pure_omni_acceptance_diff()` (`omni pure-omni-diff` + `omni-harness --pure-omni`), locking 100% bit-for-bit and JSON parity between the Rust path and the Pure-Omni path across all acceptance goldens (`13AH`).
