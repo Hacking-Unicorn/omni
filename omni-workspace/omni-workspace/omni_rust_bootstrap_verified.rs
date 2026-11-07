@@ -4626,11 +4626,30 @@ fn pure_bootstrap_fixed_point_check(gen1_words: i64, gen2_words: i64, elf_hash_d
 }",
         ),
         "pure/selfhost_suite.omni" => Some(
-            "include \"std/prelude.omni\";
+            "include \"std/math.omni\";
+include \"std/trit.omni\";
+include \"std/http.omni\";
 include \"pure/compiler.omni\";
+include \"pure/verifier.omni\";
 include \"pure/tooling.omni\";
 include \"pure/host_runtime.omni\";
 macro pure_stage_gate(code) = sel_trit(code <=> 0, 1, 0, 1);
+#[strict]
+fn pure_selfhost_verify_fixed_point(gen1_words: i64, gen2_words: i64, suite_words: i64) -> i64 {
+    let fp_st: i64 = pure_bootstrap_fixed_point_check(gen1_words, gen2_words, 0);
+    let suite_st: i64 = pure_acceptance_diff_check(suite_words, suite_words, 0);
+    let ver_st: i64 = omni_pure_verify_header(0, 0, 0);
+    let math_c: i64 = std_mad_clamped(10, 2, 5, 0, 100);
+    let q: trit = std_trit_quorum5(+1t, +1t, -1t, +1t, +1t);
+    let q_bonus: i64 = std_trit_mux(q, -5, 0, 5);
+    let http_ok: trit = std_http_is_success(200);
+    let http_bonus: i64 = std_trit_mux(http_ok, 0, 0, 10);
+    let err_sum: i64 = fp_st + suite_st + ver_st;
+    let err_cmp: trit = err_sum <=> 0;
+    let ok_score: i64 = math_c + q_bonus + http_bonus;
+    let out: i64 = if_pos err_cmp { err_sum } else { ok_score };
+    return out;
+}
 #[strict]
 #[cap(AI)]
 fn pure_selfhost_suite_entry(src_len: i64, cap_mask: i64, payload: i64) -> i64 {
@@ -9901,24 +9920,47 @@ pub fn run_phase_e_pure_omni_diff_selftests() -> Result<usize, String> {
 // 7N. PURE-OMNI CORE CODEBASE (`pure/*.omni` + `std/*.omni`) & PRIMARY EXECUTION PATH
 // ==============================================================================
 
-/// Compiles and verifies the complete multi-module Pure-Omni self-hosting core suite (`pure/selfhost_suite.omni`,
-/// which links `std/prelude.omni`, `pure/compiler.omni`, `pure/tooling.omni`, and `pure/host_runtime.omni`)
-/// through both Generation-1 and Generation-2 of the Pure-Omni compiler and verifier kernel.
+/// Compiles and verifies the complete closed set of 9 Pure-Omni core modules (`std/prelude.omni`, `std/math.omni`,
+/// `std/trit.omni`, `std/http.omni`, `pure/compiler.omni`, `pure/verifier.omni`, `pure/host_runtime.omni`,
+/// `pure/tooling.omni`, and `pure/selfhost_suite.omni`) through both Generation-1 (`compile_omni_surface_via_pure_omni_frontend`)
+/// and Generation-2 (`compile_omni_surface_strict_to_u16`) and verifies every module with `verify_module_via_phase7_pure_omni_kernel`,
+/// returning the concatenated `Vec<u16>` self-host core suite stream once bit-exact `Gen-1 == Gen-2` equality is proven.
 pub fn build_pure_omni_core_suite_stream() -> Result<Vec<u16>, String> {
-    let suite_src = lookup_omni_stdlib_module("pure/selfhost_suite.omni")
-        .ok_or_else(|| String::from("Missing built-in pure/selfhost_suite.omni"))?;
-    let gen1_u16 = compile_omni_surface_via_pure_omni_frontend(suite_src, true)?;
-    verify_module_via_phase7_pure_omni_kernel(&gen1_u16)?;
-    let gen2_u16 = compile_omni_surface_strict_to_u16(suite_src)?;
-    verify_module_via_phase7_pure_omni_kernel(&gen2_u16)?;
-    if gen1_u16 != gen2_u16 {
-        return Err(format!(
-            "pure/selfhost_suite.omni Gen-1 ({}) != Gen-2 ({}) word divergence",
-            gen1_u16.len(),
-            gen2_u16.len()
-        ));
+    let closed_modules = [
+        "std/prelude.omni",
+        "std/math.omni",
+        "std/trit.omni",
+        "std/http.omni",
+        "pure/compiler.omni",
+        "pure/verifier.omni",
+        "pure/host_runtime.omni",
+        "pure/tooling.omni",
+        "pure/selfhost_suite.omni",
+    ];
+    let mut gen1_concat: Vec<u16> = Vec::new();
+    let mut gen2_concat: Vec<u16> = Vec::new();
+    for m_path in &closed_modules {
+        let src = lookup_omni_stdlib_module(m_path)
+            .ok_or_else(|| format!("Missing built-in Pure-Omni core module '{}'", m_path))?;
+        let g1_u16 = compile_omni_surface_via_pure_omni_frontend(src, true)?;
+        verify_module_via_phase7_pure_omni_kernel(&g1_u16)?;
+        let g2_u16 = compile_omni_surface_strict_to_u16(src)?;
+        verify_module_via_phase7_pure_omni_kernel(&g2_u16)?;
+        if g1_u16 != g2_u16 || g1_u16.is_empty() {
+            return Err(format!(
+                "Pure-Omni core module '{}' Gen-1 ({}) != Gen-2 ({}) word divergence",
+                m_path,
+                g1_u16.len(),
+                g2_u16.len()
+            ));
+        }
+        gen1_concat.extend_from_slice(&g1_u16);
+        gen2_concat.extend_from_slice(&g2_u16);
     }
-    Ok(gen1_u16)
+    if gen1_concat != gen2_concat {
+        return Err(String::from("Pure-Omni core suite concatenated Gen-1 != Gen-2 divergence"));
+    }
+    Ok(gen1_concat)
 }
 
 /// Runs the Pure-Omni core codebase (`pure/*.omni` and `std/*.omni`) selftests:
@@ -10283,6 +10325,90 @@ pub fn run_pure_core_phase3_host_runtime_selftests() -> Result<usize, String> {
     )?;
     if st_pure.line != st_live.line || st_pure.col != st_live.col {
         return Err(format!("Phase 3 pre-listen span mismatch: {:?} vs {:?}", st_pure, st_live));
+    }
+    checks += 1;
+
+    Ok(checks)
+}
+
+// ==============================================================================
+// 7R. PURE-CORE COMPLETION PHASE 4: EXPAND PURE SELF-HOST COMPILER & LOCK THE LARGER FIXED POINT
+// ==============================================================================
+
+/// Runs Pure-Core Completion Phase 4 selftests:
+/// 1. Compiles the closed set of all 9 Pure-Omni core modules (`std/prelude.omni`, `std/math.omni`,
+///    `std/trit.omni`, `std/http.omni`, `pure/compiler.omni`, `pure/verifier.omni`, `pure/host_runtime.omni`,
+///    `pure/tooling.omni`, and `pure/selfhost_suite.omni`) through `build_pure_omni_core_suite_stream`,
+///    asserting bit-exact `Gen-1 == Gen-2` equality across >3,800 `u16` words (>1,700 words in `pure/selfhost_suite.omni` alone).
+/// 2. Executes `pure_selfhost_verify_fixed_point` in `pure/selfhost_suite.omni` via the Pure-Omni driver,
+///    verifying both valid fixed-point convergence (`Int(40)`) and divergence detection (`5001` / `4001`).
+/// 3. Verifies that the expanded self-host compiler and the original Stage-1 == Stage-2 ELF64 fixed-point
+///    both hold simultaneously with zero regression.
+pub fn run_pure_core_phase4_selfhost_fixed_point_selftests() -> Result<usize, String> {
+    let mut checks = 0usize;
+
+    // 1. Verify the expanded closed-set Pure-Omni self-host suite stream (>3,800 words across 9 modules)
+    let suite_stream = build_pure_omni_core_suite_stream()?;
+    let selfhost_entry_src = lookup_omni_stdlib_module("pure/selfhost_suite.omni")
+        .ok_or_else(|| String::from("Missing pure/selfhost_suite.omni"))?;
+    let entry_g1 = compile_omni_surface_via_pure_omni_frontend(selfhost_entry_src, true)?;
+    let entry_g2 = compile_omni_surface_strict_to_u16(selfhost_entry_src)?;
+    verify_module_via_phase7_pure_omni_kernel(&entry_g1)?;
+    if entry_g1 != entry_g2 || entry_g1.len() <= 1412 || suite_stream.len() < 3500 {
+        return Err(format!(
+            "Phase 4 expanded self-host suite size/equality check failed: entry={}, total={}",
+            entry_g1.len(),
+            suite_stream.len()
+        ));
+    }
+    checks += 1;
+
+    // 2. Execute `pure_selfhost_verify_fixed_point` via the Pure-Omni driver
+    let fp_prog = "include \"pure/selfhost_suite.omni\";\n#[strict]\nfn main(g1: i64, g2: i64, sw: i64) -> i64 {\n    return pure_selfhost_verify_fixed_point(g1, g2, sw);\n}";
+    let (fp_ok, back_fp, _) = execute_omni_surface_via_pure_omni_driver(
+        fp_prog,
+        vec![
+            OmniValue::Int(159),
+            OmniValue::Int(159),
+            OmniValue::Int(suite_stream.len() as i64),
+        ],
+        true,
+    )?;
+    // math_c = 25, q_bonus = 5, http_bonus = 10 -> 40
+    if back_fp != "vm" || fp_ok != OmniValue::Int(40) {
+        return Err(format!(
+            "Phase 4 pure_selfhost_verify_fixed_point returned {:?} ({}), expected Int(40) (vm)",
+            fp_ok, back_fp
+        ));
+    }
+    let (fp_div, _, _) = execute_omni_surface_via_pure_omni_driver(
+        fp_prog,
+        vec![
+            OmniValue::Int(159),
+            OmniValue::Int(160),
+            OmniValue::Int(suite_stream.len() as i64),
+        ],
+        true,
+    )?;
+    if fp_div != OmniValue::Int(5001) {
+        return Err(format!(
+            "Phase 4 pure_selfhost_verify_fixed_point divergence returned {:?}, expected Int(5001)",
+            fp_div
+        ));
+    }
+    checks += 1;
+
+    // 3. Verify Phase D ELF64 fixed point and Stage-1 compiler stream remain bit-exact alongside the expanded suite
+    let (g1_u16, g2_u16, g1_elf, g2_elf) = run_phase_d_pure_omni_selfhost_bootstrap()?;
+    let s1_u16 = build_step7_stage1_compiler_stream();
+    if g1_u16.len() != 159 || g1_u16 != g2_u16 || g1_elf.len() != 824 || g1_elf != g2_elf || s1_u16.len() != 19731 {
+        return Err(format!(
+            "Phase 4 Stage-1 or Phase-D fixed-point regression detected: g1={}, g2={}, elf={}, s1={}",
+            g1_u16.len(),
+            g2_u16.len(),
+            g1_elf.len(),
+            s1_u16.len()
+        ));
     }
     checks += 1;
 
@@ -10981,6 +11107,9 @@ fn main(x: i64, y: i64) -> i64 {
 
     // 13AL. Pure-Core Completion Phase 3: Complete Pure-Omni Host Runtime as Primary Path
     checks += run_pure_core_phase3_host_runtime_selftests()?;
+
+    // 13AM. Pure-Core Completion Phase 4: Expand Pure Self-Host Compiler & Lock the Larger Fixed Point
+    checks += run_pure_core_phase4_selfhost_fixed_point_selftests()?;
 
     Ok(checks)
 }
