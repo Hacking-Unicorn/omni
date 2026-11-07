@@ -1,0 +1,37 @@
+// ==============================================================================
+// OMNI PURE CORE PROGRAM 4 — `pure/programs/kv_ledger_service.omni`
+// ==============================================================================
+//
+// Full-stack capability-gated HTTP/1.1 + persistent KV/DB ledger service in Pure Omni:
+// - Exercises multi-route handlers (`POST /ledger/:id`, `GET /ledger/:id`),
+//   `@untrusted` request parameter sanitization (`auth_verify`), `kv_put`, `db_get`,
+//   `db_query`, `std/math.omni` clamping, and `std/trit.omni` decision scoring.
+// ==============================================================================
+
+include "std/math.omni";
+include "std/trit.omni";
+
+#[strict]
+#[cap(NET, DB_R, DB_W, AUTH, AI)]
+route POST /ledger/:id (req: i64) {
+    let raw_id: i64 = req.param("id");
+    let clean_id: i64 = auth_verify(raw_id);
+    let bounded_id: i64 = std_clamp(clean_id, 1, 10000);
+    let base_deposit: i64 = bounded_id * 10 + 500;
+    let delta: i64 = base_deposit - 600;
+    let g: trit = egate(delta);
+    let tier_bonus: i64 = std_trit_mux(g, 0, 25, 100);
+    let final_balance: i64 = base_deposit + tier_bonus;
+    let saved: i64 = kv_put(bounded_id, final_balance);
+    respond(201, saved);
+}
+
+#[strict]
+#[cap(NET, DB_R, AUTH)]
+route GET /ledger/:id (req: i64) {
+    let raw_id: i64 = req.param("id");
+    let clean_id: i64 = auth_verify(raw_id);
+    let cur_bal: i64 = db_get(clean_id);
+    let audit_row: i64 = db_query("SELECT balance FROM ledger WHERE id = ?", clean_id);
+    respond(200, cur_bal + audit_row);
+}

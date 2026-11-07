@@ -1,0 +1,44 @@
+// ==============================================================================
+// OMNI PURE CORE PROGRAM 5 — `pure/programs/compiler_self_audit.omni`
+// ==============================================================================
+//
+// Pure-Omni self-auditing compiler, verifier, tooling, and host-dispatch benchmark:
+// - Imports `pure/compiler.omni`, `pure/verifier.omni`, `pure/tooling.omni`,
+//   `pure/host_runtime.omni`, `std/math.omni`, `std/trit.omni`, and `std/http.omni`.
+// - Exercises end-to-end Pure-Omni compiler semantic checks, `@PACK5` density
+//   validation, verifier header invariants, repair strategy selection, opcode
+//   category inspection, error stage classification, and fixed-point verification.
+// ==============================================================================
+
+include "std/math.omni";
+include "std/trit.omni";
+include "std/http.omni";
+include "pure/compiler.omni";
+include "pure/verifier.omni";
+include "pure/tooling.omni";
+include "pure/host_runtime.omni";
+
+#[strict]
+#[cap(AI)]
+#[step_budget(25000)]
+#[mem_budget(32768)]
+fn main(src_words: i64, trit_len: i64, err_probe: i64) -> i64 {
+    let c_st: i64 = pure_compiler_pipeline_main(src_words, 0, 0);
+    let v_st: i64 = omni_pure_verify_header(0, 0, 0);
+    let p5_bytes: i64 = pure_lower_pack5_density(trit_len, 240);
+    let diff_st: i64 = pure_acceptance_diff_check(src_words, src_words, 0);
+    let fp_st: i64 = pure_bootstrap_fixed_point_check(src_words, src_words, 0);
+    let strat: i64 = pure_select_repair_strategy(err_probe, 1);
+    let stg: i64 = pure_explain_error_stage(err_probe);
+    let cat: i64 = pure_inspect_opcode_category(32565);
+    let h_cap: i64 = omni_pure_host_check_route_caps(7, 1, 1);
+    let kv_val: i64 = omni_pure_host_kv_apply(3, 50, 0);
+    let err_total: i64 = c_st + v_st + diff_st + fp_st + h_cap;
+    let err_cmp: trit = err_total <=> 0;
+    let delta: i64 = kv_val - 100;
+    let g: trit = egate(delta);
+    let g_bonus: i64 = std_trit_mux(g, -10, 0, 10);
+    let digest: i64 = (p5_bytes * 1000) + (strat * 100) + (cat * 10) + stg + kv_val + g_bonus;
+    let out: i64 = if_pos err_cmp { err_total } else { digest };
+    return out;
+}
