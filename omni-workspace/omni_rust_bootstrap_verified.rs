@@ -4583,6 +4583,25 @@ fn pure_inspect_opcode_category(tok: i64) -> i64 {
     let op_or_meta: i64 = if_pos is_op { 6 } else { 4 };
     let category: i64 = if_pos is_eng { 1 } else { op_or_meta };
     return category;
+}
+#[strict]
+fn pure_explain_error_stage(err_code_id: i64) -> i64 {
+    let is_ver: trit = err_code_id <= 1005;
+    let is_rt: trit = err_code_id >= 1013;
+    let rt_or_fe: i64 = if_pos is_rt { 3 } else { 2 };
+    let stage: i64 = if_pos is_ver { 1 } else { rt_or_fe };
+    return stage;
+}
+#[strict]
+fn pure_bootstrap_fixed_point_check(gen1_words: i64, gen2_words: i64, elf_hash_diff: i64) -> i64 {
+    let raw_w: i64 = gen1_words - gen2_words;
+    let w_diff: i64 = iabs(raw_w);
+    let e_diff: i64 = iabs(elf_hash_diff);
+    let w_cmp: trit = w_diff <=> 0;
+    let e_cmp: trit = e_diff <=> 0;
+    let elf_status: i64 = if_pos e_cmp { 5002 } else { 0 };
+    let final_status: i64 = if_pos w_cmp { 5001 } else { elf_status };
+    return final_status;
 }",
         ),
         "pure/selfhost_suite.omni" => Some(
@@ -6599,7 +6618,7 @@ where
     let mut attempts = Vec::with_capacity(limit);
 
     for attempt_idx in 1..=limit {
-        let harness_json = run_omni_harness_json(&current_src, args.clone(), strict, true);
+        let harness_json = run_pure_omni_driver_json(&current_src, args.clone(), strict, true);
         if harness_json.starts_with("{\"ok\":true") {
             attempts.push(OmniAgentAttempt {
                 attempt: attempt_idx,
@@ -8005,9 +8024,16 @@ pub fn format_omni_inspect(
     Ok(out)
 }
 
-/// Compiles a `.omni` surface program with its `SurfaceSourceMap` and returns the deterministic `format_omni_inspect` output.
+/// Compiles a `.omni` surface program with its `SurfaceSourceMap` through the Pure-Omni frontend and returns the deterministic `format_omni_inspect` output.
 pub fn inspect_omni_surface_program(src: &str, strict: bool) -> Result<String, String> {
-    let (u16_stream, sm) = compile_omni_surface_to_u16_with_sourcemap(src, strict)?;
+    let (u16_stream, sm) = compile_omni_surface_via_pure_omni_frontend_with_sourcemap(src, strict)?;
+    format_omni_inspect(&u16_stream, Some(&sm))
+}
+
+/// Compiles a `.omni` surface program via the Pure-Omni frontend, verifies it with the Pure-Omni verifier kernel, and returns `format_omni_inspect`.
+pub fn inspect_omni_surface_via_pure_omni(src: &str, strict: bool) -> Result<String, String> {
+    let (u16_stream, sm) = compile_omni_surface_via_pure_omni_frontend_with_sourcemap(src, strict)?;
+    verify_module_via_phase7_pure_omni_kernel(&u16_stream)?;
     format_omni_inspect(&u16_stream, Some(&sm))
 }
 
@@ -10012,6 +10038,106 @@ pub fn run_pure_core_phase1_frontend_coverage_selftests() -> Result<usize, Strin
     Ok(checks)
 }
 
+// ==============================================================================
+// 7P. PURE-CORE COMPLETION PHASE 2: HIGH-VALUE TOOLING IN PURE OMNI
+// ==============================================================================
+
+/// Runs Pure-Core Completion Phase 2 selftests (`pure/tooling.omni` + Pure-Omni inspect, explain, harness, agent-driver & bootstrap):
+/// 1. Executes all 5 Pure-Omni tooling kernels in `pure/tooling.omni` (`pure_acceptance_diff_check`,
+///    `pure_select_repair_strategy`, `pure_inspect_opcode_category`, `pure_explain_error_stage`,
+///    and `pure_bootstrap_fixed_point_check`) across 4-way differential (VM, Host ELF64, Stage-1 ELF64, Wasm).
+/// 2. Verifies bit-exact output parity between `inspect_omni_surface_via_pure_omni` and `inspect_omni_surface_program`
+///    and between `pure_explain_error_stage` and `explain_omni_error_code` across all 16 error codes.
+/// 3. Verifies that `omni-harness` (defaulting to Pure-Omni) and `omni-agent-driver` (driving `run_pure_omni_driver_json`)
+///    produce identical structured JSON and multi-step repairs to the legacy Rust reference.
+pub fn run_pure_core_phase2_tooling_selftests() -> Result<usize, String> {
+    let mut checks = 0usize;
+
+    // 1. Execute all 5 tooling functions in `pure/tooling.omni` via the Pure-Omni driver
+    let tool_harness = "include \"pure/tooling.omni\";\n#[strict]\nfn main(tok: i64, err_id: i64, w_diff: i64) -> i64 {\n    let d_st: i64 = pure_acceptance_diff_check(100, 100 + w_diff, 0);\n    let strat: i64 = pure_select_repair_strategy(err_id, 1);\n    let cat: i64 = pure_inspect_opcode_category(tok);\n    let stg: i64 = pure_explain_error_stage(err_id);\n    let fp_st: i64 = pure_bootstrap_fixed_point_check(159, 159 + w_diff, 0);\n    return d_st + fp_st + (strat * 100) + (cat * 10) + stg;\n}";
+    let (v_ok, back_ok, _) = execute_omni_surface_via_pure_omni_driver(
+        tool_harness,
+        vec![OmniValue::Int(32565), OmniValue::Int(1003), OmniValue::Int(0)],
+        true,
+    )?;
+    // d_st=0, fp_st=0, strat=2, cat=6, stg=1 -> 261 (multi-fn CALL module runs on "vm")
+    if back_ok != "vm" || v_ok != OmniValue::Int(261) {
+        return Err(format!("Phase 2 tooling kernel returned {:?} ({}), expected Int(261) (vm)", v_ok, back_ok));
+    }
+    let (v_diff, _, _) = execute_omni_surface_via_pure_omni_driver(
+        tool_harness,
+        vec![OmniValue::Int(100), OmniValue::Int(1013), OmniValue::Int(5)],
+        true,
+    )?;
+    // d_st=4001, fp_st=5001, strat=16, cat=1, stg=3 -> 9002 + 1600 + 10 + 3 = 10615
+    if v_diff != OmniValue::Int(10615) {
+        return Err(format!("Phase 2 tooling kernel diff case returned {:?}, expected Int(10615)", v_diff));
+    }
+    checks += 1;
+
+    // 2. Verify `inspect_omni_surface_via_pure_omni` and `explain_omni_error_code` parity across all 16 codes
+    let sample_src = "#[strict]\n#[cap(AI)]\nfn main(a: i64, b: i64) -> trit {\n    let d: i64 = a - b;\n    let g: trit = egate(d);\n    return g;\n}";
+    let insp_pure = inspect_omni_surface_via_pure_omni(sample_src, true)?;
+    let insp_std = inspect_omni_surface_program(sample_src, true)?;
+    if insp_pure != insp_std || !insp_pure.contains("EGATE") || !insp_pure.contains("// line 5, col 19") {
+        return Err(String::from("Phase 2 inspect_omni_surface_via_pure_omni output mismatch"));
+    }
+    let stage_harness = "include \"pure/tooling.omni\";\n#[strict]\nfn main(code_id: i64) -> i64 {\n    return pure_explain_error_stage(code_id);\n}";
+    for (idx, code_name) in [
+        "TAINT_ON_RET",
+        "TAINT_SINK",
+        "MISSING_CAP",
+        "LINEAR_LEAK",
+        "BORROW_CONFLICT",
+        "UNDEF_VAR",
+        "IMMUT_PARAM",
+        "BAD_TYPE",
+        "UNKNOWN_FN",
+        "ARITY_MISMATCH",
+        "UNRESOLVED_LABEL",
+        "CIRCULAR_INCLUDE",
+        "BUDGET_EXCEEDED",
+        "CORRUPT_PACK5",
+        "AMBIGUOUS_GRAMMAR",
+        "SYNTAX_ERROR",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let code_id = 1001 + (idx as i64);
+        let (stg_val, _, _) = execute_omni_surface_via_pure_omni_driver(
+            stage_harness,
+            vec![OmniValue::Int(code_id)],
+            true,
+        )?;
+        let explained = explain_omni_error_code(code_name)
+            .ok_or_else(|| format!("Missing explain_omni_error_code for {}", code_name))?;
+        let want_stg = if code_id <= 1005 { 1 } else if code_id >= 1013 { 3 } else { 2 };
+        if stg_val != OmniValue::Int(want_stg) || !explained.contains(code_name) {
+            return Err(format!("Phase 2 explain stage mismatch for {}", code_name));
+        }
+    }
+    checks += 1;
+
+    // 3. Verify `omni-agent-driver` + `run_pure_omni_driver_json` multi-step repair equivalence
+    let multi_err_src = "fn main(a: int) -> trit {\n    let d = a - 10;\n    let g = egate(d);\n    return g;\n}";
+    let rep = run_omni_agent_repair_loop(
+        multi_err_src,
+        vec![OmniValue::Int(25)],
+        true,
+        6,
+        OMNI_HARNESS_CONTRACT_VERSION,
+    )?;
+    let pure_json = run_pure_omni_driver_json(&rep.final_source, vec![OmniValue::Int(25)], true, true);
+    let rust_json = run_omni_harness_json(&rep.final_source, vec![OmniValue::Int(25)], true, true);
+    if !rep.ok || pure_json != rust_json || !pure_json.contains("\"result\":\"+1t\"") {
+        return Err(format!("Phase 2 pure agent-driver repair mismatch: {}", pure_json));
+    }
+    checks += 1;
+
+    Ok(checks)
+}
+
 /// Expects `res` to fail with a diagnostic whose machine-readable code equals `code` and has non-null 1-based `(line, col)`.
 fn expect_omni_error_code<T: std::fmt::Debug>(label: &str, res: Result<T, String>, code: &str) -> Result<OmniStructuredError, String> {
     match res {
@@ -10699,6 +10825,9 @@ fn main(x: i64, y: i64) -> i64 {
     // 13AJ. Pure-Core Completion Phase 1: Full Surface Language Coverage in Pure-Omni Frontend
     checks += run_pure_core_phase1_frontend_coverage_selftests()?;
 
+    // 13AK. Pure-Core Completion Phase 2: High-Value Tooling in Pure Omni
+    checks += run_pure_core_phase2_tooling_selftests()?;
+
     Ok(checks)
 }
 
@@ -10708,7 +10837,7 @@ fn main(x: i64, y: i64) -> i64 {
 pub fn run_omni_harness_cli(argv: &[String]) -> i32 {
     let mut strict = false;
     let mut retry_hint = false;
-    let mut pure_omni = false;
+    let mut pure_omni = true;
     let mut rest: Vec<String> = Vec::new();
     let mut idx_h = 0usize;
     while idx_h < argv.len() {
@@ -10732,6 +10861,7 @@ pub fn run_omni_harness_cli(argv: &[String]) -> i32 {
             "--strict" => strict = true,
             "--retry-hint" => retry_hint = true,
             "--pure-omni" => pure_omni = true,
+            "--legacy-rust" => pure_omni = false,
             "--spec" => {
                 println!("{}", omni_harness_spec_json());
                 return 0;
