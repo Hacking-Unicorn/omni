@@ -1202,3 +1202,77 @@ fn main() {
     let cnt = run_workspace_selftest().expect("Workspace selftest failed");
     println!("Omni Workspace CLI (omnic) — All {} monolith-vs-workspace differential checks PASSED.", cnt);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static REPO_CWD: Mutex<()> = Mutex::new(());
+
+    fn repo_root() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..")
+    }
+
+    fn with_repo_root<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = REPO_CWD.lock().expect("repo cwd lock");
+        let prev = std::env::current_dir().expect("current_dir");
+        std::env::set_current_dir(repo_root()).expect("chdir repo root");
+        let result = f();
+        let _ = std::env::set_current_dir(prev);
+        result
+    }
+
+    #[test]
+    fn monolith_selftest_matrix() {
+        with_repo_root(|| {
+            let n = monolith::run_unit_and_differential_selftests()
+                .expect("monolith selftest failed");
+            assert!(
+                n >= 378,
+                "expected at least 378 monolith checks, got {n}"
+            );
+        });
+    }
+
+    #[test]
+    fn workspace_selftest_matrix() {
+        with_repo_root(|| {
+            let n = run_workspace_selftest().expect("workspace selftest failed");
+            assert!(
+                n >= 340,
+                "expected at least 340 workspace checks, got {n}"
+            );
+        });
+    }
+
+    #[test]
+    fn pure_bootstrap_fixed_point() {
+        with_repo_root(|| {
+            let (g1, g2, e1, e2) = omni_lang::run_phase_d_pure_omni_selfhost_bootstrap()
+                .expect("pure-bootstrap failed");
+            assert_eq!(g1, g2, "gen1 bytecode != gen2 bytecode");
+            assert_eq!(e1, e2, "gen1 ELF != gen2 ELF");
+            let code = omni_lang::run_pure_omni_bootstrap_cli(&[]);
+            assert_eq!(code, 0, "pure-bootstrap CLI exited {code}");
+        });
+    }
+
+    #[test]
+    fn pure_omni_diff_suite() {
+        with_repo_root(|| {
+            let n = omni_lang::run_pure_omni_acceptance_diff()
+                .expect("pure-omni-diff failed");
+            assert!(n >= 47, "expected at least 47 pure-omni-diff checks, got {n}");
+        });
+    }
+
+    #[test]
+    fn acceptance_diff_suite() {
+        with_repo_root(|| {
+            let n = omni_lang::run_omni_acceptance_diff(None)
+                .expect("acceptance-diff failed");
+            assert!(n >= 39, "expected at least 39 acceptance goldens, got {n}");
+        });
+    }
+}

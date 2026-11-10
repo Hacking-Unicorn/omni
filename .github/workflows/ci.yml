@@ -41,3 +41,4 @@ jobs:
           cargo run -p omni-cli --bin omni-harness -- --spec
           cargo run -p omni-cli --bin omni-agent-driver -- --list-strategies
           cargo run -p omni-cli --bin omni-agent-driver -- --strict "fn main(a: int) -> trit { let d = a - 10; let g = egate(d); return g; }" 25
+          cargo test --workspace
