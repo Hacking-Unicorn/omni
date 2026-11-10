@@ -47,6 +47,95 @@ pub trait OmniNarrowHost {
     fn host_time_ns(&mut self, cap_mask: CapMask) -> Result<u64, String>;
 }
 
+/// Resolves a host FS/DB path against an explicit, canonicalized sandbox root.
+///
+/// Rejects empty or NUL paths, `..` traversal, absolute paths outside the root,
+/// and symlink escapes before any file is opened for read or write.
+pub fn resolve_sandboxed_host_path(root: &std::path::Path, path: &str) -> Result<std::path::PathBuf, String> {
+    const ESC: &str = "error[PATH_ESCAPE] line 1, col 1";
+    if path.is_empty() {
+        return Err(format!("{}: Host file path must be non-empty", ESC));
+    }
+    if path.contains('\0') {
+        return Err(format!("{}: Host file path must not contain NUL", ESC));
+    }
+    let requested = std::path::Path::new(path);
+    if requested.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return Err(format!("{}: Host file path must not contain '..' traversal", ESC));
+    }
+    let root_canon = root.canonicalize().map_err(|e| {
+        format!("{}: Sandbox root '{}' cannot be canonicalized: {}", ESC, root.display(), e)
+    })?;
+    let candidate = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        root_canon.join(requested)
+    };
+    let resolved = canonicalize_host_path_under_root(&root_canon, &candidate)?;
+    if !resolved.starts_with(&root_canon) {
+        return Err(format!("{}: Host file path escapes the sandbox root", ESC));
+    }
+    Ok(resolved)
+}
+
+fn canonicalize_host_path_under_root(
+    root: &std::path::Path,
+    candidate: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    const ESC: &str = "error[PATH_ESCAPE] line 1, col 1";
+    // Walk every component, canonicalizing existing prefixes (including symlink
+    // ancestors such as /tmp). Only the *final* resolved path is checked against
+    // the sandbox root so intermediate ancestors of the root are not rejected.
+    let mut cur = std::path::PathBuf::new();
+    for comp in candidate.components() {
+        match comp {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                cur.push(comp);
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                return Err(format!("{}: Host file path must not contain '..' traversal", ESC));
+            }
+            std::path::Component::Normal(_) => {
+                cur.push(comp);
+                if std::fs::symlink_metadata(&cur).is_ok() {
+                    cur = cur.canonicalize().map_err(|e| {
+                        format!("{}: Host file path could not be canonicalized: {}", ESC, e)
+                    })?;
+                }
+            }
+        }
+    }
+    if !cur.starts_with(root) {
+        return Err(format!(
+            "{}: Host file path escapes the sandbox root via a symlink or absolute path",
+            ESC
+        ));
+    }
+    Ok(cur)
+}
+
+fn reject_unsandboxed_virtual_path(path: &str) -> Result<(), String> {
+    const ESC: &str = "error[PATH_ESCAPE] line 1, col 1";
+    if path.is_empty() {
+        return Err(format!("{}: Host file path must be non-empty", ESC));
+    }
+    if path.contains('\0') {
+        return Err(format!("{}: Host file path must not contain NUL", ESC));
+    }
+    let requested = std::path::Path::new(path);
+    if requested.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return Err(format!("{}: Host file path must not contain '..' traversal", ESC));
+    }
+    if requested.is_absolute() {
+        return Err(format!(
+            "{}: Host file path must not be an absolute path outside the sandbox",
+            ESC
+        ));
+    }
+    Ok(())
+}
+
 /// Live OS reference implementation of `OmniNarrowHost` backed by `std::net`, `std::fs`, and `std::time::Instant`.
 pub struct StdNarrowHostAdapter {
     next_handle: u64,
@@ -54,6 +143,7 @@ pub struct StdNarrowHostAdapter {
     streams: BTreeMap<u64, std::net::TcpStream>,
     files: BTreeMap<u64, (std::path::PathBuf, bool, Vec<u8>)>,
     start_instant: std::time::Instant,
+    sandbox_root: std::path::PathBuf,
 }
 
 impl Default for StdNarrowHostAdapter {
@@ -64,12 +154,19 @@ impl Default for StdNarrowHostAdapter {
 
 impl StdNarrowHostAdapter {
     pub fn new() -> Self {
+        Self::with_sandbox_root(std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")))
+    }
+
+    pub fn with_sandbox_root(root: impl AsRef<std::path::Path>) -> Self {
+        let given = root.as_ref().to_path_buf();
+        let sandbox_root = given.canonicalize().unwrap_or(given);
         Self {
             next_handle: 1,
             listeners: BTreeMap::new(),
             streams: BTreeMap::new(),
             files: BTreeMap::new(),
             start_instant: std::time::Instant::now(),
+            sandbox_root,
         }
     }
 
@@ -151,7 +248,7 @@ impl OmniNarrowHost for StdNarrowHostAdapter {
                 "error[MISSING_CAP] line 1, col 1: Narrow host syscall 'host_file_open(read)' requires CAP_ID_DB_R or CAP_ID_FS",
             ));
         }
-        let p = std::path::PathBuf::from(path);
+        let p = resolve_sandboxed_host_path(&self.sandbox_root, path)?;
         let initial_bytes = if !write && p.exists() {
             std::fs::read(&p).map_err(|e| format!("Failed to read host file '{}': {}", p.display(), e))?
         } else {
@@ -302,6 +399,7 @@ impl OmniNarrowHost for SimulatedNarrowHostAdapter {
                 "error[MISSING_CAP] line 1, col 1: Narrow host syscall 'host_file_open(read)' requires CAP_ID_DB_R or CAP_ID_FS",
             ));
         }
+        reject_unsandboxed_virtual_path(path)?;
         let existing = self.virtual_files.get(path).cloned().unwrap_or_default();
         let fh = self.alloc_handle();
         self.open_files.insert(fh, (String::from(path), write, existing));
@@ -657,15 +755,27 @@ pub fn handle_omni_http_request(
     })
 }
 
+
+fn sandbox_root_for_explicit_path(path: &std::path::Path) -> std::path::PathBuf {
+    if path.is_absolute() {
+        path.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(path)
+            .to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+    }
+}
+
 /// Loads a persistent host KV/DB store from disk through the narrow capability-gated host adapter (`StdNarrowHostAdapter`).
 pub fn load_omni_kv_file(path: &std::path::Path) -> Result<BTreeMap<i64, i64>, String> {
-    let mut host = StdNarrowHostAdapter::new();
+    let mut host = StdNarrowHostAdapter::with_sandbox_root(sandbox_root_for_explicit_path(path));
     load_omni_kv_via_narrow_host(&mut host, cap_bit(CAP_ID_DB_R), &path.to_string_lossy())
 }
 
 /// Atomically persists a host KV/DB store to disk through the narrow capability-gated host adapter (`StdNarrowHostAdapter`).
 pub fn save_omni_kv_file(path: &std::path::Path, kv: &BTreeMap<i64, i64>) -> Result<(), String> {
-    let mut host = StdNarrowHostAdapter::new();
+    let mut host = StdNarrowHostAdapter::with_sandbox_root(sandbox_root_for_explicit_path(path));
     save_omni_kv_via_narrow_host(&mut host, cap_bit(CAP_ID_DB_W), &path.to_string_lossy(), kv)
 }
 
@@ -748,7 +858,11 @@ pub(crate) fn serve_omni_http_batch_inner(
     let module = decode_omni_token_stream(&u16_stream)?;
     let combined_caps: CapMask = module.functions.iter().fold(0u16, |acc, f| acc | f.cap_mask);
 
-    let mut host = StdNarrowHostAdapter::new();
+    let mut host = if let Some(ref p) = db_file {
+        StdNarrowHostAdapter::with_sandbox_root(sandbox_root_for_explicit_path(p))
+    } else {
+        StdNarrowHostAdapter::new()
+    };
     let (listener_h, addr_str) = host.host_tcp_listen(combined_caps, bind_addr)?;
     let local_addr: std::net::SocketAddr = addr_str
         .parse()
@@ -882,3 +996,124 @@ pub fn run_omni_serve_cli(argv: &[String]) -> i32 {
         }
     }
 }
+
+/// Negative and positive selftests for capability-bound FS/DB sandboxing.
+/// Returns the number of checks passed (4: in-root write, `..` traversal, absolute escape, symlink escape).
+pub fn run_host_sandbox_selftests() -> Result<usize, String> {
+    let mut checks = 0usize;
+    let tmp = std::env::temp_dir().join(format!("omni_sandbox_{}_{}", std::process::id(), {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+    }));
+    std::fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
+    let root = tmp.join("root");
+    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    let caps = cap_bit(CAP_ID_FS) | cap_bit(CAP_ID_DB_R) | cap_bit(CAP_ID_DB_W);
+    let cleanup = |dir: &std::path::Path| {
+        let _ = std::fs::remove_dir_all(dir);
+    };
+
+    let expect_path_escape = |res: Result<u64, String>, kind: &str| -> Result<(), String> {
+        match res {
+            Ok(_) => {
+                cleanup(&tmp);
+                Err(format!("sandbox {kind} was not rejected"))
+            }
+            Err(e) if e.contains("error[PATH_ESCAPE]") => Ok(()),
+            Err(e) => {
+                cleanup(&tmp);
+                Err(format!("sandbox {kind} produced unexpected error: {e}"))
+            }
+        }
+    };
+
+    // 1. In-root access still works.
+    {
+        let mut host = StdNarrowHostAdapter::with_sandbox_root(&root);
+        let fh = match host.host_file_open(caps, "ok.kv", true) {
+            Ok(h) => h,
+            Err(e) => {
+                cleanup(&tmp);
+                return Err(format!("in-root host_file_open failed: {e}"));
+            }
+        };
+        if let Err(e) = host.host_file_write(caps, fh, b"hello") {
+            cleanup(&tmp);
+            return Err(format!("in-root host_file_write failed: {e}"));
+        }
+        if let Err(e) = host.host_file_close(caps, fh) {
+            cleanup(&tmp);
+            return Err(format!("in-root host_file_close failed: {e}"));
+        }
+        match std::fs::read(root.join("ok.kv")) {
+            Ok(bytes) if bytes == b"hello" => {}
+            Ok(bytes) => {
+                cleanup(&tmp);
+                return Err(format!("in-root write mismatch: {:?}", bytes));
+            }
+            Err(e) => {
+                cleanup(&tmp);
+                return Err(format!("in-root file missing after close: {e}"));
+            }
+        }
+        checks += 1;
+    }
+
+    // 2. `..` traversal is rejected before any open.
+    {
+        let mut host = StdNarrowHostAdapter::with_sandbox_root(&root);
+        expect_path_escape(host.host_file_open(caps, "../escape.kv", true), ".. traversal")?;
+        expect_path_escape(host.host_file_open(caps, "foo/../../escape.kv", false), "nested .. traversal")?;
+        checks += 1;
+    }
+
+    // 3. Absolute path outside the root is rejected.
+    {
+        let mut host = StdNarrowHostAdapter::with_sandbox_root(&root);
+        expect_path_escape(host.host_file_open(caps, "/etc/passwd", false), "absolute path")?;
+        checks += 1;
+    }
+
+    // 4. Symlink escape is rejected.
+    {
+        let mut host = StdNarrowHostAdapter::with_sandbox_root(&root);
+        let outside = tmp.join("outside_secret");
+        if let Err(e) = std::fs::write(&outside, b"secret") {
+            cleanup(&tmp);
+            return Err(format!("failed to write symlink target: {e}"));
+        }
+        let link = root.join("escape_link");
+        #[cfg(unix)]
+        {
+            if let Err(e) = std::os::unix::fs::symlink(&outside, &link) {
+                cleanup(&tmp);
+                return Err(format!("failed to create escape symlink: {e}"));
+            }
+            expect_path_escape(host.host_file_open(caps, "escape_link", false), "symlink escape")?;
+            let out_dir = tmp.join("out_dir");
+            if let Err(e) = std::fs::create_dir(&out_dir) {
+                cleanup(&tmp);
+                return Err(format!("failed to create symlink dir: {e}"));
+            }
+            if let Err(e) = std::fs::write(out_dir.join("x"), b"x") {
+                cleanup(&tmp);
+                return Err(format!("failed to write symlink dir file: {e}"));
+            }
+            let dir_link = root.join("dir_link");
+            if let Err(e) = std::os::unix::fs::symlink(&out_dir, &dir_link) {
+                cleanup(&tmp);
+                return Err(format!("failed to create dir symlink: {e}"));
+            }
+            expect_path_escape(host.host_file_open(caps, "dir_link/x", false), "dir symlink escape")?;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (outside, link, host);
+        }
+        checks += 1;
+    }
+
+    cleanup(&tmp);
+    Ok(checks)
+}
+

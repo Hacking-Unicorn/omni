@@ -2739,6 +2739,9 @@ fn main(x: i64, y: i64) -> i64 {
     // 13AR. Strengthening Phase S4: Hardening, Health Metrics & Friction Reduction
     checks += run_pure_core_phase_s4_metrics_and_friction_selftests()?;
 
+    // 13AS. Host FS/DB capability root-jail (PATH_ESCAPE)
+    checks += run_host_sandbox_selftests()?;
+
     Ok(checks)
 }
 
