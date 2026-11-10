@@ -1,4 +1,0 @@
-fn main(x: i64 @untrusted) -> i64 {
-    let safe_a = 1;
-    return x;
-}

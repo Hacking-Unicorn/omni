@@ -69,7 +69,7 @@ rustc -O omni_rust_bootstrap.rs -o omni_boot_bin
 ./omni_boot_bin pure-omni-diff
 
 # 4. Workspace 8-Crate Differential Selftest (339 Windows / 340 Linux checks)
-cd omni-workspace/omni-workspace
+cd omni-workspace
 cargo run -p omni-cli -- selftest
 cargo run -p omni-cli -- pure-omni-diff
 ```

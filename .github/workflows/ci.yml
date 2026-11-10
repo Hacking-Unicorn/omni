@@ -29,7 +29,7 @@ jobs:
           ./omni agent-driver --strict "fn main(a: int) -> trit { let d = a - 10; let g = egate(d); return g; }" 25
 
       - name: Build and run 8-crate Cargo workspace differential selftest (339/340 checks + pure-omni-diff + omni-harness & omni-agent-driver binaries)
-        working-directory: omni-workspace/omni-workspace
+        working-directory: omni-workspace
         env:
           CARGO_INCREMENTAL: "0"
         run: |

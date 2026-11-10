@@ -1,6 +1,6 @@
 # Omni Language, ISA, Verifier, VM, AOT Compiler & Model Harness
 
-> **Workspace Path Note:** The 8-crate Cargo workspace lives at [`omni-workspace/omni-workspace/`](./omni-workspace/omni-workspace/), while the standalone single-file reference compiler lives at the repository root in [`omni_rust_bootstrap.rs`](./omni_rust_bootstrap.rs) (compiles directly with `rustc -O omni_rust_bootstrap.rs -o omni` with no flags required).
+> **Workspace Path Note:** The 8-crate Cargo workspace lives at [`omni-workspace/`](./omni-workspace/), while the standalone single-file reference compiler lives at the repository root in [`omni_rust_bootstrap.rs`](./omni_rust_bootstrap.rs) (compiles directly with `rustc -O omni_rust_bootstrap.rs -o omni` with no flags required).
 
 Zero-dependency Rust implementation of the **Omni** 16-bit binary token ISA (`0x7F00..=0x7F7F`), static linear/capability/taint verifier with machine-readable error codes (`error[<CODE>]`) and 1-based `(line, col)` source spans, deterministic ternary & numeric VM (`OmniBinaryVm`) with both an in-VM host contract simulator and a live native TCP HTTP/1.1 + file-backed DB/KV host (`omni serve`: `route`, `req.param`, `db_query`, `db_get`, `kv_put`, `auth_verify`, `respond`), self-hosting Stage-1/Stage-2 `x86-64` ELF64 and 64-bit WebAssembly AOT backends (verified for the pure numeric/ternary/`@PACK5`/arena subset), `.omni` surface language compiler (`omni-lang`) with strict single-form mode (`#[strict]`), the version-locked model driver (`omni-harness`, contract `omni-harness-v1.0.0`), and the autonomous emit-and-repair agent driver (`omni-agent-driver`).
 
@@ -14,7 +14,7 @@ Zero-dependency Rust implementation of the **Omni** 16-bit binary token ISA (`0x
 - [`pure/`](./pure/) — Pure-Omni core compiler, static verifier, host runtime, tooling kernels, and multi-module self-host suite (`pure/compiler.omni`, `pure/verifier.omni`, `pure/host_runtime.omni`, `pure/tooling.omni`, `pure/selfhost_suite.omni`) plus 6 real programs in [`pure/programs/`](./pure/programs/) (`14,559` `u16` words `Gen-1 == Gen-2` across the 18-module closed suite).
 - [`std/`](./std/) — Pure-Omni standard library modules (`std/prelude.omni`, `std/math.omni`, `std/trit.omni`, `std/http.omni`, `std/pack5.omni`, `std/decision.omni`, `std/resource.omni`).
 - [`omni_rust_bootstrap.rs`](./omni_rust_bootstrap.rs) — Standalone single-file reference monolith (`378` self-test checks, `0` warnings).
-- [`omni-workspace/omni-workspace/`](./omni-workspace/omni-workspace/) — 8-crate Cargo workspace (`339` Windows / `340` Linux `x86-64` monolith-vs-workspace differential checks, `0` warnings):
+- [`omni-workspace/`](./omni-workspace/) — 8-crate Cargo workspace (`339` Windows / `340` Linux `x86-64` monolith-vs-workspace differential checks, `0` warnings):
   - `crates/omni-isa` — 128-opcode table (`0x7F00..=0x7F7F`), token ranges, contract version constants (`OMNI_HARNESS_CONTRACT_VERSION`, `OMNI_REPAIR_STRATEGIES_VERSION`, `OMNI_NARROW_HOST_VERSION`, `OMNI_ACCEPTANCE_SUITE_VERSION`, `OMNI_ERROR_CONTRACT_VERSION`, `OMNI_PHASE7_PURE_KERNEL_VERSION`), zero-allocation `@PACK5` (`5 trits/byte`) codec & direct ops, FNV-1a64 hashing.
   - `crates/omni-ir` — Binary token stream decoder (`decode_omni_token_stream`) and IR types.
   - `crates/omni-verifier` — Static capability bitmask, linear ownership/borrow/arena state machine, SSA, and `@UNTRUSTED` taint verifier (`verify_binary_function`, `verify_u16_stream`) emitting machine-readable `error[<CODE>]` diagnostics.
@@ -32,7 +32,7 @@ Zero-dependency Rust implementation of the **Omni** 16-bit binary token ISA (`0x
 
 ### 1. Run the 8-Crate Workspace Selftest (`339` / `340` Checks)
 ```powershell
-cd omni-workspace/omni-workspace
+cd omni-workspace
 $env:CARGO_INCREMENTAL=0; cargo build --workspace
 cargo run -p omni-cli -- selftest
 cargo run -p omni-cli -- pure-omni-diff

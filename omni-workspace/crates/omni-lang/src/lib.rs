@@ -6827,6 +6827,7 @@ pub fn run_acceptance_suite_selftest() -> Result<usize, String> {
     let cnt = run_omni_acceptance_diff(None)?;
     let candidate_paths = [
         std::path::Path::new("spec/acceptance/acceptance_manifest.json"),
+        std::path::Path::new("../spec/acceptance/acceptance_manifest.json"),
         std::path::Path::new("../../spec/acceptance/acceptance_manifest.json"),
     ];
     for p in &candidate_paths {

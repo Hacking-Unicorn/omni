@@ -1,7 +1,0 @@
-# GitHub Linguist — Recognize all .omni source files as Omni
-*.omni linguist-language=Omni
-*.omni linguist-detectable=true
-spec/acceptance/goldens/*.omni linguist-language=Omni
-spec/pure_self_host/*.omni linguist-language=Omni
-pure/**/*.omni linguist-language=Omni
-std/**/*.omni linguist-language=Omni
