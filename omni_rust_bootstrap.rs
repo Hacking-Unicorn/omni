@@ -5313,6 +5313,7 @@ pub fn compile_omni_surface_to_u16_with_sourcemap(
             cur_off += pkt.len();
         }
         let stream = pack_fn_module(&[], fn_id, &params, ret_ty, cap_mask, &ins_packets);
+        lockstep_shadow_verify("compile", &stream)?;
         Ok((stream, sm))
     } else {
         let mut stream = vec![TOK_MOD_BEGIN];
@@ -5341,6 +5342,7 @@ pub fn compile_omni_surface_to_u16_with_sourcemap(
             }
         }
         stream.push(TOK_MOD_END);
+        lockstep_shadow_verify("compile", &stream)?;
         Ok((stream, sm))
     }
 }
@@ -5565,7 +5567,7 @@ pub fn execute_omni_surface_program_with_budgets(
         (None, None) => None,
     };
     let (u16_stream, sm) = compile_omni_surface_via_pure_omni_frontend_with_sourcemap(&wrapped, false)?;
-    for rep in verify_u16_stream(&u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
+    for rep in verify_u16_stream_lockstep("run", &u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
         if !rep.passed {
             let first = rep.errors.first().cloned().unwrap_or_default();
             let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
@@ -5604,7 +5606,7 @@ pub fn execute_omni_surface_aot_first(
     let wrapped = wrap_omni_surface_snippet(src);
     let (attr_steps, attr_mem) = extract_omni_surface_budgets(&wrapped);
     let (u16_stream, sm) = compile_omni_surface_via_pure_omni_frontend_with_sourcemap(&wrapped, false)?;
-    for rep in verify_u16_stream(&u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
+    for rep in verify_u16_stream_lockstep("run", &u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
         if !rep.passed {
             let first = rep.errors.first().cloned().unwrap_or_default();
             let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
@@ -5709,7 +5711,7 @@ pub fn compile_omni_surface_via_stage1_to_elf(
 ) -> Result<Vec<u8>, String> {
     let wrapped = wrap_omni_surface_snippet(src);
     let u16_stream = compile_omni_surface_to_u16(&wrapped)?;
-    for rep in verify_u16_stream(&u16_stream)? {
+    for rep in verify_u16_stream_lockstep("run", &u16_stream)? {
         if !rep.passed {
             let first = rep.errors.first().cloned().unwrap_or_default();
             return Err(format!("{} (fn #{}: {:?})", first, rep.fn_idx, rep.errors));
@@ -7980,7 +7982,7 @@ pub fn serve_omni_http_via_narrow_host<H: OmniNarrowHost>(
     }
     let (u16_stream, sm) = compile_omni_surface_via_pure_omni_frontend_with_sourcemap(src, false)?;
     if let Err(kernel_err) = verify_module_via_phase7_pure_omni_kernel(&u16_stream) {
-        for rep in verify_u16_stream(&u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
+        for rep in verify_u16_stream_lockstep("serve", &u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
             if !rep.passed {
                 let first = rep.errors.first().cloned().unwrap_or_default();
                 let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
@@ -7989,7 +7991,7 @@ pub fn serve_omni_http_via_narrow_host<H: OmniNarrowHost>(
         }
         return Err(annotate_omni_error_with_sourcemap(&kernel_err, &sm));
     }
-    for rep in verify_u16_stream(&u16_stream)? {
+    for rep in verify_u16_stream_lockstep("serve", &u16_stream)? {
         if !rep.passed {
             let first = rep.errors.first().cloned().unwrap_or_default();
             let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
@@ -8157,7 +8159,7 @@ pub fn handle_omni_http_request(
     }
     let (u16_stream, sm) = compile_omni_surface_via_pure_omni_frontend_with_sourcemap(src, false)?;
     if let Err(kernel_err) = verify_module_via_phase7_pure_omni_kernel(&u16_stream) {
-        for rep in verify_u16_stream(&u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
+        for rep in verify_u16_stream_lockstep("serve", &u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
             if !rep.passed {
                 let first = rep.errors.first().cloned().unwrap_or_default();
                 let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
@@ -8166,7 +8168,7 @@ pub fn handle_omni_http_request(
         }
         return Err(annotate_omni_error_with_sourcemap(&kernel_err, &sm));
     }
-    for rep in verify_u16_stream(&u16_stream)? {
+    for rep in verify_u16_stream_lockstep("serve", &u16_stream)? {
         if !rep.passed {
             let first = rep.errors.first().cloned().unwrap_or_default();
             let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
@@ -8307,7 +8309,7 @@ fn serve_omni_http_batch_inner(
     }
     let (u16_stream, sm) = compile_omni_surface_via_pure_omni_frontend_with_sourcemap(src, false)?;
     if let Err(kernel_err) = verify_module_via_phase7_pure_omni_kernel(&u16_stream) {
-        for rep in verify_u16_stream(&u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
+        for rep in verify_u16_stream_lockstep("serve", &u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
             if !rep.passed {
                 let first = rep.errors.first().cloned().unwrap_or_default();
                 let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
@@ -8316,7 +8318,7 @@ fn serve_omni_http_batch_inner(
         }
         return Err(annotate_omni_error_with_sourcemap(&kernel_err, &sm));
     }
-    for rep in verify_u16_stream(&u16_stream)? {
+    for rep in verify_u16_stream_lockstep("serve", &u16_stream)? {
         if !rep.passed {
             let first = rep.errors.first().cloned().unwrap_or_default();
             let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
@@ -9641,7 +9643,7 @@ pub fn execute_omni_surface_via_pure_omni_driver(
 
     // Run both the Pure-Omni verifier kernel and binary offset verifier so exact SurfaceSourceMap spans are preserved
     if let Err(kernel_err) = verify_module_via_phase7_pure_omni_kernel(&u16_stream) {
-        for rep in verify_u16_stream(&u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
+        for rep in verify_u16_stream_lockstep("run", &u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
             if !rep.passed {
                 let first = rep.errors.first().cloned().unwrap_or_default();
                 let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
@@ -9650,7 +9652,7 @@ pub fn execute_omni_surface_via_pure_omni_driver(
         }
         return Err(annotate_omni_error_with_sourcemap(&kernel_err, &sm));
     }
-    for rep in verify_u16_stream(&u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
+    for rep in verify_u16_stream_lockstep("run", &u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
         if !rep.passed {
             let first = rep.errors.first().cloned().unwrap_or_default();
             let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
@@ -10023,7 +10025,7 @@ pub fn serve_omni_http_via_pure_omni_host<H: OmniNarrowHost>(
     }
     let (u16_stream, sm) = compile_omni_surface_via_pure_omni_frontend_with_sourcemap(src, false)?;
     if let Err(kernel_err) = verify_module_via_phase7_pure_omni_kernel(&u16_stream) {
-        for rep in verify_u16_stream(&u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
+        for rep in verify_u16_stream_lockstep("serve", &u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
             if !rep.passed {
                 let first = rep.errors.first().cloned().unwrap_or_default();
                 let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
@@ -10032,7 +10034,7 @@ pub fn serve_omni_http_via_pure_omni_host<H: OmniNarrowHost>(
         }
         return Err(annotate_omni_error_with_sourcemap(&kernel_err, &sm));
     }
-    for rep in verify_u16_stream(&u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
+    for rep in verify_u16_stream_lockstep("serve", &u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
         if !rep.passed {
             let first = rep.errors.first().cloned().unwrap_or_default();
             let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
@@ -11641,18 +11643,20 @@ pub fn rust_verify_as_engine_report(stream: &[u16]) -> OmniEngineModuleReport {
 }
 
 fn omni_verifier_engine_module() -> Result<BinModule, String> {
-    let u16_stream = compile_omni_surface_strict_to_u16(OMNI_VERIFIER_ENGINE_SURFACE)?;
-    let decoded = decode_omni_token_stream(&u16_stream)?;
-    for f in &decoded.functions {
-        let rep = verify_binary_function(f);
-        if !rep.passed {
-            return Err(format!(
-                "Omni verifier engine failed Rust binary verification (fn #{}): {:?}",
-                f.fn_idx, rep.errors
-            ));
+    with_lockstep_suspended(|| {
+        let u16_stream = compile_omni_surface_strict_to_u16(OMNI_VERIFIER_ENGINE_SURFACE)?;
+        let decoded = decode_omni_token_stream(&u16_stream)?;
+        for f in &decoded.functions {
+            let rep = verify_binary_function(f);
+            if !rep.passed {
+                return Err(format!(
+                    "Omni verifier engine failed Rust binary verification (fn #{}): {:?}",
+                    f.fn_idx, rep.errors
+                ));
+            }
         }
-    }
-    Ok(decoded)
+        Ok(decoded)
+    })
 }
 
 pub fn verify_u16_stream_via_omni_engine(stream: &[u16]) -> Result<OmniEngineModuleReport, String> {
@@ -11745,6 +11749,231 @@ pub fn compare_rust_and_omni_verifier(label: &str, stream: &[u16]) -> Result<(),
         }
     }
     Ok(())
+}
+
+// ==============================================================================
+// LOCKSTEP SHADOW MODE
+// Every compile / run / serve invocation runs the Rust verifier and the Omni
+// verifier engine and hard-errors on any verdict, error-code, or span mismatch.
+// The engine's own compile is excluded (reentrancy / OnceLock init).
+// ==============================================================================
+
+use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static LOCKSTEP_COMPILE_COUNT: AtomicU64 = AtomicU64::new(0);
+static LOCKSTEP_RUN_COUNT: AtomicU64 = AtomicU64::new(0);
+static LOCKSTEP_SERVE_COUNT: AtomicU64 = AtomicU64::new(0);
+static LOCKSTEP_LAST_RUST_NS: AtomicU64 = AtomicU64::new(0);
+static LOCKSTEP_LAST_SHADOW_NS: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    static LOCKSTEP_SUSPENDED: Cell<bool> = Cell::new(false);
+    static LOCKSTEP_INJECT_PATH: Cell<Option<&'static str>> = Cell::new(None);
+}
+
+fn lockstep_counter(path: &str) -> &'static AtomicU64 {
+    match path {
+        "compile" => &LOCKSTEP_COMPILE_COUNT,
+        "run" => &LOCKSTEP_RUN_COUNT,
+        "serve" => &LOCKSTEP_SERVE_COUNT,
+        _ => &LOCKSTEP_RUN_COUNT,
+    }
+}
+
+pub fn reset_lockstep_counters() {
+    LOCKSTEP_COMPILE_COUNT.store(0, Ordering::SeqCst);
+    LOCKSTEP_RUN_COUNT.store(0, Ordering::SeqCst);
+    LOCKSTEP_SERVE_COUNT.store(0, Ordering::SeqCst);
+}
+
+pub fn lockstep_invocation_count(path: &str) -> u64 {
+    lockstep_counter(path).load(Ordering::SeqCst)
+}
+
+pub fn set_lockstep_inject_path(path: Option<&'static str>) {
+    LOCKSTEP_INJECT_PATH.with(|c| c.set(path));
+}
+
+/// `(rust_only_ns, rust_plus_omni_ns)` averaged in the lockstep selftest, or last call.
+pub fn last_lockstep_overhead_ns() -> (u64, u64) {
+    (
+        LOCKSTEP_LAST_RUST_NS.load(Ordering::SeqCst),
+        LOCKSTEP_LAST_SHADOW_NS.load(Ordering::SeqCst),
+    )
+}
+
+fn with_lockstep_suspended<T>(f: impl FnOnce() -> T) -> T {
+    LOCKSTEP_SUSPENDED.with(|s| {
+        let prev = s.get();
+        s.set(true);
+        let out = f();
+        s.set(prev);
+        out
+    })
+}
+
+fn format_lockstep_mismatch(path: &str, rust: &OmniEngineModuleReport, omni: &OmniEngineModuleReport) -> String {
+    format!(
+        "error[LOCKSTEP_MISMATCH] line 1, col 1: path={path}: Rust and Omni verifiers disagree rust_decode={:?} omni_decode={:?} rust_fns={:?} omni_fns={:?}",
+        rust.decode_error, omni.decode_error, rust.functions, omni.functions
+    )
+}
+
+fn reports_agree(rust: &OmniEngineModuleReport, omni: &OmniEngineModuleReport) -> bool {
+    if rust.decode_error.is_some() != omni.decode_error.is_some() {
+        return false;
+    }
+    if let (Some((rc, ro)), Some((oc, oo))) = (rust.decode_error, omni.decode_error) {
+        return rc == oc && (ro == 0 || ro == oo);
+    }
+    if rust.functions.len() != omni.functions.len() {
+        return false;
+    }
+    rust.functions.iter().zip(omni.functions.iter()).all(|(rf, of)| {
+        rf.fn_idx == of.fn_idx
+            && rf.passed == of.passed
+            && rf.errors.len() == of.errors.len()
+            && rf.errors.iter().zip(of.errors.iter()).all(|(re, oe)| re.code == oe.code && re.offset == oe.offset)
+    })
+}
+
+fn inject_disagreement(report: &OmniEngineModuleReport) -> OmniEngineModuleReport {
+    let mut out = report.clone();
+    if let Some((code, off)) = out.decode_error {
+        out.decode_error = Some((if code == 3006 { 3001 } else { 3006 }, off));
+        return out;
+    }
+    if let Some(f) = out.functions.first_mut() {
+        f.passed = !f.passed;
+        if f.errors.is_empty() {
+            f.errors.push(OmniEngineError {
+                code: 9999,
+                name: "UNKNOWN",
+                offset: 0,
+            });
+        } else {
+            f.errors.clear();
+        }
+        return out;
+    }
+    out.decode_error = Some((3006, 0));
+    out
+}
+
+/// Run Rust and Omni verifiers in lockstep. Hard-error on any disagreement.
+/// Skipped while the Omni engine module itself is being compiled.
+pub fn lockstep_shadow_verify(path: &str, stream: &[u16]) -> Result<(), String> {
+    if LOCKSTEP_SUSPENDED.with(|s| s.get()) {
+        return Ok(());
+    }
+    let t_rust = Instant::now();
+    let rust = rust_verify_as_engine_report(stream);
+    let rust_ns = t_rust.elapsed().as_nanos() as u64;
+    let t_omni = Instant::now();
+    let mut omni = verify_u16_stream_via_omni_engine(stream)?;
+    let omni_ns = t_omni.elapsed().as_nanos() as u64;
+    let shadow_ns = rust_ns.saturating_add(omni_ns);
+    LOCKSTEP_LAST_RUST_NS.store(rust_ns, Ordering::SeqCst);
+    LOCKSTEP_LAST_SHADOW_NS.store(shadow_ns, Ordering::SeqCst);
+
+    let inject = LOCKSTEP_INJECT_PATH.with(|c| c.get()) == Some(path);
+    if inject {
+        omni = inject_disagreement(&omni);
+    }
+    lockstep_counter(path).fetch_add(1, Ordering::SeqCst);
+    if !reports_agree(&rust, &omni) {
+        return Err(format_lockstep_mismatch(path, &rust, &omni));
+    }
+    Ok(())
+}
+
+/// `verify_u16_stream` after a lockstep agreement check (used by run and serve).
+pub fn verify_u16_stream_lockstep(path: &str, stream: &[u16]) -> Result<Vec<BinVerificationReport>, String> {
+    lockstep_shadow_verify(path, stream)?;
+    verify_u16_stream(stream)
+}
+
+pub fn run_lockstep_shadow_selftests() -> Result<usize, String> {
+    let mut checks = 0usize;
+    let ok_src = "#[strict] fn main(a: i64) -> i64 { let b: i64 = a + 1; return b; }";
+    let route_src = "#[strict]\n#[cap(NET)]\nroute GET /ping/:x (req: i64) {\n    let x: i64 = req.param(\"x\");\n    respond(200, x + 1);\n}";
+
+    // Warm the engine so overhead numbers are steady-state, not first-compile.
+    let _ = compile_omni_surface_to_u16(ok_src)?;
+
+    reset_lockstep_counters();
+    set_lockstep_inject_path(None);
+    let _stream = compile_omni_surface_to_u16(ok_src)
+        .map_err(|e| format!("lockstep compile path failed: {e}"))?;
+    if lockstep_invocation_count("compile") == 0 {
+        return Err(String::from("lockstep was not invoked on the compile path"));
+    }
+    checks += 1;
+
+    reset_lockstep_counters();
+    let got = execute_omni_surface_program(ok_src, vec![OmniValue::Int(41)])
+        .map_err(|e| format!("lockstep run path failed: {e}"))?;
+    if got != OmniValue::Int(42) {
+        return Err(format!("lockstep run returned {got:?}, want Int(42)"));
+    }
+    if lockstep_invocation_count("run") == 0 {
+        return Err(String::from("lockstep was not invoked on the run path"));
+    }
+    checks += 1;
+
+    reset_lockstep_counters();
+    let mut kv = BTreeMap::new();
+    let resp = handle_omni_http_request(route_src, "GET", "/ping/5", &mut kv)
+        .map_err(|e| format!("lockstep serve path failed: {e}"))?;
+    if resp.status != 200 {
+        return Err(format!("lockstep serve returned status {}, want 200 (body={})", resp.status, resp.body));
+    }
+    if lockstep_invocation_count("serve") == 0 {
+        return Err(String::from("lockstep was not invoked on the serve path"));
+    }
+    checks += 1;
+
+    for path in ["compile", "run", "serve"] {
+        set_lockstep_inject_path(Some(path));
+        let err = match path {
+            "compile" => compile_omni_surface_to_u16(ok_src).err(),
+            "run" => execute_omni_surface_program(ok_src, vec![OmniValue::Int(1)]).err(),
+            _ => handle_omni_http_request(route_src, "GET", "/ping/1", &mut BTreeMap::new()).err(),
+        };
+        set_lockstep_inject_path(None);
+        let err = err.ok_or_else(|| format!("lockstep inject on {path} did not fail"))?;
+        if !err.contains("error[LOCKSTEP_MISMATCH]") || !err.contains(&format!("path={path}")) {
+            return Err(format!("lockstep inject on {path} produced the wrong diagnostic: {err}"));
+        }
+        checks += 1;
+    }
+
+    set_lockstep_inject_path(None);
+    let stream = compile_omni_surface_to_u16(ok_src)?;
+    let warmup = 5usize;
+    let iters = 25usize;
+    for _ in 0..warmup {
+        let _ = rust_verify_as_engine_report(&stream);
+        lockstep_shadow_verify("compile", &stream)?;
+    }
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        let _ = rust_verify_as_engine_report(&stream);
+    }
+    let rust_ns = t0.elapsed().as_nanos() as u64 / iters as u64;
+    let t1 = Instant::now();
+    for _ in 0..iters {
+        lockstep_shadow_verify("compile", &stream)?;
+    }
+    let shadow_ns = t1.elapsed().as_nanos() as u64 / iters as u64;
+    LOCKSTEP_LAST_RUST_NS.store(rust_ns, Ordering::SeqCst);
+    LOCKSTEP_LAST_SHADOW_NS.store(shadow_ns, Ordering::SeqCst);
+    if shadow_ns == 0 {
+        return Err(String::from("lockstep overhead measurement produced a zero shadow time"));
+    }
+    checks += 1;
+    Ok(checks)
 }
 
 /// Differential suite: every existing verifier corpus / negative case, plus fuzzed streams.
@@ -12812,6 +13041,9 @@ fn main(x: i64, y: i64) -> i64 {
 
     // 13AU. Value-returning if_pos/match_trit join slot is a single contiguous SSA dest
     checks += run_if_pos_join_slot_selftests()?;
+
+    // 13AV. Lockstep shadow mode on compile / run / serve
+    checks += run_lockstep_shadow_selftests()?;
 
     Ok(checks)
 }

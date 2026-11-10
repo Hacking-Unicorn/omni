@@ -3311,6 +3311,7 @@ pub fn compile_omni_surface_to_u16_with_sourcemap(
             cur_off += pkt.len();
         }
         let stream = pack_fn_module(&[], fn_id, &params, ret_ty, cap_mask, &ins_packets);
+        lockstep_shadow_verify("compile", &stream)?;
         Ok((stream, sm))
     } else {
         let mut stream = vec![TOK_MOD_BEGIN];
@@ -3339,6 +3340,7 @@ pub fn compile_omni_surface_to_u16_with_sourcemap(
             }
         }
         stream.push(TOK_MOD_END);
+        lockstep_shadow_verify("compile", &stream)?;
         Ok((stream, sm))
     }
 }
@@ -3563,7 +3565,7 @@ pub fn execute_omni_surface_program_with_budgets(
         (None, None) => None,
     };
     let (u16_stream, sm) = compile_omni_surface_via_pure_omni_frontend_with_sourcemap(&wrapped, false)?;
-    for rep in verify_u16_stream(&u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
+    for rep in verify_u16_stream_lockstep("run", &u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
         if !rep.passed {
             let first = rep.errors.first().cloned().unwrap_or_default();
             let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
@@ -3602,7 +3604,7 @@ pub fn execute_omni_surface_aot_first(
     let wrapped = wrap_omni_surface_snippet(src);
     let (attr_steps, attr_mem) = extract_omni_surface_budgets(&wrapped);
     let (u16_stream, sm) = compile_omni_surface_via_pure_omni_frontend_with_sourcemap(&wrapped, false)?;
-    for rep in verify_u16_stream(&u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
+    for rep in verify_u16_stream_lockstep("run", &u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
         if !rep.passed {
             let first = rep.errors.first().cloned().unwrap_or_default();
             let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
@@ -3707,7 +3709,7 @@ pub fn compile_omni_surface_via_stage1_to_elf(
 ) -> Result<Vec<u8>, String> {
     let wrapped = wrap_omni_surface_snippet(src);
     let u16_stream = compile_omni_surface_to_u16(&wrapped)?;
-    for rep in verify_u16_stream(&u16_stream)? {
+    for rep in verify_u16_stream_lockstep("run", &u16_stream)? {
         if !rep.passed {
             let first = rep.errors.first().cloned().unwrap_or_default();
             return Err(format!("{} (fn #{}: {:?})", first, rep.fn_idx, rep.errors));

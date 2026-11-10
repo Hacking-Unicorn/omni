@@ -512,7 +512,7 @@ pub fn serve_omni_http_via_narrow_host<H: OmniNarrowHost>(
     }
     let (u16_stream, sm) = compile_omni_surface_via_pure_omni_frontend_with_sourcemap(src, false)?;
     if let Err(kernel_err) = verify_module_via_phase7_pure_omni_kernel(&u16_stream) {
-        for rep in verify_u16_stream(&u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
+        for rep in verify_u16_stream_lockstep("serve", &u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
             if !rep.passed {
                 let first = rep.errors.first().cloned().unwrap_or_default();
                 let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
@@ -521,7 +521,7 @@ pub fn serve_omni_http_via_narrow_host<H: OmniNarrowHost>(
         }
         return Err(annotate_omni_error_with_sourcemap(&kernel_err, &sm));
     }
-    for rep in verify_u16_stream(&u16_stream)? {
+    for rep in verify_u16_stream_lockstep("serve", &u16_stream)? {
         if !rep.passed {
             let first = rep.errors.first().cloned().unwrap_or_default();
             let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
@@ -689,7 +689,7 @@ pub fn handle_omni_http_request(
     }
     let (u16_stream, sm) = compile_omni_surface_via_pure_omni_frontend_with_sourcemap(src, false)?;
     if let Err(kernel_err) = verify_module_via_phase7_pure_omni_kernel(&u16_stream) {
-        for rep in verify_u16_stream(&u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
+        for rep in verify_u16_stream_lockstep("serve", &u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
             if !rep.passed {
                 let first = rep.errors.first().cloned().unwrap_or_default();
                 let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
@@ -698,7 +698,7 @@ pub fn handle_omni_http_request(
         }
         return Err(annotate_omni_error_with_sourcemap(&kernel_err, &sm));
     }
-    for rep in verify_u16_stream(&u16_stream)? {
+    for rep in verify_u16_stream_lockstep("serve", &u16_stream)? {
         if !rep.passed {
             let first = rep.errors.first().cloned().unwrap_or_default();
             let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
@@ -839,7 +839,7 @@ pub(crate) fn serve_omni_http_batch_inner(
     }
     let (u16_stream, sm) = compile_omni_surface_via_pure_omni_frontend_with_sourcemap(src, false)?;
     if let Err(kernel_err) = verify_module_via_phase7_pure_omni_kernel(&u16_stream) {
-        for rep in verify_u16_stream(&u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
+        for rep in verify_u16_stream_lockstep("serve", &u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
             if !rep.passed {
                 let first = rep.errors.first().cloned().unwrap_or_default();
                 let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
@@ -848,7 +848,7 @@ pub(crate) fn serve_omni_http_batch_inner(
         }
         return Err(annotate_omni_error_with_sourcemap(&kernel_err, &sm));
     }
-    for rep in verify_u16_stream(&u16_stream)? {
+    for rep in verify_u16_stream_lockstep("serve", &u16_stream)? {
         if !rep.passed {
             let first = rep.errors.first().cloned().unwrap_or_default();
             let annotated = annotate_omni_error_with_sourcemap(&first, &sm);

@@ -244,7 +244,7 @@ pub fn execute_omni_surface_via_pure_omni_driver(
 
     // Run both the Pure-Omni verifier kernel and binary offset verifier so exact SurfaceSourceMap spans are preserved
     if let Err(kernel_err) = verify_module_via_phase7_pure_omni_kernel(&u16_stream) {
-        for rep in verify_u16_stream(&u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
+        for rep in verify_u16_stream_lockstep("run", &u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
             if !rep.passed {
                 let first = rep.errors.first().cloned().unwrap_or_default();
                 let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
@@ -253,7 +253,7 @@ pub fn execute_omni_surface_via_pure_omni_driver(
         }
         return Err(annotate_omni_error_with_sourcemap(&kernel_err, &sm));
     }
-    for rep in verify_u16_stream(&u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
+    for rep in verify_u16_stream_lockstep("run", &u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
         if !rep.passed {
             let first = rep.errors.first().cloned().unwrap_or_default();
             let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
@@ -626,7 +626,7 @@ pub fn serve_omni_http_via_pure_omni_host<H: OmniNarrowHost>(
     }
     let (u16_stream, sm) = compile_omni_surface_via_pure_omni_frontend_with_sourcemap(src, false)?;
     if let Err(kernel_err) = verify_module_via_phase7_pure_omni_kernel(&u16_stream) {
-        for rep in verify_u16_stream(&u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
+        for rep in verify_u16_stream_lockstep("serve", &u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
             if !rep.passed {
                 let first = rep.errors.first().cloned().unwrap_or_default();
                 let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
@@ -635,7 +635,7 @@ pub fn serve_omni_http_via_pure_omni_host<H: OmniNarrowHost>(
         }
         return Err(annotate_omni_error_with_sourcemap(&kernel_err, &sm));
     }
-    for rep in verify_u16_stream(&u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
+    for rep in verify_u16_stream_lockstep("serve", &u16_stream).map_err(|e| annotate_omni_error_with_sourcemap(&e, &sm))? {
         if !rep.passed {
             let first = rep.errors.first().cloned().unwrap_or_default();
             let annotated = annotate_omni_error_with_sourcemap(&first, &sm);
@@ -2753,6 +2753,9 @@ fn main(x: i64, y: i64) -> i64 {
 
     // 13AU. Value-returning if_pos/match_trit join slot is a single contiguous SSA dest
     checks += run_if_pos_join_slot_selftests()?;
+
+    // 13AV. Lockstep shadow mode on compile / run / serve
+    checks += run_lockstep_shadow_selftests()?;
 
     Ok(checks)
 }
