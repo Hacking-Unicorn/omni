@@ -12484,6 +12484,75 @@ pub fn run_if_pos_join_slot_selftests() -> Result<usize, String> {
     Ok(checks)
 }
 
+// ==============================================================================
+// 13AX/13AY. FROZEN BOOTSTRAP HASH PIN (P0) + FOUR-BACKEND DIFFERENTIAL HARNESS
+// ==============================================================================
+//
+// Test-only host code. Nothing in this section feeds a hashed stream: it reads the
+// Stage-1 compiler stream / Phase-D bootstrap / core-suite stream and hashes them, and it
+// runs ordinary test programs through the four backends. It must never be referenced
+// from `build_step7_stage1_compiler_stream`, `lookup_omni_stdlib_module`,
+// `PURE_OMNI_CORE_SUITE_MODULES`, or any `PHASE_D_*` artifact.
+
+/// The frozen bootstrap hashes (FNV-1a64). Documented in `spec.md:94,191`,
+/// `omni_progress_checklist.md:5-7`, `spec/PURE_SELF_HOST_ROADMAP.md:53`. Before this pin,
+/// the code only asserted self-consistency (gen1 == gen2, Stage-1 == Stage-2), so a change
+/// that moved one of these values passed every test. Re-freezing any of them is an explicit,
+/// reviewed decision: update the constant here in the same commit and say why.
+pub const OMNI_FROZEN_BOOTSTRAP_HASHES: &[(&str, u64)] = &[
+    ("stage1_compiler_bc", 0x677F57AE71D28FED),
+    ("stage1_compiler_elf", 0xEAFC81F46B482FF8),
+    ("phase_d_gen1_bc", 0x23B8D17257CCA9C4),
+    ("phase_d_gen1_elf", 0xE221085777B8AC47),
+    ("pure_core_suite_bc", 0x78462AE4C81DF408),
+];
+
+/// Recomputes every frozen bootstrap artifact hash exactly the way the shipping commands
+/// build them (`fixed-point`: Stage-1 bc + `compile_pure_u16_to_x86_64_elf_with_args(.., 45, 40, 90)`;
+/// `run_phase_d_pure_omni_selfhost_bootstrap`; `build_pure_omni_core_suite_stream`).
+/// Returns `(name, artifact_size, fnv1a64)` in `OMNI_FROZEN_BOOTSTRAP_HASHES` order.
+pub fn compute_omni_frozen_bootstrap_hashes() -> Result<Vec<(&'static str, usize, u64)>, String> {
+    let mut out: Vec<(&'static str, usize, u64)> = Vec::new();
+    let s1 = build_step7_stage1_compiler_stream();
+    let s1_bc = encode_u16_stream_to_bytes(&s1);
+    out.push(("stage1_compiler_bc", s1_bc.len(), fnv1a_64_hash(&s1_bc)));
+    let s1_elf = compile_pure_u16_to_x86_64_elf_with_args(&s1, 45, 40, 90)?;
+    out.push(("stage1_compiler_elf", s1_elf.len(), fnv1a_64_hash(&s1_elf)));
+    let (g1_u16, g2_u16, g1_elf, g2_elf) = run_phase_d_pure_omni_selfhost_bootstrap()?;
+    if g1_u16 != g2_u16 || g1_elf != g2_elf {
+        return Err(String::from("hash-pin: Phase D Generation-1 != Generation-2"));
+    }
+    let g1_bc = encode_u16_stream_to_bytes(&g1_u16);
+    out.push(("phase_d_gen1_bc", g1_bc.len(), fnv1a_64_hash(&g1_bc)));
+    out.push(("phase_d_gen1_elf", g1_elf.len(), fnv1a_64_hash(&g1_elf)));
+    let suite = build_pure_omni_core_suite_stream()?;
+    let suite_bc = encode_u16_stream_to_bytes(&suite);
+    out.push(("pure_core_suite_bc", suite_bc.len(), fnv1a_64_hash(&suite_bc)));
+    Ok(out)
+}
+
+/// P0 `frozen_hash_pin`: every frozen bootstrap hash must equal its pinned constant.
+pub fn run_frozen_bootstrap_hash_pin_selftests() -> Result<usize, String> {
+    let got = compute_omni_frozen_bootstrap_hashes()?;
+    if got.len() != OMNI_FROZEN_BOOTSTRAP_HASHES.len() {
+        return Err(String::from("hash-pin: artifact count mismatch"));
+    }
+    let mut bad: Vec<String> = Vec::new();
+    for (i, &(name, want)) in OMNI_FROZEN_BOOTSTRAP_HASHES.iter().enumerate() {
+        let (gname, size, h) = got[i];
+        if gname != name || h != want {
+            bad.push(format!("{name}: got 0x{h:016X} ({size} B), frozen 0x{want:016X}"));
+        }
+    }
+    if !bad.is_empty() {
+        return Err(format!(
+            "error[FROZEN_HASH_MOVED] frozen bootstrap hash moved: {}. Re-freezing is a reviewed decision; update OMNI_FROZEN_BOOTSTRAP_HASHES only with explicit sign-off.",
+            bad.join("; ")
+        ));
+    }
+    Ok(OMNI_FROZEN_BOOTSTRAP_HASHES.len())
+}
+
 pub fn run_ai_first_surface_selftests() -> Result<usize, String> {
     let mut checks = 0usize;
 
@@ -13193,6 +13262,9 @@ fn main(x: i64, y: i64) -> i64 {
 
     // 13AW. Vera P1 byte-readback sibling (VM + Wasm assert; x86/Stage-1 native run)
     checks += run_byte_readback_parity_selftests()?;
+
+    // 13AX. P0 frozen bootstrap hash pin (0x677F.., 0xEAFC.., 0x23B8../0xE221.., 0x7846..)
+    checks += run_frozen_bootstrap_hash_pin_selftests()?;
 
     Ok(checks)
 }
@@ -18546,6 +18618,28 @@ fn main() {
             }
             "acceptance-diff" | "--acceptance-diff" => {
                 std::process::exit(run_omni_acceptance_diff_cli(&cli_args[2..]));
+            }
+            "hash-pin" | "--hash-pin" => {
+                match compute_omni_frozen_bootstrap_hashes() {
+                    Ok(hs) => {
+                        let mut ok = true;
+                        for (i, (name, size, h)) in hs.iter().enumerate() {
+                            let want = OMNI_FROZEN_BOOTSTRAP_HASHES[i].1;
+                            let tag = if *h == want { "OK  " } else { ok = false; "MOVED" };
+                            println!("{} {:<20} {:>7} B  FNV-1a64=0x{:016X}  frozen=0x{:016X}", tag, name, size, h, want);
+                        }
+                        if ok {
+                            println!("[HASH-PIN PASS] all {} frozen bootstrap hashes unchanged", hs.len());
+                            return;
+                        }
+                        eprintln!("[HASH-PIN FAIL] a frozen bootstrap hash moved");
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        eprintln!("[HASH-PIN ERROR] {}", e);
+                        std::process::exit(2);
+                    }
+                }
             }
             "pure-driver" | "--pure-driver" => {
                 std::process::exit(run_pure_omni_driver_cli(&cli_args[2..]));
