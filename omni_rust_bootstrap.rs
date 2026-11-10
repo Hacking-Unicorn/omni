@@ -12585,6 +12585,9 @@ pub enum DiffObs {
     Panic(String),
     /// Backend refused to compile the program (gate, unsupported opcode, multi-function, ...).
     Unsupported(String),
+    /// The shared frontend/assembler or the binary verifier rejected the program, so no
+    /// backend ran it. Recorded identically for all four backends.
+    Rejected(String),
     /// Native execution not possible on this host.
     NativeUnavailable,
 }
@@ -12606,6 +12609,7 @@ impl DiffObs {
             DiffObs::RunErr(e) => format!("ERR {}", e),
             DiffObs::Panic(e) => format!("PANIC {}", e),
             DiffObs::Unsupported(e) => format!("UNSUPPORTED {}", e),
+            DiffObs::Rejected(e) => format!("REJECTED {}", e),
             DiffObs::NativeUnavailable => String::from("NATIVE-UNAVAILABLE"),
         }
     }
@@ -12678,17 +12682,57 @@ fn diff4_native_obs(elf: &[u8], tag: &str) -> DiffObs {
     }
 }
 
+/// Stage-1 leg of the harness on an already-built u16 stream: the same gates and the same
+/// Stage-1 self-compiler invocation as `compile_omni_surface_via_stage1_to_elf`, minus the frontend.
+pub fn compile_u16_via_stage1_to_elf_for_diff(u16_stream: &[u16], arg0: i64, arg1: i64, arg2: i64) -> Result<Vec<u8>, String> {
+    for rep in verify_u16_stream_lockstep("run", u16_stream)? {
+        if !rep.passed {
+            let first = rep.errors.first().cloned().unwrap_or_default();
+            return Err(format!("{} (fn #{}: {:?})", first, rep.fn_idx, rep.errors));
+        }
+    }
+    let module = decode_omni_token_stream(u16_stream)?;
+    if module.functions.len() != 1 {
+        return Err(String::from("Stage-1 ELF64 emitter requires a single-function module"));
+    }
+    for ins in &module.functions[0].instructions {
+        if !is_x86_64_aot_supported_opcode(ins.op_tok) {
+            return Err(format!("Unsupported opcode 0x{:04X} in Stage-1 ELF64 emitter", ins.op_tok));
+        }
+    }
+    let s1_stream = build_step7_stage1_compiler_stream();
+    let s1_mod = decode_omni_token_stream(&s1_stream)?;
+    let mut vm = OmniBinaryVm::new();
+    let res = vm.execute_function(
+        &s1_mod,
+        0,
+        vec![OmniValue::U16Array(u16_stream.to_vec()), OmniValue::Int(arg0), OmniValue::Int(arg1), OmniValue::Int(arg2)],
+    )?;
+    match res {
+        OmniValue::Bytes(elf) => Ok(elf),
+        other => Err(format!("Stage-1 self-compiler returned non-Bytes: {:?}", other)),
+    }
+}
+
 /// Runs one surface program through all four backends on the *same* verified u16 stream:
 /// - `vm`: `OmniBinaryVm::execute_function` directly (not AOT-first, which is really Wasm);
 /// - `wasm`: `compile_pure_u16_to_wasm` + `execute_wasm_module_i64`;
 /// - `x86`: `compile_pure_u16_to_x86_64_elf_with_args`, executed natively;
-/// - `stage1`: `compile_omni_surface_via_stage1_to_elf` (the Stage-1 self-compiler stream), executed natively.
+/// - `stage1`: `compile_u16_via_stage1_to_elf_for_diff` (the Stage-1 self-compiler stream, same gates as
+///   `compile_omni_surface_via_stage1_to_elf`), executed natively.
 /// Up to 3 i64 args are baked into the ELFs (the emitter ABI). Every backend runs under
 /// `catch_unwind`, so a host panic is recorded as `DiffObs::Panic` instead of aborting.
 /// `Err` only when the frontend or verifier rejects the program (no backend can run it).
+/// A source starting with `#asm` (first line) is Omni assembly text and goes through
+/// `assemble_omni_text_to_u16` instead of the surface frontend (used for label-id 0 / 16-label
+/// cases the surface frontend cannot express).
 pub fn run_four_backend_differential(src: &str, args: &[i64], tag: &str) -> Result<FourBackendReport, String> {
-    let wrapped = wrap_omni_surface_snippet(src);
-    let u16_stream = compile_omni_surface_to_u16(&wrapped)?;
+    let u16_stream = if let Some(asm) = src.strip_prefix("#asm\n") {
+        assemble_omni_text_to_u16(asm)?
+    } else {
+        let wrapped = wrap_omni_surface_snippet(src);
+        compile_omni_surface_to_u16(&wrapped)?
+    };
     for rep in verify_u16_stream(&u16_stream)? {
         if !rep.passed {
             return Err(format!("diff4: verifier rejected fn #{}: {:?}", rep.fn_idx, rep.errors));
@@ -12735,7 +12779,7 @@ pub fn run_four_backend_differential(src: &str, args: &[i64], tag: &str) -> Resu
     };
     obs.push(("x86", x86_obs));
 
-    let s1_elf = diff4_catch(|| compile_omni_surface_via_stage1_to_elf(src, a3[0], a3[1], a3[2]));
+    let s1_elf = diff4_catch(|| compile_u16_via_stage1_to_elf_for_diff(&u16_stream, a3[0], a3[1], a3[2]));
     let s1_obs = match &s1_elf {
         Ok(Ok(elf)) => diff4_native_obs(elf, &format!("{tag}_stage1")),
         Ok(Err(e)) => DiffObs::Unsupported(e.clone()),
@@ -12759,6 +12803,8 @@ pub enum DiffExpect {
     Bytes(&'static [u8]),
     /// A structured `Err` (never a host panic, never a silent value).
     StructuredErr,
+    /// Frontend/assembler/verifier rejection whose message contains this code.
+    Rejected(&'static str),
 }
 
 impl DiffExpect {
@@ -12767,6 +12813,7 @@ impl DiffExpect {
             DiffExpect::I64(v) => *o == DiffObs::Out { exit: 0, stdout: v.to_le_bytes().to_vec() },
             DiffExpect::Bytes(b) => *o == DiffObs::Out { exit: 0, stdout: b.to_vec() },
             DiffExpect::StructuredErr => matches!(o, DiffObs::RunErr(_)),
+            DiffExpect::Rejected(code) => matches!(o, DiffObs::Rejected(m) if m.contains(code)),
         }
     }
 }
@@ -12970,6 +13017,46 @@ pub const OMNI_DIFF4_GOLDENS: &[DiffGolden] = &[
         runs: &[(&[-7], DiffExpect::I64(100)), (&[-1], DiffExpect::I64(100)), (&[7], DiffExpect::I64(200))],
         backends: DIFF4_ALL,
     },
+    // --- Label-cap boundary (16 label tokens 0x7EF0..0x7EFF; surface ids start at 1) ---
+    // r = sum(if_pos c {k} else {10k}, k=1..6) + 100*max(x,0); x=5 -> 21+500 = 521; x=-5, 0 -> 210+0 = 210.
+    // 6 value if_pos (2 labels each) + 1 while (3 labels) = exactly 15 surface labels (ids 1..15).
+    DiffGolden {
+        id: "lbl15_surface",
+        proposal: "label-cap",
+        src: "fn lbl15(x: i64) -> i64 { let c = x <=> 0; let a1 = if_pos c { 1 } else { 10 }; let a2 = if_pos c { 2 } else { 20 }; let a3 = if_pos c { 3 } else { 30 }; let a4 = if_pos c { 4 } else { 40 }; let a5 = if_pos c { 5 } else { 50 }; let a6 = if_pos c { 6 } else { 60 }; let acc = 0; let i = 0; while i < x { acc += 100; i += 1; } let r = a1 + a2 + a3 + a4 + a5 + a6 + acc; return r; }",
+        runs: &[(&[5], DiffExpect::I64(521)), (&[-5], DiffExpect::I64(210)), (&[0], DiffExpect::I64(210))],
+        backends: DIFF4_ALL,
+    },
+    // Same program with a 7th if_pos = 16 surface labels. Today the surface frontend rejects it
+    // (alloc_lbl: `next_lbl > 15` -> error[BUDGET_EXCEEDED], next_lbl starts at 1).
+    // OPEN DECISION (16 vs 15 labels per fn): if the cap is raised to 16 at the frontend, this
+    // expectation becomes I64(528) for x=5 (28 + 500) and I64(280) for x=-5.
+    DiffGolden {
+        id: "lbl16_surface",
+        proposal: "label-cap",
+        src: "fn lbl16(x: i64) -> i64 { let c = x <=> 0; let a1 = if_pos c { 1 } else { 10 }; let a2 = if_pos c { 2 } else { 20 }; let a3 = if_pos c { 3 } else { 30 }; let a4 = if_pos c { 4 } else { 40 }; let a5 = if_pos c { 5 } else { 50 }; let a6 = if_pos c { 6 } else { 60 }; let a7 = if_pos c { 7 } else { 70 }; let acc = 0; let i = 0; while i < x { acc += 100; i += 1; } let r = a1 + a2 + a3 + a4 + a5 + a6 + a7 + acc; return r; }",
+        runs: &[(&[5], DiffExpect::Rejected("BUDGET_EXCEEDED")), (&[-5], DiffExpect::Rejected("BUDGET_EXCEEDED"))],
+        backends: DIFF4_ALL,
+    },
+    // Exactly 16 labels (ids 0..15) in assembly: lbl15_surface plus `JMP 0; LABEL 0` at entry.
+    // OPEN DECISION (16 vs 15 labels per fn): recorded as accepted by the binary verifier and run
+    // correctly by all four backends at d2d6c13. If the cap is set to 15, this should become a
+    // verifier rejection instead.
+    DiffGolden {
+        id: "lbl16_asm_ids_0_15",
+        proposal: "label-cap",
+        src: "#asm\nPARAM $0 I64 SAFE\nRET_TY I64\nJMP 0\nLABEL 0\n%0 = TCMP $0 0\nBR_POS %0 1\n%1 = CINT 10\nJMP 2\nLABEL 1\n%1 = CINT 1\nLABEL 2\nBR_POS %0 3\n%2 = CINT 20\nJMP 4\nLABEL 3\n%2 = CINT 2\nLABEL 4\nBR_POS %0 5\n%3 = CINT 30\nJMP 6\nLABEL 5\n%3 = CINT 3\nLABEL 6\nBR_POS %0 7\n%4 = CINT 40\nJMP 8\nLABEL 7\n%4 = CINT 4\nLABEL 8\nBR_POS %0 9\n%5 = CINT 50\nJMP 10\nLABEL 9\n%5 = CINT 5\nLABEL 10\nBR_POS %0 11\n%6 = CINT 60\nJMP 12\nLABEL 11\n%6 = CINT 6\nLABEL 12\n%7 = CINT 0\n%8 = CINT 0\nLABEL 13\n%9 = CLT %8 $0\nBR_POS %9 14\nJMP 15\nLABEL 14\n%7 = IADD %7 100\n%8 = IADD %8 1\nJMP 13\nLABEL 15\n%10 = IADD %1 %2\n%11 = IADD %10 %3\n%12 = IADD %11 %4\n%13 = IADD %12 %5\n%14 = IADD %13 %6\n%15 = IADD %14 %7\nRET %15\n",
+        runs: &[(&[5], DiffExpect::I64(521)), (&[-5], DiffExpect::I64(210))],
+        backends: DIFF4_ALL,
+    },
+    // Exactly 15 labels using ids 0..14 (lbl15_surface renumbered down by one): isolates label id 0.
+    DiffGolden {
+        id: "lbl15_asm_ids_0_14",
+        proposal: "label-cap",
+        src: "#asm\nPARAM $0 I64 SAFE\nRET_TY I64\n%0 = TCMP $0 0\nBR_POS %0 0\n%1 = CINT 10\nJMP 1\nLABEL 0\n%1 = CINT 1\nLABEL 1\nBR_POS %0 2\n%2 = CINT 20\nJMP 3\nLABEL 2\n%2 = CINT 2\nLABEL 3\nBR_POS %0 4\n%3 = CINT 30\nJMP 5\nLABEL 4\n%3 = CINT 3\nLABEL 5\nBR_POS %0 6\n%4 = CINT 40\nJMP 7\nLABEL 6\n%4 = CINT 4\nLABEL 7\nBR_POS %0 8\n%5 = CINT 50\nJMP 9\nLABEL 8\n%5 = CINT 5\nLABEL 9\nBR_POS %0 10\n%6 = CINT 60\nJMP 11\nLABEL 10\n%6 = CINT 6\nLABEL 11\n%7 = CINT 0\n%8 = CINT 0\nLABEL 12\n%9 = CLT %8 $0\nBR_POS %9 13\nJMP 14\nLABEL 13\n%7 = IADD %7 100\n%8 = IADD %8 1\nJMP 12\nLABEL 14\n%10 = IADD %1 %2\n%11 = IADD %10 %3\n%12 = IADD %11 %4\n%13 = IADD %12 %5\n%14 = IADD %13 %6\n%15 = IADD %14 %7\nRET %15\n",
+        runs: &[(&[5], DiffExpect::I64(521)), (&[-5], DiffExpect::I64(210))],
+        backends: DIFF4_ALL,
+    },
     // --- P9: iset_patch_i64 with a negative offset must be a structured error on the VM ---
     // AOT behaviour for this input is unspecified, so only the VM is asserted.
     DiffGolden {
@@ -13058,8 +13145,15 @@ pub fn run_omni_diff4_suite() -> Result<Vec<(&'static str, &'static str, DiffVer
     for g in OMNI_DIFF4_GOLDENS {
         let mut reports = Vec::new();
         for (ri, (args, _)) in g.runs.iter().enumerate() {
-            let rep = run_four_backend_differential(g.src, args, &format!("{}_{}", g.id, ri))
-                .map_err(|e| format!("diff4 golden '{}' frontend/verify failed: {e}", g.id))?;
+            let rep = match run_four_backend_differential(g.src, args, &format!("{}_{}", g.id, ri)) {
+                Ok(r) => r,
+                Err(e) if g.runs.iter().any(|(_, w)| matches!(w, DiffExpect::Rejected(_))) => FourBackendReport {
+                    u16_len: 0,
+                    obs: OMNI_DIFF4_BACKENDS.iter().map(|b| (*b, DiffObs::Rejected(e.clone()))).collect(),
+                    stage1_elf_eq_host: None,
+                },
+                Err(e) => return Err(format!("diff4 golden '{}' frontend/verify failed: {e}", g.id)),
+            };
             reports.push(rep);
         }
         for &backend in OMNI_DIFF4_BACKENDS.iter() {
