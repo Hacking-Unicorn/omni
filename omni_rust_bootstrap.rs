@@ -12479,6 +12479,18 @@ pub fn run_if_pos_join_slot_selftests() -> Result<usize, String> {
                 }
                 checks += 1;
             }
+            // P11: also run the Stage-1 ELF natively (previously compile-only, and only for
+            // arith_else_temps) and require Stage-1 == host bytes for every case/input.
+            let host_elf = compile_omni_surface_to_x86_64_elf(src, inp, 0, 0)
+                .map_err(|e| format!("if_pos join-slot '{name}' x86-64 compile failed: {e}"))?;
+            let s1_elf = compile_omni_surface_via_stage1_to_elf(src, inp, 0, 0)
+                .map_err(|e| format!("if_pos join-slot '{name}' Stage-1 compile failed: {e}"))?;
+            if s1_elf != host_elf {
+                return Err(format!("if_pos join-slot '{name}' x={inp}: Stage-1 ELF != host x86-64 ELF"));
+            }
+            if expect_native_elf_i64(&s1_elf, &format!("ifpos_{name}_{inp}_s1"), want, &format!("if_pos join-slot '{name}' Stage-1 x={inp}"))? {
+                checks += 1;
+            }
         }
     }
     Ok(checks)
@@ -13114,6 +13126,27 @@ pub fn run_cross_backend_effect_golden_selftests() -> Result<usize, String> {
         return Err(String::from("Cross-backend effect goldens graded nothing"));
     }
     Ok(checks)
+}
+
+/// P11 helper: runs `elf` natively and requires stdout == `want` as 8 bytes LE with exit 0.
+/// Returns `Ok(false)` (nothing asserted) only on hosts that cannot execute x86-64 ELF.
+pub fn expect_native_elf_i64(elf: &[u8], tag: &str, want: i64, ctx: &str) -> Result<bool, String> {
+    match run_native_elf_for_diff(elf, tag)? {
+        None => Ok(false),
+        Some(r) => {
+            if r.timed_out || r.signal.is_some() || r.exit_code != Some(0) || r.stdout.len() != 8 {
+                return Err(format!(
+                    "{ctx}: native ELF failed (exit {:?}, signal {:?}, timeout {}, {} stdout bytes), want {want}",
+                    r.exit_code, r.signal, r.timed_out, r.stdout.len()
+                ));
+            }
+            let got = i64::from_le_bytes(r.stdout[..8].try_into().unwrap());
+            if got != want {
+                return Err(format!("{ctx}: native ELF returned {got}, want {want}"));
+            }
+            Ok(true)
+        }
+    }
 }
 
 /// `omnic backend-diff` / `omnic diff4` CLI.
@@ -18798,6 +18831,18 @@ RET %4
                 return Err(String::from("Decision hook golden failed for (12, 12) -> 0"));
             }
             checks_passed += 1;
+            // P11: `execute_omni_surface_program` is AOT-first (= Wasm here). Also run the real VM and
+            // the native x86-64 ELF. (Stage-1 has no EGATE arm: tracked as p11_decision_hook/stage1 in
+            // OMNI_DIFF4_KNOWN_DIVERGENCES.)
+            for (a, b, want) in [(30i64, 10i64, 1i64), (5, 20, -1), (12, 12, 0)] {
+                let vm_v = execute_omni_surface_program_with_budgets(hook_src, vec![OmniValue::Int(a), OmniValue::Int(b)], None, None)?;
+                if vm_v != OmniValue::Trit(want as i8) {
+                    return Err(format!("Decision hook golden VM ({a}, {b}) got {vm_v:?} want {want}"));
+                }
+                let elf = compile_omni_surface_to_x86_64_elf(hook_src, a, b, 0)?;
+                expect_native_elf_i64(&elf, &format!("dhook_{a}_{b}"), want, &format!("Decision hook golden x86-64 ({a}, {b})"))?;
+            }
+            checks_passed += 1;
         }
 
         // 13d. Pack5 Lowering for Surface Trit Vectors Golden (Item 3: denser encoding vs i64 expansion)
@@ -18846,6 +18891,15 @@ RET %4
                     pack5_val, naive_bytes
                 ));
             }
+            checks_passed += 1;
+            // P11: the value above came from AOT-first (= Wasm). Also require the real VM and the native
+            // x86-64 ELF. (Stage-1: p11_pack5_trit_vec/stage1 in OMNI_DIFF4_KNOWN_DIVERGENCES.)
+            let pack5_vm = execute_omni_surface_program_with_budgets(pack5_surf, vec![], None, None)?;
+            if pack5_vm != OmniValue::Int(2455) {
+                return Err(format!("Pack5 surface lowering golden VM got {:?}, want Int(2455)", pack5_vm));
+            }
+            let pack5_elf = compile_omni_surface_to_x86_64_elf(pack5_surf, 0, 0, 0)?;
+            expect_native_elf_i64(&pack5_elf, "pack5_trit_vec_x86", 2455, "Pack5 surface lowering golden x86-64")?;
             checks_passed += 1;
         }
 
@@ -18915,7 +18969,9 @@ RET %4
                 }
             ";
             let while_u16 = compile_omni_surface_to_u16(while_surf)?;
-            let vm_even = execute_omni_surface_program(while_surf, vec![OmniValue::Int(10)])?;
+            // P11 (C5): this used to call `execute_omni_surface_program`, which is AOT-first (= Wasm),
+            // so the "VM" leg was really a second Wasm run. Use the real VM.
+            let vm_even = execute_omni_surface_program_with_budgets(while_surf, vec![OmniValue::Int(10)], None, None)?;
             let wasm_even = execute_omni_surface_wasm_i64(while_surf, &[10])?;
             let surf_elf = compile_omni_surface_to_x86_64_elf(while_surf, 10, 0, 0)?;
             let mut s1_vm = OmniBinaryVm::new();
@@ -18936,6 +18992,22 @@ RET %4
                 ));
             }
             checks_passed += 2;
+            // P11: execute both ELFs natively (previously only byte-compared) across several limits.
+            // 2+4+6+8+10 = 30 (limit 10, 11); limit 2 -> 2; limit 1 -> 0; limit 100 -> 2550.
+            for (limit, want) in [(10i64, 30i64), (11, 30), (2, 2), (1, 0), (100, 2550)] {
+                let host = compile_omni_surface_to_x86_64_elf(while_surf, limit, 0, 0)?;
+                let s1 = compile_omni_surface_via_stage1_to_elf(while_surf, limit, 0, 0)?;
+                if host != s1 {
+                    return Err(format!("while_sum_even_golden limit={limit}: Stage-1 ELF != host ELF"));
+                }
+                expect_native_elf_i64(&host, &format!("wse_{limit}_x86"), want, &format!("while_sum_even_golden x86-64 limit={limit}"))?;
+                expect_native_elf_i64(&s1, &format!("wse_{limit}_s1"), want, &format!("while_sum_even_golden Stage-1 limit={limit}"))?;
+                let vm_v = execute_omni_surface_program_with_budgets(while_surf, vec![OmniValue::Int(limit)], None, None)?;
+                if vm_v != OmniValue::Int(want) {
+                    return Err(format!("while_sum_even_golden VM limit={limit} got {vm_v:?} want {want}"));
+                }
+            }
+            checks_passed += 1;
         }
 
         // 13h. Phase 4: Surface Linear Memory Arena & Borrow Checker Golden + Negative Leak/Borrow Rejections
@@ -18953,6 +19025,16 @@ RET %4
             if execute_omni_surface_program(arena_ok_surf, vec![OmniValue::Int(8)])? != OmniValue::Int(50) {
                 return Err(String::from("Surface arena_lifecycle_golden execution mismatch"));
             }
+            // P11/P2: also the real VM, the native x86-64 ELF and the native Stage-1 ELF. Two DROPs pass
+            // on Stage-1 only by luck (the misdecode eats the 2nd DROP, not RET); the odd-count crash is
+            // tracked as p2_drop1/p2_drop3 stage1 in OMNI_DIFF4_KNOWN_DIVERGENCES.
+            if execute_omni_surface_program_with_budgets(arena_ok_surf, vec![OmniValue::Int(8)], None, None)? != OmniValue::Int(50) {
+                return Err(String::from("Surface arena_lifecycle_golden VM mismatch"));
+            }
+            let arena_host = compile_omni_surface_to_x86_64_elf(arena_ok_surf, 8, 0, 0)?;
+            expect_native_elf_i64(&arena_host, "arena_lifecycle_x86", 50, "arena_lifecycle_golden x86-64")?;
+            let arena_s1 = compile_omni_surface_via_stage1_to_elf(arena_ok_surf, 8, 0, 0)?;
+            expect_native_elf_i64(&arena_s1, "arena_lifecycle_s1", 50, "arena_lifecycle_golden Stage-1")?;
 
             let arena_leak_surf = "
                 fn bad_surface_arena_leak(x: i64) -> i64 {
@@ -19069,6 +19151,9 @@ fn pack5_direct_aot() -> i64 {
             if elf_p5.len() < 120 || &elf_p5[0..4] != &[0x7F, b'E', b'L', b'F'] {
                 return Err(String::from("@PACK5 x86-64 ELF64 header mismatch"));
             }
+            // P11 (C4): the ELF used to be header-checked only. Execute it natively.
+            // (Stage-1: p11_pack5_direct_aot/stage1 in OMNI_DIFF4_KNOWN_DIVERGENCES.)
+            expect_native_elf_i64(&elf_p5, "pack5_direct_x86", 2422, "Direct @PACK5 x86-64 ELF")?;
             let wasm_p5 = execute_omni_surface_wasm_i64(pack5_direct_src, &[])?;
             let (aot_val, backend) = execute_omni_surface_aot_first(pack5_direct_src, vec![])?;
             let vm_val = execute_omni_surface_program_with_budgets(pack5_direct_src, vec![], Some(100_000), Some(1024 * 1024))?;
