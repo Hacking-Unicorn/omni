@@ -2757,6 +2757,9 @@ fn main(x: i64, y: i64) -> i64 {
     // 13AV. Lockstep shadow mode on compile / run / serve
     checks += run_lockstep_shadow_selftests()?;
 
+    // 13AW. Vera P1 byte-readback sibling (VM + Wasm assert; x86/Stage-1 native run)
+    checks += run_byte_readback_parity_selftests()?;
+
     Ok(checks)
 }
 

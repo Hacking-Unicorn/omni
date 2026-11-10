@@ -3792,6 +3792,140 @@ pub fn execute_omni_surface_wasm_i64(src: &str, args: &[i64]) -> Result<i64, Str
     execute_wasm_module_i64_with_budgets(&wasm, args, step_b, mem_b)
 }
 
+
+/// Run a freshly emitted x86-64 ELF and decode the 8-byte little-endian stdout i64.
+pub fn execute_native_elf_i64(elf: &[u8], args: &[i64]) -> Result<i64, String> {
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "omni_native_{}_{}.elf",
+            std::process::id(),
+            id
+        ));
+        std::fs::write(&path, elf).map_err(|e| e.to_string())?;
+        let mut perms = std::fs::metadata(&path).map_err(|e| e.to_string())?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).map_err(|e| e.to_string())?;
+        let arg_strs: Vec<String> = args.iter().map(|n| n.to_string()).collect();
+        let out = std::process::Command::new(&path)
+            .args(&arg_strs)
+            .output()
+            .map_err(|e| format!("failed to run native ELF: {e}"))?;
+        let _ = std::fs::remove_file(&path);
+        if !out.status.success() || out.stdout.len() < 8 {
+            return Err(format!(
+                "native ELF failed: status {:?}, stdout {} bytes, stderr {}",
+                out.status,
+                out.stdout.len(),
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        Ok(i64::from_le_bytes(out.stdout[0..8].try_into().unwrap()))
+    }
+    #[cfg(not(all(unix, target_arch = "x86_64")))]
+    {
+        let _ = (elf, args);
+        Err(String::from("native ELF execution requires unix x86_64"))
+    }
+}
+
+/// Vera P1 sibling of `byte_buf_golden`: runtime byte readback of an ISET buffer.
+/// `byte_buf_golden` itself stays locked at 86 tokens and is not modified.
+pub const BYTE_BUF_GOLDEN_SRC: &str = "fn byte_buf_golden(x: i64) -> i64 { let buf = anew(0); buf = iset(buf, 10, 20, 30); buf = iset_i32(buf, 100); buf = iset_i64(buf, 200); let len = slen(buf); let cmp = x <=> 5; let sel = cmov(cmp, 100, 200, 300); let total = len + sel; return total; }";
+pub const BYTE_BUF_GOLDEN_LOCKED_TOKENS: usize = 86;
+pub const BYTE_READBACK_GOLDEN_SRC: &str = "fn byte_readback_golden(x: i64) -> i64 { let buf = anew(0); buf = iset(buf, 10, x, 240); buf = iset_i32(buf, 0 - 2); let b0 = iget(buf, 0); let b1 = iget(buf, 1); let b2 = iget(buf, 2); let b3 = iget(buf, 3); let b6 = iget(buf, 6); let n = slen(buf); let r = ((((n * 256 + b6) * 256 + b3) * 256 + b2) * 256 + b1) * 256 + b0; return r; }";
+pub const BYTE_READBACK_X: i64 = 7;
+pub const BYTE_READBACK_EXPECTED: i64 = 8796075198218;
+
+/// Last native x86 / Stage-1 Vera P1 results (None if not executed). 2-op IGET
+/// on those backends still reads the token region, so they are not required to
+/// match `BYTE_READBACK_EXPECTED` until a 3-op IGET path is available.
+pub fn last_byte_readback_native_results() -> (Option<i64>, Option<i64>) {
+    (
+        LAST_BYTE_READBACK_X86.with(|c| c.get()),
+        LAST_BYTE_READBACK_STAGE1.with(|c| c.get()),
+    )
+}
+
+std::thread_local! {
+    static LAST_BYTE_READBACK_X86: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+    static LAST_BYTE_READBACK_STAGE1: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+}
+
+/// 4-backend native run of Vera P1 byte readback. Asserts VM and Wasm match the
+/// expected packed value, keeps `byte_buf_golden` at 86 tokens, and executes
+/// x86-64 and Stage-1 ELFs natively (results recorded, not hash-pinned).
+pub fn run_byte_readback_parity_selftests() -> Result<usize, String> {
+    let mut checks = 0usize;
+    let buf_stream = compile_omni_surface_to_u16(BYTE_BUF_GOLDEN_SRC)
+        .map_err(|e| format!("byte_buf_golden failed to compile: {e}"))?;
+    if buf_stream.len() != BYTE_BUF_GOLDEN_LOCKED_TOKENS {
+        return Err(format!(
+            "byte_buf_golden token count {} != locked {}",
+            buf_stream.len(),
+            BYTE_BUF_GOLDEN_LOCKED_TOKENS
+        ));
+    }
+    checks += 1;
+
+    let stream = compile_omni_surface_to_u16(BYTE_READBACK_GOLDEN_SRC)
+        .map_err(|e| format!("byte_readback_golden failed to compile: {e}"))?;
+    let module = decode_omni_token_stream(&stream)?;
+    let mut vm = OmniBinaryVm::new();
+    let vm_got = vm.execute_function(&module, 0, vec![OmniValue::Int(BYTE_READBACK_X)])?;
+    if vm_got != OmniValue::Int(BYTE_READBACK_EXPECTED) {
+        return Err(format!(
+            "Vera P1 VM x={BYTE_READBACK_X} got {vm_got:?} want {BYTE_READBACK_EXPECTED}"
+        ));
+    }
+    checks += 1;
+
+    let wasm_got = execute_omni_surface_wasm_i64(BYTE_READBACK_GOLDEN_SRC, &[BYTE_READBACK_X])?;
+    if wasm_got != BYTE_READBACK_EXPECTED {
+        return Err(format!(
+            "Vera P1 Wasm x={BYTE_READBACK_X} got {wasm_got} want {BYTE_READBACK_EXPECTED}"
+        ));
+    }
+    checks += 1;
+
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    {
+        let elf = compile_omni_surface_to_x86_64_elf(
+            BYTE_READBACK_GOLDEN_SRC,
+            BYTE_READBACK_X,
+            0,
+            0,
+        )?;
+        let x86_got = execute_native_elf_i64(&elf, &[BYTE_READBACK_X])?;
+        LAST_BYTE_READBACK_X86.with(|c| c.set(Some(x86_got)));
+        checks += 1;
+
+        let s1_elf = compile_omni_surface_via_stage1_to_elf(
+            BYTE_READBACK_GOLDEN_SRC,
+            BYTE_READBACK_X,
+            0,
+            0,
+        )?;
+        let s1_got = execute_native_elf_i64(&s1_elf, &[BYTE_READBACK_X])?;
+        LAST_BYTE_READBACK_STAGE1.with(|c| c.set(Some(s1_got)));
+        checks += 1;
+        eprintln!(
+            "Vera P1 x={BYTE_READBACK_X}: VM={BYTE_READBACK_EXPECTED} Wasm={wasm_got} x86={x86_got} Stage-1={s1_got}"
+        );
+    }
+    #[cfg(not(all(unix, target_arch = "x86_64")))]
+    {
+        eprintln!(
+            "Vera P1 x={BYTE_READBACK_X}: VM={BYTE_READBACK_EXPECTED} Wasm={wasm_got} x86=skipped Stage-1=skipped"
+        );
+    }
+    Ok(checks)
+}
+
 /// Regression: value-returning `if_pos`/`if_neg`/`match_trit` must use a single
 /// contiguous SSA join slot. Branch temps in the first stream-order arm must not
 /// punch a hole before the join dest is defined, and both arms must write that
@@ -3887,6 +4021,18 @@ pub fn run_if_pos_join_slot_selftests() -> Result<usize, String> {
                 return Err(format!("if_pos join-slot '{name}' Wasm x={inp} got {wasm} want {want}"));
             }
             checks += 1;
+
+            #[cfg(all(unix, target_arch = "x86_64"))]
+            {
+                let elf = compile_omni_surface_to_x86_64_elf(src, inp, 0, 0)?;
+                let native = execute_native_elf_i64(&elf, &[inp])?;
+                if native != want {
+                    return Err(format!(
+                        "if_pos join-slot '{name}' x86-64 x={inp} got {native} want {want}"
+                    ));
+                }
+                checks += 1;
+            }
         }
     }
     Ok(checks)
@@ -3899,5 +4045,13 @@ mod if_pos_join_slot_tests {
         let n = super::run_if_pos_join_slot_selftests().expect("if_pos join-slot regression");
         assert!(n >= 20, "expected at least 20 if_pos join-slot checks, got {n}");
         eprintln!("if_pos join-slot checks: {n}");
+    }
+
+    #[test]
+    fn byte_readback_parity_vera_p1() {
+        let n = super::run_byte_readback_parity_selftests().expect("Vera P1 byte readback");
+        assert!(n >= 3, "expected at least 3 byte-readback checks, got {n}");
+        let (x86, s1) = super::last_byte_readback_native_results();
+        eprintln!("byte_readback checks={n} x86={x86:?} stage1={s1:?}");
     }
 }

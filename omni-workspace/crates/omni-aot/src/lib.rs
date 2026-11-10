@@ -28,19 +28,31 @@ fn collect_func_pack5_map(func: &BinFunction) -> BTreeMap<u16, (Vec<u8>, usize, 
                 let is_typed_write = (ins.operands.len() == 3
                     && (ins.operands[1] == BinOperand::ImmInt(-4) || ins.operands[1] == BinOperand::ImmInt(-8)))
                     || (ins.operands.len() == 4 && ins.operands[1] == BinOperand::ImmInt(-9));
-                if !is_typed_write {
-                    let mut bytes = match ins.operands.first() {
-                        Some(BinOperand::Reg(s)) => reg_pack5.get(s).map(|(b, _, _)| b.clone()).unwrap_or_default(),
-                        _ => Vec::new(),
-                    };
-                    for op_b in &ins.operands[1..] {
-                        if let BinOperand::ImmInt(v) = *op_b {
-                            bytes.push((v & 0xFF) as u8);
+                if let Some(d) = ins.dest_reg {
+                    if is_typed_write {
+                        // Runtime width/patch write: not a compile-time pack5 constant.
+                        reg_pack5.remove(&d);
+                    } else {
+                        let mut bytes = match ins.operands.first() {
+                            Some(BinOperand::Reg(s)) => reg_pack5.get(s).map(|(b, _, _)| b.clone()).unwrap_or_default(),
+                            _ => Vec::new(),
+                        };
+                        let mut complete = true;
+                        for op_b in &ins.operands[1..] {
+                            if let BinOperand::ImmInt(v) = *op_b {
+                                bytes.push((v & 0xFF) as u8);
+                            } else {
+                                complete = false;
+                            }
                         }
-                    }
-                    let n_trits = bytes.len() * 5;
-                    if let Some(d) = ins.dest_reg {
-                        reg_pack5.insert(d, (bytes, n_trits, false));
+                        if complete {
+                            let n_trits = bytes.len() * 5;
+                            reg_pack5.insert(d, (bytes, n_trits, false));
+                        } else {
+                            // Dynamic ISET byte: must not const-fold later IGETs
+                            // (skipping non-immediates would yield a stale/partial buffer).
+                            reg_pack5.remove(&d);
+                        }
                     }
                 }
             }
@@ -691,6 +703,10 @@ fn encode_sleb128(mut val: i64) -> Vec<u8> {
     out
 }
 
+/// Linear memory reserved for ISET/IGET byte buffers in Wasm AOT (2 pages = 128 KiB).
+pub const WASM_ISET_MEMORY_PAGES: u32 = 2;
+pub const WASM_ISET_MEMORY_BYTES: i64 = (WASM_ISET_MEMORY_PAGES as i64) * 65536;
+
 pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
     let module = decode_omni_token_stream(stream)?;
     let func = module.functions.first().ok_or("No function in module")?;
@@ -913,28 +929,135 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
                     }
                 }
                 if !handled {
-                    b.extend_from_slice(&[0x42, 0x00]);
-                    emit_wasm_set_dest(b, ins.dest_reg);
+                    // Runtime ISET-heap byte load. The @PACK5 const / dynamic-index
+                    // path above is unchanged. OOB or missing index yields 0.
+                    if ins.operands.len() >= 2 {
+                        emit_wasm_op(b, &ins.operands[1]);
+                        b.push(0x21);
+                        b.extend(encode_uleb128(scratch0));
+                        // in_bounds = (idx >= 0) && (idx < buf_len)
+                        b.push(0x20);
+                        b.extend(encode_uleb128(scratch0));
+                        b.extend_from_slice(&[0x42, 0x00, 0x53, 0x50]); // idx < 0, eqz → >= 0
+                        b.push(0x20);
+                        b.extend(encode_uleb128(scratch0));
+                        b.push(0x20);
+                        b.extend(encode_uleb128(buf_len_local));
+                        b.push(0x53); // idx < buf_len
+                        b.push(0x71); // i32.and
+                        b.push(0x21);
+                        b.extend(encode_uleb128(scratch1));
+                        // addr = idx * in_bounds (0 when OOB, so a dummy load is safe)
+                        b.push(0x20);
+                        b.extend(encode_uleb128(scratch0));
+                        b.push(0x20);
+                        b.extend(encode_uleb128(scratch1));
+                        b.push(0x7E); // i64.mul
+                        b.push(0xA7); // i32.wrap_i64
+                        b.extend_from_slice(&[0x2D, 0x00, 0x00]); // i32.load8_u
+                        b.push(0xAD); // i64.extend_i32_u
+                        b.extend_from_slice(&[0x42, 0x00]);
+                        b.push(0x20);
+                        b.extend(encode_uleb128(scratch1));
+                        b.push(0x1B); // select
+                        emit_wasm_set_dest(b, ins.dest_reg);
+                    } else {
+                        b.extend_from_slice(&[0x42, 0x00]);
+                        emit_wasm_set_dest(b, ins.dest_reg);
+                    }
                 }
             }
             0x7F0F => {
-                let delta: i64 = if ins.operands.len() == 3 && ins.operands[1] == BinOperand::ImmInt(-4) {
-                    4
-                } else if ins.operands.len() == 3 && ins.operands[1] == BinOperand::ImmInt(-8) {
-                    8
-                } else if ins.operands.len() == 4 && ins.operands[1] == BinOperand::ImmInt(-9) {
-                    0
-                } else {
-                    ins.operands.len().saturating_sub(1) as i64
-                };
-                if delta != 0 {
+                let ops = &ins.operands;
+                let emit_can_fit = |b: &mut Vec<u8>, width: i64| {
+                    // (buf_len + width) <= MEM  iff  !((buf_len + width) > MEM)
                     b.push(0x20);
                     b.extend(encode_uleb128(buf_len_local));
                     b.push(0x42);
-                    b.extend(encode_sleb128(delta));
+                    b.extend(encode_sleb128(width));
+                    b.push(0x7C);
+                    b.push(0x42);
+                    b.extend(encode_sleb128(WASM_ISET_MEMORY_BYTES));
+                    b.extend_from_slice(&[0x55, 0x50]); // gt, eqz
+                };
+                if ops.len() == 3 && ops[1] == BinOperand::ImmInt(-4) {
+                    emit_can_fit(b, 4);
+                    b.extend_from_slice(&[0x04, 0x40]); // if
+                    b.push(0x20);
+                    b.extend(encode_uleb128(buf_len_local));
+                    b.push(0xA7);
+                    emit_wasm_op(b, &ops[2]);
+                    b.push(0xA7);
+                    b.extend_from_slice(&[0x36, 0x00, 0x00]); // i32.store
+                    b.push(0x20);
+                    b.extend(encode_uleb128(buf_len_local));
+                    b.push(0x42);
+                    b.extend(encode_sleb128(4));
                     b.push(0x7C);
                     b.push(0x21);
                     b.extend(encode_uleb128(buf_len_local));
+                    b.push(0x0B);
+                } else if ops.len() == 3 && ops[1] == BinOperand::ImmInt(-8) {
+                    emit_can_fit(b, 8);
+                    b.extend_from_slice(&[0x04, 0x40]);
+                    b.push(0x20);
+                    b.extend(encode_uleb128(buf_len_local));
+                    b.push(0xA7);
+                    emit_wasm_op(b, &ops[2]);
+                    b.extend_from_slice(&[0x37, 0x00, 0x00]); // i64.store
+                    b.push(0x20);
+                    b.extend(encode_uleb128(buf_len_local));
+                    b.push(0x42);
+                    b.extend(encode_sleb128(8));
+                    b.push(0x7C);
+                    b.push(0x21);
+                    b.extend(encode_uleb128(buf_len_local));
+                    b.push(0x0B);
+                } else if ops.len() == 4 && ops[1] == BinOperand::ImmInt(-9) {
+                    // Silent no-op unless 0 <= off && off + 8 <= buf_len. Length unchanged.
+                    emit_wasm_op(b, &ops[2]);
+                    b.push(0x21);
+                    b.extend(encode_uleb128(scratch0));
+                    emit_wasm_op(b, &ops[3]);
+                    b.push(0x21);
+                    b.extend(encode_uleb128(scratch1));
+                    b.push(0x20);
+                    b.extend(encode_uleb128(scratch0));
+                    b.extend_from_slice(&[0x42, 0x00, 0x53, 0x50]); // off >= 0
+                    b.push(0x20);
+                    b.extend(encode_uleb128(scratch0));
+                    b.push(0x42);
+                    b.extend(encode_sleb128(8));
+                    b.push(0x7C);
+                    b.push(0x20);
+                    b.extend(encode_uleb128(buf_len_local));
+                    b.extend_from_slice(&[0x55, 0x50]); // !(off+8 > len)
+                    b.push(0x71);
+                    b.extend_from_slice(&[0x04, 0x40]);
+                    b.push(0x20);
+                    b.extend(encode_uleb128(scratch0));
+                    b.push(0xA7);
+                    b.push(0x20);
+                    b.extend(encode_uleb128(scratch1));
+                    b.extend_from_slice(&[0x37, 0x00, 0x00]); // i64.store
+                    b.push(0x0B);
+                } else {
+                    for op_b in &ops[1..] {
+                        emit_can_fit(b, 1);
+                        b.extend_from_slice(&[0x04, 0x40]);
+                        b.push(0x20);
+                        b.extend(encode_uleb128(buf_len_local));
+                        b.push(0xA7);
+                        emit_wasm_op(b, op_b);
+                        b.push(0xA7);
+                        b.extend_from_slice(&[0x3A, 0x00, 0x00]); // i32.store8
+                        b.push(0x20);
+                        b.extend(encode_uleb128(buf_len_local));
+                        b.extend_from_slice(&[0x42, 0x01, 0x7C]);
+                        b.push(0x21);
+                        b.extend(encode_uleb128(buf_len_local));
+                        b.push(0x0B);
+                    }
                 }
                 if ins.dest_reg.is_some() {
                     b.push(0x20);
@@ -1183,8 +1306,15 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
     code_sec.extend(encode_uleb128(body.len()));
     code_sec.extend(body);
 
+    let mem_sec = vec![0x01, 0x00, WASM_ISET_MEMORY_PAGES as u8];
     let mut wasm = vec![0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00];
-    for (sec_id, payload) in [(1u8, type_sec), (3u8, func_sec), (7u8, exp_sec), (10u8, code_sec)] {
+    for (sec_id, payload) in [
+        (1u8, type_sec),
+        (3u8, func_sec),
+        (5u8, mem_sec),
+        (7u8, exp_sec),
+        (10u8, code_sec),
+    ] {
         wasm.push(sec_id);
         wasm.extend(encode_uleb128(payload.len()));
         wasm.extend(payload);
@@ -1263,6 +1393,11 @@ fn skip_wasm_to_matching_end(body: &[u8], mut pos: usize) -> Result<usize, Strin
             0x42 => {
                 let _ = decode_sleb128(body, &mut pos)?;
             }
+            0x28..=0x3E => {
+                // load/store memarg: align, offset
+                let _ = decode_uleb128(body, &mut pos)?;
+                let _ = decode_uleb128(body, &mut pos)?;
+            }
             _ => {}
         }
     }
@@ -1296,6 +1431,7 @@ pub fn execute_wasm_module_i64_with_budgets(
     let mut pos = 8usize;
     let mut num_params = 0usize;
     let mut code_body: Option<&[u8]> = None;
+    let mut memory: Vec<u8> = Vec::new();
 
     while pos < wasm.len() {
         let sec_id = wasm[pos];
@@ -1313,6 +1449,22 @@ pub fn execute_wasm_module_i64_with_budgets(
             }
             p += 1;
             num_params = decode_uleb128(wasm, &mut p)?;
+        } else if sec_id == 5 {
+            let mut p = pos;
+            let mem_cnt = decode_uleb128(wasm, &mut p)?;
+            if mem_cnt > 0 {
+                if p >= sec_end {
+                    return Err(String::from("Truncated Wasm Memory section"));
+                }
+                let flags = wasm[p];
+                p += 1;
+                let min_pages = decode_uleb128(wasm, &mut p)?;
+                if flags & 1 != 0 {
+                    let _max = decode_uleb128(wasm, &mut p)?;
+                }
+                let bytes = min_pages.saturating_mul(65536);
+                memory.resize(bytes, 0);
+            }
         } else if sec_id == 10 {
             let mut p = pos;
             let fn_cnt = decode_uleb128(wasm, &mut p)?;
@@ -1341,7 +1493,10 @@ pub fn execute_wasm_module_i64_with_budgets(
         total_locals += cnt;
     }
 
-    let frame_bytes = wasm.len().saturating_add(total_locals.max(args.len()).saturating_mul(8));
+    let frame_bytes = wasm
+        .len()
+        .saturating_add(total_locals.max(args.len()).saturating_mul(8))
+        .saturating_add(memory.len());
     if frame_bytes > memory_budget_bytes {
         return Err(format!(
             "error[BUDGET_EXCEEDED]: Wasm AOT memory budget exceeded ({} > {} bytes)",
@@ -1492,9 +1647,52 @@ pub fn execute_wasm_module_i64_with_budgets(
                 }
                 stack.push(if a == i64::MIN && b == -1 { 0 } else { a.wrapping_rem(b) });
             }
+            0xA7 => {
+                let a = stack.pop().ok_or("Wasm stack underflow on i32.wrap_i64")?;
+                stack.push((a as i32) as i64);
+            }
             0xAD => {
                 let a = stack.pop().ok_or("Wasm stack underflow on i64.extend_i32_u")?;
                 stack.push((a as u32) as i64);
+            }
+            0x2D | 0x28 | 0x29 | 0x36 | 0x37 | 0x3A => {
+                let _align = decode_uleb128(body, &mut bpos)?;
+                let offset = decode_uleb128(body, &mut bpos)?;
+                let is_store = matches!(op, 0x36 | 0x37 | 0x3A);
+                let val = if is_store {
+                    stack.pop().ok_or("Wasm stack underflow on store value")?
+                } else {
+                    0
+                };
+                let addr_i = stack.pop().ok_or("Wasm stack underflow on mem addr")?;
+                let addr = (addr_i as u32 as u64).saturating_add(offset as u64) as usize;
+                let width: usize = match op {
+                    0x2D | 0x3A => 1,
+                    0x28 | 0x36 => 4,
+                    _ => 8,
+                };
+                if is_store {
+                    if addr.saturating_add(width) > memory.len() {
+                        return Err(format!(
+                            "Wasm store out of bounds (addr={addr}, width={width}, mem={})",
+                            memory.len()
+                        ));
+                    }
+                    match op {
+                        0x3A => memory[addr] = val as u8,
+                        0x36 => memory[addr..addr + 4].copy_from_slice(&(val as u32).to_le_bytes()),
+                        _ => memory[addr..addr + 8].copy_from_slice(&(val as u64).to_le_bytes()),
+                    }
+                } else if addr.saturating_add(width) > memory.len() {
+                    stack.push(0);
+                } else {
+                    let loaded = match op {
+                        0x2D => memory[addr] as i64,
+                        0x28 => i32::from_le_bytes(memory[addr..addr + 4].try_into().unwrap()) as i64,
+                        _ => i64::from_le_bytes(memory[addr..addr + 8].try_into().unwrap()),
+                    };
+                    stack.push(loaded);
+                }
             }
             0x1B => {
                 let c = stack.pop().ok_or("Wasm stack underflow on select c")?;
