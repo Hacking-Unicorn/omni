@@ -2751,6 +2751,9 @@ fn main(x: i64, y: i64) -> i64 {
     }
     checks += 1;
 
+    // 13AU. Value-returning if_pos/match_trit join slot is a single contiguous SSA dest
+    checks += run_if_pos_join_slot_selftests()?;
+
     Ok(checks)
 }
 

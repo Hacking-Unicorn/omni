@@ -1972,6 +1972,57 @@ impl SurfaceLowerCtx {
         }
     }
 
+
+    fn first_dest_name_in_range(&self, start: usize, end: usize) -> Option<String> {
+        if self.emit_asm {
+            for line in &self.lines[start..end] {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 3 && parts[1] == "=" {
+                    return Some(String::from(parts[0]));
+                }
+            }
+            None
+        } else {
+            for pkt in &self.packets[start..end] {
+                if let Some(&tok) = pkt.first() {
+                    if (REG_BASE..REG_BASE + 192).contains(&tok) {
+                        return Some(format!("%{}", tok - REG_BASE));
+                    }
+                }
+            }
+            None
+        }
+    }
+
+    /// If a value-returning branch would emit temps before writing the join dest,
+    /// define that dest first so SSA numbering stays a single contiguous join slot.
+    /// Programs whose first branch already writes the dest (existing goldens) are unchanged.
+    fn ensure_contiguous_join_slot(
+        &mut self,
+        region_start: usize,
+        dst: &str,
+        line: usize,
+        col: usize,
+    ) -> Result<(), String> {
+        let end = if self.emit_asm {
+            self.lines.len()
+        } else {
+            self.packets.len()
+        };
+        if self.first_dest_name_in_range(region_start, end).as_deref() == Some(dst) {
+            return Ok(());
+        }
+        let asm = format!("{} = CINT 0", dst);
+        if self.emit_asm {
+            self.lines.insert(region_start, asm);
+        } else {
+            let pkt = encode_asm_ins_packet_u16(&asm, self.ret_ty_tok)?;
+            self.packets.insert(region_start, pkt);
+            self.pkt_spans.insert(region_start, (line.max(1), col.max(1)));
+        }
+        Ok(())
+    }
+
     pub(crate) fn lower_block_into_target(
         &mut self,
         stmts: &[SurfaceStmt],
@@ -2113,7 +2164,9 @@ impl SurfaceLowerCtx {
                 self.cur_span = (*line, *col);
                 self.emit(format!("{} {} {}", br_mnem, cond_op, l_then))?;
                 let saved_vars = self.var_map.clone();
+                let else_start = if self.emit_asm { self.lines.len() } else { self.packets.len() };
                 self.lower_block_into_target(else_blk, &dst, false, *line, *col)?;
+                self.ensure_contiguous_join_slot(else_start, &dst, *line, *col)?;
                 self.var_map = saved_vars.clone();
                 let jmp_placeholder_idx = if self.emit_asm { self.lines.len() } else { self.packets.len() };
                 if self.emit_asm {
@@ -2162,7 +2215,9 @@ impl SurfaceLowerCtx {
                 let saved_vars = self.var_map.clone();
                 self.cur_span = (*line, *col);
                 self.emit(format!("LABEL {}", l_neg))?;
+                let neg_start = if self.emit_asm { self.lines.len() } else { self.packets.len() };
                 self.lower_block_into_target(neg_blk, &dst, false, *line, *col)?;
+                self.ensure_contiguous_join_slot(neg_start, &dst, *line, *col)?;
                 self.var_map = saved_vars.clone();
                 self.cur_span = (*line, *col);
                 self.emit(format!("JMP {}", l_join))?;
@@ -3733,4 +3788,114 @@ pub fn execute_omni_surface_wasm_i64(src: &str, args: &[i64]) -> Result<i64, Str
     }
     let wasm = compile_pure_u16_to_wasm(&u16_stream)?;
     execute_wasm_module_i64_with_budgets(&wasm, args, step_b, mem_b)
+}
+
+/// Regression: value-returning `if_pos`/`if_neg`/`match_trit` must use a single
+/// contiguous SSA join slot. Branch temps in the first stream-order arm must not
+/// punch a hole before the join dest is defined, and both arms must write that
+/// same dest. Existing simple goldens (dest already written first) stay unchanged.
+pub fn run_if_pos_join_slot_selftests() -> Result<usize, String> {
+    let mut checks = 0usize;
+    let cases: &[(&str, &str, &[(i64, i64)], Option<usize>)] = &[
+        (
+            "arith_else_temps",
+            "fn main(x: i64) -> i64 { let c = x <=> 0; let r = if_pos c { 200 } else { (x + 1) * 2 }; return r; }",
+            &[(5, 200), (0, 2), (-3, -4)],
+            None,
+        ),
+        (
+            "let_in_else",
+            "fn main(x: i64) -> i64 { let c = x <=> 0; let r = if_pos c { 200 } else { let y = x + 1; y }; return r; }",
+            &[(5, 200), (0, 1), (-3, -2)],
+            None,
+        ),
+        (
+            "nested_complex_else",
+            "fn main(x: i64) -> i64 { let c0 = x <=> 0; let r = if_pos c0 { 10 } else { let c1 = x <=> -5; if_pos c1 { 30 } else { 20 } }; return r; }",
+            &[(5, 10), (0, 30), (-5, 20), (-6, 20)],
+            None,
+        ),
+        (
+            "match_trit_complex_neg",
+            "fn main(x: i64) -> i64 { let c = x <=> 0; let r = match_trit c { neg => (x + 3) * 2, zero => 100, pos => x + 50 }; return r; }",
+            &[(5, 55), (0, 100), (-3, 0)],
+            None,
+        ),
+        (
+            "simple_if_unchanged",
+            "fn br_pos_golden(x: i64) -> i64 { let c = x <=> 0; let r = if_pos c { 200 } else { 100 }; return r; }",
+            &[(1, 200), (0, 100), (-1, 100)],
+            Some(49),
+        ),
+    ];
+
+    for &(name, src, ios, locked) in cases {
+        let stream = compile_omni_surface_to_u16(src)
+            .map_err(|e| format!("if_pos join-slot '{name}' failed to compile: {e}"))?;
+        for rep in verify_u16_stream(&stream)? {
+            if !rep.passed {
+                return Err(format!(
+                    "if_pos join-slot '{name}' failed binary verify (fn #{}): {:?}",
+                    rep.fn_idx, rep.errors
+                ));
+            }
+        }
+        checks += 1;
+
+        let asm = compile_omni_surface_to_asm(src)
+            .map_err(|e| format!("if_pos join-slot '{name}' asm lower failed: {e}"))?;
+        let via_asm = assemble_omni_text_to_u16(&asm)
+            .map_err(|e| format!("if_pos join-slot '{name}' asm assemble failed: {e}"))?;
+        if via_asm != stream {
+            return Err(format!("if_pos join-slot '{name}': direct u16 != assembled asm"));
+        }
+        checks += 1;
+
+        if let Some(n) = locked {
+            if stream.len() != n {
+                return Err(format!(
+                    "if_pos join-slot '{name}' token count {} != locked {n} (join init must not change simple goldens)",
+                    stream.len()
+                ));
+            }
+            checks += 1;
+        }
+
+        let _ = compile_omni_surface_to_wasm(src)
+            .map_err(|e| format!("if_pos join-slot '{name}' wasm compile failed: {e}"))?;
+        let _ = compile_omni_surface_to_x86_64_elf(src, ios[0].0, 0, 0)
+            .map_err(|e| format!("if_pos join-slot '{name}' x86-64 compile failed: {e}"))?;
+        checks += 1;
+
+        if name == "arith_else_temps" {
+            let _ = compile_omni_surface_via_stage1_to_elf(src, ios[0].0, 0, 0)
+                .map_err(|e| format!("if_pos join-slot '{name}' Stage-1 compile failed: {e}"))?;
+            checks += 1;
+        }
+
+        for &(inp, want) in ios {
+            let module = decode_omni_token_stream(&stream)?;
+            let mut vm = OmniBinaryVm::new();
+            let got = vm.execute_function(&module, 0, vec![OmniValue::Int(inp)])?;
+            if got != OmniValue::Int(want) {
+                return Err(format!("if_pos join-slot '{name}' VM x={inp} got {got:?} want {want}"));
+            }
+            let wasm = execute_omni_surface_wasm_i64(src, &[inp])?;
+            if wasm != want {
+                return Err(format!("if_pos join-slot '{name}' Wasm x={inp} got {wasm} want {want}"));
+            }
+            checks += 1;
+        }
+    }
+    Ok(checks)
+}
+
+#[cfg(test)]
+mod if_pos_join_slot_tests {
+    #[test]
+    fn if_pos_join_slot_regression() {
+        let n = super::run_if_pos_join_slot_selftests().expect("if_pos join-slot regression");
+        assert!(n >= 20, "expected at least 20 if_pos join-slot checks, got {n}");
+        eprintln!("if_pos join-slot checks: {n}");
+    }
 }
