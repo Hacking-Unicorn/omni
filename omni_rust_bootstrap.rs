@@ -12484,6 +12484,721 @@ pub fn run_if_pos_join_slot_selftests() -> Result<usize, String> {
     Ok(checks)
 }
 
+// ==============================================================================
+// 13AY. FOUR-BACKEND DIFFERENTIAL HARNESS + CROSS-BACKEND EFFECT GOLDENS
+// ==============================================================================
+//
+// Test-only host code. Nothing in this section feeds a hashed stream: it runs ordinary
+// test programs through the four backends. It must never be referenced from
+// `build_step7_stage1_compiler_stream`, `lookup_omni_stdlib_module`,
+// `PURE_OMNI_CORE_SUITE_MODULES`, or any `PHASE_D_*` artifact.
+
+/// Outcome of running a native ELF under the differential harness.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeElfRun {
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub timed_out: bool,
+}
+
+pub const OMNI_DIFF4_NATIVE_TIMEOUT_MS: u64 = 20_000;
+
+/// Writes `elf` to a unique temp file, runs it natively (no argv; arguments are baked in by the
+/// emitter), captures stdout/exit/signal, and kills it after `OMNI_DIFF4_NATIVE_TIMEOUT_MS`.
+/// Returns `Ok(None)` on hosts that cannot execute x86-64 Linux ELF.
+pub fn run_native_elf_for_diff(elf: &[u8], tag: &str) -> Result<Option<NativeElfRun>, String> {
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    {
+        use std::io::Read;
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{Command, Stdio};
+        let safe_tag: String = tag.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+        let path = std::env::temp_dir().join(format!("omni_diff4_{}_{}.elf", std::process::id(), safe_tag));
+        std::fs::write(&path, elf).map_err(|e| format!("diff4: write {}: {e}", path.display()))?;
+        let mut perms = std::fs::metadata(&path).map_err(|e| e.to_string())?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).map_err(|e| e.to_string())?;
+        let mut child = Command::new(&path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("diff4: spawn {}: {e}", path.display()))?;
+        let mut so = child.stdout.take().ok_or("diff4: no stdout pipe")?;
+        let reader = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = so.read_to_end(&mut buf);
+            buf
+        });
+        let start = std::time::Instant::now();
+        let mut timed_out = false;
+        let status = loop {
+            match child.try_wait().map_err(|e| e.to_string())? {
+                Some(st) => break st,
+                None => {
+                    if start.elapsed().as_millis() as u64 > OMNI_DIFF4_NATIVE_TIMEOUT_MS {
+                        let _ = child.kill();
+                        timed_out = true;
+                        break child.wait().map_err(|e| e.to_string())?;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        };
+        let stdout = reader.join().unwrap_or_default();
+        let _ = std::fs::remove_file(&path);
+        return Ok(Some(NativeElfRun { exit_code: status.code(), signal: status.signal(), stdout, timed_out }));
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = (elf, tag);
+        Ok(None)
+    }
+}
+
+/// One backend's normalized observable. Two backends agree iff their `DiffObs` are equal;
+/// for `Out` that is exit code plus stdout compared byte-for-byte.
+/// VM/Wasm results are normalized to what a native ELF writes: `i64`/`trit` -> 8 bytes LE,
+/// `bytes` -> the raw buffer (the "arena/buffer memory dump" observable), exit code 0.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DiffObs {
+    Out { exit: i32, stdout: Vec<u8> },
+    Signal(i32),
+    Timeout,
+    /// Structured runtime error (VM `Err`, Wasm trap/budget).
+    RunErr(String),
+    /// A Rust host panic. Never an acceptable outcome for guest-reachable input.
+    Panic(String),
+    /// Backend refused to compile the program (gate, unsupported opcode, multi-function, ...).
+    Unsupported(String),
+    /// Native execution not possible on this host.
+    NativeUnavailable,
+}
+
+impl DiffObs {
+    pub fn describe(&self) -> String {
+        match self {
+            DiffObs::Out { exit, stdout } => {
+                let hex: Vec<String> = stdout.iter().map(|b| format!("{:02x}", b)).collect();
+                if stdout.len() == 8 {
+                    let v = i64::from_le_bytes(stdout[..8].try_into().unwrap());
+                    format!("i64 {} (exit {}, stdout {})", v, exit, hex.join(""))
+                } else {
+                    format!("bytes[{}] {:?} (exit {}, stdout {})", stdout.len(), stdout, exit, hex.join(""))
+                }
+            }
+            DiffObs::Signal(s) => format!("SIGNAL {}", s),
+            DiffObs::Timeout => String::from("TIMEOUT"),
+            DiffObs::RunErr(e) => format!("ERR {}", e),
+            DiffObs::Panic(e) => format!("PANIC {}", e),
+            DiffObs::Unsupported(e) => format!("UNSUPPORTED {}", e),
+            DiffObs::NativeUnavailable => String::from("NATIVE-UNAVAILABLE"),
+        }
+    }
+    /// True for outcomes that take part in byte-for-byte comparison.
+    pub fn is_comparable(&self) -> bool {
+        !matches!(self, DiffObs::Unsupported(_) | DiffObs::NativeUnavailable)
+    }
+}
+
+pub const OMNI_DIFF4_BACKENDS: [&str; 4] = ["vm", "wasm", "x86", "stage1"];
+
+#[derive(Clone, Debug)]
+pub struct FourBackendReport {
+    pub u16_len: usize,
+    /// In `OMNI_DIFF4_BACKENDS` order.
+    pub obs: Vec<(&'static str, DiffObs)>,
+    /// Stage-1 emitted ELF == host x86 emitter ELF (byte-identical), when both compiled.
+    pub stage1_elf_eq_host: Option<bool>,
+}
+
+impl FourBackendReport {
+    pub fn get(&self, backend: &str) -> &DiffObs {
+        &self.obs.iter().find(|(b, _)| *b == backend).expect("diff4 backend").1
+    }
+    /// All comparable observations are byte-identical.
+    pub fn all_agree(&self) -> bool {
+        let cmp: Vec<&DiffObs> = self.obs.iter().map(|(_, o)| o).filter(|o| o.is_comparable()).collect();
+        cmp.windows(2).all(|w| w[0] == w[1])
+    }
+}
+
+fn diff4_catch<T>(f: impl FnOnce() -> Result<T, String>) -> Result<Result<T, String>, String> {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    std::panic::set_hook(prev);
+    r.map_err(|p| {
+        if let Some(s) = p.downcast_ref::<String>() {
+            s.clone()
+        } else if let Some(s) = p.downcast_ref::<&str>() {
+            String::from(*s)
+        } else {
+            String::from("non-string panic payload")
+        }
+    })
+}
+
+fn diff4_vm_value_to_obs(v: &OmniValue) -> DiffObs {
+    match v {
+        OmniValue::Int(n) => DiffObs::Out { exit: 0, stdout: n.to_le_bytes().to_vec() },
+        OmniValue::Trit(t) => DiffObs::Out { exit: 0, stdout: (*t as i64).to_le_bytes().to_vec() },
+        OmniValue::Bytes(b) => DiffObs::Out { exit: 0, stdout: b.clone() },
+        other => DiffObs::Out { exit: 0, stdout: format!("{:?}", other).into_bytes() },
+    }
+}
+
+fn diff4_native_obs(elf: &[u8], tag: &str) -> DiffObs {
+    match run_native_elf_for_diff(elf, tag) {
+        Ok(Some(r)) => {
+            if r.timed_out {
+                DiffObs::Timeout
+            } else if let Some(sig) = r.signal {
+                DiffObs::Signal(sig)
+            } else {
+                DiffObs::Out { exit: r.exit_code.unwrap_or(-1), stdout: r.stdout }
+            }
+        }
+        Ok(None) => DiffObs::NativeUnavailable,
+        Err(e) => DiffObs::RunErr(e),
+    }
+}
+
+/// Runs one surface program through all four backends on the *same* verified u16 stream:
+/// - `vm`: `OmniBinaryVm::execute_function` directly (not AOT-first, which is really Wasm);
+/// - `wasm`: `compile_pure_u16_to_wasm` + `execute_wasm_module_i64`;
+/// - `x86`: `compile_pure_u16_to_x86_64_elf_with_args`, executed natively;
+/// - `stage1`: `compile_omni_surface_via_stage1_to_elf` (the Stage-1 self-compiler stream), executed natively.
+/// Up to 3 i64 args are baked into the ELFs (the emitter ABI). Every backend runs under
+/// `catch_unwind`, so a host panic is recorded as `DiffObs::Panic` instead of aborting.
+/// `Err` only when the frontend or verifier rejects the program (no backend can run it).
+pub fn run_four_backend_differential(src: &str, args: &[i64], tag: &str) -> Result<FourBackendReport, String> {
+    let wrapped = wrap_omni_surface_snippet(src);
+    let u16_stream = compile_omni_surface_to_u16(&wrapped)?;
+    for rep in verify_u16_stream(&u16_stream)? {
+        if !rep.passed {
+            return Err(format!("diff4: verifier rejected fn #{}: {:?}", rep.fn_idx, rep.errors));
+        }
+    }
+    let mut a3: Vec<i64> = args.to_vec();
+    while a3.len() < 3 {
+        a3.push(0);
+    }
+    let mut obs: Vec<(&'static str, DiffObs)> = Vec::new();
+
+    let vm_obs = match diff4_catch(|| {
+        let module = decode_omni_token_stream(&u16_stream)?;
+        let entry = if module.functions.iter().any(|f| f.fn_idx == 0) {
+            0
+        } else {
+            module.functions.last().map(|f| f.fn_idx).ok_or("No functions in module")?
+        };
+        let mut vm = OmniBinaryVm::new();
+        vm.execute_function(&module, entry, args.iter().map(|v| OmniValue::Int(*v)).collect())
+    }) {
+        Ok(Ok(v)) => diff4_vm_value_to_obs(&v),
+        Ok(Err(e)) => DiffObs::RunErr(e),
+        Err(p) => DiffObs::Panic(p),
+    };
+    obs.push(("vm", vm_obs));
+
+    let wasm_obs = match diff4_catch(|| compile_pure_u16_to_wasm(&u16_stream)) {
+        Ok(Ok(w)) => match diff4_catch(|| execute_wasm_module_i64(&w, args)) {
+            Ok(Ok(v)) => DiffObs::Out { exit: 0, stdout: v.to_le_bytes().to_vec() },
+            Ok(Err(e)) => DiffObs::RunErr(e),
+            Err(p) => DiffObs::Panic(p),
+        },
+        Ok(Err(e)) => DiffObs::Unsupported(e),
+        Err(p) => DiffObs::Panic(p),
+    };
+    obs.push(("wasm", wasm_obs));
+
+    let host_elf = diff4_catch(|| compile_pure_u16_to_x86_64_elf_with_args(&u16_stream, a3[0], a3[1], a3[2]));
+    let x86_obs = match &host_elf {
+        Ok(Ok(elf)) => diff4_native_obs(elf, &format!("{tag}_x86")),
+        Ok(Err(e)) => DiffObs::Unsupported(e.clone()),
+        Err(p) => DiffObs::Panic(p.clone()),
+    };
+    obs.push(("x86", x86_obs));
+
+    let s1_elf = diff4_catch(|| compile_omni_surface_via_stage1_to_elf(src, a3[0], a3[1], a3[2]));
+    let s1_obs = match &s1_elf {
+        Ok(Ok(elf)) => diff4_native_obs(elf, &format!("{tag}_stage1")),
+        Ok(Err(e)) => DiffObs::Unsupported(e.clone()),
+        Err(p) => DiffObs::Panic(p.clone()),
+    };
+    obs.push(("stage1", s1_obs));
+
+    let stage1_elf_eq_host = match (&host_elf, &s1_elf) {
+        (Ok(Ok(h)), Ok(Ok(s))) => Some(h == s),
+        _ => None,
+    };
+    Ok(FourBackendReport { u16_len: u16_stream.len(), obs, stage1_elf_eq_host })
+}
+
+/// Independently derived expectation for one run of a differential golden.
+#[derive(Clone, Copy, Debug)]
+pub enum DiffExpect {
+    /// stdout = 8 bytes LE of this value, exit 0.
+    I64(i64),
+    /// stdout = exactly these bytes (bytes-returning fn: the buffer dump), exit 0.
+    Bytes(&'static [u8]),
+    /// A structured `Err` (never a host panic, never a silent value).
+    StructuredErr,
+}
+
+impl DiffExpect {
+    pub fn matches(&self, o: &DiffObs) -> bool {
+        match self {
+            DiffExpect::I64(v) => *o == DiffObs::Out { exit: 0, stdout: v.to_le_bytes().to_vec() },
+            DiffExpect::Bytes(b) => *o == DiffObs::Out { exit: 0, stdout: b.to_vec() },
+            DiffExpect::StructuredErr => matches!(o, DiffObs::RunErr(_)),
+        }
+    }
+}
+
+/// A cross-backend effect golden. Expected values are derived by hand from `spec.md` and the
+/// byte layout, never copied from a backend. `backends` lists which backends are asserted.
+pub struct DiffGolden {
+    pub id: &'static str,
+    pub proposal: &'static str,
+    pub src: &'static str,
+    pub runs: &'static [(&'static [i64], DiffExpect)],
+    pub backends: &'static [&'static str],
+}
+
+const DIFF4_ALL: &[&str] = &["vm", "wasm", "x86", "stage1"];
+
+pub const OMNI_DIFF4_GOLDENS: &[DiffGolden] = &[
+    // --- P1: runtime-value byte readback (acceptance test for the IGET/ISET byte-storage fix) ---
+    // bytes = [10, x&0xFF, 240] ++ i32_le(-2) = [.., FE, FF, FF, FF]; n = 7
+    // r = ((((n*256 + b6)*256 + b3)*256 + b2)*256 + b1)*256 + b0
+    // x=7   -> b1=7   -> 8796075198218
+    // x=200 -> b1=200 -> 8796075247626
+    // x=300 -> b1=44  -> 8796075207690   (iset stores v & 0xFF)
+    // x=-1  -> b1=255 -> 8796075261706
+    DiffGolden {
+        id: "p1_byte_readback",
+        proposal: "P1",
+        src: "fn byte_readback_golden(x: i64) -> i64 { let buf = anew(0); buf = iset(buf, 10, x, 240); buf = iset_i32(buf, 0 - 2); let b0 = iget(buf, 0); let b1 = iget(buf, 1); let b2 = iget(buf, 2); let b3 = iget(buf, 3); let b6 = iget(buf, 6); let n = slen(buf); let r = ((((n * 256 + b6) * 256 + b3) * 256 + b2) * 256 + b1) * 256 + b0; return r; }",
+        runs: &[(&[7], DiffExpect::I64(8796075198218)), (&[200], DiffExpect::I64(8796075247626)), (&[300], DiffExpect::I64(8796075207690)), (&[-1], DiffExpect::I64(8796075261706))],
+        backends: DIFF4_ALL,
+    },
+    // iset(buf,10,20,x) then iget(buf,2) must read back the runtime value x.
+    DiffGolden {
+        id: "p1_iget_runtime_value",
+        proposal: "P1",
+        src: "fn igetbufd(x: i64) -> i64 { let buf = anew(0); buf = iset(buf, 10, 20, x); let v = iget(buf, 2); return v; }",
+        runs: &[(&[7], DiffExpect::I64(7)), (&[200], DiffExpect::I64(200))],
+        backends: DIFF4_ALL,
+    },
+    // Buffer memory dump: bytes-returning fn, compared byte-for-byte as the native stdout.
+    DiffGolden {
+        id: "p1_buffer_dump_const",
+        proposal: "P1",
+        src: "fn dumpc(x: i64) -> bytes { let buf = anew(0); buf = iset(buf, 10, 20, 240); buf = iset_i32(buf, 0 - 2); return buf; }",
+        runs: &[(&[7], DiffExpect::Bytes(&[10, 20, 240, 0xFE, 0xFF, 0xFF, 0xFF]))],
+        backends: DIFF4_ALL,
+    },
+    DiffGolden {
+        id: "p1_buffer_dump_param",
+        proposal: "P1",
+        src: "fn dump(x: i64) -> bytes { let buf = anew(0); buf = iset(buf, 10, x, 240); buf = iset_i32(buf, 0 - 2); return buf; }",
+        runs: &[(&[7], DiffExpect::Bytes(&[10, 7, 240, 0xFE, 0xFF, 0xFF, 0xFF]))],
+        backends: DIFF4_ALL,
+    },
+    // P6 (bonus, IGET/ISET area): branch-dependent iset + non-immediate/negative byte.
+    // x=7: c=-1 -> else arm: iset(buf, -1, 44) -> [255, 44]; n=2 -> 2*10^6 + 255*1000 + 44
+    DiffGolden {
+        id: "p6_pack5_flow",
+        proposal: "P6",
+        src: "fn pack5_flow_golden(x: i64) -> i64 { let buf = anew(0); let c = x <=> 100; let b2 = if_pos c { iset(buf, 9) } else { iset(buf, 0 - 1, 44) }; let v0 = iget(b2, 0); let v1 = iget(b2, 1); let n = slen(b2); let r = n * 1000000 + v0 * 1000 + v1; return r; }",
+        runs: &[(&[7], DiffExpect::I64(2255044))],
+        backends: DIFF4_ALL,
+    },
+    // P7 (bonus, IGET/ISET area): two independent buffers keep independent lengths: 3*10 + 1
+    DiffGolden {
+        id: "p7_two_buffers",
+        proposal: "P7",
+        src: "fn twob(x: i64) -> i64 { let a = anew(0); a = iset(a, 1, 2, 3); let b = anew(0); b = iset(b, 4); let la = slen(a); let lb = slen(b); let r = la * 10 + lb; return r; }",
+        runs: &[(&[7], DiffExpect::I64(31))],
+        backends: DIFF4_ALL,
+    },
+    // --- P2: Stage-1 DROP parity, odd and even drop counts (x + 42) ---
+    DiffGolden {
+        id: "p2_drop1",
+        proposal: "P2",
+        src: "#[strict]\nfn drop1(x: i64) -> i64 {\n    let a: arena = arena(4096);\n    let res: i64 = x + 42;\n    drop(a);\n    return res;\n}",
+        runs: &[(&[7], DiffExpect::I64(49)), (&[-42], DiffExpect::I64(0))],
+        backends: DIFF4_ALL,
+    },
+    DiffGolden {
+        id: "p2_drop3",
+        proposal: "P2",
+        src: "#[strict]\nfn drop3(x: i64) -> i64 {\n    let a: arena = arena(4096);\n    let b: arena = arena(64);\n    let c: arena = arena(32);\n    let res: i64 = x + 42;\n    drop(c);\n    drop(b);\n    drop(a);\n    return res;\n}",
+        runs: &[(&[7], DiffExpect::I64(49))],
+        backends: DIFF4_ALL,
+    },
+    // Even drop count: passes on Stage-1 only because the misdecode eats the 2nd DROP, not RET.
+    DiffGolden {
+        id: "p2_drop2_arena_lifecycle",
+        proposal: "P2",
+        src: "#[strict]\nfn arena_lifecycle_golden(x: i64) -> i64 {\n    let a: arena = arena(4096);\n    let r: arena = borrow_r(a);\n    let res: i64 = x + 42;\n    drop(r);\n    drop(a);\n    return res;\n}",
+        runs: &[(&[8], DiffExpect::I64(50)), (&[7], DiffExpect::I64(49))],
+        backends: DIFF4_ALL,
+    },
+    // --- P11: existing passing suites, now executed natively on all four ---
+    DiffGolden {
+        id: "p11_while_sum_even",
+        proposal: "P11",
+        src: "#[strict]\nfn while_sum_even_golden(limit: i64) -> i64 {\n    let acc: i64 = 0;\n    let i: i64 = 2;\n    while i <= limit {\n        acc += i;\n        i += 2;\n    }\n    return acc;\n}",
+        // 2+4+6+8+10 = 30; limit 11 same; limit 2 -> 2; limit 0/1 -> 0; limit 100 -> 2*(1+..+50) = 2550
+        runs: &[(&[10], DiffExpect::I64(30)), (&[11], DiffExpect::I64(30)), (&[2], DiffExpect::I64(2)), (&[1], DiffExpect::I64(0)), (&[0], DiffExpect::I64(0)), (&[100], DiffExpect::I64(2550))],
+        backends: DIFF4_ALL,
+    },
+    DiffGolden {
+        id: "p11_if_pos_arith_else_temps",
+        proposal: "P11",
+        src: "fn main(x: i64) -> i64 { let c = x <=> 0; let r = if_pos c { 200 } else { (x + 1) * 2 }; return r; }",
+        runs: &[(&[5], DiffExpect::I64(200)), (&[0], DiffExpect::I64(2)), (&[-3], DiffExpect::I64(-4))],
+        backends: DIFF4_ALL,
+    },
+    DiffGolden {
+        id: "p11_if_pos_nested_complex_else",
+        proposal: "P11",
+        src: "fn main(x: i64) -> i64 { let c0 = x <=> 0; let r = if_pos c0 { 10 } else { let c1 = x <=> -5; if_pos c1 { 30 } else { 20 } }; return r; }",
+        runs: &[(&[5], DiffExpect::I64(10)), (&[0], DiffExpect::I64(30)), (&[-5], DiffExpect::I64(20)), (&[-6], DiffExpect::I64(20))],
+        backends: DIFF4_ALL,
+    },
+    DiffGolden {
+        id: "p11_match_trit_complex_neg",
+        proposal: "P11",
+        src: "fn main(x: i64) -> i64 { let c = x <=> 0; let r = match_trit c { neg => (x + 3) * 2, zero => 100, pos => x + 50 }; return r; }",
+        runs: &[(&[5], DiffExpect::I64(55)), (&[0], DiffExpect::I64(100)), (&[-3], DiffExpect::I64(0))],
+        backends: DIFF4_ALL,
+    },
+    // bonus(2000) + dot(8)*50 + b_len(2)*10 + (t0 - t1 = 1 - (-1)) = 2422
+    DiffGolden {
+        id: "p11_pack5_direct_aot",
+        proposal: "P11/P10",
+        src: "#[strict]\n#[cap(AI)]\nfn pack5_direct_aot() -> i64 {\n    let raw: bytes = pack5_bytes([+1t, -1t, 0t, +1t, +1t, -1t, 0t, -1t, +1t, +1t]);\n    let dot: i64 = pack5_tdot(raw, raw);\n    let g: trit = pack5_gate(raw);\n    let tv: trit_vec = unpack5(raw, 10);\n    let t0: i64 = pack5_get(tv, 0);\n    let t1: i64 = pack5_get(tv, 1);\n    let b_len: i64 = pack5_len(raw);\n    let bonus: i64 = if_pos g { 2000 } else { 0 };\n    return bonus + dot * 50 + b_len * 10 + (t0 - t1);\n}",
+        runs: &[(&[], DiffExpect::I64(2422))],
+        backends: DIFF4_ALL,
+    },
+    // pack5 of 10 trits = 2 bytes (227, 219); tdot = 8; egate = +1 -> 2*1000 + 227 + 219 + 8 + 1 = 2455
+    DiffGolden {
+        id: "p11_pack5_trit_vec",
+        proposal: "P11/P10",
+        src: "#[strict]\n#[cap(AI)]\nfn pack5_trit_vec_golden() -> i64 {\n    let v: trit_vec = [+1t, -1t, 0t, +1t, +1t, -1t, 0t, -1t, +1t, +1t];\n    let packed: bytes = pack5(v);\n    let packed_byte_len: i64 = slen(packed);\n    let first_pack5_byte: i64 = iget(packed, 0);\n    let second_pack5_byte: i64 = iget(packed, 1);\n    let dot: i64 = tdot(v, v);\n    let gate: trit = egate(v);\n    let res: i64 = packed_byte_len * 1000 + first_pack5_byte + second_pack5_byte + dot + gate;\n    return res;\n}",
+        runs: &[(&[], DiffExpect::I64(2455))],
+        backends: DIFF4_ALL,
+    },
+    // egate(a - b) = sign(a - b)
+    DiffGolden {
+        id: "p11_decision_hook",
+        proposal: "P11/P10",
+        src: "#[cap(AI)] fn decision_hook_golden(a: i64, b: i64) -> trit { let delta = a - b; let gate = egate(delta); return gate; }",
+        runs: &[(&[30, 10], DiffExpect::I64(1)), (&[5, 20], DiffExpect::I64(-1)), (&[12, 12], DiffExpect::I64(0))],
+        backends: DIFF4_ALL,
+    },
+    // --- P3: IMOD stale-rdx (spec: x % 0 = 0, MIN % -1 = 0) ---
+    DiffGolden {
+        id: "p3_imod_rdx_clobber",
+        proposal: "P3",
+        src: "fn imod_clobber_golden(x: i64) -> i64 { let z = x - x; let c = x <=> 5; let r0 = x % z; let one = z + 1; let m = one << 63; let n = z - one; let c2 = x <=> 5; let r1 = m % n; let r = r0 * 10 + r1; return r; }",
+        runs: &[(&[7], DiffExpect::I64(0))],
+        backends: DIFF4_ALL,
+    },
+    DiffGolden {
+        id: "p3_imod_zero_after_tcmp",
+        proposal: "P3",
+        src: "fn mod0b(x: i64) -> i64 { let c = x <=> 5; let r = x % 0; let s = r + 0; return s; }",
+        runs: &[(&[7], DiffExpect::I64(0))],
+        backends: DIFF4_ALL,
+    },
+    DiffGolden {
+        id: "p3_imod_min_neg1_after_tcmp",
+        proposal: "P3",
+        src: "fn minmodt(x: i64) -> i64 { let c = x <=> 5; let one = x - x + 1; let m = one << 63; let n = 0 - one; let r = m % n; return r; }",
+        runs: &[(&[7], DiffExpect::I64(0))],
+        backends: DIFF4_ALL,
+    },
+    // Control: same ops without a preceding TCMP (rdx happens to be 0) -> agrees today.
+    DiffGolden {
+        id: "p3_imod_control_no_tcmp",
+        proposal: "P3",
+        src: "fn minmod(x: i64) -> i64 { let one = x - x + 1; let m = one << 63; let n = 0 - one; let r = m % n; let q = x % 0; let s = r + q; return s; }",
+        runs: &[(&[7], DiffExpect::I64(0))],
+        backends: DIFF4_ALL,
+    },
+    // --- P4: trit ops clamp i64 operands (spec.md:53, VM 1115-1121) ---
+    // x=7 -> clamp 1: tand(1,1)=1, tor(1,-1)=1, txor(1,1)=-1, tnot(1)=-1, tmaj(1,-1,-1)=-1
+    // r = 1*10000 + 3*1000 + 1*100 + 1*10 + 1 = 13111
+    DiffGolden {
+        id: "p4_trit_clamp",
+        proposal: "P4",
+        src: "fn trit_clamp_golden(x: i64) -> i64 { let a = tand(x, 3); let b = tor(x, 0 - 3); let c = txor(x, 3); let d = tnot(x); let e = tmaj(x, 0 - 1, 0 - 1); let r = a * 10000 + (b + 2) * 1000 + (c + 2) * 100 + (d + 2) * 10 + (e + 2); return r; }",
+        runs: &[(&[7], DiffExpect::I64(13111))],
+        backends: DIFF4_ALL,
+    },
+    // --- P5: BR_POS / BR_NEG on a non-trit i64 condition (clamp: 7 -> +1, -7 -> -1) ---
+    DiffGolden {
+        id: "p5_if_pos_nontrit",
+        proposal: "P5",
+        src: "fn brp(x: i64) -> i64 { let r = if_pos x { 100 } else { 200 }; return r; }",
+        runs: &[(&[7], DiffExpect::I64(100)), (&[1], DiffExpect::I64(100)), (&[0], DiffExpect::I64(200)), (&[-7], DiffExpect::I64(200))],
+        backends: DIFF4_ALL,
+    },
+    DiffGolden {
+        id: "p5_if_neg_nontrit",
+        proposal: "P5",
+        src: "fn brn(x: i64) -> i64 { let r = if_neg x { 100 } else { 200 }; return r; }",
+        runs: &[(&[-7], DiffExpect::I64(100)), (&[-1], DiffExpect::I64(100)), (&[7], DiffExpect::I64(200))],
+        backends: DIFF4_ALL,
+    },
+    // --- P9: iset_patch_i64 with a negative offset must be a structured error on the VM ---
+    // AOT behaviour for this input is unspecified, so only the VM is asserted.
+    DiffGolden {
+        id: "p9_vm_patch_negative_offset",
+        proposal: "P9",
+        src: "fn patchn(x: i64) -> i64 { let buf = anew(0); buf = iset_i64(buf, 5); let off = 0 - 3; buf = iset_patch_i64(buf, off, 77); let n = slen(buf); return n; }",
+        runs: &[(&[7], DiffExpect::StructuredErr)],
+        backends: &["vm"],
+    },
+];
+
+/// Known backend divergences: `(golden id, backend, reason with file:line)`.
+/// Strict: an entry is an expected failure. If every run of that golden passes on that
+/// backend, the selftest fails with XPASS so the entry gets removed in the fixing commit.
+/// Line numbers refer to `omni_rust_bootstrap.rs` at origin/isa/multibyte-loads d2d6c13
+/// *before* this harness was added (later edits shift them); function/label names are stable anchors.
+pub const OMNI_DIFF4_KNOWN_DIVERGENCES: &[(&str, &str, &str)] = &[
+    // P1/P6/P7: IGET/ISET byte storage. Wasm readback was fixed in d2d6c13 (p1_byte_readback and
+    // p1_iget_runtime_value pass on Wasm); x86/Stage-1 remain. These are the fix's acceptance tests.
+    ("p1_byte_readback", "x86", "x86 2-op IGET loads u16 words from the argv[1] token region [rbp+rax*2-0x2E000] (IGET arm 14530-14573), not the ISET heap [rbp+r11-0x20000] (ISET arm 14574+)"),
+    ("p1_byte_readback", "stage1", "Stage-1 IGET mirrors the x86 token-region load (lbl_iget 16411-16416)"),
+    ("p1_iget_runtime_value", "x86", "same as p1_byte_readback/x86"),
+    ("p1_iget_runtime_value", "stage1", "same as p1_byte_readback/stage1"),
+    ("p1_buffer_dump_const", "wasm", "Wasm has no bytes-return ABI: compile_pure_u16_to_wasm (14923) never checks ret_ty and RET (15413/15491) returns the buffer-length local as i64"),
+    ("p1_buffer_dump_param", "wasm", "same as p1_buffer_dump_const/wasm"),
+    ("p1_buffer_dump_param", "x86", "N12: TY_BYTES-return prologue sets r12=0 (14405-14406), so p0 is the input array, not arg0; the dump has b1=0 instead of x"),
+    ("p1_buffer_dump_param", "stage1", "N12: Stage-1 copies the TY_BYTES-return prologue (lbl_ty_bytes_pr 16089+), same r12=0"),
+    ("p6_pack5_flow", "wasm", "N4: still 2009000 after d2d6c13; an all-immediate but branch-dependent buffer is still folded by the flow-insensitive collect_func_pack5_map (14217) as a complete compile-time constant (mechanism inferred from output)"),
+    ("p6_pack5_flow", "x86", "N4: x86 IGET const path uses the same flow-insensitive map (14217)"),
+    ("p6_pack5_flow", "stage1", "Stage-1 IGET reads the token region (lbl_iget 16411); no fold"),
+    ("p7_two_buffers", "wasm", "single buf_len_local shared by every ANEW buffer (ANEW 15096, ISET 15183+)"),
+    ("p7_two_buffers", "x86", "single global r11 length shared by every ANEW buffer (ISET arm 14574+)"),
+    ("p7_two_buffers", "stage1", "single global r11 length (lbl_iset 16417+)"),
+    // P2: Stage-1 DROP misdecode.
+    ("p2_drop1", "stage1", "Stage-1 no-dest dispatch (16222-16241) has no DROP 0x7F05 arm; the dest-form fallthrough (16243-16247) reads r_cur=pos+4 inside the next packet and swallows RET -> SIGSEGV"),
+    ("p2_drop3", "stage1", "same as p2_drop1: odd DROP count before RET swallows RET -> SIGSEGV"),
+    // P10: Stage-1 has no TPACK5/TUNPACK5/TDOT/EGATE/TLOGIC arms.
+    ("p11_pack5_direct_aot", "stage1", "Stage-1 opcode dispatch (16243-16520) has no TPACK5/TUNPACK5/TDOT/EGATE arms; values fall into the generic copy path"),
+    ("p11_pack5_trit_vec", "stage1", "same as p11_pack5_direct_aot/stage1 (pack5/tdot/egate) plus no IGET const fold"),
+    ("p11_decision_hook", "stage1", "Stage-1 has no EGATE 0x7F35 arm; egate(delta) is emitted as a copy of delta"),
+    // P3: IMOD stale rdx.
+    ("p3_imod_rdx_clobber", "x86", "N1: IMOD guard (14667-14675) jumps over cqo/idiv for b==0 and MIN/-1, then mov rax,rdx copies a stale rdx (TCMP leaves rdx=trit)"),
+    ("p3_imod_rdx_clobber", "stage1", "N1: Stage-1 IMOD (lbl_imod 16343+) emits the same guard + mov rax,rdx"),
+    ("p3_imod_zero_after_tcmp", "x86", "N1, see p3_imod_rdx_clobber/x86"),
+    ("p3_imod_zero_after_tcmp", "stage1", "N1, see p3_imod_rdx_clobber/stage1"),
+    ("p3_imod_min_neg1_after_tcmp", "x86", "N1, see p3_imod_rdx_clobber/x86"),
+    ("p3_imod_min_neg1_after_tcmp", "stage1", "N1, see p3_imod_rdx_clobber/stage1"),
+    // P4: trit ops without clamping (spec.md:53).
+    ("p4_trit_clamp", "wasm", "N3: Wasm TNOT/TAND/TOR/TXOR/TMAJ do not clamp i64 operands (15332, 15352-15357)"),
+    ("p4_trit_clamp", "x86", "N3: x86 TAND/TOR share IMIN/IMAX (14714), TNOT shares INEG (14676); no clamp"),
+    ("p4_trit_clamp", "stage1", "N3: Stage-1 shares the same arms (16293, 16310); no clamp"),
+    // P5: BR_POS/BR_NEG compare == +-1 instead of clamping.
+    ("p5_if_pos_nontrit", "wasm", "N2: Wasm BR_POS compares == 1 (15451-15460); VM clamps via eval_as_trit (1115, 1213-1218)"),
+    ("p5_if_pos_nontrit", "x86", "N2: x86 BR_POS emits cmp rax,1; je (14793-14800)"),
+    ("p5_if_pos_nontrit", "stage1", "N2: Stage-1 BR_POS (lbl_br_pos 16504+) emits the same cmp rax,1"),
+    ("p5_if_neg_nontrit", "wasm", "N2: Wasm BR_NEG compares == -1 (15451-15460)"),
+    ("p5_if_neg_nontrit", "x86", "N2: x86 BR_NEG emits cmp rax,-1; je (14793-14800)"),
+    ("p5_if_neg_nontrit", "stage1", "N2: Stage-1 BR_NEG (lbl_br_neg 16513+) mirrors x86"),
+    // P9: VM host panic.
+    ("p9_vm_patch_negative_offset", "vm", "N6: ISET mode -9 casts a negative offset to usize; off+8 wraps and buf[off..off+8] panics (1324-1326) instead of returning error[...]"),
+];
+
+pub fn omni_diff4_known_divergence(id: &str, backend: &str) -> Option<&'static str> {
+    OMNI_DIFF4_KNOWN_DIVERGENCES.iter().find(|(g, b, _)| *g == id && *b == backend).map(|(_, _, r)| *r)
+}
+
+/// Per-(golden, backend) verdict of the differential suite.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DiffVerdict {
+    Pass,
+    XFail(&'static str),
+    XPass(&'static str),
+    Fail(String),
+    Skipped(String),
+}
+
+/// Runs every `OMNI_DIFF4_GOLDENS` entry through all four backends and grades it.
+/// Returns `(golden id, backend, verdict, per-run observations)`.
+pub fn run_omni_diff4_suite() -> Result<Vec<(&'static str, &'static str, DiffVerdict, Vec<String>)>, String> {
+    for &(g, b, _) in OMNI_DIFF4_KNOWN_DIVERGENCES {
+        if !OMNI_DIFF4_GOLDENS.iter().any(|d| d.id == g) || !OMNI_DIFF4_BACKENDS.contains(&b) {
+            return Err(format!("diff4: known-divergence entry ({g}, {b}) does not name a golden/backend"));
+        }
+    }
+    let mut out = Vec::new();
+    for g in OMNI_DIFF4_GOLDENS {
+        let mut reports = Vec::new();
+        for (ri, (args, _)) in g.runs.iter().enumerate() {
+            let rep = run_four_backend_differential(g.src, args, &format!("{}_{}", g.id, ri))
+                .map_err(|e| format!("diff4 golden '{}' frontend/verify failed: {e}", g.id))?;
+            reports.push(rep);
+        }
+        for &backend in OMNI_DIFF4_BACKENDS.iter() {
+            if !g.backends.contains(&backend) {
+                continue;
+            }
+            let mut all_pass = true;
+            let mut native_missing = false;
+            let mut notes = Vec::new();
+            let mut first_fail = String::new();
+            for (ri, (args, want)) in g.runs.iter().enumerate() {
+                let o = reports[ri].get(backend);
+                if *o == DiffObs::NativeUnavailable {
+                    native_missing = true;
+                }
+                let ok = want.matches(o);
+                notes.push(format!("args={:?} want={:?} got={}", args, want, o.describe()));
+                if !ok {
+                    if all_pass {
+                        first_fail = format!("args={:?} want={:?} got={}", args, want, o.describe());
+                    }
+                    all_pass = false;
+                }
+                if matches!(o, DiffObs::Panic(_)) && omni_diff4_known_divergence(g.id, backend).is_none() {
+                    all_pass = false;
+                }
+            }
+            let verdict = if native_missing {
+                DiffVerdict::Skipped(String::from("native x86-64 execution unavailable on this host"))
+            } else {
+                match (omni_diff4_known_divergence(g.id, backend), all_pass) {
+                    (None, true) => DiffVerdict::Pass,
+                    (None, false) => DiffVerdict::Fail(first_fail),
+                    (Some(r), false) => DiffVerdict::XFail(r),
+                    (Some(r), true) => DiffVerdict::XPass(r),
+                }
+            };
+            out.push((g.id, backend, verdict, notes));
+        }
+    }
+    Ok(out)
+}
+
+/// 13AX selftest: the cross-backend effect goldens. Counts one check per (golden, backend)
+/// that passes or fails as expected; any unexpected FAIL or XPASS fails the selftest.
+pub fn run_cross_backend_effect_golden_selftests() -> Result<usize, String> {
+    let results = run_omni_diff4_suite()?;
+    let mut checks = 0usize;
+    let mut problems = Vec::new();
+    for (id, backend, verdict, _) in &results {
+        match verdict {
+            DiffVerdict::Pass | DiffVerdict::XFail(_) => checks += 1,
+            DiffVerdict::Skipped(_) => {}
+            DiffVerdict::Fail(d) => problems.push(format!("FAIL {id}/{backend}: {d}")),
+            DiffVerdict::XPass(r) => problems.push(format!(
+                "XPASS {id}/{backend}: now matches the hand-derived expectation; remove it from OMNI_DIFF4_KNOWN_DIVERGENCES (was: {r})"
+            )),
+        }
+    }
+    if !problems.is_empty() {
+        return Err(format!("Cross-backend effect goldens: {}", problems.join(" | ")));
+    }
+    if checks == 0 {
+        return Err(String::from("Cross-backend effect goldens graded nothing"));
+    }
+    Ok(checks)
+}
+
+/// `omnic backend-diff` / `omnic diff4` CLI.
+///   backend-diff --suite                 run OMNI_DIFF4_GOLDENS, print PASS/XFAIL/XPASS/FAIL per backend
+///   backend-diff <file.omni|"src"> [a..] run one program on vm/wasm/x86/stage1, compare byte-for-byte
+/// Exit: 0 = suite green / all comparable backends agree; 1 = FAIL/XPASS / divergence; 2 = usage/frontend error.
+pub fn run_omni_backend_diff_cli(argv: &[String]) -> i32 {
+    if argv.first().map(|s| s.as_str()) == Some("--suite") {
+        let verbose = argv.iter().any(|a| a == "-v" || a == "--verbose");
+        let results = match run_omni_diff4_suite() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[BACKEND-DIFF ERROR] {e}");
+                return 2;
+            }
+        };
+        let (mut p, mut xf, mut xp, mut f, mut s) = (0, 0, 0, 0, 0);
+        for (id, backend, verdict, notes) in &results {
+            let (tag, why) = match verdict {
+                DiffVerdict::Pass => { p += 1; ("PASS ", String::new()) }
+                DiffVerdict::XFail(r) => { xf += 1; ("XFAIL", format!(" -- {r}")) }
+                DiffVerdict::XPass(r) => { xp += 1; ("XPASS", format!(" -- remove known-divergence entry ({r})")) }
+                DiffVerdict::Fail(d) => { f += 1; ("FAIL ", format!(" -- {d}")) }
+                DiffVerdict::Skipped(r) => { s += 1; ("SKIP ", format!(" -- {r}")) }
+            };
+            println!("{tag} {id:<32} {backend:<6}{why}");
+            if verbose || matches!(verdict, DiffVerdict::Fail(_) | DiffVerdict::XPass(_) | DiffVerdict::XFail(_)) {
+                for n in notes {
+                    println!("        {n}");
+                }
+            }
+        }
+        println!("[BACKEND-DIFF SUITE] {} graded: {p} pass, {xf} xfail, {xp} xpass, {f} fail, {s} skipped", results.len());
+        return if f == 0 && xp == 0 { 0 } else { 1 };
+    }
+    if argv.is_empty() {
+        eprintln!("usage: omnic backend-diff (--suite [-v] | <file.omni | \"source\"> [i64 args...])");
+        return 2;
+    }
+    let target = &argv[0];
+    let src = if target.ends_with(".omni") && std::path::Path::new(target).is_file() {
+        match std::fs::read_to_string(target) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("failed to read {target}: {e}");
+                return 2;
+            }
+        }
+    } else {
+        target.clone()
+    };
+    let mut args = Vec::new();
+    for a in &argv[1..] {
+        match a.parse::<i64>() {
+            Ok(v) => args.push(v),
+            Err(_) => {
+                eprintln!("argument '{a}' is not an i64");
+                return 2;
+            }
+        }
+    }
+    let rep = match run_four_backend_differential(&src, &args, "cli") {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[BACKEND-DIFF ERROR] {e}");
+            return 2;
+        }
+    };
+    println!("u16 tokens: {}", rep.u16_len);
+    for (b, o) in &rep.obs {
+        println!("{b:<6} : {}", o.describe());
+    }
+    match rep.stage1_elf_eq_host {
+        Some(eq) => println!("stage1 ELF == x86 ELF : {eq}"),
+        None => println!("stage1 ELF == x86 ELF : n/a"),
+    }
+    if rep.all_agree() {
+        println!("[BACKEND-DIFF AGREE] all comparable backends byte-identical");
+        0
+    } else {
+        println!("[BACKEND-DIFF DIVERGE] comparable backends differ");
+        1
+    }
+}
+
 pub fn run_ai_first_surface_selftests() -> Result<usize, String> {
     let mut checks = 0usize;
 
@@ -13193,6 +13908,10 @@ fn main(x: i64, y: i64) -> i64 {
 
     // 13AW. Vera P1 byte-readback sibling (VM + Wasm assert; x86/Stage-1 native run)
     checks += run_byte_readback_parity_selftests()?;
+
+    // 13AY. Cross-backend effect goldens: VM / Wasm / x86-64 ELF (native) / Stage-1 ELF (native),
+    // graded against hand-derived values with a strict known-divergence list (P1, P2, P3, P4, P5, P6, P7, P9, P11)
+    checks += run_cross_backend_effect_golden_selftests()?;
 
     Ok(checks)
 }
@@ -18546,6 +19265,9 @@ fn main() {
             }
             "acceptance-diff" | "--acceptance-diff" => {
                 std::process::exit(run_omni_acceptance_diff_cli(&cli_args[2..]));
+            }
+            "backend-diff" | "--backend-diff" | "diff4" => {
+                std::process::exit(run_omni_backend_diff_cli(&cli_args[2..]));
             }
             "pure-driver" | "--pure-driver" => {
                 std::process::exit(run_pure_omni_driver_cli(&cli_args[2..]));
