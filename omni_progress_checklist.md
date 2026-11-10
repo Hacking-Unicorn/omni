@@ -48,7 +48,7 @@
 
 ## Phase 4: Audit Fixes, Surface Arenas, `@ENG` String Literals & Direct Surface-to-AOT (Verified for Proven Subset)
 - [x] **1. Audit & Cross-Platform Hardening**:
-  - Eliminated all 7 compiler warnings across `omni_rust_bootstrap.rs`, `omni_rust_bootstrap_verified.rs`, and the 8-crate Cargo workspace (`0` warnings, `0` errors).
+  - Eliminated all 7 compiler warnings across `omni_rust_bootstrap.rs` and the 8-crate Cargo workspace (`0` warnings, `0` errors).
   - Replaced hardcoded `/tmp/...` paths in `run_unit_and_differential_selftests` with `std::env::temp_dir().join(...)` for full Windows/Linux/macOS portability.
   - Added unconditional `OmniBinaryVm` assertion coverage across all platforms for `1d-2` (`divzero`), `1f` (`IMOD0`), and `1i` (`Nested-branch golden`).
   - Reconciled `SPEC.md` Section 1 token partition hex ranges (`0x7DFD..=0x7EFE`) with the normative `omni-isa` constants.

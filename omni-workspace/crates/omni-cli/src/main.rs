@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{self, BufRead, Write};
 
 #[allow(dead_code, unused_imports)]
-#[path = "../../../omni_rust_bootstrap_verified.rs"]
+#[path = "../../../../omni_rust_bootstrap.rs"]
 mod monolith;
 
 use omni_aot::{
