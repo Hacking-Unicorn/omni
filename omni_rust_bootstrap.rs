@@ -18159,6 +18159,9 @@ fn main(a: i64) -> i64 {
         checks_passed += run_ai_first_surface_selftests()?;
     }
 
+    // M2. Milestone 2 foundation guards (spec/m2/): frozen hashes, byte lock, census, labels, lint, decoder.
+    checks_passed += run_m2_foundation_selftests()?;
+
     Ok(checks_passed)
 }
 
@@ -18176,6 +18179,421 @@ fn print_artifact_manifest(paths: &[&str]) {
     }
 }
 
+// ==============================================================================
+// M2. MILESTONE 2 FOUNDATION (spec/m2/): FROZEN-HASH GUARD, SINGLE-MODE BYTE LOCK,
+//     SHAPE CENSUS. These are read-only guards: they change no emitted byte.
+// ==============================================================================
+
+/// Frozen bootstrap artefacts (spec/m2/DECISIONS.md): `(name, length, FNV-1a64)`.
+/// Lengths are in u16 words for streams and in bytes for ELF images.
+pub const M2_FROZEN_HASHES: [(&str, usize, u64); 4] = [
+    ("phase_d_omni_bc_words", 159, 0x23B8D17257CCA9C4),
+    ("phase_d_elf_bytes", 824, 0xE221085777B8AC47),
+    ("pure_core_suite_words", 14559, 0x78462AE4C81DF408),
+    ("stage1_elf_bytes", 106242, 0xEAFC81F46B482FF8),
+];
+
+/// Committed single-mode byte-lock manifest (regenerate with `m2-lock`, review the diff).
+pub const M2_SINGLE_MODE_LOCK_TSV: &str = include_str!("spec/m2/single_mode_lock.tsv");
+/// Committed shape census over the frozen corpus (regenerate with `m2-census`).
+pub const M2_SHAPE_CENSUS_TSV: &str = include_str!("spec/m2/shape_census.tsv");
+
+/// Acceptance goldens embedded verbatim (spec/acceptance/goldens/*.omni).
+pub const M2_GOLDEN_SOURCES: &[(&str, &str)] = &[
+    ("arena_lifecycle_golden", include_str!("spec/acceptance/goldens/arena_lifecycle_golden.omni")),
+    ("asm_roundtrip", include_str!("spec/acceptance/goldens/asm_roundtrip.omni")),
+    ("br_neg_arith_golden", include_str!("spec/acceptance/goldens/br_neg_arith_golden.omni")),
+    ("br_pos_golden", include_str!("spec/acceptance/goldens/br_pos_golden.omni")),
+    ("branch_loop_golden", include_str!("spec/acceptance/goldens/branch_loop_golden.omni")),
+    ("byte_buf_golden", include_str!("spec/acceptance/goldens/byte_buf_golden.omni")),
+    ("custom_non_seed_alu", include_str!("spec/acceptance/goldens/custom_non_seed_alu.omni")),
+    ("decision_hook_golden", include_str!("spec/acceptance/goldens/decision_hook_golden.omni")),
+    ("iabs_golden", include_str!("spec/acceptance/goldens/iabs_golden.omni")),
+    ("idiv_zero", include_str!("spec/acceptance/goldens/idiv_zero.omni")),
+    ("match_trit_golden", include_str!("spec/acceptance/goldens/match_trit_golden.omni")),
+    ("multi_fn_weighted_term", include_str!("spec/acceptance/goldens/multi_fn_weighted_term.omni")),
+    ("neg_ambiguous_grammar", include_str!("spec/acceptance/goldens/neg_ambiguous_grammar.omni")),
+    ("neg_arity_mismatch", include_str!("spec/acceptance/goldens/neg_arity_mismatch.omni")),
+    ("neg_bad_type", include_str!("spec/acceptance/goldens/neg_bad_type.omni")),
+    ("neg_borrow_conflict", include_str!("spec/acceptance/goldens/neg_borrow_conflict.omni")),
+    ("neg_budget_exceeded", include_str!("spec/acceptance/goldens/neg_budget_exceeded.omni")),
+    ("neg_circular_include", include_str!("spec/acceptance/goldens/neg_circular_include.omni")),
+    ("neg_corrupt_pack5", include_str!("spec/acceptance/goldens/neg_corrupt_pack5.omni")),
+    ("neg_immut_param", include_str!("spec/acceptance/goldens/neg_immut_param.omni")),
+    ("neg_linear_leak", include_str!("spec/acceptance/goldens/neg_linear_leak.omni")),
+    ("neg_missing_cap", include_str!("spec/acceptance/goldens/neg_missing_cap.omni")),
+    ("neg_syntax_error", include_str!("spec/acceptance/goldens/neg_syntax_error.omni")),
+    ("neg_taint_on_ret", include_str!("spec/acceptance/goldens/neg_taint_on_ret.omni")),
+    ("neg_taint_sink", include_str!("spec/acceptance/goldens/neg_taint_sink.omni")),
+    ("neg_undef_var", include_str!("spec/acceptance/goldens/neg_undef_var.omni")),
+    ("neg_unknown_fn", include_str!("spec/acceptance/goldens/neg_unknown_fn.omni")),
+    ("neg_unresolved_label", include_str!("spec/acceptance/goldens/neg_unresolved_label.omni")),
+    ("nested_branch_golden", include_str!("spec/acceptance/goldens/nested_branch_golden.omni")),
+    ("pack5_direct_aot", include_str!("spec/acceptance/goldens/pack5_direct_aot.omni")),
+    ("pack5_trit_vec_golden", include_str!("spec/acceptance/goldens/pack5_trit_vec_golden.omni")),
+    ("route_db_query_golden", include_str!("spec/acceptance/goldens/route_db_query_golden.omni")),
+    ("route_kv_golden", include_str!("spec/acceptance/goldens/route_kv_golden.omni")),
+    ("seed0_risk", include_str!("spec/acceptance/goldens/seed0_risk.omni")),
+    ("seed4_consensus", include_str!("spec/acceptance/goldens/seed4_consensus.omni")),
+    ("seed6_clamp", include_str!("spec/acceptance/goldens/seed6_clamp.omni")),
+    ("sel_mix", include_str!("spec/acceptance/goldens/sel_mix.omni")),
+    ("shl_65", include_str!("spec/acceptance/goldens/shl_65.omni")),
+    ("stdlib_macro_pipeline_golden", include_str!("spec/acceptance/goldens/stdlib_macro_pipeline_golden.omni")),
+    ("while_sum_even_golden", include_str!("spec/acceptance/goldens/while_sum_even_golden.omni")),
+];
+
+fn m2_words_fnv(words: &[u16]) -> u64 {
+    fnv1a_64_hash(&encode_u16_stream_to_bytes(words))
+}
+
+/// Recomputes the four frozen artefacts: `(name, length, fnv)` in `M2_FROZEN_HASHES` order.
+pub fn m2_compute_frozen_hashes() -> Result<Vec<(&'static str, usize, u64)>, String> {
+    let (g1, g2, e1, e2) = run_phase_d_pure_omni_selfhost_bootstrap()?;
+    if g1 != g2 || e1 != e2 {
+        return Err(String::from("M2 frozen guard: Phase D gen1 != gen2"));
+    }
+    let suite = build_pure_omni_core_suite_stream()?;
+    let stage1 = build_step7_stage1_compiler_stream();
+    let s1_elf = compile_pure_u16_to_x86_64_elf_with_args(&stage1, 45, 40, 90)?;
+    Ok(vec![
+        (M2_FROZEN_HASHES[0].0, g1.len(), m2_words_fnv(&g1)),
+        (M2_FROZEN_HASHES[1].0, e1.len(), fnv1a_64_hash(&e1)),
+        (M2_FROZEN_HASHES[2].0, suite.len(), m2_words_fnv(&suite)),
+        (M2_FROZEN_HASHES[3].0, s1_elf.len(), fnv1a_64_hash(&s1_elf)),
+    ])
+}
+
+/// selftest_m2_frozen_hashes: asserts all four frozen artefacts are bit-identical to the record.
+pub fn selftest_m2_frozen_hashes() -> Result<usize, String> {
+    let got = m2_compute_frozen_hashes()?;
+    for (i, &(name, len, h)) in got.iter().enumerate() {
+        let (_, want_len, want_h) = M2_FROZEN_HASHES[i];
+        if len != want_len || h != want_h {
+            return Err(format!(
+                "M2 frozen-hash guard FAILED for {}: got len={} fnv=0x{:016X}, frozen len={} fnv=0x{:016X}",
+                name, len, h, want_len, want_h
+            ));
+        }
+    }
+    Ok(got.len())
+}
+
+/// The fixed corpus guarded by the byte lock and the census:
+/// every acceptance golden, every pure core-suite module, the verifier engine,
+/// the Stage-1 compiler stream and the Phase D gen-1 stream.
+pub fn m2_lock_corpus() -> Vec<(String, Result<Vec<u16>, String>)> {
+    let mut out: Vec<(String, Result<Vec<u16>, String>)> = Vec::new();
+    for &(gid, src) in M2_GOLDEN_SOURCES {
+        out.push((format!("golden:{}", gid), compile_omni_surface_to_u16(src)));
+    }
+    for m_path in PURE_OMNI_CORE_SUITE_MODULES.iter() {
+        let r = match lookup_omni_stdlib_module(m_path) {
+            Some(src) => compile_omni_surface_strict_to_u16(src),
+            None => Err(format!("missing module {}", m_path)),
+        };
+        out.push((format!("suite:{}", m_path), r));
+    }
+    out.push((
+        String::from("pure/verifier_engine.omni"),
+        with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(OMNI_VERIFIER_ENGINE_SURFACE)),
+    ));
+    out.push((String::from("stage1_compiler_stream"), Ok(build_step7_stage1_compiler_stream())));
+    out.push((
+        String::from("phase_d_gen1_stream"),
+        run_phase_d_pure_omni_selfhost_bootstrap().map(|(g1, _, _, _)| g1),
+    ));
+    out
+}
+
+/// Renders the single-mode byte-lock manifest: for each corpus stream, the x86-64 single-function
+/// ELF (CLI defaults 0,0,0 and 45,40,90) and the Wasm module, as `len` + FNV-1a64, or `REJECT`.
+pub fn m2_render_single_mode_lock() -> String {
+    m2_render_single_mode_lock_with(&compile_pure_u16_to_x86_64_elf_with_args, &compile_pure_u16_to_wasm)
+}
+
+/// Emitter-generic form, so the workspace crates can be checked against the same committed lock.
+pub fn m2_render_single_mode_lock_with(
+    x86: &dyn Fn(&[u16], i64, i64, i64) -> Result<Vec<u8>, String>,
+    wasm: &dyn Fn(&[u16]) -> Result<Vec<u8>, String>,
+) -> String {
+    let mut s = String::new();
+    s.push_str("# M2 single-mode byte lock (generated by `omni m2-lock`; do not hand-edit).\n");
+    s.push_str("# id\tartefact\tlen\tfnv1a64   (REJECT = compile error today; must stay an error)\n");
+    for (id, r) in m2_lock_corpus() {
+        match r {
+            Err(_) => s.push_str(&format!("{}\tsrc\tREJECT\n", id)),
+            Ok(words) => {
+                s.push_str(&format!("{}\tu16\t{}\t0x{:016X}\n", id, words.len(), m2_words_fnv(&words)));
+                for &(tag, a, b, c) in &[("x86_000", 0i64, 0i64, 0i64), ("x86_454090", 45, 40, 90)] {
+                    match x86(&words, a, b, c) {
+                        Ok(elf) => s.push_str(&format!("{}\t{}\t{}\t0x{:016X}\n", id, tag, elf.len(), fnv1a_64_hash(&elf))),
+                        Err(_) => s.push_str(&format!("{}\t{}\tREJECT\n", id, tag)),
+                    }
+                }
+                match wasm(&words) {
+                    Ok(w) => s.push_str(&format!("{}\twasm\t{}\t0x{:016X}\n", id, w.len(), fnv1a_64_hash(&w))),
+                    Err(_) => s.push_str(&format!("{}\twasm\tREJECT\n", id)),
+                }
+            }
+        }
+    }
+    s
+}
+
+fn m2_tsv_body(s: &str) -> Vec<&str> {
+    s.lines().filter(|l| !l.trim().is_empty() && !l.starts_with('#')).collect()
+}
+
+pub fn m2_compare_tsv(what: &str, want: &str, got: &str) -> Result<usize, String> {
+    let w = m2_tsv_body(want);
+    let g = m2_tsv_body(got);
+    for i in 0..w.len().max(g.len()) {
+        let a = w.get(i).copied().unwrap_or("<missing>");
+        let b = g.get(i).copied().unwrap_or("<missing>");
+        if a != b {
+            return Err(format!("M2 {} drift at row {}: committed `{}` vs current `{}`", what, i + 1, a, b));
+        }
+    }
+    if w.is_empty() {
+        return Err(format!("M2 {} manifest is empty", what));
+    }
+    Ok(w.len())
+}
+
+/// selftest_m2_single_mode_byte_lock: every existing single-mode x86-64 / Wasm output is unchanged.
+pub fn selftest_m2_single_mode_byte_lock() -> Result<usize, String> {
+    let current = m2_render_single_mode_lock();
+    let rows = m2_compare_tsv("single-mode byte lock", M2_SINGLE_MODE_LOCK_TSV, &current)?;
+    // Guard self-check: a one-byte drift in any locked artefact must be detected.
+    let tampered = current.replacen("\tx86_454090\t", "\tx86_454090\t9", 1);
+    if rows == 0 || m2_compare_tsv("tamper", M2_SINGLE_MODE_LOCK_TSV, &tampered).is_ok() {
+        return Err(String::from("M2 byte-lock guard failed to detect an injected drift"));
+    }
+    Ok(2)
+}
+
+#[inline]
+fn m2_is_label_pos(op_tok: u16, idx: usize) -> bool {
+    match op_tok {
+        0x7F40 => idx == 0,
+        0x7F41 => true,
+        0x7F42 | 0x7F43 | 0x7F44 => idx >= 1,
+        _ => false,
+    }
+}
+
+fn m2_operand_ty(op: &BinOperand, f: &BinFunction, reg_ty: &[u16; 192]) -> u16 {
+    match *op {
+        BinOperand::Reg(r) if (r - REG_BASE) < 192 => reg_ty[(r - REG_BASE) as usize],
+        BinOperand::Param(p) => f.params.get((p - PAR_BASE) as usize).map(|x| x.1).unwrap_or(TY_VOID),
+        _ => TY_VOID,
+    }
+}
+
+/// Shape census keys (spec/m2/PLAN.md M2-01). C1's IGET/ISET multi-byte shapes are
+/// deliberately NOT counted here (that scan belongs to C1).
+pub const M2_CENSUS_KEYS: [&str; 15] = [
+    "ret_3op",
+    "iget_imm_neg",
+    "iget_imm_on_anew",
+    "param_ge4",
+    "slen_on_array",
+    "div_nonimm_divisor",
+    "div_imm_zero_or_m1",
+    "sel_trit_bytes_operand",
+    "label_mixed_forms_fn",
+    "label_duplicate_def",
+    "label_imm_ge83",
+    "label_out_of_m2_domain",
+    "br_trit_lt3_labels",
+    "branch_without_label",
+    "multi_fn_module",
+];
+
+/// Counts the census shapes in one decoded module.
+pub fn m2_census_module(m: &BinModule) -> [usize; 15] {
+    let mut c = [0usize; 15];
+    if m.functions.len() > 1 {
+        c[14] += 1;
+    }
+    for f in &m.functions {
+        let mut reg_ty = [TY_VOID; 192];
+        let mut reg_anew = [false; 192];
+        for ins in &f.instructions {
+            if let Some(d) = ins.dest_reg {
+                let k = (d - REG_BASE) as usize;
+                if k < 192 {
+                    reg_ty[k] = ins.ty_tok;
+                    reg_anew[k] = ins.op_tok == 0x7F0D;
+                }
+            }
+        }
+        let mut seen_lbl = false;
+        let mut seen_imm = false;
+        let mut defs: Vec<u16> = Vec::new();
+        for ins in &f.instructions {
+            let ops = &ins.operands;
+            for op in ops {
+                if let BinOperand::Param(p) = *op {
+                    if p - PAR_BASE >= 4 {
+                        c[3] += 1;
+                        break;
+                    }
+                }
+            }
+            match ins.op_tok {
+                0x7F4A if ops.len() == 3 => c[0] += 1,
+                0x7F0E if ops.len() == 2 => {
+                    if let BinOperand::ImmInt(v) = ops[1] {
+                        if v < 0 {
+                            c[1] += 1;
+                        }
+                        if let BinOperand::Reg(r) = ops[0] {
+                            if (r - REG_BASE) < 192 && reg_anew[(r - REG_BASE) as usize] {
+                                c[2] += 1;
+                            }
+                        }
+                    }
+                }
+                0x7F50 if !ops.is_empty() && m2_operand_ty(&ops[0], f, &reg_ty) == TY_ARRAY => c[4] += 1,
+                0x7F13 | 0x7F14 if ops.len() >= 2 => match ops[1] {
+                    BinOperand::ImmInt(0) | BinOperand::ImmInt(-1) => c[6] += 1,
+                    BinOperand::ImmInt(_) => {}
+                    _ => c[5] += 1,
+                },
+                0x7F45 => {
+                    if ops.iter().any(|o| m2_operand_ty(o, f, &reg_ty) == TY_BYTES) {
+                        c[7] += 1;
+                    }
+                }
+                _ => {}
+            }
+            if matches!(ins.op_tok, 0x7F40..=0x7F44) {
+                let mut n_lbl = 0usize;
+                for (i, op) in ops.iter().enumerate() {
+                    if !m2_is_label_pos(ins.op_tok, i) {
+                        continue;
+                    }
+                    match *op {
+                        BinOperand::Label(_) => seen_lbl = true,
+                        BinOperand::ImmInt(_) => seen_imm = true,
+                        _ => {}
+                    }
+                    if let Some(key) = extract_label_id(op) {
+                        n_lbl += 1;
+                        if let BinOperand::ImmInt(_) = *op {
+                            if key >= 83 && !(LBL_BASE..=LBL_MAX).contains(&key) {
+                                c[10] += 1;
+                            }
+                        }
+                        if key >= 4080 && !(LBL_BASE..=LBL_MAX).contains(&key) {
+                            c[11] += 1;
+                        }
+                        if ins.op_tok == 0x7F40 {
+                            if defs.contains(&key) {
+                                c[9] += 1;
+                            } else {
+                                defs.push(key);
+                            }
+                        }
+                    }
+                }
+                if ins.op_tok == 0x7F42 && n_lbl < 3 {
+                    c[12] += 1;
+                }
+                if n_lbl == 0 {
+                    c[13] += 1;
+                }
+            }
+        }
+        if seen_lbl && seen_imm {
+            c[8] += 1;
+        }
+    }
+    c
+}
+
+/// Renders the census: one `id\tkey\tcount` row per non-zero count, plus a `TOTAL` block.
+pub fn m2_render_shape_census() -> String {
+    let mut s = String::new();
+    s.push_str("# M2 shape census over the frozen corpus (generated by `omni m2-census`; do not hand-edit).\n");
+    s.push_str("# id\tkey\tcount   (only non-zero counts; DECODE_ERROR = stream does not decode)\n");
+    let mut total = [0usize; 15];
+    for (id, r) in m2_lock_corpus() {
+        let words = match r {
+            Ok(w) => w,
+            Err(_) => continue,
+        };
+        match decode_omni_token_stream(&words) {
+            Err(_) => s.push_str(&format!("{}\tDECODE_ERROR\t1\n", id)),
+            Ok(m) => {
+                let c = m2_census_module(&m);
+                for k in 0..15 {
+                    if c[k] > 0 {
+                        s.push_str(&format!("{}\t{}\t{}\n", id, M2_CENSUS_KEYS[k], c[k]));
+                        total[k] += c[k];
+                    }
+                }
+            }
+        }
+    }
+    for k in 0..15 {
+        s.push_str(&format!("TOTAL\t{}\t{}\n", M2_CENSUS_KEYS[k], total[k]));
+    }
+    s
+}
+
+/// selftest_m2_shape_census: the frozen corpus still has exactly the committed shape counts.
+pub fn selftest_m2_shape_census() -> Result<usize, String> {
+    m2_compare_tsv("shape census", M2_SHAPE_CENSUS_TSV, &m2_render_shape_census())?;
+    Ok(1)
+}
+
+/// All Milestone 2 foundation selftests (M2-01 ..).
+pub fn run_m2_foundation_selftests() -> Result<usize, String> {
+    let mut n = 0usize;
+    n += selftest_m2_frozen_hashes()?;
+    n += selftest_m2_single_mode_byte_lock()?;
+    n += selftest_m2_shape_census()?;
+    Ok(n)
+}
+
+/// `omni m2-frozen | m2-lock | m2-census` (Milestone 2 tooling).
+pub fn run_m2_cli(args: &[String]) -> i32 {
+    let cmd = args.first().map(|s| s.as_str()).unwrap_or("");
+    match cmd {
+        "m2-frozen" => match m2_compute_frozen_hashes() {
+            Ok(v) => {
+                let mut ok = true;
+                for (i, (name, len, h)) in v.iter().enumerate() {
+                    let (_, wl, wh) = M2_FROZEN_HASHES[i];
+                    let st = if *len == wl && *h == wh { "OK" } else { ok = false; "CHANGED" };
+                    println!("{}\t{}\t0x{:016X}\t{}", name, len, h, st);
+                }
+                if ok { 0 } else { 1 }
+            }
+            Err(e) => {
+                eprintln!("{}", e);
+                1
+            }
+        },
+        "m2-lock" => {
+            print!("{}", m2_render_single_mode_lock());
+            0
+        }
+        "m2-census" => {
+            print!("{}", m2_render_shape_census());
+            0
+        }
+        _ => {
+            eprintln!("usage: omni m2-frozen | m2-lock | m2-census");
+            2
+        }
+    }
+}
+
+// ==== END M2 FOUNDATION ====
+
 fn main() {
     let cli_args: Vec<String> = env::args().collect();
     if cli_args.first().map(|a| a.contains("omni-harness")).unwrap_or(false)
@@ -18187,6 +18605,9 @@ fn main() {
         match cli_args[1].as_str() {
             "harness" | "--harness" => {
                 std::process::exit(run_omni_harness_cli(&cli_args[2..]));
+            }
+            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" => {
+                std::process::exit(run_m2_cli(&cli_args[1..]));
             }
             "agent-driver" | "--agent-driver" => {
                 std::process::exit(run_omni_agent_driver_cli(&cli_args[2..]));
