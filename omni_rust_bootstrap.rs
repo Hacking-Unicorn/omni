@@ -18902,6 +18902,7 @@ pub fn run_m2_foundation_selftests() -> Result<usize, String> {
     n += selftest_m2_frozen_hashes()?;
     n += selftest_m2_single_mode_byte_lock()?;
     n += selftest_m2_shape_census()?;
+    n += selftest_m2_label_reference()?;
     Ok(n)
 }
 
@@ -18932,11 +18933,287 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
             print!("{}", m2_render_shape_census());
             0
         }
+        "m2-labels" => match m2_eval_label_cases() {
+            Ok(rows) => {
+                print!("{}", m2_render_label_reference(&rows));
+                0
+            }
+            Err(e) => {
+                eprintln!("{}", e);
+                1
+            }
+        },
         _ => {
-            eprintln!("usage: omni m2-frozen | m2-lock | m2-census");
+            eprintln!("usage: omni m2-frozen | m2-lock | m2-census | m2-labels");
             2
         }
     }
+}
+
+// ---- M2-02: label-resolution reference (spec/m2/PLAN.md §3) ----------------------------
+//
+// Rust reference behaviour locked here:
+//   key   = extract_label_id(op): Label(tok) -> raw token 0x7EF0+k; ImmInt(v) -> v & 0xFFFF
+//   defs  = every LABEL with an extractable key (verify_binary_function); duplicates allowed
+//   uses  = JMP: all operands; BR_TRIT/BR_POS/BR_NEG: operands[1..]; undefined -> UNRESOLVED_LABEL
+//   emit  = LABEL emits 0 bytes and records (key, offset); resolution is first-definition-wins
+// Known, recorded divergences (NOT fixed here): Stage-1 (frozen) and pure/verifier_engine.omni.
+
+/// Committed label reference table (regenerate with `m2-labels`, review the diff).
+pub const M2_LABEL_REFERENCE_TSV: &str = include_str!("spec/m2/label_reference.tsv");
+
+const M2_LBL_BASE_ASM: &str = "PARAM $0 I64 SAFE\nRET_TY I64\nLABEL 1\nJMP 1\nRET 7\n";
+
+/// Replaces the n-th label token (0x7EF0..0x7EFF, stream order) of an assembled stream.
+fn m2_lbl_patch(asm: &str, repl: &[(usize, &[u16])]) -> Result<Vec<u16>, String> {
+    let s = assemble_omni_text_to_u16(asm)?;
+    let mut out = Vec::with_capacity(s.len() + 8);
+    let mut n = 0usize;
+    for &w in &s {
+        if (LBL_BASE..=LBL_MAX).contains(&w) {
+            if let Some(&(_, toks)) = repl.iter().find(|(k, _)| *k == n) {
+                out.extend_from_slice(toks);
+                n += 1;
+                continue;
+            }
+            n += 1;
+        }
+        out.push(w);
+    }
+    Ok(out)
+}
+
+fn m2_imm16(v: u16) -> [u16; 2] {
+    [TOK_IMM_I16, v]
+}
+
+/// The label differential cases (L1..L9 of the plan; L10/L11 need the multi-function
+/// emitter (M2-09) and L12 is the Stage-1 anchor covered by the frozen-hash guard).
+pub fn m2_label_cases() -> Result<Vec<(&'static str, Vec<u16>)>, String> {
+    let b = M2_LBL_BASE_ASM;
+    let dup = "PARAM $0 I64 SAFE\nRET_TY I64\nJMP 1\nLABEL 1\n%0 = CINT 5\nLABEL 1\nRET 7\n";
+    let mut v: Vec<(&'static str, Vec<u16>)> = Vec::new();
+    v.push(("L1_lbl_def_lbl_use", assemble_omni_text_to_u16(b)?));
+    v.push(("L2_imm5_def_imm5_use", m2_lbl_patch(b, &[(0, &m2_imm16(5)), (1, &m2_imm16(5))])?));
+    v.push(("L2_imm82_def_imm82_use", m2_lbl_patch(b, &[(0, &m2_imm16(82)), (1, &m2_imm16(82))])?));
+    v.push(("L2_imm1_def_imm1_use", m2_lbl_patch(b, &[(0, &m2_imm16(1)), (1, &m2_imm16(1))])?));
+    v.push(("L3_mixed_lbl_def_imm_use", m2_lbl_patch(b, &[(1, &m2_imm16(1))])?));
+    v.push(("L3_mixed_imm_def_lbl_use", m2_lbl_patch(b, &[(0, &m2_imm16(1))])?));
+    v.push(("L4_alias_imm7EF1_def_lbl_use", m2_lbl_patch(b, &[(0, &m2_imm16(0x7EF1))])?));
+    v.push(("L5_duplicate_def", assemble_omni_text_to_u16(dup)?));
+    v.push((
+        "L5_duplicate_first_only",
+        assemble_omni_text_to_u16("PARAM $0 I64 SAFE\nRET_TY I64\nJMP 1\nLABEL 1\n%0 = CINT 5\nRET 7\n")?,
+    ));
+    v.push((
+        "L5_duplicate_last_only",
+        assemble_omni_text_to_u16("PARAM $0 I64 SAFE\nRET_TY I64\nJMP 1\n%0 = CINT 5\nLABEL 1\nRET 7\n")?,
+    ));
+    for &(name, id) in &[
+        ("L6_imm83", 83u16),
+        ("L6_imm254", 254),
+        ("L6_imm255", 255),
+        ("L6_imm256", 256),
+        ("L6_imm4079", 4079),
+        ("L7_imm4080", 4080),
+        ("L7_imm5000", 5000),
+        ("L7_imm_minus1", 0xFFFF),
+    ] {
+        v.push((name, m2_lbl_patch(b, &[(0, &m2_imm16(id)), (1, &m2_imm16(id))])?));
+    }
+    v.push((
+        "L7_imm32_0x00010001_masks_to_1",
+        m2_lbl_patch(b, &[(0, &[TOK_IMM_I32, 0x0001, 0x0001]), (1, &m2_imm16(1))])?,
+    ));
+    v.push((
+        "L8_br_trit_2_labels",
+        // The assembler requires 3 labels; drop the 3rd label operand token (stream order #2).
+        m2_lbl_patch(
+            "PARAM $0 I64 SAFE\nRET_TY I64\n%0 = TCMP $0 0\nBR_TRIT %0 1 2 3\nLABEL 1\nLABEL 2\nLABEL 3\nRET 7\n",
+            &[(2, &[])],
+        )?,
+    ));
+    v.push((
+        "L8_br_trit_3_labels",
+        assemble_omni_text_to_u16(
+            "PARAM $0 I64 SAFE\nRET_TY I64\n%0 = TCMP $0 0\nBR_TRIT %0 1 2 3\nLABEL 1\nLABEL 2\nLABEL 3\nRET 7\n",
+        )?,
+    ));
+    v.push((
+        "L9_jmp_second_operand_undefined",
+        // JMP LBL1 LBL2 with only LBL1 defined (the assembler accepts one JMP operand).
+        m2_lbl_patch(b, &[(1, &[LBL_BASE + 1, LBL_BASE + 2])])?,
+    ));
+    Ok(v)
+}
+
+/// Runs the frozen Stage-1 compiler (on the VM) over a stream: Ok(ELF bytes) or Err.
+fn m2_stage1_on_vm(stage1: &BinModule, s: &[u16]) -> Result<Vec<u8>, String> {
+    let mut vm = OmniBinaryVm::new();
+    let args = vec![OmniValue::U16Array(s.to_vec()), OmniValue::Int(0), OmniValue::Int(0), OmniValue::Int(0)];
+    match vm.execute_function(stage1, 0, args)? {
+        OmniValue::Bytes(b) => Ok(b),
+        other => Err(format!("Stage-1 returned {:?}", other)),
+    }
+}
+
+/// One evaluated label case.
+pub struct M2LabelRow {
+    pub name: &'static str,
+    pub rust_verify: bool,
+    pub rust_x86: Option<Vec<u8>>,
+    pub stage1: Option<Vec<u8>>,
+    pub omni_verifier_agrees: bool,
+}
+
+pub fn m2_eval_label_cases() -> Result<Vec<M2LabelRow>, String> {
+    let s1 = decode_omni_token_stream(&build_step7_stage1_compiler_stream())?;
+    let mut rows = Vec::new();
+    for (name, s) in m2_label_cases()? {
+        let m = decode_omni_token_stream(&s)?;
+        let rust_verify = m.functions.iter().all(|f| verify_binary_function(f).passed);
+        let rust_x86 = compile_pure_u16_to_x86_64_elf_with_args(&s, 0, 0, 0).ok();
+        if rust_verify != rust_x86.is_some() {
+            return Err(format!("M2 label case {}: Rust verifier/AOT verdict split", name));
+        }
+        let stage1 = m2_stage1_on_vm(&s1, &s).ok();
+        let omni_verifier_agrees = compare_rust_and_omni_verifier(name, &s).is_ok();
+        rows.push(M2LabelRow { name, rust_verify, rust_x86, stage1, omni_verifier_agrees });
+    }
+    Ok(rows)
+}
+
+fn m2_len_fnv(b: &Option<Vec<u8>>, none: &str) -> String {
+    match b {
+        Some(x) => format!("{}\t0x{:016X}", x.len(), fnv1a_64_hash(x)),
+        None => format!("{}\t-", none),
+    }
+}
+
+pub fn m2_render_label_reference(rows: &[M2LabelRow]) -> String {
+    let mut s = String::new();
+    s.push_str("# M2 label-resolution reference (generated by `omni m2-labels`; do not hand-edit).\n");
+    s.push_str("# case\trust_verify\trust_x86_len\trust_x86_fnv\tstage1_len\tstage1_fnv\tstage1_vs_rust\tomni_verifier_vs_rust\n");
+    for r in rows {
+        let s1_vs = match (&r.rust_x86, &r.stage1) {
+            (Some(a), Some(b)) if a == b => "SAME",
+            (None, None) => "SAME",
+            _ => "DIVERGE",
+        };
+        s.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\n",
+            r.name,
+            if r.rust_verify { "ACCEPT" } else { "REJECT" },
+            m2_len_fnv(&r.rust_x86, "REJECT"),
+            m2_len_fnv(&r.stage1, "ERROR"),
+            s1_vs,
+            if r.omni_verifier_agrees { "AGREE" } else { "DIVERGE" }
+        ));
+    }
+    s
+}
+
+/// selftest_m2_label_reference: locks the Rust reference and the recorded divergences.
+pub fn selftest_m2_label_reference() -> Result<usize, String> {
+    let rows = m2_eval_label_cases()?;
+    let get = |n: &str| rows.iter().find(|r| r.name == n).ok_or_else(|| format!("missing label case {}", n));
+    let mut checks = 0usize;
+    // (a) Key rule: LBL k and IMM k are distinct keys -> mixed forms are UNRESOLVED in Rust.
+    for n in ["L3_mixed_lbl_def_imm_use", "L3_mixed_imm_def_lbl_use", "L9_jmp_second_operand_undefined"] {
+        if get(n)?.rust_verify {
+            return Err(format!("M2 label reference: Rust must reject {}", n));
+        }
+    }
+    checks += 1;
+    // (b) Alias rule: IMM 0x7EF1 is the same key as LBL 1 -> identical bytes to L1.
+    if get("L4_alias_imm7EF1_def_lbl_use")?.rust_x86 != get("L1_lbl_def_lbl_use")?.rust_x86 {
+        return Err(String::from("M2 label reference: IMM 0x7EF1 must alias LBL 1"));
+    }
+    // (c) Mask rule: IMM_I32 0x00010001 keys as 1.
+    if get("L7_imm32_0x00010001_masks_to_1")?.rust_x86 != get("L2_imm1_def_imm1_use")?.rust_x86 {
+        return Err(String::from("M2 label reference: IMM_I32 label key must be v & 0xFFFF"));
+    }
+    checks += 2;
+    // (d) First definition wins (LABEL emits no bytes, so dropping the 2nd def is byte-neutral).
+    let dup = get("L5_duplicate_def")?;
+    if dup.rust_x86.is_none() || dup.rust_x86 != get("L5_duplicate_first_only")?.rust_x86 {
+        return Err(String::from("M2 label reference: Rust duplicate LABEL must resolve to the first def"));
+    }
+    if dup.rust_x86 == get("L5_duplicate_last_only")?.rust_x86 {
+        return Err(String::from("M2 label reference: first/last duplicate fixtures do not discriminate"));
+    }
+    checks += 1;
+    // (e) All IMM ids, including >= 4080 and 0xFFFF, are accepted by Rust today.
+    for n in ["L6_imm83", "L6_imm255", "L6_imm4079", "L7_imm4080", "L7_imm5000", "L7_imm_minus1"] {
+        if !get(n)?.rust_verify {
+            return Err(format!("M2 label reference: Rust must accept {}", n));
+        }
+    }
+    // (f) BR_TRIT with < 3 labels is accepted and emits no branch (A:550-554): it is byte-shorter.
+    let (b2, b3) = (get("L8_br_trit_2_labels")?, get("L8_br_trit_3_labels")?);
+    match (&b2.rust_x86, &b3.rust_x86) {
+        (Some(x), Some(y)) if x.len() < y.len() => {}
+        _ => return Err(String::from("M2 label reference: BR_TRIT 2-label shape not locked")),
+    }
+    checks += 2;
+    // (g) Recorded divergences: exactly these cases, nothing more, nothing less.
+    let s1_div: Vec<&str> = rows
+        .iter()
+        .filter(|r| match (&r.rust_x86, &r.stage1) {
+            (Some(a), Some(b)) => a != b,
+            (None, None) => false,
+            _ => true,
+        })
+        .map(|r| r.name)
+        .collect();
+    // Stage-1 (frozen, A:1612 MAX_LABELS = 83, A:1764-1772 LBL->k, A:2058-2066 last-def-wins):
+    let want_s1 = [
+        "L3_mixed_lbl_def_imm_use",
+        "L3_mixed_imm_def_lbl_use",
+        "L4_alias_imm7EF1_def_lbl_use",
+        "L5_duplicate_def",
+        "L6_imm83",
+        "L6_imm254",
+        "L6_imm255",
+        "L6_imm256",
+        "L6_imm4079",
+        "L7_imm4080",
+        "L7_imm5000",
+        "L7_imm_minus1",
+        "L7_imm32_0x00010001_masks_to_1",
+        "L8_br_trit_2_labels",
+        "L9_jmp_second_operand_undefined",
+    ];
+    let ov_div: Vec<&str> = rows.iter().filter(|r| !r.omni_verifier_agrees).map(|r| r.name).collect();
+    // pure/verifier_engine.omni (VE:426 LBL->k, VE:340-358 keys 0..254):
+    let want_ov = [
+        "L3_mixed_lbl_def_imm_use",
+        "L3_mixed_imm_def_lbl_use",
+        "L4_alias_imm7EF1_def_lbl_use",
+        "L6_imm255",
+        "L6_imm256",
+        "L6_imm4079",
+        "L7_imm4080",
+        "L7_imm5000",
+        "L7_imm_minus1",
+    ];
+    for (who, got, want) in [("Stage-1", &s1_div, &want_s1[..]), ("Omni verifier", &ov_div, &want_ov[..])] {
+        for w in want {
+            if !got.contains(w) {
+                return Err(format!("M2 label reference: expected recorded {} divergence on {} is gone (update the record)", who, w));
+            }
+        }
+        for g in got.iter() {
+            if !want.contains(g) {
+                return Err(format!("M2 label reference: NEW {} divergence on {}", who, g));
+            }
+        }
+    }
+    checks += 2;
+    // (h) Byte-exact snapshot of the whole table.
+    m2_compare_tsv("label reference", M2_LABEL_REFERENCE_TSV, &m2_render_label_reference(&rows))?;
+    checks += 1;
+    Ok(checks)
 }
 
 // ==== END M2 FOUNDATION ====

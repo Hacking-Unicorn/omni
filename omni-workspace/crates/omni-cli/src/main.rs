@@ -978,6 +978,19 @@ pub fn run_workspace_m2_guards() -> Result<usize, String> {
     );
     monolith::m2_compare_tsv("workspace single-mode byte lock", monolith::M2_SINGLE_MODE_LOCK_TSV, &ws_lock)?;
     checks += 1;
+    // M2-02: the workspace verifier and emitter agree with the monolith's label reference.
+    for (name, s) in monolith::m2_label_cases()? {
+        let ws_ok = verify_u16_stream(&s).map(|r| r.iter().all(|x| x.passed)).unwrap_or(false);
+        let mono = decode_omni_token_stream(&s)
+            .ok()
+            .map(|_| monolith::verify_u16_stream(&s).map(|r| r.iter().all(|x| x.passed)).unwrap_or(false));
+        let ws_elf = compile_pure_u16_to_x86_64_elf_with_args(&s, 0, 0, 0).ok();
+        let mono_elf = monolith::compile_pure_u16_to_x86_64_elf_with_args(&s, 0, 0, 0).ok();
+        if Some(ws_ok) != mono || ws_elf != mono_elf {
+            return Err(format!("Workspace vs monolith label reference divergence on {}", name));
+        }
+    }
+    checks += 1;
     Ok(checks)
 }
 
