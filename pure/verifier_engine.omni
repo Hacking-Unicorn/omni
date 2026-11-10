@@ -404,7 +404,7 @@ fn parse_eng(stream: bytes, pos: i64, nwords: i64) -> i64 {
 }
 
 #[strict]
-fn parse_operand(stream: bytes, pos: i64, nwords: i64) -> i64 {
+fn parse_operand_raw(stream: bytes, pos: i64, nwords: i64) -> i64 {
     let have: i64 = is_gt(nwords, pos);
     let tok: i64 = load_u16(stream, pos) * have;
     let is_reg: i64 = in_range(tok, 32256, 32447);
@@ -421,7 +421,6 @@ fn parse_operand(stream: bytes, pos: i64, nwords: i64) -> i64 {
     let is_fn: i64 = is_eq(tok, 32492);
     let is_sk: i64 = is_eq(tok, 32493);
     let is_sym: i64 = is_sch + is_fn + is_sk;
-    let is_kv: i64 = is_eq(tok, 32494);
     let is_simple: i64 = is_reg + is_par + is_lbl + is_trit;
     let simple_flags: i64 = (is_reg + is_par) * 1 + is_lbl * 2 + is_trit * 8;
     let simple_tok: i64 = is_lbl * (tok - 32496) + is_reg * tok + is_par * tok;
@@ -441,38 +440,39 @@ fn parse_operand(stream: bytes, pos: i64, nwords: i64) -> i64 {
         + is_i16 * need_i16 * pack_op(imm_pos, 8, imm_tok)
         + is_i32 * need_i32 * pack_op(imm_pos, 8, imm_tok)
         + sym_ok * pack_op(pos + 2, 8, 0);
-    let var_kind: i64 = have * (is_eng + is_kv);
     let c_eng: trit = is_eng <=> 0;
     let eng_p: i64 = if_pos c_eng {
         parse_eng(stream, pos, nwords)
     } else {
         0
     };
-    let c_kv: trit = is_kv <=> 0;
-    let kv_p: i64 = if_pos c_kv {
-        parse_kv(stream, pos, nwords)
-    } else {
-        0
-    };
-    let var_p: i64 = eng_p + kv_p;
+    let var_kind: i64 = have * is_eng;
     let err: i64 = pack_op(pos, 32, 0);
-    let r: i64 = known_fixed * fixed + var_kind * var_p + (1 - known_fixed - var_kind) * err;
+    let r: i64 = known_fixed * fixed + var_kind * eng_p + (1 - known_fixed - var_kind) * err;
     return r;
 }
 
 #[strict]
-fn parse_kv(stream: bytes, pos: i64, nwords: i64) -> i64 {
-    let need: i64 = is_gt(nwords, pos + 1);
-    let c: trit = need <=> 0;
-    let out: i64 = if_pos c {
-        let inner: i64 = parse_operand(stream, pos + 2, nwords);
-        let fl: i64 = op_flags(inner);
-        let err: i64 = is_gt(fl & 32, 0);
-        let merged: i64 = pack_op(op_pos(inner), fl, op_tok(inner));
-        let r: i64 = err * inner + (1 - err) * merged;
-        r
+fn parse_operand(stream: bytes, pos: i64, nwords: i64) -> i64 {
+    // Iterative FieldKV unwrap. TOK_FIELD_KV (0x7EEE = 32494) is a prefix
+    // of (field_idx, inner_operand); nested wrappers are skipped in a loop
+    // over linear memory, never by recursion or eager recursive calls.
+    let cur: i64 = pos;
+    let bad: i64 = 0;
+    let bad_off: i64 = pos;
+    let go: i64 = is_gt(nwords, cur) * is_eq(load_u16(stream, cur), 32494);
+    while go <=> 0 {
+        let need: i64 = is_gt(nwords, cur + 1);
+        bad = bad + (1 - need);
+        bad_off = (1 - need) * cur + need * bad_off;
+        cur = cur + need * 2;
+        go = (1 - bad) * is_gt(nwords, cur) * is_eq(load_u16(stream, cur), 32494);
+    }
+    let c_bad: trit = bad <=> 0;
+    let out: i64 = if_pos c_bad {
+        pack_op(bad_off, 32, 0)
     } else {
-        pack_op(pos, 32, 0)
+        parse_operand_raw(stream, cur, nwords)
     };
     return out;
 }
