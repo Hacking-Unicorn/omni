@@ -1275,4 +1275,13 @@ mod tests {
             assert!(n >= 39, "expected at least 39 acceptance goldens, got {n}");
         });
     }
+
+    #[test]
+    fn verifier_engine_diff_suite() {
+        with_repo_root(|| {
+            let n = omni_lang::run_verifier_engine_diff_selftests()
+                .expect("verifier engine differential failed");
+            assert!(n >= 40, "expected at least 40 verifier-diff cases, got {n}");
+        });
+    }
 }

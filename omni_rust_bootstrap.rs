@@ -11394,6 +11394,446 @@ fn expect_omni_error_code<T: std::fmt::Debug>(label: &str, res: Result<T, String
 /// `omni-agent-driver` automated emit + repair loops, and live TCP HTTP/1.1 + DB/KV server golden.
 /// Negative and positive selftests for capability-bound FS/DB sandboxing.
 /// Returns the number of checks passed (4: in-root write, `..` traversal, absolute escape, symlink escape).
+// ==============================================================================
+// PURE-OMNI VERIFIER ENGINE (real token-stream verifier, not a scalar kernel)
+// ==============================================================================
+
+pub const OMNI_VERIFIER_ENGINE_VERSION: &str = "omni-verifier-engine-v1.0.0";
+pub const OMNI_VERIFIER_ENGINE_SURFACE: &str =
+    include_str!("pure/verifier_engine.omni");
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OmniEngineError {
+    pub code: i64,
+    pub name: &'static str,
+    pub offset: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OmniEngineFnReport {
+    pub fn_idx: u16,
+    pub passed: bool,
+    pub errors: Vec<OmniEngineError>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OmniEngineModuleReport {
+    pub decode_error: Option<(i64, usize)>,
+    pub functions: Vec<OmniEngineFnReport>,
+}
+
+pub fn verifier_engine_error_name(code: i64) -> &'static str {
+    match code {
+        1001 => "TAINT_ON_RET",
+        1002 => "TAINT_SINK",
+        1003 => "MISSING_CAP",
+        1004 => "LINEAR_LEAK",
+        1005 => "BORROW_CONFLICT",
+        2009 => "UNRESOLVED_LABEL",
+        3001 => "UNKNOWN_OPCODE",
+        3003 => "SSA_NONCANONICAL",
+        3004 => "ARENA_OVERWRITE",
+        3005 => "REG_REASSIGN",
+        3006 => "DECODE_ERROR",
+        other => {
+            let _ = other;
+            "UNKNOWN"
+        }
+    }
+}
+
+pub fn classify_rust_verifier_error(err: &str) -> (i64, usize) {
+    let mut offset = 0usize;
+    if let Some(idx) = err.find("Offset ") {
+        let digits: String = err[idx + 7..].chars().take_while(|c| c.is_ascii_digit()).collect();
+        offset = digits.parse().unwrap_or(0);
+    } else if let Some(idx) = err.find("at offset ") {
+        let digits: String = err[idx + 10..].chars().take_while(|c| c.is_ascii_digit()).collect();
+        offset = digits.parse().unwrap_or(0);
+    } else if let Some(idx) = err.find("instruction at ") {
+        let digits: String = err[idx + 15..].chars().take_while(|c| c.is_ascii_digit()).collect();
+        offset = digits.parse().unwrap_or(0);
+    }
+    let code = if let Some(s) = err.find("error[") {
+        if let Some(e) = err[s + 6..].find(']') {
+            match &err[s + 6..s + 6 + e] {
+                "TAINT_ON_RET" => 1001,
+                "TAINT_SINK" => 1002,
+                "MISSING_CAP" => 1003,
+                "LINEAR_LEAK" => 1004,
+                "BORROW_CONFLICT" => 1005,
+                "UNRESOLVED_LABEL" => 2009,
+                _ => 3006,
+            }
+        } else {
+            3006
+        }
+    } else if err.contains("Unknown opcode") {
+        3001
+    } else if err.contains("Non-canonical SSA") {
+        3003
+    } else if err.contains("Cannot overwrite active heap arena") {
+        3004
+    } else if err.contains("Cannot reassign register") {
+        3005
+    } else {
+        3006
+    };
+    (code, offset)
+}
+
+fn parse_engine_result_bytes(buf: &[u8]) -> Result<OmniEngineModuleReport, String> {
+    if buf.len() < 24 || buf.len() % 8 != 0 {
+        return Err(format!(
+            "Omni verifier engine returned a truncated result ({} bytes)",
+            buf.len()
+        ));
+    }
+    let words: Vec<i64> = buf
+        .chunks_exact(8)
+        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let status = words[0];
+    let decode_off = words[1] as usize;
+    let n_fns = words[2];
+    if n_fns < 0 {
+        return Err(format!("Omni verifier engine returned negative fn count {n_fns}"));
+    }
+    let mut i = 3usize;
+    let mut functions = Vec::with_capacity(n_fns as usize);
+    for _ in 0..n_fns {
+        if i + 3 > words.len() {
+            return Err(String::from("Omni verifier engine result truncated in function header"));
+        }
+        let fn_idx = words[i] as u16;
+        let passed = words[i + 1] == 1;
+        let n_err = words[i + 2];
+        i += 3;
+        if n_err < 0 {
+            return Err(format!("Omni verifier engine returned negative error count {n_err}"));
+        }
+        let mut errors = Vec::with_capacity(n_err as usize);
+        for _ in 0..n_err {
+            if i + 2 > words.len() {
+                return Err(String::from("Omni verifier engine result truncated in error list"));
+            }
+            let code = words[i];
+            let offset = words[i + 1] as usize;
+            errors.push(OmniEngineError {
+                code,
+                name: verifier_engine_error_name(code),
+                offset,
+            });
+            i += 2;
+        }
+        functions.push(OmniEngineFnReport {
+            fn_idx,
+            passed: passed && errors.is_empty(),
+            errors,
+        });
+    }
+    let decode_error = if status == 3006 {
+        Some((3006, decode_off))
+    } else {
+        None
+    };
+    Ok(OmniEngineModuleReport {
+        decode_error,
+        functions,
+    })
+}
+
+pub fn rust_verify_as_engine_report(stream: &[u16]) -> OmniEngineModuleReport {
+    match decode_omni_token_stream(stream) {
+        Err(e) => {
+            let (code, offset) = classify_rust_verifier_error(&e);
+            OmniEngineModuleReport {
+                decode_error: Some((code, offset)),
+                functions: Vec::new(),
+            }
+        }
+        Ok(module) => {
+            let functions = module
+                .functions
+                .iter()
+                .map(|f| {
+                    let rep = verify_binary_function(f);
+                    let errors = rep
+                        .errors
+                        .iter()
+                        .map(|e| {
+                            let (code, offset) = classify_rust_verifier_error(e);
+                            OmniEngineError {
+                                code,
+                                name: verifier_engine_error_name(code),
+                                offset,
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    OmniEngineFnReport {
+                        fn_idx: f.fn_idx,
+                        passed: rep.passed && errors.is_empty(),
+                        errors,
+                    }
+                })
+                .collect();
+            OmniEngineModuleReport {
+                decode_error: None,
+                functions,
+            }
+        }
+    }
+}
+
+fn omni_verifier_engine_module() -> Result<BinModule, String> {
+    let u16_stream = compile_omni_surface_strict_to_u16(OMNI_VERIFIER_ENGINE_SURFACE)?;
+    let decoded = decode_omni_token_stream(&u16_stream)?;
+    for f in &decoded.functions {
+        let rep = verify_binary_function(f);
+        if !rep.passed {
+            return Err(format!(
+                "Omni verifier engine failed Rust binary verification (fn #{}): {:?}",
+                f.fn_idx, rep.errors
+            ));
+        }
+    }
+    Ok(decoded)
+}
+
+pub fn verify_u16_stream_via_omni_engine(stream: &[u16]) -> Result<OmniEngineModuleReport, String> {
+    use std::sync::OnceLock;
+    static ENGINE: OnceLock<Result<BinModule, String>> = OnceLock::new();
+    let engine = match ENGINE.get_or_init(omni_verifier_engine_module) {
+        Ok(m) => m,
+        Err(e) => return Err(e.clone()),
+    };
+    let entry = if engine.functions.iter().any(|f| f.fn_idx == 0) {
+        0
+    } else {
+        engine
+            .functions
+            .last()
+            .map(|f| f.fn_idx)
+            .ok_or_else(|| String::from("Omni verifier engine has no functions"))?
+    };
+    let mut vm = OmniBinaryVm::new();
+    let bytes = encode_u16_stream_to_bytes(stream);
+    let val = vm.execute_function(engine, entry, vec![OmniValue::Bytes(bytes)])?;
+    match val {
+        OmniValue::Bytes(buf) => parse_engine_result_bytes(&buf),
+        other => Err(format!(
+            "Omni verifier engine returned a non-bytes value: {:?}",
+            other
+        )),
+    }
+}
+
+pub fn compare_rust_and_omni_verifier(label: &str, stream: &[u16]) -> Result<(), String> {
+    let rust = rust_verify_as_engine_report(stream);
+    let omni = verify_u16_stream_via_omni_engine(stream)?;
+    if rust.decode_error.is_some() != omni.decode_error.is_some() {
+        return Err(format!(
+            "verifier-diff '{label}': decode-error mismatch rust={:?} omni={:?}",
+            rust.decode_error, omni.decode_error
+        ));
+    }
+    if let (Some((rc, ro)), Some((oc, oo))) = (rust.decode_error, omni.decode_error) {
+        if rc != oc {
+            return Err(format!(
+                "verifier-diff '{label}': decode error code rust={rc} omni={oc} offsets rust={ro} omni={oo}"
+            ));
+        }
+        // Offsets should match when the Rust decoder reports one.
+        if ro != 0 && ro != oo {
+            let rust_raw = match decode_omni_token_stream(stream) {
+                Err(e) => e,
+                Ok(_) => String::from("<rust decode unexpectedly succeeded>"),
+            };
+            return Err(format!(
+                "verifier-diff '{label}': decode error span rust={ro} omni={oo} (code {rc}); rust_msg={rust_raw}; stream={:04X?}",
+                stream
+            ));
+        }
+        return Ok(());
+    }
+    if rust.functions.len() != omni.functions.len() {
+        return Err(format!(
+            "verifier-diff '{label}': function count rust={} omni={}",
+            rust.functions.len(),
+            omni.functions.len()
+        ));
+    }
+    for (rf, of) in rust.functions.iter().zip(omni.functions.iter()) {
+        if rf.fn_idx != of.fn_idx || rf.passed != of.passed {
+            return Err(format!(
+                "verifier-diff '{label}': fn #{} verdict rust passed={} errors={:?} vs omni passed={} errors={:?}",
+                rf.fn_idx, rf.passed, rf.errors, of.passed, of.errors
+            ));
+        }
+        if rf.errors.len() != of.errors.len() {
+            return Err(format!(
+                "verifier-diff '{label}': fn #{} error-count rust={} {:?} vs omni={} {:?}",
+                rf.fn_idx,
+                rf.errors.len(),
+                rf.errors,
+                of.errors.len(),
+                of.errors
+            ));
+        }
+        for (re, oe) in rf.errors.iter().zip(of.errors.iter()) {
+            if re.code != oe.code || re.offset != oe.offset {
+                return Err(format!(
+                    "verifier-diff '{label}': fn #{} error rust=({} {}, off {}) vs omni=({} {}, off {})",
+                    rf.fn_idx, re.code, re.name, re.offset, oe.code, oe.name, oe.offset
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Differential suite: every existing verifier corpus / negative case, plus fuzzed streams.
+/// Returns the number of compared cases on success.
+pub fn run_verifier_engine_diff_selftests() -> Result<usize, String> {
+    let mut cases: Vec<(String, Vec<u16>)> = Vec::new();
+
+    let surfaces: &[(&str, &str)] = &[
+        ("ok_add", "#[strict] fn main(a: i64) -> i64 { let b: i64 = a + 1; return b; }"),
+        ("ok_egate", "#[strict] #[cap(AI)] fn main(a: i64) -> trit { let g: trit = egate(a - 5); return g; }"),
+        ("taint_on_ret", "fn main(x: i64 @untrusted) -> i64 { return x; }"),
+        ("taint_sink", "#[cap(AI)] fn main(x: i64 @untrusted) -> trit { let g = egate(x); return g; }"),
+        ("missing_cap", "fn main(x: i64) -> trit { let g = egate(x); return g; }"),
+        ("linear_leak", "fn main(x: i64) -> i64 { let a = arena(4096); return x; }"),
+        ("borrow_conflict", "fn main(x: i64) -> i64 { let a = arena(4096); let r = borrow_r(a); drop(a); drop(r); return x; }"),
+        ("ok_drop_arena", "fn main(x: i64) -> i64 { let a = arena(4096); drop(a); return x; }"),
+        ("sanitized_sink", "#[cap(AI)] fn main(x: i64 @untrusted) -> trit { let s = san_prm(x); let g = egate(s); return g; }"),
+        ("taint_upgrade", "fn main(x: i64 @untrusted) -> i64 { let y: i64 = x + 1; return y; }"),
+        ("ok_two_fn", "fn helper(a: i64) -> i64 { let b: i64 = a * 2; return b; }\nfn main(x: i64) -> i64 { let y: i64 = helper(x); return y; }"),
+        ("branch_ok", "fn main(x: i64) -> i64 { let c = x <=> 0; let r = if_pos c { 200 } else { 100 }; return r; }"),
+        ("loop_ok", "fn main(n: i64) -> i64 { let acc = 0; let i = n; do_while { acc = acc + i; i = i - 1; } i <=> 0; return acc; }"),
+        ("sql_taint", "#[cap(DB_R)] fn main(id: i64 @untrusted) -> i64 { let r = db_query(\"SELECT * FROM users WHERE id = ?\", id); return r; }"),
+        ("uncalled_tainted_helper", "fn bad_helper(u: i64 @untrusted) -> i64 { return u; }\nfn main(x: i64) -> i64 { return x + 1; }"),
+        ("ok_bytes", "fn main(x: i64) -> i64 { let b: bytes = anew(0); b = iset(b, 1); let n: i64 = slen(b); return n + x; }"),
+    ];
+    for &(name, src) in surfaces {
+        match compile_omni_surface_to_u16(src) {
+            Ok(stream) => cases.push((String::from(name), stream)),
+            Err(e) => {
+                return Err(format!(
+                    "verifier-diff corpus '{name}' failed to compile (needed as a verifier input): {e}"
+                ));
+            }
+        }
+    }
+
+    let goldens: &[(&str, &str)] = &[
+        ("seed0_risk", "fn seed0_risk(base: i64, delta: i64) -> trit { let scaled = base * 2; let score = scaled + delta; let cmp = score <=> 50; let pos = +1t; let res = tand(cmp, pos); return res; }"),
+        ("iabs_golden", "fn iabs_golden(x: i64) -> i64 { let r = iabs(x); return r; }"),
+        ("sel_mix", "fn sel_mix(x: i64) -> i64 { let prod = x * 3; let cmp = prod <=> 20; let bonus = sel_trit(cmp, 5, 10, 15); let res = prod + bonus; return res; }"),
+        ("idiv_zero", "fn idiv_zero(x: i64) -> i64 { let r = x / 0; return r; }"),
+        ("nested_branch", "fn nested_branch_golden(x: i64) -> i64 { let c0 = x <=> 0; let r = if_pos c0 { let c1 = x <=> 5; if_pos c1 { 30 } else { 20 } } else { 10 }; return r; }"),
+        ("byte_buf", "fn byte_buf_golden(x: i64) -> i64 { let buf = anew(0); buf = iset(buf, 10, 20, 30); buf = iset_i32(buf, 100); buf = iset_i64(buf, 200); let len = slen(buf); let cmp = x <=> 5; let sel = cmov(cmp, 100, 200, 300); let total = len + sel; return total; }"),
+    ];
+    for &(name, src) in goldens {
+        match compile_omni_surface_to_u16(src) {
+            Ok(stream) => cases.push((String::from(name), stream)),
+            Err(e) => return Err(format!("verifier-diff golden '{name}' failed to compile: {e}")),
+        }
+    }
+
+    let tc_safe = pack_tc(false, CAP_ID_PURE);
+    let tc_untr = pack_tc(true, CAP_ID_PURE);
+    cases.push((
+        String::from("raw_bad_taint_sink"),
+        pack_fn_module(
+            &[(0x0000, vec![(TY_STR, tc_safe)])],
+            0,
+            &[(0x7EC0, TY_STR, tc_untr)],
+            TY_STRUCT,
+            cap_bit(CAP_ID_DB_W),
+            &[
+                vec![0x7E00, 0x7F63, TY_STRUCT, pack_tc(false, CAP_ID_DB_W), TOK_SYM_SCHEMA, 0x0000, TOK_FIELD_KV, 0x0000, 0x7EC0, TOK_INS_END],
+                vec![0x7F4A, 0x7E00, TOK_INS_END],
+            ],
+        ),
+    ));
+    cases.push((
+        String::from("raw_bad_cap"),
+        pack_fn_module(
+            &[(0x0000, vec![(TY_STR, tc_safe)])],
+            0,
+            &[(0x7EC0, TY_STR, tc_safe)],
+            TY_STRUCT,
+            0x0000,
+            &[
+                vec![0x7E00, 0x7F63, TY_STRUCT, pack_tc(false, CAP_ID_DB_W), TOK_SYM_SCHEMA, 0x0000, TOK_FIELD_KV, 0x0000, 0x7EC0, TOK_INS_END],
+                vec![0x7F4A, 0x7E00, TOK_INS_END],
+            ],
+        ),
+    ));
+    cases.push((
+        String::from("raw_unknown_op"),
+        pack_fn_module(
+            &[],
+            0,
+            &[(0x7EC0, TY_I64, tc_safe)],
+            TY_I64,
+            0,
+            &[
+                vec![0x7E00, 0x7EFF, TY_I64, tc_safe, 0x7EC0, TOK_INS_END],
+                vec![0x7F4A, 0x7E00, TOK_INS_END],
+            ],
+        ),
+    ));
+
+    // Deterministic fuzz: truncated, garbage, and mutated valid streams.
+    let seed_ok = cases
+        .iter()
+        .find(|(n, _)| n == "ok_add")
+        .map(|(_, s)| s.clone())
+        .unwrap_or_default();
+    cases.push((String::from("fuzz_empty"), Vec::new()));
+    cases.push((String::from("fuzz_only_mod_begin"), vec![0x7EE0]));
+    cases.push((String::from("fuzz_begin_end"), vec![0x7EE0, 0x7EEF]));
+    cases.push((String::from("fuzz_bad_tag"), vec![0x7EE0, 0x1234, 0x7EEF]));
+    let mut lcg: u32 = 0xC0FFEE11;
+    let mut next = || {
+        lcg = lcg.wrapping_mul(1664525).wrapping_add(1013904223);
+        lcg
+    };
+    for i in 0..32 {
+        let len = 1 + (next() as usize % 24);
+        let mut s = Vec::with_capacity(len);
+        s.push(0x7EE0);
+        for _ in 1..len {
+            s.push((next() as u16) & 0x7FFF);
+        }
+        cases.push((format!("fuzz_rand_{i}"), s));
+    }
+    for i in 0..16 {
+        if seed_ok.len() < 2 {
+            break;
+        }
+        let mut s = seed_ok.clone();
+        let idx = (next() as usize) % s.len();
+        s[idx] = s[idx].wrapping_add(1 + (next() as u16 % 7));
+        cases.push((format!("fuzz_mut_ok_add_{i}"), s));
+    }
+
+    let mut matched = 0usize;
+    for (name, stream) in &cases {
+        compare_rust_and_omni_verifier(name, stream)?;
+        matched += 1;
+    }
+    if matched != cases.len() {
+        return Err(format!(
+            "verifier-diff internal count mismatch: {matched} != {}",
+            cases.len()
+        ));
+    }
+    Ok(matched)
+}
+
 pub fn run_host_sandbox_selftests() -> Result<usize, String> {
     let mut checks = 0usize;
     let tmp = std::env::temp_dir().join(format!("omni_sandbox_{}_{}", std::process::id(), {
@@ -12204,6 +12644,15 @@ fn main(x: i64, y: i64) -> i64 {
 
     // 13AS. Host FS/DB capability root-jail (PATH_ESCAPE)
     checks += run_host_sandbox_selftests()?;
+
+    // 13AT. Pure-Omni verifier engine differential against the Rust twin
+    let n_engine = run_verifier_engine_diff_selftests()?;
+    if n_engine < 40 {
+        return Err(format!(
+            "Omni verifier engine differential compared only {n_engine} cases (expected at least 40)"
+        ));
+    }
+    checks += 1;
 
     Ok(checks)
 }

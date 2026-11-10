@@ -2742,6 +2742,15 @@ fn main(x: i64, y: i64) -> i64 {
     // 13AS. Host FS/DB capability root-jail (PATH_ESCAPE)
     checks += run_host_sandbox_selftests()?;
 
+    // 13AT. Pure-Omni verifier engine differential against the Rust twin
+    let n_engine = run_verifier_engine_diff_selftests()?;
+    if n_engine < 40 {
+        return Err(format!(
+            "Omni verifier engine differential compared only {n_engine} cases (expected at least 40)"
+        ));
+    }
+    checks += 1;
+
     Ok(checks)
 }
 

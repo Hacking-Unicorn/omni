@@ -1,0 +1,1034 @@
+// ==============================================================================
+// OMNI VERIFIER ENGINE — `pure/verifier_engine.omni`
+// Version: omni-verifier-engine-v1.0.0
+// ==============================================================================
+//
+// Real Pure-Omni static verifier: walks a little-endian u16 token-stream
+// (encoded as `bytes`) and enforces the same rules as the Rust reference
+// twin `verify_binary_function` / `verify_u16_stream`:
+//   capability monotonicity (MISSING_CAP = 1003)
+//   @UNTRUSTED taint lattice (TAINT_ON_RET = 1001, TAINT_SINK = 1002)
+//   linear arena conservation (LINEAR_LEAK = 1004)
+//   borrow / move / drop state machine (BORROW_CONFLICT = 1005)
+//   branch-label resolution (UNRESOLVED_LABEL = 2009)
+//   SSA ordering, arena overwrite, reassignment, unknown opcode
+//
+// This module is intentionally NOT part of the 18-module pure-bootstrap
+// closed suite, so existing suite hashes stay unchanged.
+//
+// Result buffer (little-endian i64 words):
+//   [0] status      0 = decoded, 3006 = decode error
+//   [1] decode_off  stream word offset of a decode error (else 0)
+//   [2] n_fns
+//   then for each function:
+//     fn_idx, passed (1/0), n_err, then n_err pairs of (code, offset)
+//
+// Workspace word layout used while verifying (internal):
+//   0 pos, 1 nwords, 2 cap, 3 next_ssa, 4-7 label bits, 8 nerr,
+//   9 fn_idx, 10 decode_code, 11 decode_off, 12 nfns, 13 status,
+//   14 nops, 15 ins_off,
+//   32..255 register slots (224),
+//   256..383 error pairs (up to 64),
+//   384..447 operand packs (up to 64).
+// ==============================================================================
+
+#[strict]
+fn is_eq(a: i64, b: i64) -> i64 {
+    let c: trit = a <=> b;
+    let r: i64 = sel_trit(c, 0, 1, 0);
+    return r;
+}
+
+#[strict]
+fn is_gt(a: i64, b: i64) -> i64 {
+    let c: trit = a <=> b;
+    let r: i64 = sel_trit(c, 0, 0, 1);
+    return r;
+}
+
+#[strict]
+fn is_ge(a: i64, b: i64) -> i64 {
+    let c: trit = a <=> b;
+    let r: i64 = sel_trit(c, 0, 1, 1);
+    return r;
+}
+
+#[strict]
+fn is_lt(a: i64, b: i64) -> i64 {
+    let c: trit = a <=> b;
+    let r: i64 = sel_trit(c, 1, 0, 0);
+    return r;
+}
+
+#[strict]
+fn in_range(x: i64, lo: i64, hi: i64) -> i64 {
+    let ge: i64 = is_ge(x, lo);
+    let le: i64 = is_lt(x, hi + 1);
+    let r: i64 = ge * le;
+    return r;
+}
+
+#[strict]
+fn load_u16(stream: bytes, idx: i64) -> i64 {
+    let off: i64 = idx * 2;
+    let lo: i64 = iget(stream, off);
+    let hi: i64 = iget(stream, off + 1);
+    let v: i64 = lo | (hi << 8);
+    return v;
+}
+
+#[strict]
+fn load_i64le(buf: bytes, off: i64) -> i64 {
+    let b0: i64 = iget(buf, off);
+    let b1: i64 = iget(buf, off + 1);
+    let b2: i64 = iget(buf, off + 2);
+    let b3: i64 = iget(buf, off + 3);
+    let b4: i64 = iget(buf, off + 4);
+    let b5: i64 = iget(buf, off + 5);
+    let b6: i64 = iget(buf, off + 6);
+    let b7: i64 = iget(buf, off + 7);
+    let lo: i64 = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+    let hi: i64 = b4 | (b5 << 8) | (b6 << 16) | (b7 << 24);
+    let v: i64 = lo | (hi << 32);
+    return v;
+}
+
+#[strict]
+fn init_zero_buf(n: i64) -> bytes {
+    let buf: bytes = anew(0);
+    let i: i64 = 0;
+    while n - i <=> 0 {
+        buf = iset_i64(buf, 0);
+        i = i + 1;
+    }
+    return buf;
+}
+
+#[strict]
+fn ws_get(ws: bytes, idx: i64) -> i64 {
+    let v: i64 = load_i64le(ws, idx * 8);
+    return v;
+}
+
+#[strict]
+fn ws_set(ws: bytes, idx: i64, val: i64) -> bytes {
+    let w: bytes = iset_patch_i64(ws, idx * 8, val);
+    return w;
+}
+
+#[strict]
+fn pack_op(new_pos: i64, flags: i64, tok: i64) -> i64 {
+    let p: i64 = (new_pos << 32) | (flags << 16) | (tok & 65535);
+    return p;
+}
+
+#[strict]
+fn op_pos(p: i64) -> i64 {
+    let v: i64 = p >> 32;
+    return v;
+}
+
+#[strict]
+fn op_flags(p: i64) -> i64 {
+    let v: i64 = (p >> 16) & 255;
+    return v;
+}
+
+#[strict]
+fn op_tok(p: i64) -> i64 {
+    let v: i64 = p & 65535;
+    return v;
+}
+
+#[strict]
+fn token_to_slot(tok: i64) -> i64 {
+    let in_reg: i64 = in_range(tok, 32256, 32447);
+    let in_par: i64 = in_range(tok, 32448, 32479);
+    let slot_reg: i64 = tok - 32256;
+    let slot_par: i64 = 192 + (tok - 32448);
+    let none: i64 = (1 - in_reg) * (1 - in_par);
+    let slot: i64 = in_reg * slot_reg + in_par * slot_par + none * (0 - 1);
+    return slot;
+}
+
+#[strict]
+fn unpack_untrusted(tc: i64) -> i64 {
+    let raw: i64 = tc - 32704;
+    let bit: i64 = raw & 32;
+    let r: i64 = is_gt(bit, 0);
+    return r;
+}
+
+#[strict]
+fn unpack_cap(tc: i64) -> i64 {
+    let raw: i64 = tc - 32704;
+    let cap_id: i64 = raw & 31;
+    let z: i64 = is_eq(cap_id, 0);
+    let bit: i64 = (1 - z) * (1 << (cap_id - 1 + z));
+    return bit;
+}
+
+#[strict]
+fn op_is_known(op: i64) -> i64 {
+    let r: i64 = in_range(op, 32512, 32639);
+    return r;
+}
+
+#[strict]
+fn op_has_dest(op: i64) -> i64 {
+    let known: i64 = op_is_known(op);
+    let destless: i64 = op_is_destless(op);
+    let r: i64 = known * (1 - destless);
+    return r;
+}
+
+#[strict]
+fn label_bit_word(lid: i64) -> i64 {
+    let w: i64 = lid >> 6;
+    return w;
+}
+
+#[strict]
+fn label_bit_mask(lid: i64) -> i64 {
+    let sh: i64 = lid & 63;
+    let m: i64 = 1 << sh;
+    return m;
+}
+
+
+#[strict]
+fn op_req_cap_0(op: i64) -> i64 {
+    let acc: i64 = 0;
+    acc = acc + is_eq(op, 32562) * 16;
+    acc = acc + is_eq(op, 32563) * 16;
+    acc = acc + is_eq(op, 32565) * 16;
+    acc = acc + is_eq(op, 32566) * 16;
+    acc = acc + is_eq(op, 32567) * 16;
+    acc = acc + is_eq(op, 32568) * 16;
+    acc = acc + is_eq(op, 32569) * 16;
+    acc = acc + is_eq(op, 32601) * 16;
+    acc = acc + is_eq(op, 32608) * 2;
+    acc = acc + is_eq(op, 32609) * 2;
+    acc = acc + is_eq(op, 32610) * 2;
+    acc = acc + is_eq(op, 32611) * 2;
+    acc = acc + is_eq(op, 32612) * 1;
+    acc = acc + is_eq(op, 32613) * 1;
+    acc = acc + is_eq(op, 32614) * 2;
+    acc = acc + is_eq(op, 32615) * 2;
+    acc = acc + is_eq(op, 32616) * 1;
+    acc = acc + is_eq(op, 32617) * 2;
+    acc = acc + is_eq(op, 32618) * 1;
+    acc = acc + is_eq(op, 32619) * 2;
+    acc = acc + is_eq(op, 32620) * 4;
+    acc = acc + is_eq(op, 32621) * 4;
+    acc = acc + is_eq(op, 32622) * 4;
+    acc = acc + is_eq(op, 32623) * 4;
+    return acc;
+}
+
+#[strict]
+fn op_req_cap_1(op: i64) -> i64 {
+    let acc: i64 = 0;
+    acc = acc + is_eq(op, 32624) * 128;
+    acc = acc + is_eq(op, 32625) * 4;
+    acc = acc + is_eq(op, 32626) * 512;
+    acc = acc + is_eq(op, 32627) * 512;
+    acc = acc + is_eq(op, 32628) * 512;
+    acc = acc + is_eq(op, 32629) * 256;
+    acc = acc + is_eq(op, 32630) * 8;
+    acc = acc + is_eq(op, 32631) * 8;
+    acc = acc + is_eq(op, 32632) * 8;
+    acc = acc + is_eq(op, 32633) * 8;
+    acc = acc + is_eq(op, 32634) * 8;
+    acc = acc + is_eq(op, 32635) * 8;
+    acc = acc + is_eq(op, 32636) * 64;
+    acc = acc + is_eq(op, 32637) * 16;
+    acc = acc + is_eq(op, 32638) * 32;
+    acc = acc + is_eq(op, 32639) * 32;
+    return acc;
+}
+
+#[strict]
+fn op_req_cap(op: i64) -> i64 {
+    let acc: i64 = op_req_cap_0(op) + op_req_cap_1(op);
+    return acc;
+}
+
+#[strict]
+fn op_is_sink_raw_0(op: i64) -> i64 {
+    let acc: i64 = 0;
+    acc = acc + is_eq(op, 32563) * 1;
+    acc = acc + is_eq(op, 32565) * 1;
+    acc = acc + is_eq(op, 32566) * 1;
+    acc = acc + is_eq(op, 32567) * 1;
+    acc = acc + is_eq(op, 32568) * 1;
+    acc = acc + is_eq(op, 32569) * 1;
+    acc = acc + is_eq(op, 32586) * 1;
+    acc = acc + is_eq(op, 32609) * 1;
+    acc = acc + is_eq(op, 32611) * 1;
+    acc = acc + is_eq(op, 32612) * 1;
+    acc = acc + is_eq(op, 32613) * 1;
+    acc = acc + is_eq(op, 32614) * 1;
+    acc = acc + is_eq(op, 32615) * 1;
+    acc = acc + is_eq(op, 32617) * 1;
+    acc = acc + is_eq(op, 32618) * 1;
+    acc = acc + is_eq(op, 32619) * 1;
+    acc = acc + is_eq(op, 32620) * 1;
+    acc = acc + is_eq(op, 32622) * 1;
+    acc = acc + is_eq(op, 32623) * 1;
+    acc = acc + is_eq(op, 32627) * 1;
+    acc = acc + is_eq(op, 32628) * 1;
+    acc = acc + is_eq(op, 32629) * 1;
+    acc = acc + is_eq(op, 32630) * 1;
+    acc = acc + is_eq(op, 32631) * 1;
+    return acc;
+}
+
+#[strict]
+fn op_is_sink_raw_1(op: i64) -> i64 {
+    let acc: i64 = 0;
+    acc = acc + is_eq(op, 32632) * 1;
+    acc = acc + is_eq(op, 32633) * 1;
+    acc = acc + is_eq(op, 32634) * 1;
+    acc = acc + is_eq(op, 32635) * 1;
+    acc = acc + is_eq(op, 32636) * 1;
+    acc = acc + is_eq(op, 32637) * 1;
+    acc = acc + is_eq(op, 32638) * 1;
+    acc = acc + is_eq(op, 32639) * 1;
+    return acc;
+}
+
+#[strict]
+fn op_is_sink_raw(op: i64) -> i64 {
+    let acc: i64 = op_is_sink_raw_0(op) + op_is_sink_raw_1(op);
+    return acc;
+}
+
+#[strict]
+fn op_is_sanitizer(op: i64) -> i64 {
+    let acc: i64 = 0;
+    acc = acc + is_eq(op, 32599) * 1;
+    acc = acc + is_eq(op, 32600) * 1;
+    acc = acc + is_eq(op, 32601) * 1;
+    acc = acc + is_eq(op, 32602) * 1;
+    acc = acc + is_eq(op, 32603) * 1;
+    acc = acc + is_eq(op, 32604) * 1;
+    acc = acc + is_eq(op, 32624) * 1;
+    return acc;
+}
+
+#[strict]
+fn op_is_destless(op: i64) -> i64 {
+    let acc: i64 = 0;
+    acc = acc + is_eq(op, 32512) * 1;
+    acc = acc + is_eq(op, 32517) * 1;
+    acc = acc + is_eq(op, 32576) * 1;
+    acc = acc + is_eq(op, 32577) * 1;
+    acc = acc + is_eq(op, 32578) * 1;
+    acc = acc + is_eq(op, 32579) * 1;
+    acc = acc + is_eq(op, 32580) * 1;
+    acc = acc + is_eq(op, 32582) * 1;
+    acc = acc + is_eq(op, 32583) * 1;
+    acc = acc + is_eq(op, 32585) * 1;
+    acc = acc + is_eq(op, 32586) * 1;
+    acc = acc + is_eq(op, 32591) * 1;
+    return acc;
+}
+
+
+#[strict]
+fn has_label(ws: bytes, lid: i64) -> i64 {
+    let in_rng: i64 = in_range(lid, 0, 255);
+    let w: i64 = 4 + label_bit_word(lid);
+    let bits: i64 = ws_get(ws, w);
+    let m: i64 = label_bit_mask(lid);
+    let hit: i64 = is_gt(bits & m, 0);
+    let r: i64 = in_rng * hit;
+    return r;
+}
+
+#[strict]
+fn set_label(ws: bytes, lid: i64) -> bytes {
+    let in_rng: i64 = in_range(lid, 0, 255);
+    let w: i64 = 4 + label_bit_word(lid) * in_rng;
+    let bits: i64 = ws_get(ws, w);
+    let m: i64 = label_bit_mask(lid);
+    let nxt: i64 = bits | (m * in_rng);
+    let out: bytes = ws_set(ws, w, nxt);
+    return out;
+}
+
+#[strict]
+fn append_err_if(ws: bytes, cond: i64, code: i64, off: i64) -> bytes {
+    let w: bytes = ws;
+    let c: trit = cond <=> 0;
+    let out: bytes = if_pos c {
+        let n: i64 = ws_get(w, 8);
+        let room: i64 = is_lt(n, 64);
+        let w2: bytes = if_pos room <=> 0 {
+            let base: i64 = 256 + n * 2;
+            let a: bytes = ws_set(w, base, code);
+            let b: bytes = ws_set(a, base + 1, off);
+            let c2: bytes = ws_set(b, 8, n + 1);
+            c2
+        } else {
+            w
+        };
+        w2
+    } else {
+        w
+    };
+    return out;
+}
+
+#[strict]
+fn set_decode_err(ws: bytes, off: i64) -> bytes {
+    let w: bytes = ws;
+    let already: i64 = ws_get(w, 10);
+    let first: i64 = is_eq(already, 0);
+    let w2: bytes = ws_set(w, 10, first * 3006 + (1 - first) * already);
+    let w3: bytes = ws_set(w2, 11, first * off + (1 - first) * ws_get(w2, 11));
+    let w4: bytes = ws_set(w3, 13, 3006);
+    return w4;
+}
+
+#[strict]
+fn parse_eng(stream: bytes, pos: i64, nwords: i64) -> i64 {
+    let need: i64 = is_gt(nwords, pos + 1);
+    let len: i64 = load_u16(stream, pos + 1) * need;
+    let end: i64 = pos + 2 + len;
+    let fits: i64 = is_ge(nwords, end);
+    let ok: i64 = need * fits;
+    let packed: i64 = ok * pack_op(end, 4, 0) + (1 - ok) * pack_op(pos, 32, 0);
+    return packed;
+}
+
+#[strict]
+fn parse_operand(stream: bytes, pos: i64, nwords: i64) -> i64 {
+    let have: i64 = is_gt(nwords, pos);
+    let tok: i64 = load_u16(stream, pos) * have;
+    let is_reg: i64 = in_range(tok, 32256, 32447);
+    let is_par: i64 = in_range(tok, 32448, 32479);
+    let is_lbl: i64 = in_range(tok, 32496, 32511);
+    let is_tneg: i64 = is_eq(tok, 32487);
+    let is_tzero: i64 = is_eq(tok, 32488);
+    let is_tpos: i64 = is_eq(tok, 32489);
+    let is_trit: i64 = is_tneg + is_tzero + is_tpos;
+    let is_i16: i64 = is_eq(tok, 32485);
+    let is_i32: i64 = is_eq(tok, 32486);
+    let is_eng: i64 = is_eq(tok, 32490);
+    let is_sch: i64 = is_eq(tok, 32491);
+    let is_fn: i64 = is_eq(tok, 32492);
+    let is_sk: i64 = is_eq(tok, 32493);
+    let is_sym: i64 = is_sch + is_fn + is_sk;
+    let is_kv: i64 = is_eq(tok, 32494);
+    let is_simple: i64 = is_reg + is_par + is_lbl + is_trit;
+    let simple_flags: i64 = (is_reg + is_par) * 1 + is_lbl * 2 + is_trit * 8;
+    let simple_tok: i64 = is_lbl * (tok - 32496) + is_reg * tok + is_par * tok;
+    let need_i16: i64 = is_ge(nwords, pos + 2);
+    let need_i32: i64 = is_ge(nwords, pos + 3);
+    let need_sym: i64 = is_ge(nwords, pos + 2);
+    let i16_val: i64 = load_u16(stream, pos + 1) * is_i16 * need_i16;
+    let i32_hi: i64 = load_u16(stream, pos + 1) * is_i32 * need_i32;
+    let i32_lo: i64 = load_u16(stream, pos + 2) * is_i32 * need_i32;
+    let i32_val: i64 = ((i32_hi << 16) | i32_lo) & 65535;
+    let imm_ok: i64 = is_i16 * need_i16 + is_i32 * need_i32;
+    let imm_pos: i64 = is_i16 * (pos + 2) + is_i32 * (pos + 3);
+    let imm_tok: i64 = is_i16 * i16_val + is_i32 * i32_val;
+    let sym_ok: i64 = is_sym * need_sym;
+    let known_fixed: i64 = have * (is_simple + imm_ok + sym_ok);
+    let fixed: i64 = is_simple * pack_op(pos + 1, simple_flags, simple_tok)
+        + is_i16 * need_i16 * pack_op(imm_pos, 8, imm_tok)
+        + is_i32 * need_i32 * pack_op(imm_pos, 8, imm_tok)
+        + sym_ok * pack_op(pos + 2, 8, 0);
+    let var_kind: i64 = have * (is_eng + is_kv);
+    let c_eng: trit = is_eng <=> 0;
+    let eng_p: i64 = if_pos c_eng {
+        parse_eng(stream, pos, nwords)
+    } else {
+        0
+    };
+    let c_kv: trit = is_kv <=> 0;
+    let kv_p: i64 = if_pos c_kv {
+        parse_kv(stream, pos, nwords)
+    } else {
+        0
+    };
+    let var_p: i64 = eng_p + kv_p;
+    let err: i64 = pack_op(pos, 32, 0);
+    let r: i64 = known_fixed * fixed + var_kind * var_p + (1 - known_fixed - var_kind) * err;
+    return r;
+}
+
+#[strict]
+fn parse_kv(stream: bytes, pos: i64, nwords: i64) -> i64 {
+    let need: i64 = is_gt(nwords, pos + 1);
+    let c: trit = need <=> 0;
+    let out: i64 = if_pos c {
+        let inner: i64 = parse_operand(stream, pos + 2, nwords);
+        let fl: i64 = op_flags(inner);
+        let err: i64 = is_gt(fl & 32, 0);
+        let merged: i64 = pack_op(op_pos(inner), fl, op_tok(inner));
+        let r: i64 = err * inner + (1 - err) * merged;
+        r
+    } else {
+        pack_op(pos, 32, 0)
+    };
+    return out;
+}
+
+#[strict]
+fn slot_pack(state: i64, k: i64, taint: i64, heap: i64, parent: i64) -> i64 {
+    let p1: i64 = parent + 1;
+    let v: i64 = state | (k << 8) | (taint << 16) | (heap << 17) | (p1 << 18);
+    return v;
+}
+
+#[strict]
+fn sl_state(p: i64) -> i64 {
+    let v: i64 = p & 255;
+    return v;
+}
+
+#[strict]
+fn sl_k(p: i64) -> i64 {
+    let v: i64 = (p >> 8) & 255;
+    return v;
+}
+
+#[strict]
+fn sl_taint(p: i64) -> i64 {
+    let v: i64 = (p >> 16) & 1;
+    return v;
+}
+
+#[strict]
+fn sl_heap(p: i64) -> i64 {
+    let v: i64 = (p >> 17) & 1;
+    return v;
+}
+
+#[strict]
+fn sl_parent(p: i64) -> i64 {
+    let raw: i64 = (p >> 18) & 255;
+    let v: i64 = raw - 1;
+    return v;
+}
+
+#[strict]
+fn get_reg(ws: bytes, slot: i64) -> i64 {
+    let valid: i64 = in_range(slot, 0, 223);
+    let v: i64 = ws_get(ws, 32 + slot * valid) * valid;
+    return v;
+}
+
+#[strict]
+fn set_reg(ws: bytes, slot: i64, val: i64) -> bytes {
+    let valid: i64 = in_range(slot, 0, 223);
+    let idx: i64 = valid * (32 + slot) + (1 - valid) * 13;
+    let keep: i64 = ws_get(ws, idx);
+    let written: i64 = valid * val + (1 - valid) * keep;
+    let out: bytes = ws_set(ws, idx, written);
+    return out;
+}
+
+#[strict]
+fn clear_labels_and_regs(ws: bytes) -> bytes {
+    let w: bytes = ws;
+    w = ws_set(w, 3, 32256);
+    w = ws_set(w, 4, 0);
+    w = ws_set(w, 5, 0);
+    w = ws_set(w, 6, 0);
+    w = ws_set(w, 7, 0);
+    w = ws_set(w, 8, 0);
+    w = ws_set(w, 14, 0);
+    let i: i64 = 0;
+    let more: trit = 224 <=> 0;
+    do_while {
+        w = ws_set(w, 32 + i, 0);
+        i = i + 1;
+        more = 224 - i <=> 0;
+    } more;
+    return w;
+}
+
+#[strict]
+fn collect_ops(stream: bytes, ws: bytes) -> bytes {
+    let w: bytes = ws;
+    let nwords: i64 = ws_get(w, 1);
+    let pos: i64 = ws_get(w, 0);
+    let nops: i64 = 0;
+    let go: i64 = is_gt(nwords, pos) * (1 - is_eq(load_u16(stream, pos), 32484)) * (1 - is_eq(ws_get(w, 10), 3006));
+    while go <=> 0 {
+        let p: i64 = parse_operand(stream, pos, nwords);
+        let fl: i64 = op_flags(p);
+        let err: i64 = is_gt(fl & 32, 0);
+        w = set_decode_err_if(w, err, pos);
+        let room: i64 = is_lt(nops, 64);
+        w = set_decode_err_if(w, 1 - room, pos);
+        w = ws_set(w, 384 + nops, p);
+        nops = nops + 1;
+        pos = op_pos(p);
+        w = ws_set(w, 0, pos);
+        go = (1 - err) * room * is_gt(nwords, pos) * (1 - is_eq(load_u16(stream, pos), 32484)) * (1 - is_eq(ws_get(w, 10), 3006));
+    }
+    let ended: i64 = is_gt(nwords, pos) * is_eq(load_u16(stream, pos), 32484);
+    let ins_off: i64 = ws_get(w, 15);
+    w = set_decode_err_if(w, 1 - ended, ins_off);
+    pos = pos + ended;
+    w = ws_set(w, 0, pos);
+    w = ws_set(w, 14, nops);
+    return w;
+}
+
+#[strict]
+fn set_decode_err_if(ws: bytes, cond: i64, off: i64) -> bytes {
+    let w: bytes = ws;
+    let c: trit = cond <=> 0;
+    let out: bytes = if_pos c {
+        set_decode_err(w, off)
+    } else {
+        w
+    };
+    return out;
+}
+
+#[strict]
+fn apply_params(stream: bytes, ws: bytes, p_cnt: i64, p_pos: i64) -> bytes {
+    let w: bytes = ws;
+    let i: i64 = 0;
+    while p_cnt - i <=> 0 {
+        let tok: i64 = load_u16(stream, p_pos + i * 3);
+        let ty: i64 = load_u16(stream, p_pos + i * 3 + 1);
+        let tc: i64 = load_u16(stream, p_pos + i * 3 + 2);
+        let slot: i64 = token_to_slot(tok);
+        let untr: i64 = unpack_untrusted(tc);
+        let heap: i64 = is_eq(ty, 32650) + is_eq(ty, 32651);
+        let pack: i64 = slot_pack(1, 0, untr, heap, 0 - 1);
+        w = set_reg(w, slot, pack);
+        i = i + 1;
+    }
+    return w;
+}
+
+#[strict]
+fn record_labels_from_ops(ws: bytes, is_label_op: i64) -> bytes {
+    let w: bytes = ws;
+    let nops: i64 = ws_get(w, 14);
+    let do_it: i64 = is_label_op * is_gt(nops, 0);
+    let c: trit = do_it <=> 0;
+    let out: bytes = if_pos c {
+        let p: i64 = ws_get(w, 384);
+        let fl: i64 = op_flags(p);
+        let is_lab: i64 = is_gt(fl & 2, 0) + is_gt(fl & 8, 0);
+        let lid: i64 = op_tok(p);
+        let w2: bytes = if_pos is_lab <=> 0 {
+            set_label(w, lid)
+        } else {
+            w
+        };
+        w2
+    } else {
+        w
+    };
+    return out;
+}
+
+#[strict]
+fn check_branch_labels(ws: bytes, op: i64, off: i64) -> bytes {
+    let w: bytes = ws;
+    let is_jmp: i64 = is_eq(op, 32577);
+    let is_brt: i64 = is_eq(op, 32578);
+    let is_brp: i64 = is_eq(op, 32579);
+    let is_brn: i64 = is_eq(op, 32580);
+    let is_br: i64 = is_jmp + is_brt + is_brp + is_brn;
+    let nops: i64 = ws_get(w, 14);
+    let start: i64 = is_jmp * 0 + (1 - is_jmp) * 1;
+    let count: i64 = nops - start;
+    let missing: i64 = is_br * is_lt(count, 1);
+    w = append_err_if(w, missing, 2009, off);
+    let i: i64 = start;
+    let go: i64 = is_br * (1 - missing) * is_gt(count, 0);
+    while go <=> 0 {
+        let p: i64 = ws_get(w, 384 + i);
+        let fl: i64 = op_flags(p);
+        let can: i64 = is_gt(fl & 2, 0) + is_gt(fl & 8, 0);
+        let lid: i64 = op_tok(p);
+        let ok: i64 = can * has_label(w, lid);
+        w = append_err_if(w, 1 - ok, 2009, off);
+        i = i + 1;
+        go = is_gt(nops, i);
+    }
+    return w;
+}
+
+#[strict]
+fn handle_drop(ws: bytes, off: i64) -> bytes {
+    let w: bytes = ws;
+    let nops: i64 = ws_get(w, 14);
+    let has: i64 = is_gt(nops, 0);
+    let p: i64 = ws_get(w, 384) * has;
+    let tok: i64 = op_tok(p);
+    let slot: i64 = token_to_slot(tok);
+    let valid: i64 = is_ge(slot, 0);
+    let pack: i64 = get_reg(w, slot);
+    let st: i64 = sl_state(pack);
+    let k: i64 = sl_k(pack);
+    let bad_st: i64 = is_eq(st, 4) + is_eq(st, 5) + is_eq(st, 0);
+    let bad_br: i64 = is_eq(st, 2) * is_gt(k, 0);
+    w = append_err_if(w, has * valid * (bad_st + bad_br), 1005, off);
+    let ok: i64 = has * valid * (1 - bad_st) * (1 - bad_br);
+    let parent: i64 = sl_parent(pack);
+    let has_p: i64 = is_ge(parent, 0) * ok;
+    let pp: i64 = get_reg(w, parent);
+    let pst: i64 = sl_state(pp);
+    let pk: i64 = sl_k(pp);
+    let dec: i64 = is_eq(pst, 2) * is_gt(pk, 1);
+    let new_pst: i64 = dec * 2 + (1 - dec) * 1;
+    let new_pk: i64 = dec * (pk - 1);
+    let new_pp: i64 = slot_pack(new_pst, new_pk, sl_taint(pp), sl_heap(pp), sl_parent(pp));
+    let c: trit = has_p <=> 0;
+    w = if_pos c {
+        set_reg(w, parent, new_pp)
+    } else {
+        w
+    };
+    let dropped: i64 = slot_pack(5, 0, sl_taint(pack), sl_heap(pack), sl_parent(pack));
+    let c2: trit = ok <=> 0;
+    w = if_pos c2 {
+        set_reg(w, slot, dropped)
+    } else {
+        w
+    };
+    return w;
+}
+
+#[strict]
+fn handle_ret(ws: bytes, off: i64) -> bytes {
+    let w: bytes = ws;
+    let nops: i64 = ws_get(w, 14);
+    let has: i64 = is_gt(nops, 0);
+    let p: i64 = ws_get(w, 384) * has;
+    let fl: i64 = op_flags(p);
+    let is_slot: i64 = has * is_gt(fl & 1, 0);
+    let tok: i64 = op_tok(p);
+    let slot: i64 = token_to_slot(tok);
+    let valid: i64 = is_slot * is_ge(slot, 0);
+    let pack: i64 = get_reg(w, slot);
+    let taint: i64 = sl_taint(pack) * valid;
+    w = append_err_if(w, taint, 1001, off);
+    let moved: i64 = slot_pack(4, sl_k(pack), sl_taint(pack), sl_heap(pack), sl_parent(pack));
+    let c: trit = valid <=> 0;
+    w = if_pos c {
+        set_reg(w, slot, moved)
+    } else {
+        w
+    };
+    let i: i64 = 0;
+    let more: trit = 192 <=> 0;
+    do_while {
+        let rp: i64 = get_reg(w, i);
+        let heap: i64 = sl_heap(rp);
+        let st: i64 = sl_state(rp);
+        let live: i64 = 1 - is_eq(st, 4) - is_eq(st, 5) - is_eq(st, 0);
+        w = append_err_if(w, heap * live, 1004, off);
+        i = i + 1;
+        more = 192 - i <=> 0;
+    } more;
+    return w;
+}
+
+#[strict]
+fn handle_dest(ws: bytes, op: i64, dest: i64, tc: i64, cap: i64, off: i64) -> bytes {
+    let w: bytes = ws;
+    let next_ssa: i64 = ws_get(w, 3);
+    let above: i64 = is_gt(dest, next_ssa);
+    w = append_err_if(w, above, 3003, off);
+    let next2: i64 = above * (dest + 1) + (1 - above) * next_ssa;
+    let eq: i64 = is_eq(dest, next_ssa);
+    let next3: i64 = eq * (next_ssa + 1) + (1 - eq) * next2;
+    w = ws_set(w, 3, next3);
+    let reuse: i64 = (1 - above) * (1 - eq);
+    let dslot: i64 = token_to_slot(dest);
+    let dvalid: i64 = is_ge(dslot, 0);
+    let dp: i64 = get_reg(w, dslot);
+    let dst: i64 = sl_state(dp);
+    let dheap: i64 = sl_heap(dp);
+    let live_heap: i64 = dheap * (1 - is_eq(dst, 5) - is_eq(dst, 4));
+    w = append_err_if(w, reuse * dvalid * live_heap, 3004, off);
+    let not_owned: i64 = 1 - is_eq(dst, 1);
+    w = append_err_if(w, reuse * dvalid * (1 - live_heap) * not_owned, 3005, off);
+
+    let ins_untr: i64 = unpack_untrusted(tc);
+    let ins_cap: i64 = unpack_cap(tc);
+    let req: i64 = op_req_cap(op);
+    let not_fn: i64 = 65535 ^ (cap & 65535);
+    let missing: i64 = is_gt(((ins_cap & not_fn) | (req & not_fn)), 0);
+    w = append_err_if(w, missing, 1003, off);
+
+    let nops: i64 = ws_get(w, 14);
+    let any_untr: i64 = 0;
+    let parent: i64 = 0 - 1;
+    let i: i64 = 0;
+    while nops - i <=> 0 {
+        let p: i64 = ws_get(w, 384 + i);
+        let fl: i64 = op_flags(p);
+        any_untr = any_untr + is_gt(fl & 4, 0);
+        let is_slot: i64 = is_gt(fl & 1, 0);
+        let tok: i64 = op_tok(p);
+        let slot: i64 = token_to_slot(tok);
+        let valid: i64 = is_slot * is_ge(slot, 0);
+        let rp: i64 = get_reg(w, slot);
+        let st: i64 = sl_state(rp);
+        let k: i64 = sl_k(rp);
+        let bad: i64 = is_eq(st, 4) + is_eq(st, 5) + is_eq(st, 0) + is_eq(st, 3);
+        w = append_err_if(w, valid * bad, 1005, off);
+        any_untr = any_untr + valid * sl_taint(rp);
+        let is_bw: i64 = is_eq(op, 32515);
+        let is_br: i64 = is_eq(op, 32514);
+        let is_mv: i64 = is_eq(op, 32516);
+        let do_bw: i64 = valid * is_bw * is_eq(st, 1);
+        let do_br: i64 = valid * is_br * (is_eq(st, 1) + is_eq(st, 2));
+        let do_mv: i64 = valid * is_mv * is_eq(st, 1);
+        let new_k: i64 = do_br * (is_eq(st, 2) * k + 1) + (1 - do_br) * k;
+        let new_st: i64 = do_bw * 3 + do_br * 2 + do_mv * 4 + (1 - do_bw) * (1 - do_br) * (1 - do_mv) * st;
+        let np: i64 = slot_pack(new_st, new_k, sl_taint(rp), sl_heap(rp), sl_parent(rp));
+        let changed: i64 = do_bw + do_br + do_mv;
+        let c: trit = changed <=> 0;
+        w = if_pos c {
+            set_reg(w, slot, np)
+        } else {
+            w
+        };
+        parent = do_bw * slot + do_br * slot + (1 - do_bw) * (1 - do_br) * parent;
+        i = i + 1;
+    }
+
+    let any: i64 = is_gt(any_untr, 0);
+    let sink: i64 = op_is_sink_raw(op);
+    w = append_err_if(w, sink * any, 1002, off);
+    let san: i64 = op_is_sanitizer(op);
+    let upgrade: i64 = (1 - san) * any * (1 - ins_untr);
+    w = append_err_if(w, upgrade, 1002, off);
+
+    let heap: i64 = is_eq(op, 32513) + is_eq(op, 32638);
+    let outp: i64 = slot_pack(1, 0, ins_untr, heap, parent);
+    let c2: trit = dvalid <=> 0;
+    w = if_pos c2 {
+        set_reg(w, dslot, outp)
+    } else {
+        w
+    };
+    return w;
+}
+
+#[strict]
+fn scan_labels(stream: bytes, ws: bytes, ins_start: i64, ins_cnt: i64) -> bytes {
+    let w: bytes = ws;
+    let nwords: i64 = ws_get(w, 1);
+    let pos: i64 = ins_start;
+    let left: i64 = ins_cnt;
+    let go: i64 = left * (1 - is_eq(ws_get(w, 10), 3006));
+    while go <=> 0 {
+        let have: i64 = is_gt(nwords, pos);
+        w = set_decode_err_if(w, 1 - have, pos);
+        let first: i64 = load_u16(stream, pos);
+        let is_dest: i64 = in_range(first, 32256, 32447);
+        let need: i64 = is_dest * 4 + (1 - is_dest) * 1;
+        w = set_decode_err_if(w, 1 - is_ge(nwords, pos + need), pos);
+        let op: i64 = is_dest * load_u16(stream, pos + 1) + (1 - is_dest) * first;
+        w = ws_set(w, 15, pos);
+        pos = pos + need;
+        w = ws_set(w, 0, pos);
+        w = collect_ops(stream, w);
+        pos = ws_get(w, 0);
+        let is_lab: i64 = is_eq(op, 32576);
+        w = record_labels_from_ops(w, is_lab);
+        left = left - 1;
+        go = left * (1 - is_eq(ws_get(w, 10), 3006));
+    }
+    return w;
+}
+
+#[strict]
+fn verify_ins_body(stream: bytes, ws: bytes, ins_start: i64, ins_cnt: i64, cap: i64) -> bytes {
+    let w: bytes = ws;
+    let nwords: i64 = ws_get(w, 1);
+    let pos: i64 = ins_start;
+    let left: i64 = ins_cnt;
+    let go: i64 = left * (1 - is_eq(ws_get(w, 10), 3006));
+    while go <=> 0 {
+        let have: i64 = is_gt(nwords, pos);
+        w = set_decode_err_if(w, 1 - have, pos);
+        let ins_off: i64 = pos;
+        w = ws_set(w, 15, ins_off);
+        let first: i64 = load_u16(stream, pos);
+        let is_dest: i64 = in_range(first, 32256, 32447);
+        let need: i64 = is_dest * 4 + (1 - is_dest) * 1;
+        w = set_decode_err_if(w, 1 - is_ge(nwords, pos + need), pos);
+        let dest: i64 = is_dest * first;
+        let op: i64 = is_dest * load_u16(stream, pos + 1) + (1 - is_dest) * first;
+        let tc: i64 = is_dest * load_u16(stream, pos + 3) + (1 - is_dest) * 32704;
+        pos = pos + need;
+        w = ws_set(w, 0, pos);
+        w = collect_ops(stream, w);
+        pos = ws_get(w, 0);
+        let known: i64 = op_is_known(op);
+        w = append_err_if(w, 1 - known, 3001, ins_off);
+        let is_drop: i64 = known * is_eq(op, 32517);
+        let is_ret: i64 = known * is_eq(op, 32586);
+        let cdrop: trit = is_drop <=> 0;
+        w = if_pos cdrop {
+            handle_drop(w, ins_off)
+        } else {
+            w
+        };
+        let cret: trit = is_ret <=> 0;
+        w = if_pos cret {
+            handle_ret(w, ins_off)
+        } else {
+            w
+        };
+        let skip: i64 = (1 - known) + is_drop + is_ret;
+        w = check_branch_labels(w, op, ins_off);
+        let do_dest: i64 = known * (1 - skip) * op_has_dest(op) * is_dest;
+        let cdest: trit = do_dest <=> 0;
+        w = if_pos cdest {
+            handle_dest(w, op, dest, tc, cap, ins_off)
+        } else {
+            w
+        };
+        left = left - 1;
+        go = left * (1 - is_eq(ws_get(w, 10), 3006));
+    }
+    return w;
+}
+
+#[strict]
+fn emit_fn_result(out: bytes, ws: bytes, fn_idx: i64) -> bytes {
+    let o: bytes = out;
+    let nerr: i64 = ws_get(ws, 8);
+    let passed: i64 = is_eq(nerr, 0);
+    o = iset_i64(o, fn_idx);
+    o = iset_i64(o, passed);
+    o = iset_i64(o, nerr);
+    let i: i64 = 0;
+    while nerr - i <=> 0 {
+        let code: i64 = ws_get(ws, 256 + i * 2);
+        let off: i64 = ws_get(ws, 256 + i * 2 + 1);
+        o = iset_i64(o, code);
+        o = iset_i64(o, off);
+        i = i + 1;
+    }
+    return o;
+}
+
+#[strict]
+fn verify_one_fn(stream: bytes, ws: bytes, fn_idx: i64, p_cnt: i64, p_pos: i64, cap: i64, ins_cnt: i64, ins_start: i64) -> bytes {
+    let w: bytes = clear_labels_and_regs(ws);
+    w = ws_set(w, 2, cap);
+    w = ws_set(w, 9, fn_idx);
+    w = apply_params(stream, w, p_cnt, p_pos);
+    w = scan_labels(stream, w, ins_start, ins_cnt);
+    let dec: i64 = is_eq(ws_get(w, 10), 3006);
+    let c: trit = (1 - dec) <=> 0;
+    w = if_pos c {
+        let w2: bytes = w;
+        w2 = ws_set(w2, 8, 0);
+        w2 = verify_ins_body(stream, w2, ins_start, ins_cnt, cap);
+        w2
+    } else {
+        w
+    };
+    return w;
+}
+
+#[strict]
+fn omni_verify_module(stream: bytes) -> bytes {
+    let nbytes: i64 = slen(stream);
+    let nwords: i64 = nbytes / 2;
+    let ws: bytes = init_zero_buf(448);
+    ws = ws_set(ws, 1, nwords);
+    let empty: i64 = is_eq(nwords, 0);
+    let hdr: i64 = load_u16(stream, 0);
+    let bad_hdr: i64 = empty + (1 - is_eq(hdr, 32480));
+    ws = set_decode_err_if(ws, bad_hdr, 0);
+    let pos: i64 = 1;
+    ws = ws_set(ws, 0, pos);
+    let out: bytes = anew(0);
+    let nfns: i64 = 0;
+    let go: i64 = (1 - is_eq(ws_get(ws, 10), 3006)) * is_gt(nwords, pos);
+    while go <=> 0 {
+        let tag: i64 = load_u16(stream, pos);
+        let is_end: i64 = is_eq(tag, 32495);
+        let is_sch: i64 = is_eq(tag, 32481);
+        let is_ex: i64 = is_eq(tag, 32482);
+        let is_fn: i64 = is_eq(tag, 32483);
+        let known: i64 = is_end + is_sch + is_ex + is_fn;
+        ws = set_decode_err_if(ws, 1 - known, pos);
+        pos = pos + 1;
+        let csch: trit = is_sch <=> 0;
+        pos = if_pos csch {
+            let have: i64 = is_ge(nwords, pos + 2);
+            ws = set_decode_err_if(ws, 1 - have, pos);
+            let fcnt: i64 = load_u16(stream, pos + 1);
+            let need: i64 = pos + 2 + fcnt * 2;
+            ws = set_decode_err_if(ws, 1 - is_ge(nwords, need), pos);
+            need
+        } else {
+            pos
+        };
+        let cex: trit = is_ex <=> 0;
+        pos = if_pos cex {
+            let have: i64 = is_ge(nwords, pos + 4);
+            ws = set_decode_err_if(ws, 1 - have, pos);
+            pos + 4
+        } else {
+            pos
+        };
+        let cfn: trit = is_fn <=> 0;
+        let pair: i64 = if_pos cfn {
+            let have: i64 = is_ge(nwords, pos + 2);
+            ws = set_decode_err_if(ws, 1 - have, pos);
+            let fn_idx: i64 = load_u16(stream, pos);
+            let p_cnt: i64 = load_u16(stream, pos + 1);
+            let sig: i64 = pos + 2 + p_cnt * 3 + 3;
+            ws = set_decode_err_if(ws, 1 - is_ge(nwords, sig), pos);
+            let p_pos: i64 = pos + 2;
+            let cap: i64 = load_u16(stream, pos + 2 + p_cnt * 3 + 1);
+            let ins_cnt: i64 = load_u16(stream, pos + 2 + p_cnt * 3 + 2);
+            let ins_start: i64 = pos + 2 + p_cnt * 3 + 3;
+            ws = ws_set(ws, 0, ins_start);
+            ws = verify_one_fn(stream, ws, fn_idx, p_cnt, p_pos, cap, ins_cnt, ins_start);
+            out = emit_fn_result(out, ws, fn_idx);
+            nfns = nfns + 1;
+            let endpos: i64 = ws_get(ws, 0);
+            endpos
+        } else {
+            pos
+        };
+        pos = is_fn * pair + (1 - is_fn) * pos;
+        let cend: trit = is_end <=> 0;
+        pos = if_pos cend {
+            nwords
+        } else {
+            pos
+        };
+        ws = ws_set(ws, 0, pos);
+        go = (1 - is_eq(ws_get(ws, 10), 3006)) * is_gt(nwords, pos);
+    }
+    let status: i64 = ws_get(ws, 13);
+    let dec_off: i64 = ws_get(ws, 11);
+    let hdr_out: bytes = anew(0);
+    hdr_out = iset_i64(hdr_out, status);
+    hdr_out = iset_i64(hdr_out, dec_off);
+    hdr_out = iset_i64(hdr_out, nfns);
+    let i: i64 = 0;
+    let n: i64 = slen(out) / 8;
+    while n - i <=> 0 {
+        let v: i64 = load_i64le(out, i * 8);
+        hdr_out = iset_i64(hdr_out, v);
+        i = i + 1;
+    }
+    return hdr_out;
+}
