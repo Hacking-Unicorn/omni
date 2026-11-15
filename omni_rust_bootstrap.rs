@@ -5795,6 +5795,769 @@ pub fn execute_omni_surface_wasm_i64(src: &str, args: &[i64]) -> Result<i64, Str
 }
 
 // ==============================================================================
+// M3-01. CANONICAL FRONTEND DUMPS (`fe-dump`) & THE M3 FRONTEND LOCK
+// ==============================================================================
+// Fixed binary formats the future Omni frontend (`pure/m3/`) is diffed against.
+// Token dump: [M3_TOK_MAGIC, count_lo, count_hi] then per token
+//   [kind, line_lo, line_hi, col_lo, col_hi, v0, v1, v2, v3, nbytes, bytes...]
+//   (v0..v3 = little-endian i64 value: Int value or Trit value, else 0).
+// Sourcemap dump: [M3_SM_MAGIC, n_lo, n_hi] then per entry
+//   [off_lo, off_hi, line_lo, line_hi, col_lo, col_hi], then budget, default and pack5 spans.
+// Errors are compared as `CLASS:line:col` (message text is not part of the lock).
+// AST dump (0x4D41) and packet dump (0x4D50) formats are specified in spec/m3/FE_DUMP.md.
+// The lock covers the closed suite modules (strict, as the suite compiles them), the
+// verifier engine, the acceptance goldens on disk (minus the cwd-dependent
+// `neg_circular_include`), `spec/m3/fixtures/q*.omni` (quirks Q1-Q8) and one
+// `spec/m3/fixtures/neg_*.omni` per frontend error class.
+
+pub const M3_FE_DUMP_VERSION: &str = "omni-m3-fe-dump-v1";
+pub const M3_TOK_MAGIC: u16 = 0x4D33;
+pub const M3_SM_MAGIC: u16 = 0x4D53;
+pub const M3_TK_IDENT: u16 = 1;
+pub const M3_TK_INT: u16 = 2;
+pub const M3_TK_TRIT: u16 = 3;
+pub const M3_TK_STR: u16 = 4;
+pub const M3_TK_AT: u16 = 5;
+pub const M3_TK_SYM: u16 = 6;
+pub const M3_TK_OP: u16 = 7;
+pub const M3_TK_HASH: u16 = 8;
+
+pub const M3_FE_LOCK_TSV: &str = include_str!("spec/m3/corpus.tsv");
+
+pub const M3_FE_LOOKUP_CORPUS: [&str; 18] = [
+    "std/prelude.omni",
+    "std/math.omni",
+    "std/trit.omni",
+    "std/http.omni",
+    "std/pack5.omni",
+    "std/decision.omni",
+    "std/resource.omni",
+    "pure/compiler.omni",
+    "pure/verifier.omni",
+    "pure/host_runtime.omni",
+    "pure/tooling.omni",
+    "pure/selfhost_suite.omni",
+    "pure/programs/ternary_neural_router.omni",
+    "pure/programs/arena_audit_pipeline.omni",
+    "pure/programs/policy_consensus_engine.omni",
+    "pure/programs/kv_ledger_service.omni",
+    "pure/programs/compiler_self_audit.omni",
+    "pure/programs/pack5_decision_controller.omni",
+];
+
+pub const M3_FE_FILE_CORPUS: &[(&str, &str)] = &[
+    ("golden/arena_lifecycle_golden.omni", include_str!("spec/acceptance/goldens/arena_lifecycle_golden.omni")),
+    ("golden/asm_roundtrip.omni", include_str!("spec/acceptance/goldens/asm_roundtrip.omni")),
+    ("golden/br_neg_arith_golden.omni", include_str!("spec/acceptance/goldens/br_neg_arith_golden.omni")),
+    ("golden/br_pos_golden.omni", include_str!("spec/acceptance/goldens/br_pos_golden.omni")),
+    ("golden/branch_loop_golden.omni", include_str!("spec/acceptance/goldens/branch_loop_golden.omni")),
+    ("golden/byte_buf_golden.omni", include_str!("spec/acceptance/goldens/byte_buf_golden.omni")),
+    ("golden/custom_non_seed_alu.omni", include_str!("spec/acceptance/goldens/custom_non_seed_alu.omni")),
+    ("golden/decision_hook_golden.omni", include_str!("spec/acceptance/goldens/decision_hook_golden.omni")),
+    ("golden/iabs_golden.omni", include_str!("spec/acceptance/goldens/iabs_golden.omni")),
+    ("golden/idiv_zero.omni", include_str!("spec/acceptance/goldens/idiv_zero.omni")),
+    ("golden/match_trit_golden.omni", include_str!("spec/acceptance/goldens/match_trit_golden.omni")),
+    ("golden/multi_fn_weighted_term.omni", include_str!("spec/acceptance/goldens/multi_fn_weighted_term.omni")),
+    ("golden/neg_ambiguous_grammar.omni", include_str!("spec/acceptance/goldens/neg_ambiguous_grammar.omni")),
+    ("golden/neg_arity_mismatch.omni", include_str!("spec/acceptance/goldens/neg_arity_mismatch.omni")),
+    ("golden/neg_bad_type.omni", include_str!("spec/acceptance/goldens/neg_bad_type.omni")),
+    ("golden/neg_borrow_conflict.omni", include_str!("spec/acceptance/goldens/neg_borrow_conflict.omni")),
+    ("golden/neg_budget_exceeded.omni", include_str!("spec/acceptance/goldens/neg_budget_exceeded.omni")),
+    ("golden/neg_corrupt_pack5.omni", include_str!("spec/acceptance/goldens/neg_corrupt_pack5.omni")),
+    ("golden/neg_immut_param.omni", include_str!("spec/acceptance/goldens/neg_immut_param.omni")),
+    ("golden/neg_linear_leak.omni", include_str!("spec/acceptance/goldens/neg_linear_leak.omni")),
+    ("golden/neg_missing_cap.omni", include_str!("spec/acceptance/goldens/neg_missing_cap.omni")),
+    ("golden/neg_syntax_error.omni", include_str!("spec/acceptance/goldens/neg_syntax_error.omni")),
+    ("golden/neg_taint_on_ret.omni", include_str!("spec/acceptance/goldens/neg_taint_on_ret.omni")),
+    ("golden/neg_taint_sink.omni", include_str!("spec/acceptance/goldens/neg_taint_sink.omni")),
+    ("golden/neg_undef_var.omni", include_str!("spec/acceptance/goldens/neg_undef_var.omni")),
+    ("golden/neg_unknown_fn.omni", include_str!("spec/acceptance/goldens/neg_unknown_fn.omni")),
+    ("golden/neg_unresolved_label.omni", include_str!("spec/acceptance/goldens/neg_unresolved_label.omni")),
+    ("golden/nested_branch_golden.omni", include_str!("spec/acceptance/goldens/nested_branch_golden.omni")),
+    ("golden/pack5_direct_aot.omni", include_str!("spec/acceptance/goldens/pack5_direct_aot.omni")),
+    ("golden/pack5_trit_vec_golden.omni", include_str!("spec/acceptance/goldens/pack5_trit_vec_golden.omni")),
+    ("golden/route_db_query_golden.omni", include_str!("spec/acceptance/goldens/route_db_query_golden.omni")),
+    ("golden/route_kv_golden.omni", include_str!("spec/acceptance/goldens/route_kv_golden.omni")),
+    ("golden/seed0_risk.omni", include_str!("spec/acceptance/goldens/seed0_risk.omni")),
+    ("golden/seed4_consensus.omni", include_str!("spec/acceptance/goldens/seed4_consensus.omni")),
+    ("golden/seed6_clamp.omni", include_str!("spec/acceptance/goldens/seed6_clamp.omni")),
+    ("golden/sel_mix.omni", include_str!("spec/acceptance/goldens/sel_mix.omni")),
+    ("golden/shl_65.omni", include_str!("spec/acceptance/goldens/shl_65.omni")),
+    ("golden/stdlib_macro_pipeline_golden.omni", include_str!("spec/acceptance/goldens/stdlib_macro_pipeline_golden.omni")),
+    ("golden/while_sum_even_golden.omni", include_str!("spec/acceptance/goldens/while_sum_even_golden.omni")),
+    ("m3fix/q1_nonstrict_control.omni", include_str!("spec/m3/fixtures/q1_nonstrict_control.omni")),
+    ("m3fix/q1_strict_substring.omni", include_str!("spec/m3/fixtures/q1_strict_substring.omni")),
+    ("m3fix/q2_trit_text.omni", include_str!("spec/m3/fixtures/q2_trit_text.omni")),
+    ("m3fix/q3_neg_fold.omni", include_str!("spec/m3/fixtures/q3_neg_fold.omni")),
+    ("m3fix/q4_le_ge.omni", include_str!("spec/m3/fixtures/q4_le_ge.omni")),
+    ("m3fix/q5_macro_after_def.omni", include_str!("spec/m3/fixtures/q5_macro_after_def.omni")),
+    ("m3fix/q5_macro_order.omni", include_str!("spec/m3/fixtures/q5_macro_order.omni")),
+    ("m3fix/q6_include_once.omni", include_str!("spec/m3/fixtures/q6_include_once.omni")),
+    ("m3fix/q6_include_twice.omni", include_str!("spec/m3/fixtures/q6_include_twice.omni")),
+    ("m3fix/q7_fn_ids.omni", include_str!("spec/m3/fixtures/q7_fn_ids.omni")),
+    ("m3fix/q8a_ssa_limit.omni", include_str!("spec/m3/fixtures/q8a_ssa_limit.omni")),
+    ("m3fix/q8b_label_limit.omni", include_str!("spec/m3/fixtures/q8b_label_limit.omni")),
+    ("m3fix/q8c_label_ok.omni", include_str!("spec/m3/fixtures/q8c_label_ok.omni")),
+    ("m3fix/q8d_label_15.omni", include_str!("spec/m3/fixtures/q8d_label_15.omni")),
+    ("m3fix/q8e_label_17.omni", include_str!("spec/m3/fixtures/q8e_label_17.omni")),
+    ("m3fix/neg_ambiguous_grammar.omni", include_str!("spec/m3/fixtures/neg_ambiguous_grammar.omni")),
+    ("m3fix/neg_arity_mismatch.omni", include_str!("spec/m3/fixtures/neg_arity_mismatch.omni")),
+    ("m3fix/neg_bad_type.omni", include_str!("spec/m3/fixtures/neg_bad_type.omni")),
+    ("m3fix/neg_budget_exceeded.omni", include_str!("spec/m3/fixtures/neg_budget_exceeded.omni")),
+    ("m3fix/neg_circular_include.omni", include_str!("spec/m3/fixtures/neg_circular_include.omni")),
+    ("m3fix/neg_immut_param.omni", include_str!("spec/m3/fixtures/neg_immut_param.omni")),
+    ("m3fix/neg_missing_cap.omni", include_str!("spec/m3/fixtures/neg_missing_cap.omni")),
+    ("m3fix/neg_syntax_error.omni", include_str!("spec/m3/fixtures/neg_syntax_error.omni")),
+    ("m3fix/neg_undef_var.omni", include_str!("spec/m3/fixtures/neg_undef_var.omni")),
+    ("m3fix/neg_unknown_fn.omni", include_str!("spec/m3/fixtures/neg_unknown_fn.omni")),
+    ("m3fix/neg_unresolved_label.omni", include_str!("spec/m3/fixtures/neg_unresolved_label.omni")),
+];
+
+fn m3_push_u32(out: &mut Vec<u16>, v: usize) -> Result<(), String> {
+    if v > u32::MAX as usize {
+        return Err(format!("fe-dump value {} exceeds u32", v));
+    }
+    out.push((v & 0xFFFF) as u16);
+    out.push(((v >> 16) & 0xFFFF) as u16);
+    Ok(())
+}
+
+/// Canonical token dump of `tokenize_omni_surface_inner` (same strictness rule as the compiler).
+pub fn m3_dump_tokens(src: &str, strict: bool) -> Result<Vec<u16>, String> {
+    let effective_strict = strict || src.contains("#[strict]");
+    let toks = tokenize_omni_surface_inner(src, effective_strict)?;
+    let mut out = vec![M3_TOK_MAGIC];
+    m3_push_u32(&mut out, toks.len())?;
+    for t in &toks {
+        let (kind, val, text): (u16, i64, &str) = match &t.tok {
+            SurfaceTok::Ident(s) => (M3_TK_IDENT, 0, s.as_str()),
+            SurfaceTok::Int(v) => (M3_TK_INT, *v, ""),
+            SurfaceTok::Trit(s, v) => (M3_TK_TRIT, *v as i64, s.as_str()),
+            SurfaceTok::StrLit(s) => (M3_TK_STR, 0, s.as_str()),
+            SurfaceTok::AtIdent(s) => (M3_TK_AT, 0, s.as_str()),
+            SurfaceTok::Sym(s) => (M3_TK_SYM, 0, s.as_str()),
+            SurfaceTok::Op(s) => (M3_TK_OP, 0, s.as_str()),
+            SurfaceTok::Hash => (M3_TK_HASH, 0, ""),
+        };
+        out.push(kind);
+        m3_push_u32(&mut out, t.line)?;
+        m3_push_u32(&mut out, t.col)?;
+        let uv = val as u64;
+        for k in 0..4 {
+            out.push(((uv >> (16 * k)) & 0xFFFF) as u16);
+        }
+        let bytes = text.as_bytes();
+        if bytes.len() > 0xFFFF {
+            return Err(String::from("fe-dump token text longer than 65535 bytes"));
+        }
+        out.push(bytes.len() as u16);
+        for b in bytes {
+            out.push(*b as u16);
+        }
+    }
+    Ok(out)
+}
+
+/// Canonical dump of `compile_omni_surface_to_u16_with_sourcemap`: (u16 stream, sourcemap words).
+pub fn m3_dump_stream(src: &str, strict: bool) -> Result<(Vec<u16>, Vec<u16>), String> {
+    let (stream, sm) = compile_omni_surface_to_u16_with_sourcemap(src, strict)?;
+    let mut smw = vec![M3_SM_MAGIC];
+    m3_push_u32(&mut smw, sm.offset_to_span.len())?;
+    for (off, (l, c)) in &sm.offset_to_span {
+        m3_push_u32(&mut smw, *off)?;
+        m3_push_u32(&mut smw, *l)?;
+        m3_push_u32(&mut smw, *c)?;
+    }
+    m3_push_u32(&mut smw, sm.budget_span.0)?;
+    m3_push_u32(&mut smw, sm.budget_span.1)?;
+    m3_push_u32(&mut smw, sm.default_span.0)?;
+    m3_push_u32(&mut smw, sm.default_span.1)?;
+    match sm.pack5_span {
+        Some((l, c)) => {
+            smw.push(1);
+            m3_push_u32(&mut smw, l)?;
+            m3_push_u32(&mut smw, c)?;
+        }
+        None => smw.push(0),
+    }
+    Ok((stream, smw))
+}
+
+/// `error[CLASS] line L, col C: ...` -> `CLASS:L:C` (anything else -> `OTHER`).
+pub fn m3_error_key(e: &str) -> String {
+    let class = match (e.find("error["), e.find(']')) {
+        (Some(a), Some(b)) if b > a + 6 => &e[a + 6..b],
+        _ => return String::from("OTHER"),
+    };
+    let num_after = |pat: &str| -> Option<usize> {
+        let i = e.find(pat)? + pat.len();
+        let digits: String = e[i..].chars().take_while(|ch| ch.is_ascii_digit()).collect();
+        digits.parse::<usize>().ok()
+    };
+    match (num_after("line "), num_after("col ")) {
+        (Some(l), Some(c)) => format!("{}:{}:{}", class, l, c),
+        _ => format!("{}:?:?", class),
+    }
+}
+
+fn m3_words_fnv(w: &[u16]) -> String {
+    format!("{}:0x{:016X}", w.len(), fnv1a_64_hash(&encode_u16_stream_to_bytes(w)))
+}
+
+/// The token dump with every line/col zeroed: equal iff kinds, values and texts are equal.
+pub fn m3_strip_token_spans(dump: &[u16]) -> Vec<u16> {
+    let mut out = dump.to_vec();
+    let mut i = 3usize;
+    while i + 10 <= out.len() {
+        for k in 1..5 {
+            out[i + k] = 0;
+        }
+        let n = out[i + 9] as usize;
+        i += 10 + n;
+    }
+    out
+}
+
+pub const M3_AST_MAGIC: u16 = 0x4D41;
+pub const M3_PK_MAGIC: u16 = 0x4D50;
+
+fn m3_push_str(out: &mut Vec<u16>, s: &str) -> Result<(), String> {
+    let b = s.as_bytes();
+    if b.len() > 0xFFFF {
+        return Err(String::from("fe-dump string longer than 65535 bytes"));
+    }
+    out.push(b.len() as u16);
+    for x in b {
+        out.push(*x as u16);
+    }
+    Ok(())
+}
+
+fn m3_push_i64(out: &mut Vec<u16>, v: i64) {
+    let uv = v as u64;
+    for k in 0..4 {
+        out.push(((uv >> (16 * k)) & 0xFFFF) as u16);
+    }
+}
+
+fn m3_push_span(out: &mut Vec<u16>, l: usize, c: usize) -> Result<(), String> {
+    m3_push_u32(out, l)?;
+    m3_push_u32(out, c)
+}
+
+fn m3_ast_stmts(out: &mut Vec<u16>, body: &[SurfaceStmt]) -> Result<(), String> {
+    m3_push_u32(out, body.len())?;
+    for s in body {
+        m3_ast_stmt(out, s)?;
+    }
+    Ok(())
+}
+
+// Rust-side serializer only (host code); recursion here is fine, the no-recursion rule is for core .omni.
+fn m3_ast_stmt(out: &mut Vec<u16>, s: &SurfaceStmt) -> Result<(), String> {
+    match s {
+        SurfaceStmt::Let(name, ty, e, l, c) => {
+            out.push(0x10);
+            m3_push_span(out, *l, *c)?;
+            m3_push_str(out, name)?;
+            match ty {
+                Some((t, tl, tc)) => {
+                    out.push(1);
+                    m3_push_str(out, t)?;
+                    m3_push_span(out, *tl, *tc)?;
+                }
+                None => out.push(0),
+            }
+            m3_ast_expr(out, e)
+        }
+        SurfaceStmt::Assign(name, e, l, c) => {
+            out.push(0x11);
+            m3_push_span(out, *l, *c)?;
+            m3_push_str(out, name)?;
+            m3_ast_expr(out, e)
+        }
+        SurfaceStmt::DoWhile(body, cond, l, c) => {
+            out.push(0x12);
+            m3_push_span(out, *l, *c)?;
+            m3_ast_stmts(out, body)?;
+            m3_ast_expr(out, cond)
+        }
+        SurfaceStmt::While(cond, body, l, c) => {
+            out.push(0x13);
+            m3_push_span(out, *l, *c)?;
+            m3_ast_expr(out, cond)?;
+            m3_ast_stmts(out, body)
+        }
+        SurfaceStmt::Label(id, l, c) => {
+            out.push(0x14);
+            m3_push_span(out, *l, *c)?;
+            out.push(*id);
+            Ok(())
+        }
+        SurfaceStmt::Goto(id, l, c) => {
+            out.push(0x15);
+            m3_push_span(out, *l, *c)?;
+            out.push(*id);
+            Ok(())
+        }
+        SurfaceStmt::Ret(e, l, c) => {
+            out.push(0x16);
+            m3_push_span(out, *l, *c)?;
+            m3_ast_expr(out, e)
+        }
+        SurfaceStmt::Expr(e, l, c) => {
+            out.push(0x17);
+            m3_push_span(out, *l, *c)?;
+            m3_ast_expr(out, e)
+        }
+    }
+}
+
+fn m3_ast_expr(out: &mut Vec<u16>, e: &SurfaceExpr) -> Result<(), String> {
+    match e {
+        SurfaceExpr::Int(v, l, c) => {
+            out.push(0x20);
+            m3_push_span(out, *l, *c)?;
+            m3_push_i64(out, *v);
+            Ok(())
+        }
+        SurfaceExpr::Trit(s, v, l, c) => {
+            out.push(0x21);
+            m3_push_span(out, *l, *c)?;
+            m3_push_str(out, s)?;
+            out.push(*v as i16 as u16);
+            Ok(())
+        }
+        SurfaceExpr::StrLit(s, l, c) => {
+            out.push(0x22);
+            m3_push_span(out, *l, *c)?;
+            m3_push_str(out, s)
+        }
+        SurfaceExpr::TritVecLit(v, l, c) => {
+            out.push(0x23);
+            m3_push_span(out, *l, *c)?;
+            m3_push_u32(out, v.len())?;
+            for t in v {
+                out.push(*t as i16 as u16);
+            }
+            Ok(())
+        }
+        SurfaceExpr::Var(s, l, c) => {
+            out.push(0x24);
+            m3_push_span(out, *l, *c)?;
+            m3_push_str(out, s)
+        }
+        SurfaceExpr::UnOp(op, a, l, c) => {
+            out.push(0x25);
+            m3_push_span(out, *l, *c)?;
+            m3_push_str(out, op)?;
+            m3_ast_expr(out, a)
+        }
+        SurfaceExpr::BinOp(op, a, b, l, c) => {
+            out.push(0x26);
+            m3_push_span(out, *l, *c)?;
+            m3_push_str(out, op)?;
+            m3_ast_expr(out, a)?;
+            m3_ast_expr(out, b)
+        }
+        SurfaceExpr::Call(name, args, l, c) => {
+            out.push(0x27);
+            m3_push_span(out, *l, *c)?;
+            m3_push_str(out, name)?;
+            m3_push_u32(out, args.len())?;
+            for a in args {
+                m3_ast_expr(out, a)?;
+            }
+            Ok(())
+        }
+        SurfaceExpr::IfBranch(kind, cond, then_b, else_b, l, c) => {
+            out.push(0x28);
+            m3_push_span(out, *l, *c)?;
+            m3_push_str(out, kind)?;
+            m3_ast_expr(out, cond)?;
+            m3_ast_stmts(out, then_b)?;
+            m3_ast_stmts(out, else_b)
+        }
+        SurfaceExpr::MatchTrit(scrut, neg, zero, pos, l, c) => {
+            out.push(0x29);
+            m3_push_span(out, *l, *c)?;
+            m3_ast_expr(out, scrut)?;
+            m3_ast_stmts(out, neg)?;
+            m3_ast_stmts(out, zero)?;
+            m3_ast_stmts(out, pos)
+        }
+    }
+}
+
+/// Lex + parse exactly as `compile_omni_surface_to_u16_with_sourcemap` does (including its
+/// textual include expansion and re-parse), returning the parsed fns.
+fn m3_parse_like_compile(src: &str, strict: bool) -> Result<(bool, Vec<SurfaceFnDef>), String> {
+    let effective_strict = strict || src.contains("#[strict]");
+    let tokens = tokenize_omni_surface_inner(src, effective_strict)?;
+    let mut parser = SurfaceParser::new_with_strict(tokens, effective_strict);
+    let (includes, fns) = parser.parse_module()?;
+    if !includes.is_empty() {
+        let expanded = resolve_omni_surface_includes(src, None, None)?;
+        return m3_parse_like_compile(&expanded, effective_strict);
+    }
+    Ok((effective_strict, fns))
+}
+
+/// Canonical preorder AST dump of `parse_module` (after macro substitution, as the parser does it).
+pub fn m3_dump_ast(src: &str, strict: bool) -> Result<Vec<u16>, String> {
+    let (_, fns) = m3_parse_like_compile(src, strict)?;
+    let mut out = vec![M3_AST_MAGIC];
+    m3_push_u32(&mut out, fns.len())?;
+    for f in &fns {
+        out.push(0xF0);
+        m3_push_span(&mut out, f.fn_line, f.fn_col)?;
+        m3_push_str(&mut out, &f.name)?;
+        match f.fn_id_attr {
+            Some(id) => {
+                out.push(1);
+                out.push(id);
+            }
+            None => out.push(0),
+        }
+        out.push(f.cap_mask);
+        match f.step_budget_attr {
+            Some(v) => {
+                out.push(1);
+                m3_push_i64(&mut out, v as i64);
+            }
+            None => out.push(0),
+        }
+        match f.mem_budget_attr {
+            Some(v) => {
+                out.push(1);
+                m3_push_i64(&mut out, v as i64);
+            }
+            None => out.push(0),
+        }
+        match f.budget_span {
+            Some((l, c)) => {
+                out.push(1);
+                m3_push_span(&mut out, l, c)?;
+            }
+            None => out.push(0),
+        }
+        out.push(f.strict_attr as u16);
+        out.push(f.is_route as u16);
+        for opt in [&f.route_method, &f.route_path] {
+            match opt {
+                Some(s) => {
+                    out.push(1);
+                    m3_push_str(&mut out, s)?;
+                }
+                None => out.push(0),
+            }
+        }
+        out.push(f.params.len() as u16);
+        for p in &f.params {
+            m3_push_str(&mut out, &p.name)?;
+            m3_push_str(&mut out, &p.ty)?;
+            out.push(p.untrusted as u16);
+            m3_push_span(&mut out, p.line, p.col)?;
+        }
+        m3_push_str(&mut out, &f.ret_ty)?;
+        m3_push_span(&mut out, f.ret_line, f.ret_col)?;
+        m3_ast_stmts(&mut out, &f.body)?;
+    }
+    Ok(out)
+}
+
+/// Canonical per-function packet dump: the u16 packets `SurfaceLowerCtx` emits, each with its span.
+/// Mirrors the front half of `compile_omni_surface_to_u16_with_sourcemap` (no lockstep) and then
+/// re-packs the packets and checks the result equals the real compiler's stream word for word.
+pub fn m3_dump_packets(src: &str, strict: bool) -> Result<Vec<u16>, String> {
+    let (effective_strict, fns) = m3_parse_like_compile(src, strict)?;
+    let multi_fn = fns.len() > 1;
+    let mut fn_sigs: BTreeMap<String, (u16, usize, String)> = BTreeMap::new();
+    let mut assigned_ids: Vec<u16> = Vec::with_capacity(fns.len());
+    for (idx, f) in fns.iter().enumerate() {
+        let fid = if let Some(id_attr) = f.fn_id_attr {
+            id_attr
+        } else if !multi_fn || idx + 1 == fns.len() {
+            0
+        } else {
+            (idx + 1) as u16
+        };
+        let fn_strict = effective_strict || f.strict_attr;
+        let ret_asm = String::from(map_omni_surface_type_inner(&f.ret_ty, f.ret_line, f.ret_col, fn_strict)?);
+        for p in &f.params {
+            let _ = map_omni_surface_type_inner(&p.ty, p.line, p.col, fn_strict)?;
+        }
+        if fn_sigs.contains_key(&f.name) {
+            return Err(format!(
+                "error[SYNTAX_ERROR] line {}, col {}: Duplicate function definition '{}'",
+                f.ret_line, f.ret_col, f.name
+            ));
+        }
+        fn_sigs.insert(f.name.clone(), (fid, f.params.len(), ret_asm));
+        assigned_ids.push(fid);
+    }
+    let mut out = vec![M3_PK_MAGIC];
+    m3_push_u32(&mut out, fns.len())?;
+    let mut repack: Vec<u16> = Vec::new();
+    if multi_fn {
+        repack.push(TOK_MOD_BEGIN);
+    }
+    for (idx, f) in fns.iter().enumerate() {
+        let fid = assigned_ids[idx];
+        let fn_strict = effective_strict || f.strict_attr;
+        let mut params = Vec::with_capacity(f.params.len());
+        for (p_idx, p) in f.params.iter().enumerate() {
+            let ty_str = map_omni_surface_type_inner(&p.ty, p.line, p.col, fn_strict)?;
+            params.push((PAR_BASE + (p_idx as u16), parse_asm_ty_tok(ty_str), pack_tc(p.untrusted, CAP_ID_PURE)));
+        }
+        let ret_ty_str = map_omni_surface_type_inner(&f.ret_ty, f.ret_line, f.ret_col, fn_strict)?;
+        let ret_ty_tok = parse_asm_ty_tok(ret_ty_str);
+        let mut ctx = SurfaceLowerCtx::new(&f.params, fn_sigs.clone(), ret_ty_tok, false);
+        ctx.cur_span = (f.fn_line.max(1), f.fn_col.max(1));
+        if f.is_route {
+            let method_code = match f.route_method.as_deref() {
+                Some("GET") => 1,
+                Some("POST") => 2,
+                Some("PUT") => 3,
+                Some("DELETE") => 4,
+                _ => 0,
+            };
+            let path_hash = fnv1a_32_positive(f.route_path.as_deref().unwrap_or("/"));
+            let r_rt = ctx.alloc_reg(f.fn_line, f.fn_col)?;
+            ctx.cur_span = (f.fn_line.max(1), f.fn_col.max(1));
+            ctx.emit(format!("{} = ROUTE {} {}", r_rt, method_code, path_hash))?;
+        }
+        for stmt in &f.body {
+            ctx.lower_stmt(stmt)?;
+        }
+        ctx.check_unresolved_labels()?;
+        out.push(fid);
+        out.push(params.len() as u16);
+        for (pt, pty, ptc) in &params {
+            out.push(*pt);
+            out.push(*pty);
+            out.push(*ptc);
+        }
+        out.push(ret_ty_tok);
+        out.push(f.cap_mask);
+        m3_push_u32(&mut out, ctx.packets.len())?;
+        for (pkt, sp) in ctx.packets.iter().zip(ctx.pkt_spans.iter()) {
+            m3_push_span(&mut out, sp.0, sp.1)?;
+            if pkt.len() > 0xFFFF {
+                return Err(String::from("fe-dump packet longer than 65535 words"));
+            }
+            out.push(pkt.len() as u16);
+            out.extend_from_slice(pkt);
+        }
+        if multi_fn {
+            repack.push(TOK_FN_DEF);
+            repack.push(fid);
+            repack.push(params.len() as u16);
+            for (pt, pty, ptc) in &params {
+                repack.push(*pt);
+                repack.push(*pty);
+                repack.push(*ptc);
+            }
+            repack.push(ret_ty_tok);
+            repack.push(f.cap_mask);
+            repack.push(ctx.packets.len() as u16);
+            for pkt in &ctx.packets {
+                repack.extend_from_slice(pkt);
+            }
+        } else {
+            repack = pack_fn_module(&[], fid, &params, ret_ty_tok, f.cap_mask, &ctx.packets);
+        }
+    }
+    if multi_fn {
+        repack.push(TOK_MOD_END);
+    }
+    if !fns.is_empty() {
+        if let Ok((stream, _)) = compile_omni_surface_to_u16_with_sourcemap(src, strict) {
+            if stream != repack {
+                return Err(String::from("error[FE_DUMP_DIVERGENCE] line 1, col 1: packet dump does not re-pack to the compiler's stream"));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// One lock row: `name<TAB>strict<TAB>tok=..<TAB>ast=..<TAB>pk=..<TAB>out=..`.
+pub fn m3_fe_lock_row(name: &str, src: &str, strict: bool) -> String {
+    let tok = match m3_dump_tokens(src, strict) {
+        Ok(t) => format!("tok={}:tokv={}", m3_words_fnv(&t), m3_words_fnv(&m3_strip_token_spans(&t))),
+        Err(e) => format!("tok=ERR:{}", m3_error_key(&e)),
+    };
+    let ast = match m3_dump_ast(src, strict) {
+        Ok(a) => format!("ast={}", m3_words_fnv(&a)),
+        Err(e) => format!("ast=ERR:{}", m3_error_key(&e)),
+    };
+    let pk = match m3_dump_packets(src, strict) {
+        Ok(p) => format!("pk={}", m3_words_fnv(&p)),
+        Err(e) => format!("pk=ERR:{}", m3_error_key(&e)),
+    };
+    let out = match m3_dump_stream(src, strict) {
+        Ok((s, sm)) => format!("out={}:sm={}", m3_words_fnv(&s), m3_words_fnv(&sm)),
+        Err(e) => format!("out=ERR:{}", m3_error_key(&e)),
+    };
+    format!("{}\t{}\t{}\t{}\t{}\t{}", name, if strict { 1 } else { 0 }, tok, ast, pk, out)
+}
+
+/// The circular-include fixture names a repo-root-relative path, so the lock resolves it through
+/// the resolver's in-memory VFS instead of the process cwd (same result as compiling it from the
+/// repo root, without depending on where the test runs).
+pub fn m3_fe_lock_row_circular(name: &str, vfs_path: &str, src: &str) -> String {
+    let mut vfs = BTreeMap::new();
+    vfs.insert(String::from(vfs_path), String::from(src));
+    let inc = match resolve_omni_surface_includes(src, None, Some(&vfs)) {
+        Ok(x) => format!("inc=OK:{}", x.len()),
+        Err(e) => format!("inc=ERR:{}", m3_error_key(&e)),
+    };
+    format!("{}\t0\t{}", name, inc)
+}
+
+/// One negative fixture per frontend error class: (class, fixture name). Each must fail the
+/// stream compile with exactly that class.
+pub const M3_NEG_CLASS_FIXTURES: [(&str, &str); 11] = [
+    ("SYNTAX_ERROR", "m3fix/neg_syntax_error.omni"),
+    ("ARITY_MISMATCH", "m3fix/neg_arity_mismatch.omni"),
+    ("UNRESOLVED_LABEL", "m3fix/neg_unresolved_label.omni"),
+    ("BAD_TYPE", "m3fix/neg_bad_type.omni"),
+    ("AMBIGUOUS_GRAMMAR", "m3fix/neg_ambiguous_grammar.omni"),
+    ("UNDEF_VAR", "m3fix/neg_undef_var.omni"),
+    ("BUDGET_EXCEEDED", "m3fix/neg_budget_exceeded.omni"),
+    ("UNKNOWN_FN", "m3fix/neg_unknown_fn.omni"),
+    ("MISSING_CAP", "m3fix/neg_missing_cap.omni"),
+    ("IMMUT_PARAM", "m3fix/neg_immut_param.omni"),
+    ("CIRCULAR_INCLUDE", "m3fix/neg_circular_include.omni"),
+];
+
+/// Every lock row, in manifest order.
+pub fn m3_fe_lock_rows() -> Result<Vec<String>, String> {
+    let mut rows = Vec::new();
+    for key in M3_FE_LOOKUP_CORPUS.iter() {
+        let src = lookup_omni_stdlib_module(key)
+            .ok_or_else(|| format!("M3 lock: missing built-in module '{}'", key))?;
+        rows.push(m3_fe_lock_row(&format!("lookup/{}", key), src, true));
+    }
+    rows.push(m3_fe_lock_row("engine/pure/verifier_engine.omni", OMNI_VERIFIER_ENGINE_SURFACE, false));
+    for (name, src) in M3_FE_FILE_CORPUS.iter() {
+        if *name == "m3fix/neg_circular_include.omni" {
+            rows.push(m3_fe_lock_row_circular(name, "spec/m3/fixtures/neg_circular_include.omni", src));
+        } else {
+            rows.push(m3_fe_lock_row(name, src, false));
+        }
+    }
+    Ok(rows)
+}
+
+/// M3-01 lock: the Rust frontend's canonical dumps must equal `spec/m3/corpus.tsv` row for row.
+pub fn run_m3_fe_lock_selftests() -> Result<usize, String> {
+    let rows = m3_fe_lock_rows()?;
+    let want: Vec<&str> = M3_FE_LOCK_TSV
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        .collect();
+    if want.len() != rows.len() {
+        return Err(format!("M3 frontend lock: {} rows computed, {} locked", rows.len(), want.len()));
+    }
+    for (got, exp) in rows.iter().zip(want.iter()) {
+        if got.as_str() != *exp {
+            return Err(format!("M3 frontend lock mismatch:\n  got  {}\n  want {}", got, exp));
+        }
+    }
+    let mut checks = rows.len();
+    for (class, fx) in M3_NEG_CLASS_FIXTURES.iter() {
+        let row = rows
+            .iter()
+            .find(|r| r.split('\t').next() == Some(*fx))
+            .ok_or_else(|| format!("M3 negative fixture '{}' missing from the lock", fx))?;
+        let want_out = format!("out=ERR:{}:", class);
+        let want_inc = format!("inc=ERR:{}:", class);
+        if !row.contains(&want_out) && !row.contains(&want_inc) {
+            return Err(format!("M3 negative fixture '{}' does not fail with {}: {}", fx, class, row));
+        }
+        checks += 1;
+    }
+    Ok(checks)
+}
+
+/// M3-01 canonical dumper.
+///   fe-dump lock                                         (prints the spec/m3/corpus.tsv rows)
+///   fe-dump --tokens|--ast|--packets|--stream <file.omni> [out.bin] [--strict]
+/// `tokens`/`ast`/`packets`/`stream` without dashes are accepted too. With `out.bin`, the dump is
+/// written as little-endian u16 words; `--stream` also writes `<out.bin>.sm` (sourcemap dump).
+/// Includes resolve as an in-memory compile does (built-in modules, then the cwd).
+pub fn run_m3_fe_dump_cli(argv: &[String]) -> i32 {
+    let strict = argv.iter().any(|a| a == "--strict");
+    let rest: Vec<&str> = argv.iter().map(|s| s.as_str()).filter(|a| *a != "--strict").collect();
+    let usage = || {
+        eprintln!("usage: fe-dump lock | fe-dump --tokens|--ast|--packets|--stream <file.omni> [out.bin] [--strict]");
+        2
+    };
+    let mode = match rest.first() {
+        Some(m) => m.trim_start_matches('-'),
+        None => return usage(),
+    };
+    if mode == "lock" {
+        return match m3_fe_lock_rows() {
+            Ok(rows) => {
+                println!("# {} lock rows: name, strict, tok=words:fnv1a64:tokv=span-free words:fnv1a64, ast=words:fnv1a64, pk=words:fnv1a64, out=words:fnv1a64:sm=words:fnv1a64 (any column may be ERR:CLASS:line:col; inc= rows go through the include resolver)", M3_FE_DUMP_VERSION);
+                for r in rows {
+                    println!("{}", r);
+                }
+                0
+            }
+            Err(e) => {
+                eprintln!("[FE-DUMP FAIL] {}", e);
+                1
+            }
+        };
+    }
+    if !matches!(mode, "tokens" | "ast" | "packets" | "stream") || rest.len() < 2 {
+        return usage();
+    }
+    let src = match fs::read_to_string(rest[1]) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[FE-DUMP FAIL] cannot read '{}': {}", rest[1], e);
+            return 1;
+        }
+    };
+    let res = match mode {
+        "tokens" => m3_dump_tokens(&src, strict).map(|t| (t, None)),
+        "ast" => m3_dump_ast(&src, strict).map(|t| (t, None)),
+        "packets" => m3_dump_packets(&src, strict).map(|t| (t, None)),
+        _ => m3_dump_stream(&src, strict).map(|(s, sm)| (s, Some(sm))),
+    };
+    match res {
+        Ok((words, sm)) => {
+            let mut msg = format!("[FE-DUMP] {} {} words={}", mode, rest[1], m3_words_fnv(&words));
+            if let Some(smw) = &sm {
+                msg.push_str(&format!(" sm={}", m3_words_fnv(smw)));
+            }
+            if let Some(outp) = rest.get(2) {
+                if let Err(e) = fs::write(outp, encode_u16_stream_to_bytes(&words)) {
+                    eprintln!("[FE-DUMP FAIL] write: {}", e);
+                    return 1;
+                }
+                if let Some(smw) = sm {
+                    if let Err(e) = fs::write(format!("{}.sm", outp), encode_u16_stream_to_bytes(&smw)) {
+                        eprintln!("[FE-DUMP FAIL] write: {}", e);
+                        return 1;
+                    }
+                }
+            }
+            println!("{}", msg);
+            0
+        }
+        Err(e) => {
+            println!("[FE-DUMP] {} {} ERR:{}", mode, rest[1], m3_error_key(&e));
+            1
+        }
+    }
+}
+
+// ==============================================================================
 // 7C. VERSION-LOCKED MODEL HARNESS (`omni-harness`) & STRUCTURED DIAGNOSTICS
 // ==============================================================================
 
@@ -13194,6 +13957,9 @@ fn main(x: i64, y: i64) -> i64 {
     // 13AW. Vera P1 byte-readback sibling (VM + Wasm assert; x86/Stage-1 native run)
     checks += run_byte_readback_parity_selftests()?;
 
+    // 13M3a. M3-01 frontend lock: canonical token / AST / packet / stream / sourcemap dumps == spec/m3/corpus.tsv, plus one negative fixture per error class
+    checks += run_m3_fe_lock_selftests()?;
+
     Ok(checks)
 }
 
@@ -18577,6 +19343,9 @@ fn main() {
                     p0, p1, rew, probs
                 );
                 return;
+            }
+            "fe-dump" | "--fe-dump" => {
+                std::process::exit(run_m3_fe_dump_cli(&cli_args[2..]));
             }
             "fixed-point" | "--fixed-point" => {
                 let s1_u16 = build_step7_stage1_compiler_stream();

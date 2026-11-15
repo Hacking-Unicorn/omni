@@ -1,0 +1,17 @@
+// Q7: fn id assignment (attr, else idx+1, last fn = 0).
+fn helper_a(x: i64) -> i64 {
+    return x + 1;
+}
+#[fn_id(5)]
+fn helper_b(x: i64) -> i64 {
+    return x * 2;
+}
+fn helper_c(x: i64) -> i64 {
+    return x - 3;
+}
+fn main(x: i64) -> i64 {
+    let a = helper_a(x);
+    let b = helper_b(a);
+    let c = helper_c(b);
+    return c;
+}

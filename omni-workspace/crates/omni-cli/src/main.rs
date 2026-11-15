@@ -872,6 +872,13 @@ pub fn run_workspace_selftest() -> Result<usize, String> {
     if ai_first_checks != m_ai_first_checks {
         return Err(format!("Monolith vs workspace AI-first selftest count mismatch: {} != {}", m_ai_first_checks, ai_first_checks));
     }
+    // M3-01: monolith vs workspace canonical frontend dumps, row for row.
+    let m3_ws = omni_lang::m3_fe_lock_rows()?;
+    let m3_mono = monolith::m3_fe_lock_rows()?;
+    if m3_ws != m3_mono {
+        return Err("Monolith vs workspace M3 frontend lock rows mismatch".into());
+    }
+    checks += m3_ws.len();
     if omni_harness_spec_json() != monolith::omni_harness_spec_json() {
         return Err("Monolith vs workspace omni_harness_spec_json mismatch".into());
     }
@@ -953,6 +960,9 @@ fn main() {
         match args[1].as_str() {
             "harness" | "--harness" => {
                 std::process::exit(run_omni_harness_cli(&args[2..]));
+            }
+            "fe-dump" | "--fe-dump" => {
+                std::process::exit(omni_lang::run_m3_fe_dump_cli(&args[2..]));
             }
             "agent-driver" | "--agent-driver" => {
                 std::process::exit(run_omni_agent_driver_cli(&args[2..]));

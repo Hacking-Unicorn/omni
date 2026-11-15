@@ -1,0 +1,4 @@
+// neg BAD_TYPE: unknown parameter type.
+fn main(x: widget) -> i64 {
+    return 1;
+}

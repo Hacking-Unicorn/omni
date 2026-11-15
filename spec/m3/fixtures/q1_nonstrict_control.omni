@@ -1,0 +1,5 @@
+// Q1 control: no strict marker anywhere, so TRIT_POS is accepted.
+fn main(x: i64) -> i64 {
+    let t = TRIT_POS;
+    return x;
+}

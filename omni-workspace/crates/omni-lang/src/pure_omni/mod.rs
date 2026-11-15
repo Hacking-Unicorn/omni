@@ -2760,6 +2760,9 @@ fn main(x: i64, y: i64) -> i64 {
     // 13AW. Vera P1 byte-readback sibling (VM + Wasm assert; x86/Stage-1 native run)
     checks += run_byte_readback_parity_selftests()?;
 
+    // 13M3a. M3-01 frontend lock: canonical token / AST / packet / stream / sourcemap dumps == spec/m3/corpus.tsv, plus one negative fixture per error class
+    checks += run_m3_fe_lock_selftests()?;
+
     Ok(checks)
 }
 

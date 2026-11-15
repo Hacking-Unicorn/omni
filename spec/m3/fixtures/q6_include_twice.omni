@@ -1,0 +1,6 @@
+// Q6: includes are textual with no de-duplication.
+include "std/math.omni";
+    include "std/math.omni";
+fn main(x: i64) -> i64 {
+    return x;
+}

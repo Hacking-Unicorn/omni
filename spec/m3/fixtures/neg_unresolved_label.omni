@@ -1,0 +1,5 @@
+// neg UNRESOLVED_LABEL: goto a label that is never defined.
+fn main(x: i64) -> i64 {
+    goto 4;
+    return x;
+}
