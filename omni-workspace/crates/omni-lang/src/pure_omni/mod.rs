@@ -2763,6 +2763,9 @@ fn main(x: i64, y: i64) -> i64 {
     // 13BB. Per-buffer storage: pack5_flow / two_bufs / append-copy (VM + Wasm + run path; x86 P6)
     checks += run_buffer_flow_parity_selftests()?;
 
+    // 13BC. ISA-B 3-op IGET / 4-op ISET patches (VM + Wasm + run + x86 assert; Stage-1 must reject)
+    checks += run_isa_b_multibyte_parity_selftests()?;
+
     Ok(checks)
 }
 

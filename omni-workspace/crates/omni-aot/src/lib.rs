@@ -155,6 +155,36 @@ fn emit_cli_arg_parser(mc: &mut Vec<u8>, argc_min: u8, disp_argv: u8, target_reg
     mc.extend_from_slice(&[0x49, 0x89, 0xC0 + target_reg_code]);
 }
 
+/// ISA-B strict bounds on x86-64 with rax = buffer length, rcx = off: jumps forward by `skip`
+/// bytes (past the guarded load/store) unless width <= len, off <= len - width (unsigned, so a
+/// negative off fails), and the same against r11 (the current heap length). Clobbers rax.
+/// ISA-B out-of-bounds trap: exit(66) with nothing on stdout. A deterministic runtime error;
+/// `execute_native_elf_i64` reports it as error[OUT_OF_BOUNDS].
+pub const X86_OOB_EXIT_STATUS: i32 = 66;
+const X86_OOB_TRAP: [u8; 12] = [
+    0xBF, 0x42, 0x00, 0x00, 0x00, // mov edi, 66
+    0xB8, 0x3C, 0x00, 0x00, 0x00, // mov eax, 60 (exit)
+    0x0F, 0x05,                   // syscall
+];
+
+/// Guarded heap access: bounds check, `access`, then `jmp +12` over the exit(66) trap that every
+/// failed check lands on.
+fn emit_x86_guarded_heap_access(code: &mut Vec<u8>, width: u8, access: &[u8]) {
+    emit_x86_heap_bounds_check(code, width, access.len() as u8 + 2);
+    code.extend_from_slice(access);
+    code.extend_from_slice(&[0xEB, X86_OOB_TRAP.len() as u8]);
+    code.extend_from_slice(&X86_OOB_TRAP);
+}
+
+fn emit_x86_heap_bounds_check(code: &mut Vec<u8>, width: u8, skip: u8) {
+    // rel8 = bytes left in this sequence after each jump + skip: 19, 14, 5, 0.
+    code.extend_from_slice(&[0x48, 0x83, 0xE8, width, 0x72, 19 + skip]); // sub rax, w; jb skip
+    code.extend_from_slice(&[0x48, 0x39, 0xC1, 0x77, 14 + skip]); // cmp rcx, rax; ja skip
+    code.extend_from_slice(&[0x4C, 0x89, 0xD8]); // mov rax, r11
+    code.extend_from_slice(&[0x48, 0x83, 0xE8, width, 0x72, 5 + skip]); // sub rax, w; jb skip
+    code.extend_from_slice(&[0x48, 0x39, 0xC1, 0x77, skip]); // cmp rcx, rax; ja skip
+}
+
 pub fn compile_pure_u16_to_x86_64_elf(stream: &[u16], arg0: i64, arg1: i64) -> Result<Vec<u8>, String> {
     compile_pure_u16_to_x86_64_elf_with_args(stream, arg0, arg1, 90)
 }
@@ -371,6 +401,25 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
                         }
                     }
                 }
+                if ins.operands.len() == 3 {
+                    // ISA-B 3-op IGET buf, mode, off: zero-extended LE load from the ISET heap.
+                    let width: u8 = match ins.operands[1] {
+                        BinOperand::ImmInt(-2) => 2,
+                        BinOperand::ImmInt(-4) => 4,
+                        BinOperand::ImmInt(-8) => 8,
+                        _ => return Err(String::from("error[BAD_TYPE]: 3-op IGET mode must be -2, -4, or -8")),
+                    };
+                    let load: &[u8] = match width {
+                        2 => &[0x0F, 0xB7, 0x84, 0x0D, 0x00, 0x00, 0xFE, 0xFF], // movzx eax, word [rbp+rcx-0x20000]
+                        4 => &[0x8B, 0x84, 0x0D, 0x00, 0x00, 0xFE, 0xFF],       // mov eax, dword [...]
+                        _ => &[0x48, 0x8B, 0x84, 0x0D, 0x00, 0x00, 0xFE, 0xFF], // mov rax, qword [...]
+                    };
+                    emit_load_op(&mut code, &ins.operands[0], false); // rax = buffer len
+                    emit_load_op(&mut code, &ins.operands[2], true); // rcx = off
+                    emit_x86_guarded_heap_access(&mut code, width, load); // OOB: exit(66)
+                    if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                    continue;
+                }
                 if let (2, Some(BinOperand::Reg(r_arr))) = (ins.operands.len(), ins.operands.first()) {
                     if x86_buffer_regs.contains(r_arr) {
                         // ISET-heap byte readback: 0 unless idx < buffer len (the register's
@@ -400,6 +449,22 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
                     emit_load_op(&mut code, &ins.operands[2], true);
                     emit_load_op(&mut code, &ins.operands[3], false);
                     code.extend_from_slice(&[0x48, 0x89, 0x84, 0x0D, 0x00, 0x00, 0xFE, 0xFF]);
+                } else if ins.operands.len() == 4
+                    && (ins.operands[1] == BinOperand::ImmInt(-2) || ins.operands[1] == BinOperand::ImmInt(-4))
+                {
+                    // ISA-B 4-op ISET buf, mode, off, val: LE patch of 2/4 bytes. Out of bounds
+                    // (not 0 <= off && off + width <= len, and <= r11) traps with exit(66).
+                    let width: u8 = if ins.operands[1] == BinOperand::ImmInt(-2) { 2 } else { 4 };
+                    let store: &[u8] = if width == 2 {
+                        &[0x66, 0x89, 0x94, 0x0D, 0x00, 0x00, 0xFE, 0xFF] // mov word [rbp+rcx-0x20000], dx
+                    } else {
+                        &[0x89, 0x94, 0x0D, 0x00, 0x00, 0xFE, 0xFF] // mov dword [rbp+rcx-0x20000], edx
+                    };
+                    emit_load_op(&mut code, &ins.operands[3], false);
+                    code.extend_from_slice(&[0x48, 0x89, 0xC2]); // mov rdx, rax (val)
+                    emit_load_op(&mut code, &ins.operands[0], false); // rax = buffer len
+                    emit_load_op(&mut code, &ins.operands[2], true); // rcx = off
+                    emit_x86_guarded_heap_access(&mut code, width, store); // OOB: exit(66)
                 } else {
                     for op_b in &ins.operands[1..] {
                         emit_load_op(&mut code, op_b, false);
@@ -865,6 +930,13 @@ fn wasm_buf_bump(b: &mut Vec<u8>, l: &WasmBufLocals, width: i64) {
 
 /// Pushes i32 cond: 0 <= off && off + width <= blen (off in `off_l`). Tested as
 /// off <= blen - width, so a huge off cannot overflow into an in-bounds sum.
+/// ISA-B strict bounds: traps (`unreachable`) unless 0 <= off && off + width <= blen. The
+/// evaluator reports the trap as error[OUT_OF_BOUNDS].
+fn wasm_trap_unless_in_bounds(b: &mut Vec<u8>, l: &WasmBufLocals, off_l: usize, width: i64) {
+    wasm_buf_in_bounds(b, l, off_l, width);
+    b.extend_from_slice(&[0x45, 0x04, 0x40, 0x00, 0x0B]); // i32.eqz; if; unreachable; end
+}
+
 fn wasm_buf_in_bounds(b: &mut Vec<u8>, l: &WasmBufLocals, off_l: usize, width: i64) {
     wasm_lget(b, off_l);
     wasm_i64c(b, 0);
@@ -892,6 +964,12 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
                 "Opcode 0x{:04X} ({}) requires high-level VM runtime state and is not lowered by standalone WebAssembly AOT",
                 ins.op_tok, lbl
             ));
+        }
+        if ins.op_tok == 0x7F0E
+            && ins.operands.len() == 3
+            && !matches!(ins.operands[1], BinOperand::ImmInt(-2) | BinOperand::ImmInt(-4) | BinOperand::ImmInt(-8))
+        {
+            return Err(String::from("error[BAD_TYPE]: 3-op IGET mode must be -2, -4, or -8"));
         }
     }
 
@@ -1072,6 +1150,31 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
                     emit_wasm_set_dest(b, ins.dest_reg);
                 }
             }
+            0x7F0E if ins.operands.len() == 3 => {
+                // ISA-B 3-op IGET buf, mode, off: zero-extended LE load from the buffer's own
+                // region; 0 unless 0 <= off && off + width <= len. Never uses the pack5 map.
+                let width: i64 = match ins.operands[1] {
+                    BinOperand::ImmInt(-2) => 2,
+                    BinOperand::ImmInt(-4) => 4,
+                    BinOperand::ImmInt(-8) => 8,
+                    _ => 0,
+                };
+                emit_wasm_op(b, &ins.operands[0]);
+                wasm_buf_split(b, &bl);
+                emit_wasm_op(b, &ins.operands[2]);
+                wasm_lset(b, scratch0);
+                wasm_trap_unless_in_bounds(b, &bl, scratch0, width.max(1));
+                wasm_lget(b, bl.bbase);
+                wasm_lget(b, scratch0);
+                b.push(0x7C);
+                b.push(0xA7);
+                match width {
+                    2 => b.extend_from_slice(&[0x2F, 0x01, 0x00, 0xAD]), // i32.load16_u; i64.extend_i32_u
+                    4 => b.extend_from_slice(&[0x28, 0x02, 0x00, 0xAD]), // i32.load; i64.extend_i32_u
+                    _ => b.extend_from_slice(&[0x29, 0x03, 0x00]),       // i64.load
+                }
+                emit_wasm_set_dest(b, ins.dest_reg);
+            }
             0x7F0E => {
                 let mut handled = false;
                 if let (Some(BinOperand::Reg(r_arr)), Some(idx_op)) =
@@ -1157,22 +1260,38 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
                         b.push(0x86);
                     }
                 };
-                if ops.len() == 4 && ops[1] == BinOperand::ImmInt(-9) {
-                    // Patch in place: silent no-op unless 0 <= off && off + 8 <= len. Length unchanged.
+                let patch_width: i64 = match (ops.len(), ops.get(1)) {
+                    (4, Some(BinOperand::ImmInt(-9))) => 8,
+                    (4, Some(BinOperand::ImmInt(-4))) => 4,
+                    (4, Some(BinOperand::ImmInt(-2))) => 2,
+                    _ => 0,
+                };
+                if patch_width > 0 {
+                    // Patch in place, length unchanged. -9 (8 bytes): silent no-op unless
+                    // 0 <= off && off + 8 <= len. ISA-B -4/-2 (4/2 bytes): out of bounds traps.
                     emit_src(b);
                     wasm_buf_split(b, &bl);
                     emit_wasm_op(b, &ops[2]);
                     wasm_lset(b, scratch0);
                     emit_wasm_op(b, &ops[3]);
                     wasm_lset(b, scratch1);
-                    wasm_buf_in_bounds(b, &bl, scratch0, 8);
+                    if patch_width == 8 {
+                        wasm_buf_in_bounds(b, &bl, scratch0, patch_width);
+                    } else {
+                        wasm_trap_unless_in_bounds(b, &bl, scratch0, patch_width);
+                        wasm_buf_in_bounds(b, &bl, scratch0, patch_width); // now always true
+                    }
                     b.extend_from_slice(&[0x04, 0x40]);
                     wasm_lget(b, bl.bbase);
                     wasm_lget(b, scratch0);
                     b.push(0x7C);
                     b.push(0xA7);
                     wasm_lget(b, scratch1);
-                    b.extend_from_slice(&[0x37, 0x00, 0x00]); // i64.store
+                    match patch_width {
+                        8 => b.extend_from_slice(&[0x37, 0x00, 0x00]), // i64.store
+                        4 => b.extend_from_slice(&[0xA7, 0x36, 0x00, 0x00]), // i32.store
+                        _ => b.extend_from_slice(&[0xA7, 0x3B, 0x00, 0x00]), // i32.store16
+                    }
                     b.push(0x0B);
                 } else {
                     emit_src(b);
@@ -1750,7 +1869,8 @@ pub fn execute_wasm_module_i64_with_budgets(
                 let v = decode_sleb128(body, &mut bpos)?;
                 stack.push(v);
             }
-            0x50 => {
+            0x45 | 0x50 => {
+                // i32.eqz / i64.eqz (the evaluator keeps every value as i64)
                 let a = stack.pop().ok_or("Wasm stack underflow on i64.eqz")?;
                 stack.push(if a == 0 { 1 } else { 0 });
             }
@@ -1814,10 +1934,10 @@ pub fn execute_wasm_module_i64_with_budgets(
                 let a = stack.pop().ok_or("Wasm stack underflow on i64.extend_i32_u")?;
                 stack.push((a as u32) as i64);
             }
-            0x2D | 0x28 | 0x29 | 0x36 | 0x37 | 0x3A => {
+            0x2D | 0x2F | 0x28 | 0x29 | 0x36 | 0x37 | 0x3A | 0x3B => {
                 let _align = decode_uleb128(body, &mut bpos)?;
                 let offset = decode_uleb128(body, &mut bpos)?;
-                let is_store = matches!(op, 0x36 | 0x37 | 0x3A);
+                let is_store = matches!(op, 0x36 | 0x37 | 0x3A | 0x3B);
                 let val = if is_store {
                     stack.pop().ok_or("Wasm stack underflow on store value")?
                 } else {
@@ -1827,6 +1947,7 @@ pub fn execute_wasm_module_i64_with_budgets(
                 let addr = (addr_i as u32 as u64).saturating_add(offset as u64) as usize;
                 let width: usize = match op {
                     0x2D | 0x3A => 1,
+                    0x2F | 0x3B => 2,
                     0x28 | 0x36 => 4,
                     _ => 8,
                 };
@@ -1839,6 +1960,7 @@ pub fn execute_wasm_module_i64_with_budgets(
                     }
                     match op {
                         0x3A => memory[addr] = val as u8,
+                        0x3B => memory[addr..addr + 2].copy_from_slice(&(val as u16).to_le_bytes()),
                         0x36 => memory[addr..addr + 4].copy_from_slice(&(val as u32).to_le_bytes()),
                         _ => memory[addr..addr + 8].copy_from_slice(&(val as u64).to_le_bytes()),
                     }
@@ -1847,6 +1969,7 @@ pub fn execute_wasm_module_i64_with_budgets(
                 } else {
                     let loaded = match op {
                         0x2D => memory[addr] as i64,
+                        0x2F => u16::from_le_bytes([memory[addr], memory[addr + 1]]) as i64,
                         0x28 => i32::from_le_bytes(memory[addr..addr + 4].try_into().unwrap()) as i64,
                         _ => i64::from_le_bytes(memory[addr..addr + 8].try_into().unwrap()),
                     };
@@ -1866,6 +1989,10 @@ pub fn execute_wasm_module_i64_with_budgets(
                 if ctrl_stack.pop().is_none() {
                     break;
                 }
+            }
+            0x00 => {
+                // `unreachable` is only emitted for ISA-B strict-bounds failures.
+                return Err(String::from("error[OUT_OF_BOUNDS]: Wasm trap (unreachable) on an out-of-bounds buffer access"));
             }
             other => {
                 return Err(format!("Unsupported Wasm opcode 0x{:02X} in evaluator", other));

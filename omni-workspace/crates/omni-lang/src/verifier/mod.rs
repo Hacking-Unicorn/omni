@@ -812,6 +812,7 @@ pub fn run_verifier_engine_diff_selftests() -> Result<usize, String> {
         ("sql_taint", "#[cap(DB_R)] fn main(id: i64 @untrusted) -> i64 { let r = db_query(\"SELECT * FROM users WHERE id = ?\", id); return r; }"),
         ("uncalled_tainted_helper", "fn bad_helper(u: i64 @untrusted) -> i64 { return u; }\nfn main(x: i64) -> i64 { return x + 1; }"),
         ("ok_bytes", "fn main(x: i64) -> i64 { let b: bytes = anew(0); b = iset(b, 1); let n: i64 = slen(b); return n + x; }"),
+        ("ok_multibyte_ld_st", "fn main(x: i64) -> i64 { let b: bytes = anew(0); b = iset_i64(b, x); b = st_u16(b, 0, x); b = st_u32(b, 2, x); b = st_u64(b, 0, x); let v: i64 = ld_u16(b, 0) + ld_u32(b, 2) + ld_u64(b, 0); return v; }"),
     ];
     for &(name, src) in surfaces {
         match compile_omni_surface_to_u16(src) {

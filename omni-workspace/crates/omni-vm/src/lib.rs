@@ -269,6 +269,32 @@ impl OmniBinaryVm {
                     self.charge_memory(64)?;
                     OmniValue::Bytes(Vec::with_capacity(64))
                 }
+                0x7F0E if ins.operands.len() == 3 => {
+                    // ISA-B 3-op IGET buf, mode, off: LE zero-extended load of 2/4/8 bytes.
+                    // Strict bounds: 0 <= off && off + width <= len (checked add); otherwise a
+                    // deterministic runtime error[OUT_OF_BOUNDS] (never read-as-0).
+                    let width = match ins.operands[1] {
+                        BinOperand::ImmInt(-2) => 2usize,
+                        BinOperand::ImmInt(-4) => 4usize,
+                        BinOperand::ImmInt(-8) => 8usize,
+                        _ => return Err(String::from("error[BAD_TYPE]: 3-op IGET mode must be -2, -4, or -8")),
+                    };
+                    let off = Self::eval_as_i64(&ins.operands[2], &regs);
+                    match (Self::eval_op(&ins.operands[0], &regs), off) {
+                        (OmniValue::Bytes(buf), Some(off)) if off >= 0 => {
+                            match (off as u64).checked_add(width as u64) {
+                                Some(end) if end <= buf.len() as u64 => {
+                                    let o = off as usize;
+                                    let mut le = [0u8; 8];
+                                    le[..width].copy_from_slice(&buf[o..o + width]);
+                                    OmniValue::Int(u64::from_le_bytes(le) as i64)
+                                }
+                                _ => return Err(format!("error[OUT_OF_BOUNDS]: 3-op IGET off {} width {} len {}", off, width, buf.len())),
+                            }
+                        }
+                        _ => return Err(String::from("error[OUT_OF_BOUNDS]: 3-op IGET offset out of bounds")),
+                    }
+                }
                 0x7F0E => {
                     let arr_val = Self::eval_op(&ins.operands[0], &regs);
                     let idx_val = Self::eval_op(&ins.operands[1], &regs);
@@ -310,6 +336,28 @@ impl OmniBinaryVm {
                             if u_off + 8 <= buf.len() {
                                 buf[u_off..u_off + 8].copy_from_slice(&(v as u64).to_le_bytes());
                             }
+                        }
+                    } else if ins.operands.len() == 4
+                        && (ins.operands[1] == BinOperand::ImmInt(-2) || ins.operands[1] == BinOperand::ImmInt(-4))
+                    {
+                        // ISA-B 4-op ISET buf, mode, off, val: LE patch of 2/4 bytes. Strict bounds
+                        // (0 <= off && off + width <= len, checked add); out of bounds is a
+                        // deterministic runtime error[OUT_OF_BOUNDS] (never a silent no-op).
+                        let width = if ins.operands[1] == BinOperand::ImmInt(-2) { 2usize } else { 4usize };
+                        if let (Some(off), Some(v)) = (
+                            Self::eval_as_i64(&ins.operands[2], &regs),
+                            Self::eval_as_i64(&ins.operands[3], &regs),
+                        ) {
+                            let in_bounds = off >= 0
+                                && matches!((off as u64).checked_add(width as u64), Some(end) if end <= buf.len() as u64);
+                            if !in_bounds {
+                                return Err(format!(
+                                    "error[OUT_OF_BOUNDS]: 4-op ISET off {} width {} len {}",
+                                    off, width, buf.len()
+                                ));
+                            }
+                            let o = off as usize;
+                            buf[o..o + width].copy_from_slice(&(v as u64).to_le_bytes()[..width]);
                         }
                     } else {
                         self.charge_memory(ins.operands.len().saturating_sub(1))?;
