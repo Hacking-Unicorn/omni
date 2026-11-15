@@ -12614,9 +12614,7 @@ pub fn run_multibyte_load_parity_selftests() -> Result<usize, String> {
 /// contiguous SSA join slot. Branch temps in the first stream-order arm must not
 /// punch a hole before the join dest is defined, and both arms must write that
 /// same dest. Existing simple goldens (dest already written first) stay unchanged.
-pub fn run_if_pos_join_slot_selftests() -> Result<usize, String> {
-    let mut checks = 0usize;
-    let cases: &[(&str, &str, &[(i64, i64)], Option<usize>)] = &[
+pub const IF_POS_JOIN_SLOT_CASES: &[(&str, &str, &[(i64, i64)], Option<usize>)] = &[
         (
             "arith_else_temps",
             "fn main(x: i64) -> i64 { let c = x <=> 0; let r = if_pos c { 200 } else { (x + 1) * 2 }; return r; }",
@@ -12647,7 +12645,36 @@ pub fn run_if_pos_join_slot_selftests() -> Result<usize, String> {
             &[(1, 200), (0, 100), (-1, 100)],
             Some(49),
         ),
-    ];
+];
+
+/// P11 (Vera): Stage-1 legs for the if_pos join-slot cases. Kept out of
+/// `run_if_pos_join_slot_selftests` (part of the AI-first chain that the workspace
+/// twin mirrors and count-checks, omni-cli main.rs:870-873) and run from the top-level
+/// selftest next to 13AY instead.
+pub fn run_if_pos_join_slot_stage1_selftests() -> Result<usize, String> {
+    let mut checks = 0usize;
+    for &(name, src, ios, _) in IF_POS_JOIN_SLOT_CASES {
+        for &(inp, want) in ios {
+            // P11: also run the Stage-1 ELF natively (previously compile-only, and only for
+            // arith_else_temps) and require Stage-1 == host bytes for every case/input.
+            let host_elf = compile_omni_surface_to_x86_64_elf(src, inp, 0, 0)
+                .map_err(|e| format!("if_pos join-slot '{name}' x86-64 compile failed: {e}"))?;
+            let s1_elf = compile_omni_surface_via_stage1_to_elf(src, inp, 0, 0)
+                .map_err(|e| format!("if_pos join-slot '{name}' Stage-1 compile failed: {e}"))?;
+            if s1_elf != host_elf {
+                return Err(format!("if_pos join-slot '{name}' x={inp}: Stage-1 ELF != host x86-64 ELF"));
+            }
+            if expect_native_elf_i64(&s1_elf, &format!("ifpos_{name}_{inp}_s1"), want, &format!("if_pos join-slot '{name}' Stage-1 x={inp}"))? {
+                checks += 1;
+            }
+        }
+    }
+    Ok(checks)
+}
+
+pub fn run_if_pos_join_slot_selftests() -> Result<usize, String> {
+    let mut checks = 0usize;
+    let cases = IF_POS_JOIN_SLOT_CASES;
 
     for &(name, src, ios, locked) in cases {
         let stream = compile_omni_surface_to_u16(src)
@@ -12715,18 +12742,6 @@ pub fn run_if_pos_join_slot_selftests() -> Result<usize, String> {
                         "if_pos join-slot '{name}' x86-64 x={inp} got {native} want {want}"
                     ));
                 }
-                checks += 1;
-            }
-            // P11: also run the Stage-1 ELF natively (previously compile-only, and only for
-            // arith_else_temps) and require Stage-1 == host bytes for every case/input.
-            let host_elf = compile_omni_surface_to_x86_64_elf(src, inp, 0, 0)
-                .map_err(|e| format!("if_pos join-slot '{name}' x86-64 compile failed: {e}"))?;
-            let s1_elf = compile_omni_surface_via_stage1_to_elf(src, inp, 0, 0)
-                .map_err(|e| format!("if_pos join-slot '{name}' Stage-1 compile failed: {e}"))?;
-            if s1_elf != host_elf {
-                return Err(format!("if_pos join-slot '{name}' x={inp}: Stage-1 ELF != host x86-64 ELF"));
-            }
-            if expect_native_elf_i64(&s1_elf, &format!("ifpos_{name}_{inp}_s1"), want, &format!("if_pos join-slot '{name}' Stage-1 x={inp}"))? {
                 checks += 1;
             }
         }
@@ -14353,10 +14368,6 @@ fn main(x: i64, y: i64) -> i64 {
 
     // 13AX. 3-op IGET / 4-op ISET patches (VM + Wasm + x86 assert; Stage-1 recorded)
     checks += run_multibyte_load_parity_selftests()?;
-
-    // 13AY. Cross-backend effect goldens: VM / Wasm / x86-64 ELF (native) / Stage-1 ELF (native),
-    // graded against hand-derived values with a strict known-divergence list (P1, P2, P3, P4, P5, P6, P7, P9, P11)
-    checks += run_cross_backend_effect_golden_selftests()?;
 
     Ok(checks)
 }
@@ -19891,6 +19902,13 @@ fn main(a: i64) -> i64 {
         // 13p..13t. AI-First Surface Additions: Golden Size Gate, Strict Single-Form Grammar,
         // Machine-Readable Error Codes, Full-Stack Route + DB/KV Host ABI, and Version-Locked Harness
         checks_passed += run_ai_first_surface_selftests()?;
+
+        // 13AY. Cross-backend effect goldens: VM / Wasm / x86-64 ELF (native) / Stage-1 ELF (native),
+        // graded against hand-derived values with a strict known-divergence list (P1, P2, P3, P4, P5, P6, P7, P9, P11).
+        // Run here, not inside run_ai_first_surface_selftests, so the monolith/workspace AI-first
+        // count check (omni-cli main.rs:870-873) still compares like with like.
+        checks_passed += run_cross_backend_effect_golden_selftests()?;
+        checks_passed += run_if_pos_join_slot_stage1_selftests()?;
     }
 
     Ok(checks_passed)
