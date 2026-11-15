@@ -439,6 +439,45 @@ pub fn m2_lint_surface(src: &str) -> Result<(Vec<M2LintFinding>, Vec<M2BudgetRow
     Ok((m2_lint_module(&m, M2_LABEL_CAP_FRONTEND), m2_budget_report(&m)))
 }
 
+/// Foreign modules linked into M2 modules but owned elsewhere. Their functions are linted
+/// and reported as notes, never gated: pure/isa/table.omni (Raven, f600102) is the single
+/// copy of opcode metadata and has its own budget lock (selftest 13BA). Its byte accessors
+/// use 2-op IGET on bytes (L4), which is VM-only until C1's `IGET -1` lands (DECISIONS D-13).
+pub const M2_FOREIGN_MODULES: &[(&str, &str)] = &[("pure/isa/table.omni", include_str!("../pure/isa/table.omni"))];
+
+fn m2_count_fn_decls(src: &str) -> usize {
+    src.lines().filter(|l| l.starts_with("fn ")).count()
+}
+
+/// Lints a frontend module; findings in functions declared by an M2_FOREIGN_MODULES source
+/// (matched by position in declaration order) are split out. ANEW_COUNT only counts
+/// M2-owned functions. Returns (gated findings, foreign notes, budget rows).
+pub fn m2_lint_surface_scoped(src: &str) -> Result<(Vec<M2LintFinding>, Vec<M2LintFinding>, Vec<M2BudgetRow>), String> {
+    let u16s = compile_omni_surface_to_u16(src)?;
+    let m = decode_omni_token_stream(&u16s)?;
+    let total = m2_count_fn_decls(src);
+    if total != m.functions.len() {
+        return Err(format!("M2 lint scope: {} fn declarations but {} compiled functions", total, m.functions.len()));
+    }
+    let mut foreign_idx: Vec<u16> = Vec::new();
+    for &(_, fsrc) in M2_FOREIGN_MODULES {
+        if let Some(pos) = src.find(fsrc) {
+            let before = m2_count_fn_decls(&src[..pos]);
+            let n = m2_count_fn_decls(fsrc);
+            foreign_idx.extend(m.functions[before..before + n].iter().map(|f| f.fn_idx));
+        }
+    }
+    // Whole-module lint (the call graph needs every function), then split by owner.
+    let (notes, mut gated): (Vec<M2LintFinding>, Vec<M2LintFinding>) = m2_lint_module(&m, M2_LABEL_CAP_FRONTEND)
+        .into_iter()
+        .filter(|f| f.rule != "ANEW_COUNT")
+        .partition(|f| foreign_idx.contains(&f.fn_idx));
+    let mut own = m.clone();
+    own.functions.retain(|f| !foreign_idx.contains(&f.fn_idx));
+    gated.extend(m2_lint_module(&own, M2_LABEL_CAP_FRONTEND).into_iter().filter(|f| f.rule == "ANEW_COUNT"));
+    Ok((gated, notes, m2_budget_report(&own)))
+}
+
 /// Lints an already-built token stream (assembly-built: label cap 16).
 pub fn m2_lint_tokens(u16s: &[u16]) -> Result<(Vec<M2LintFinding>, Vec<M2BudgetRow>), String> {
     let m = decode_omni_token_stream(u16s)?;
@@ -483,9 +522,12 @@ pub fn m2_lint_cli(paths: &[String]) -> i32 {
     for (path, src) in &items {
         let asm = path.ends_with(".omni_asm");
         let (cap, producer) = if asm { (M2_LABEL_CAP_ASM, "asm") } else { (M2_LABEL_CAP_FRONTEND, "frontend") };
-        let res = if asm { m2_lint_asm(src) } else { m2_lint_surface(src) };
+        let res = if asm { m2_lint_asm(src).map(|(f, b)| (f, Vec::new(), b)) } else { m2_lint_surface_scoped(src) };
         match res {
-            Ok((findings, budget)) => {
+            Ok((findings, notes, budget)) => {
+                for f in &notes {
+                    println!("{}	note[M2_LINT_FOREIGN:{}] fn#{} @{}: {} (foreign module, not gated)", path, f.rule, f.fn_idx, f.offset, f.msg);
+                }
                 for r in &budget {
                     println!("{}", m2_render_budget_row(path, r, cap, producer));
                 }
@@ -505,9 +547,12 @@ pub fn m2_lint_cli(paths: &[String]) -> i32 {
     status
 }
 
-/// Every `pure/m2/*.omni` module (concatenation order = link order). The lint gate runs on all of them.
-/// (Empty until M2-04 adds the first module.)
-pub const M2_PURE_MODULES: &[(&str, &str)] = &[];
+/// Every `pure/m2/*.omni` module (concatenation order = link order). The lint gate runs on all of
+/// them (M2-owned functions gated; linked M2_FOREIGN_MODULES functions reported as notes).
+pub const M2_PURE_MODULES: &[(&str, &str)] = &[
+    ("pure/m2/util.omni+pure/isa/table.omni+pure/m2/decode.omni+spec/m2/decode_harness.omni", M2_DECODE_OMNI_SRC),
+    ("pure/m2/util.omni+pure/isa/table.omni+pure/m2/decode.omni+spec/m2/decode_ws_harness.omni", M2_DECODE_WS_OMNI_SRC),
+];
 
 /// Lint fixtures: (name, source, the exact comma-separated rule set it must trip; "" = clean).
 pub const M2_LINT_FIXTURES: &[(&str, &str, &str)] = &[
@@ -609,7 +654,7 @@ pub fn selftest_m2_lint() -> Result<usize, String> {
     checks += 2;
     // Lint gate: every registered pure/m2 module must be clean.
     for &(name, src) in M2_PURE_MODULES {
-        let (f, _) = m2_lint_surface(src).map_err(|e| format!("M2 lint gate: {} failed to compile: {}", name, e))?;
+        let (f, _, _) = m2_lint_surface_scoped(src).map_err(|e| format!("M2 lint gate: {} failed to compile: {}", name, e))?;
         if !f.is_empty() {
             return Err(format!("M2 lint gate: {} has findings {:?}", name, f));
         }

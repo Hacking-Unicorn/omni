@@ -19126,6 +19126,7 @@ pub fn run_m2_foundation_selftests() -> Result<usize, String> {
     n += selftest_m2_shape_census()?;
     n += selftest_m2_label_reference()?;
     n += selftest_m2_lint()?;
+    n += selftest_m2_decode_diff()?;
     Ok(n)
 }
 
@@ -19167,8 +19168,9 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
             }
         },
         "m2-lint" => m2_lint_cli(&args[1..]),
+        "m2-decode" => m2_decode_cli(&args[1..]),
         _ => {
-            eprintln!("usage: omni m2-frozen | m2-lock | m2-census | m2-labels | m2-lint [file.omni|file.omni_asm]...");
+            eprintln!("usage: omni m2-frozen | m2-lock | m2-census | m2-labels | m2-lint [file.omni|file.omni_asm]... | m2-decode");
             2
         }
     }
@@ -19442,6 +19444,7 @@ pub fn selftest_m2_label_reference() -> Result<usize, String> {
 
 // M2-03+: host-side M2 tooling lives in m2_host/ (kept out of the monolith to avoid main-line collisions).
 include!("m2_host/lint.rs");
+include!("m2_host/decode_diff.rs");
 
 // ==== END M2 FOUNDATION ====
 
