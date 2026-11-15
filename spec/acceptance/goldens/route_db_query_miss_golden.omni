@@ -1,0 +1,7 @@
+#[strict]
+#[cap(NET, DB_R)]
+route GET /users/:id (req: i64) {
+    let id: i64 = req.param("id");
+    let row: i64 = db_query("SELECT * FROM users WHERE id = ?", id);
+    respond(200, row);
+}
