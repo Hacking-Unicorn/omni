@@ -26,6 +26,8 @@ pub enum OmniValue {
 pub const DEFAULT_VM_STEP_LIMIT: u64 = 50_000_000;
 pub const DEFAULT_VM_MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_VM_CALL_DEPTH: usize = 64;
+/// Documented `DB_QRY` (0x7F65) not-found value (Boss Lady decision; HANDOFF.md §6.7). Never `key*10`.
+pub const OMNI_DB_QRY_MISS: i64 = -1;
 
 pub struct OmniBinaryVm {
     pub tables: HashMap<u16, Vec<BTreeMap<u16, OmniValue>>>,
@@ -488,20 +490,24 @@ impl OmniBinaryVm {
                     } else { OmniValue::Void }
                 }
                 0x7F64 | 0x7F65 => {
+                    // DB_QRY (0x7F65) miss = OMNI_DB_QRY_MISS (-1); DB_GET (0x7F64) miss unchanged (key*10).
+                    let is_qry = ins.op_tok == 0x7F65;
                     if ins.operands.len() == 1 {
                         let key = Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0);
-                        let val = self.kv_store.get(&key).copied().unwrap_or(key.wrapping_mul(10));
+                        let miss = if is_qry { OMNI_DB_QRY_MISS } else { key.wrapping_mul(10) };
+                        let val = self.kv_store.get(&key).copied().unwrap_or(miss);
                         OmniValue::Int(val)
                     } else if ins.operands.len() >= 2 {
                         let tbl = Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0);
                         let key = Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0);
                         let composite_key = tbl.wrapping_mul(1_000_000).wrapping_add(key);
+                        let miss = if is_qry { OMNI_DB_QRY_MISS } else { key.wrapping_mul(10) };
                         let val = self
                             .kv_store
                             .get(&composite_key)
                             .or_else(|| self.kv_store.get(&key))
                             .copied()
-                            .unwrap_or(key.wrapping_mul(10));
+                            .unwrap_or(miss);
                         OmniValue::Int(val)
                     } else {
                         OmniValue::Int(0)
