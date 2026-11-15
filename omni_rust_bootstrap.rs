@@ -13058,7 +13058,17 @@ pub enum DiffExpect {
     StructuredErr,
     /// Frontend/assembler/verifier rejection whose message contains this code.
     Rejected(&'static str),
+    /// ISA-B strict-bounds runtime error (Boss Lady ruling 2026-11-14: an out-of-bounds IGET/ISET is a
+    /// deterministic runtime error, never 0, never a silent no-op). PROPOSED pin, because no backend raises
+    /// one today: VM/Wasm `Err` whose message contains `OMNI_OOB_ERROR_CODE`; native ELF exit status
+    /// `OMNI_OOB_NATIVE_EXIT` with empty stdout (the `omnic run`/`eval` CLI exit status for a VM `Err`).
+    OobErr,
 }
+
+/// PROPOSED error code for ISA-B strict bounds. No `error[OUT_OF_BOUNDS]` exists in the tree yet.
+pub const OMNI_OOB_ERROR_CODE: &str = "error[OUT_OF_BOUNDS]";
+/// PROPOSED native exit status for the same error (matches the CLI's `std::process::exit(1)` on a VM `Err`).
+pub const OMNI_OOB_NATIVE_EXIT: i32 = 1;
 
 impl DiffExpect {
     pub fn matches(&self, o: &DiffObs) -> bool {
@@ -13067,6 +13077,11 @@ impl DiffExpect {
             DiffExpect::Bytes(b) => *o == DiffObs::Out { exit: 0, stdout: b.to_vec() },
             DiffExpect::StructuredErr => matches!(o, DiffObs::RunErr(_)),
             DiffExpect::Rejected(code) => matches!(o, DiffObs::Rejected(m) if m.contains(code)),
+            DiffExpect::OobErr => match o {
+                DiffObs::RunErr(m) => m.contains(OMNI_OOB_ERROR_CODE),
+                DiffObs::Out { exit, stdout } => *exit == OMNI_OOB_NATIVE_EXIT && stdout.is_empty(),
+                _ => false,
+            },
         }
     }
 }
@@ -13356,21 +13371,75 @@ pub const OMNI_DIFF4_GOLDENS: &[DiffGolden] = &[
         runs: &[(&[7], DiffExpect::I64(281474976645127)), (&[0], DiffExpect::I64(281474976645120))],
         backends: DIFF4_ALL,
     },
-    // bytes 1 2 x (len 3): ld_i16@2 (2+2 > 3) = 0, ld_i16@-1 = 0, st_i16@2 no-op, slen 3,
-    // ld_i16@1 = x*256 + 2. r = ((a*10 + b)*10 + n)*100000 + c.
+    // In-bounds part of the former isab_bounds (expected values unchanged): bytes 1 2 x (len 3),
+    // ld_i16@1 ends exactly at len (boundary, in bounds) = x*256 + 2, slen 3. r = n*100000 + c.
     DiffGolden {
         id: "isab_bounds",
         proposal: "ISA-A",
-        src: "fn isab_bounds(x: i64) -> i64 { let buf = anew(0); buf = iset(buf, 1, 2, x); let a = ld_i16(buf, 2); let m = 0 - 1; let b = ld_i16(buf, m); buf = st_i16(buf, 2, 99); let n = slen(buf); let c = ld_i16(buf, 1); let r = ((a * 10 + b) * 10 + n) * 100000 + c; return r; }",
+        src: "fn isab_bounds(x: i64) -> i64 { let buf = anew(0); buf = iset(buf, 1, 2, x); let n = slen(buf); let c = ld_i16(buf, 1); let r = n * 100000 + c; return r; }",
         runs: &[(&[3], DiffExpect::I64(300770)), (&[0], DiffExpect::I64(300002))],
         backends: DIFF4_ALL,
     },
-    // The WIP's own combined golden (MULTIBYTE_LOAD_SRC), re-derived by hand: n=20, a=-300,
-    // b=0x12345678, c=-2, d=x, e=0 (OOB) -> 200700007020 at x=7.
+    // --- ISA-B strict bounds: each program has exactly one out-of-bounds access; the whole run must
+    // end in the strict-bounds error (DiffExpect::OobErr), on all four backends.
+    DiffGolden {
+        id: "isab_oob_ld_i16_past_end",
+        proposal: "ISA-B-bounds",
+        src: "fn isab_oob1(x: i64) -> i64 { let buf = anew(0); buf = iset(buf, 1, 2, x); let a = ld_i16(buf, 2); return a; }",
+        runs: &[(&[3], DiffExpect::OobErr)],
+        backends: DIFF4_ALL,
+    },
+    DiffGolden {
+        id: "isab_oob_ld_i16_negative",
+        proposal: "ISA-B-bounds",
+        src: "fn isab_oob2(x: i64) -> i64 { let buf = anew(0); buf = iset(buf, 1, 2, x); let m = 0 - 1; let b = ld_i16(buf, m); return b; }",
+        runs: &[(&[3], DiffExpect::OobErr)],
+        backends: DIFF4_ALL,
+    },
+    DiffGolden {
+        id: "isab_oob_ld_i32_past_end",
+        proposal: "ISA-B-bounds",
+        src: "fn isab_oob3(x: i64) -> i64 { let buf = anew(0); buf = iset_i32(buf, x); let c = ld_i32(buf, 1); return c; }",
+        runs: &[(&[3], DiffExpect::OobErr)],
+        backends: DIFF4_ALL,
+    },
+    DiffGolden {
+        id: "isab_oob_ld_i64_past_end",
+        proposal: "ISA-B-bounds",
+        src: "fn isab_oob4(x: i64) -> i64 { let buf = anew(0); buf = iset_i32(buf, x); let d = ld_i64(buf, 0); return d; }",
+        runs: &[(&[3], DiffExpect::OobErr)],
+        backends: DIFF4_ALL,
+    },
+    DiffGolden {
+        id: "isab_oob_st_i16_past_end",
+        proposal: "ISA-B-bounds",
+        src: "fn isab_oob5(x: i64) -> i64 { let buf = anew(0); buf = iset(buf, 1, 2, x); buf = st_i16(buf, 2, 99); let n = slen(buf); return n; }",
+        runs: &[(&[3], DiffExpect::OobErr)],
+        backends: DIFF4_ALL,
+    },
+    DiffGolden {
+        id: "isab_oob_st_i32_negative",
+        proposal: "ISA-B-bounds",
+        src: "fn isab_oob6(x: i64) -> i64 { let buf = anew(0); buf = iset_i64(buf, x); let m = 0 - 2; buf = st_i32(buf, m, 7); let n = slen(buf); return n; }",
+        runs: &[(&[3], DiffExpect::OobErr)],
+        backends: DIFF4_ALL,
+    },
+    // The WIP's own combined golden (MULTIBYTE_LOAD_SRC). It contains ld_i16(buf, 100) and st_i16(buf, 100, 99)
+    // on a 20-byte buffer, so under strict bounds the run must end in the OOB error. NOTE: the WIP's
+    // MULTIBYTE_LOAD_EXPECTED (200700007020) assumes OOB load = 0; the main line must flip it too.
     DiffGolden {
         id: "isab_multibyte_wip_golden",
-        proposal: "ISA-A",
+        proposal: "ISA-B-bounds",
         src: MULTIBYTE_LOAD_SRC,
+        runs: &[(&[7], DiffExpect::OobErr)],
+        backends: DIFF4_ALL,
+    },
+    // In-bounds twin: same program with the two OOB ops removed and e = 0 written out, so the
+    // hand-derived value is unchanged: n=20, a=-300, b=0x12345678, c=-2, d=x, e=0 -> 200700007020 at x=7.
+    DiffGolden {
+        id: "isab_multibyte_inbounds",
+        proposal: "ISA-A",
+        src: "fn multibyte_load_inbounds(x: i64) -> i64 { let buf = anew(0); buf = iset(buf, 10, 20, 30, 40, 50, 60, 70, 80); buf = iset_i32(buf, 0 - 2); buf = iset_i64(buf, x); buf = st_i16(buf, 0, 0 - 300); buf = st_i32(buf, 4, 305419896); let a = ld_i16(buf, 0); let b = ld_i32(buf, 4); let c = ld_i32(buf, 8); let d = ld_i64(buf, 12); let e = 0; let n = slen(buf); let r = (((((n * 10000 + (a + 1000)) * 10 + (b - 305419896)) * 10 + (c + 2)) * 10 + d) * 10 + e) * 100 + n; return r; }",
         runs: &[(&[7], DiffExpect::I64(200700007020))],
         backends: DIFF4_ALL,
     },
@@ -13441,6 +13510,35 @@ pub const OMNI_DIFF4_KNOWN_DIVERGENCES: &[(&str, &str, &str)] = &[
     ("isab_st_patch", "stage1", "SIGSEGV: 3-op IGET as in isab_ld_i16_signed/stage1, and lbl_iset (3b828b8:16829-16845) only dispatches modes -4/-8/-9, so 4-op ISET -2 falls into the byte loop and 4-op ISET -4 into the 3-op append arm (inferred)"),
     ("isab_bounds", "stage1", "SIGSEGV, same as isab_st_patch/stage1"),
     ("isab_multibyte_wip_golden", "stage1", "SIGSEGV, same as isab_st_patch/stage1; WIP 13AX records it only (3b828b8 run_multibyte_load_parity_selftests, 'expected until the Stage-1 image is allowed to move')"),
+    // ISA-B strict bounds (Boss Lady 2026-11-14): no backend raises the OOB error yet.
+    ("isab_oob_ld_i16_past_end", "vm", "VM 3-op IGET (3b828b8 omni_rust_bootstrap.rs:1289-1309) returns Int(0) when off < 0 or off+w > len instead of the strict-bounds error"),
+    ("isab_oob_ld_i16_past_end", "wasm", "Wasm 3-op IGET lowering (3b828b8:15413 region) yields 0 out of bounds (observed), no trap"),
+    ("isab_oob_ld_i16_past_end", "x86", "x86 3-op IGET arm (3b828b8:14777 region) yields 0 out of bounds (observed), no error exit"),
+    ("isab_oob_ld_i16_past_end", "stage1", "Stage-1 SIGSEGV, see isab_ld_i16_signed/stage1 (lbl_iget 3b828b8:16823-16827)"),
+    ("isab_oob_ld_i16_negative", "vm", "VM 3-op IGET (3b828b8 omni_rust_bootstrap.rs:1289-1309) returns Int(0) when off < 0 or off+w > len instead of the strict-bounds error"),
+    ("isab_oob_ld_i16_negative", "wasm", "Wasm 3-op IGET lowering (3b828b8:15413 region) yields 0 out of bounds (observed), no trap"),
+    ("isab_oob_ld_i16_negative", "x86", "x86 3-op IGET arm (3b828b8:14777 region) yields 0 out of bounds (observed), no error exit"),
+    ("isab_oob_ld_i16_negative", "stage1", "Stage-1 SIGSEGV, see isab_ld_i16_signed/stage1 (lbl_iget 3b828b8:16823-16827)"),
+    ("isab_oob_ld_i32_past_end", "vm", "VM 3-op IGET (3b828b8 omni_rust_bootstrap.rs:1289-1309) returns Int(0) when off < 0 or off+w > len instead of the strict-bounds error"),
+    ("isab_oob_ld_i32_past_end", "wasm", "Wasm 3-op IGET lowering (3b828b8:15413 region) yields 0 out of bounds (observed), no trap"),
+    ("isab_oob_ld_i32_past_end", "x86", "x86 3-op IGET arm (3b828b8:14777 region) yields 0 out of bounds (observed), no error exit"),
+    ("isab_oob_ld_i32_past_end", "stage1", "Stage-1 SIGSEGV, see isab_ld_i16_signed/stage1 (lbl_iget 3b828b8:16823-16827)"),
+    ("isab_oob_ld_i64_past_end", "vm", "VM 3-op IGET (3b828b8 omni_rust_bootstrap.rs:1289-1309) returns Int(0) when off < 0 or off+w > len instead of the strict-bounds error"),
+    ("isab_oob_ld_i64_past_end", "wasm", "Wasm 3-op IGET lowering (3b828b8:15413 region) yields 0 out of bounds (observed), no trap"),
+    ("isab_oob_ld_i64_past_end", "x86", "x86 3-op IGET arm (3b828b8:14777 region) yields 0 out of bounds (observed), no error exit"),
+    ("isab_oob_ld_i64_past_end", "stage1", "Stage-1 SIGSEGV, see isab_ld_i16_signed/stage1 (lbl_iget 3b828b8:16823-16827)"),
+    ("isab_oob_st_i16_past_end", "vm", "VM 4-op ISET -2/-4 (3b828b8:1353-1368) skips the write when out of bounds (silent no-op) instead of the strict-bounds error"),
+    ("isab_oob_st_i16_past_end", "wasm", "Wasm 4-op ISET lowering (3b828b8:15629 region) skips the store out of bounds (observed), no trap"),
+    ("isab_oob_st_i16_past_end", "x86", "x86 4-op ISET arm (3b828b8:14871 region) skips the store out of bounds (observed), no error exit"),
+    ("isab_oob_st_i16_past_end", "stage1", "Stage-1 returns slen 6: 4-op ISET -2 falls into the lbl_iset byte-append loop (3b828b8:16829-16845) and appends 3 bytes instead of erroring (observed; mechanism inferred)"),
+    ("isab_oob_st_i32_negative", "vm", "VM 4-op ISET -2/-4 (3b828b8:1353-1368) skips the write when out of bounds (silent no-op) instead of the strict-bounds error"),
+    ("isab_oob_st_i32_negative", "wasm", "Wasm 4-op ISET lowering (3b828b8:15629 region) skips the store out of bounds (observed), no trap"),
+    ("isab_oob_st_i32_negative", "x86", "x86 4-op ISET arm (3b828b8:14871 region) skips the store out of bounds (observed), no error exit"),
+    ("isab_oob_st_i32_negative", "stage1", "Stage-1 SIGSEGV, see isab_st_patch/stage1"),
+    ("isab_multibyte_wip_golden", "vm", "VM 3-op IGET (3b828b8 omni_rust_bootstrap.rs:1289-1309) returns Int(0) when off < 0 or off+w > len instead of the strict-bounds error; returns 200700007020 (WIP MULTIBYTE_LOAD_EXPECTED assumes OOB load = 0)"),
+    ("isab_multibyte_wip_golden", "wasm", "Wasm 3-op IGET lowering (3b828b8:15413 region) yields 0 out of bounds (observed), no trap"),
+    ("isab_multibyte_wip_golden", "x86", "x86 3-op IGET arm (3b828b8:14777 region) yields 0 out of bounds (observed), no error exit"),
+    ("isab_multibyte_inbounds", "stage1", "Stage-1 SIGSEGV, see isab_st_patch/stage1"),
     // C4: surface frontend label numbering (decided cap 16).
     ("lbl16_surface", "vm", "C4 not landed: alloc_lbl starts next_lbl at 1 (3587) and rejects next_lbl > 15 with BUDGET_EXCEEDED (3646-3656)"),
     ("lbl16_surface", "wasm", "C4, see lbl16_surface/vm"),
