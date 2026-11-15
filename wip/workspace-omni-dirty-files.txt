@@ -1,0 +1,6 @@
+ M omni-workspace/crates/omni-aot/src/lib.rs
+ M omni-workspace/crates/omni-lang/src/compiler/mod.rs
+ M omni-workspace/crates/omni-lang/src/pure_omni/mod.rs
+ M omni-workspace/crates/omni-lang/src/verifier/mod.rs
+ M omni-workspace/crates/omni-vm/src/lib.rs
+ M omni_rust_bootstrap.rs
