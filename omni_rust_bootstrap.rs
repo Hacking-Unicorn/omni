@@ -12287,9 +12287,11 @@ pub const BYTE_READBACK_GOLDEN_SRC: &str = "fn byte_readback_golden(x: i64) -> i
 pub const BYTE_READBACK_X: i64 = 7;
 pub const BYTE_READBACK_EXPECTED: i64 = 8796075198218;
 
-/// Last native x86 / Stage-1 Vera P1 results (None if not executed). 2-op IGET
-/// on those backends still reads the token region, so they are not required to
-/// match `BYTE_READBACK_EXPECTED` until a 3-op IGET path is available.
+/// Last native x86 / Stage-1 Vera P1 results (None if not executed). x86-64 is
+/// asserted: a 2-op IGET on an ANEW/ISET buffer register reads the ISET heap.
+/// Stage-1 is RECORD-ONLY: its frozen IGET template still loads the u16 token
+/// region, and teaching it heap readback would move the frozen Stage-1 hashes
+/// (`0x677F57AE71D28FED` / `0xEAFC81F46B482FF8`). Do not read a Stage-1 value here as a pass.
 pub fn last_byte_readback_native_results() -> (Option<i64>, Option<i64>) {
     (
         LAST_BYTE_READBACK_X86.with(|c| c.get()),
@@ -12302,9 +12304,9 @@ std::thread_local! {
     static LAST_BYTE_READBACK_STAGE1: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
 }
 
-/// 4-backend native run of Vera P1 byte readback. Asserts VM and Wasm match the
-/// expected packed value, keeps `byte_buf_golden` at 86 tokens, and executes
-/// x86-64 and Stage-1 ELFs natively (results recorded, not hash-pinned).
+/// 4-backend native run of Vera P1 byte readback. Asserts VM, Wasm, and native
+/// x86-64 match the expected packed value (8796075198218), keeps `byte_buf_golden`
+/// at 86 tokens, and executes the Stage-1 ELF natively as record-only (see above).
 pub fn run_byte_readback_parity_selftests() -> Result<usize, String> {
     let mut checks = 0usize;
     let buf_stream = compile_omni_surface_to_u16(BYTE_BUF_GOLDEN_SRC)
@@ -12348,6 +12350,11 @@ pub fn run_byte_readback_parity_selftests() -> Result<usize, String> {
         )?;
         let x86_got = execute_native_elf_i64(&elf, &[BYTE_READBACK_X])?;
         LAST_BYTE_READBACK_X86.with(|c| c.set(Some(x86_got)));
+        if x86_got != BYTE_READBACK_EXPECTED {
+            return Err(format!(
+                "Vera P1 x86-64 x={BYTE_READBACK_X} got {x86_got} want {BYTE_READBACK_EXPECTED}"
+            ));
+        }
         checks += 1;
 
         let s1_elf = compile_omni_surface_via_stage1_to_elf(
@@ -12360,7 +12367,7 @@ pub fn run_byte_readback_parity_selftests() -> Result<usize, String> {
         LAST_BYTE_READBACK_STAGE1.with(|c| c.set(Some(s1_got)));
         checks += 1;
         eprintln!(
-            "Vera P1 x={BYTE_READBACK_X}: VM={BYTE_READBACK_EXPECTED} Wasm={wasm_got} x86={x86_got} Stage-1={s1_got}"
+            "Vera P1 x={BYTE_READBACK_X}: VM={BYTE_READBACK_EXPECTED} Wasm={wasm_got} x86={x86_got} Stage-1={s1_got} (Stage-1 record-only: frozen token-region IGET)"
         );
     }
     #[cfg(not(all(unix, target_arch = "x86_64")))]
@@ -14486,6 +14493,15 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
 
     let reg_pack5 = collect_func_pack5_map(func);
     validate_func_pack5_ops(func, &reg_pack5)?;
+    // Registers that hold an ISET-heap buffer (defined by ANEW or ISET). A 2-op IGET on
+    // one of these reads the heap byte; a 2-op IGET on a param still reads the u16 token
+    // region (the Stage-1 image uses only the param form, so its bytes do not change).
+    let x86_buffer_regs: std::collections::BTreeSet<u16> = func
+        .instructions
+        .iter()
+        .filter(|ins| matches!(ins.op_tok, 0x7F0D | 0x7F0F))
+        .filter_map(|ins| ins.dest_reg)
+        .collect();
     let emit_extract_pack5_trit_x86 = |c: &mut Vec<u8>, op: &BinOperand, trit_idx: usize, into_rcx: bool| {
         let mut direct_byte = false;
         if let BinOperand::Reg(r) = *op {
@@ -14565,6 +14581,20 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
                             }
                             continue;
                         }
+                    }
+                }
+                if let (2, Some(BinOperand::Reg(r_arr))) = (ins.operands.len(), ins.operands.first()) {
+                    if x86_buffer_regs.contains(r_arr) {
+                        // ISET-heap byte readback: 0 unless idx < buffer len (the register's
+                        // length snapshot) and idx < r11 (current heap length), both unsigned.
+                        emit_load_op(&mut code, &ins.operands[0], false); // rax = len
+                        emit_load_op(&mut code, &ins.operands[1], true); // rcx = idx
+                        code.extend_from_slice(&[0x48, 0x39, 0xC1, 0x73, 0x0F]); // cmp rcx, rax; jae oob
+                        code.extend_from_slice(&[0x4C, 0x39, 0xD9, 0x73, 0x0A]); // cmp rcx, r11; jae oob
+                        code.extend_from_slice(&[0x0F, 0xB6, 0x84, 0x0D, 0x00, 0x00, 0xFE, 0xFF]); // movzx eax, byte [rbp+rcx-0x20000]
+                        code.extend_from_slice(&[0xEB, 0x02, 0x31, 0xC0]); // jmp done; oob: xor eax, eax
+                        if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                        continue;
                     }
                 }
                 emit_load_op(&mut code, &ins.operands[1], false);

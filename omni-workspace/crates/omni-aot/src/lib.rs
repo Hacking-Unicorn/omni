@@ -273,6 +273,15 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
 
     let reg_pack5 = collect_func_pack5_map(func);
     validate_func_pack5_ops(func, &reg_pack5)?;
+    // Registers that hold an ISET-heap buffer (defined by ANEW or ISET). A 2-op IGET on
+    // one of these reads the heap byte; a 2-op IGET on a param still reads the u16 token
+    // region (the Stage-1 image uses only the param form, so its bytes do not change).
+    let x86_buffer_regs: std::collections::BTreeSet<u16> = func
+        .instructions
+        .iter()
+        .filter(|ins| matches!(ins.op_tok, 0x7F0D | 0x7F0F))
+        .filter_map(|ins| ins.dest_reg)
+        .collect();
     let emit_extract_pack5_trit_x86 = |c: &mut Vec<u8>, op: &BinOperand, trit_idx: usize, into_rcx: bool| {
         let mut direct_byte = false;
         if let BinOperand::Reg(r) = *op {
@@ -352,6 +361,20 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
                             }
                             continue;
                         }
+                    }
+                }
+                if let (2, Some(BinOperand::Reg(r_arr))) = (ins.operands.len(), ins.operands.first()) {
+                    if x86_buffer_regs.contains(r_arr) {
+                        // ISET-heap byte readback: 0 unless idx < buffer len (the register's
+                        // length snapshot) and idx < r11 (current heap length), both unsigned.
+                        emit_load_op(&mut code, &ins.operands[0], false); // rax = len
+                        emit_load_op(&mut code, &ins.operands[1], true); // rcx = idx
+                        code.extend_from_slice(&[0x48, 0x39, 0xC1, 0x73, 0x0F]); // cmp rcx, rax; jae oob
+                        code.extend_from_slice(&[0x4C, 0x39, 0xD9, 0x73, 0x0A]); // cmp rcx, r11; jae oob
+                        code.extend_from_slice(&[0x0F, 0xB6, 0x84, 0x0D, 0x00, 0x00, 0xFE, 0xFF]); // movzx eax, byte [rbp+rcx-0x20000]
+                        code.extend_from_slice(&[0xEB, 0x02, 0x31, 0xC0]); // jmp done; oob: xor eax, eax
+                        if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                        continue;
                     }
                 }
                 emit_load_op(&mut code, &ins.operands[1], false);
