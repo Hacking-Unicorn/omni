@@ -13552,12 +13552,6 @@ fn main(x: i64, y: i64) -> i64 {
     // 13AW. Vera P1 byte-readback sibling (VM + Wasm assert; x86/Stage-1 native run)
     checks += run_byte_readback_parity_selftests()?;
 
-    // 13M3a. M3-01 frontend lock: canonical token / AST / packet / stream / sourcemap dumps == spec/m3/corpus.tsv, plus one negative fixture per error class
-    checks += run_m3_fe_lock_selftests()?;
-
-    // 13M3b. M3-02 gate for pure/m3/: fails closed until m2-lint (M2-03) and the M2-08 depth check land
-    checks += run_m3_gate_selftests()?;
-
     Ok(checks)
 }
 
@@ -18868,6 +18862,14 @@ fn main(a: i64) -> i64 {
         // 13p..13t. AI-First Surface Additions: Golden Size Gate, Strict Single-Form Grammar,
         // Machine-Readable Error Codes, Full-Stack Route + DB/KV Host ABI, and Version-Locked Harness
         checks_passed += run_ai_first_surface_selftests()?;
+
+        // 13M3a. M3-01 frontend lock: canonical token / AST / packet / stream / sourcemap dumps == spec/m3/corpus.tsv, plus one negative fixture per error class
+        // Run here, not inside run_ai_first_surface_selftests, so the monolith/workspace AI-first
+        // count check (omni-cli main.rs:870-873) still compares like with like.
+        checks_passed += run_m3_fe_lock_selftests()?;
+
+        // 13M3b. M3-02 gate for pure/m3/: fails closed until m2-lint (M2-03) and the M2-08 depth check land
+        checks_passed += run_m3_gate_selftests()?;
     }
 
     Ok(checks_passed)
