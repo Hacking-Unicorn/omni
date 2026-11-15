@@ -13313,6 +13313,52 @@ pub const OMNI_DIFF4_GOLDENS: &[DiffGolden] = &[
         runs: &[(&[5], DiffExpect::Rejected("Label id > 15"))],
         backends: DIFF4_ALL,
     },
+    // --- ISA-A/B Option A shapes (HANDOFF.md 6.1): 3-op IGET buf,-2/-4/-8,off (signed LE load),
+    // 4-op ISET buf,-2/-4,off,val (LE patch), strict bounds off >= 0 && off+w <= len.
+    // Surface spellings are the WIP's ld_i16/ld_i32/ld_i64/st_i16/st_i32 (unverified names).
+    // Out-of-bounds load = 0 and out-of-bounds store = no-op follow the WIP's own golden, not a decision.
+    // bytes D4 FE x 00: ld_i16@0 = 0xFED4 = -300, ld_i16@2 = x (0 <= x < 256). r = a*1000 + b.
+    DiffGolden {
+        id: "isab_ld_i16_signed",
+        proposal: "ISA-A",
+        src: "fn isab_ld16(x: i64) -> i64 { let buf = anew(0); buf = iset(buf, 212, 254, x, 0); let a = ld_i16(buf, 0); let b = ld_i16(buf, 2); let r = a * 1000 + b; return r; }",
+        runs: &[(&[7], DiffExpect::I64(-299993)), (&[200], DiffExpect::I64(-299800))],
+        backends: DIFF4_ALL,
+    },
+    // iset_i32(-2) then iset_i64(x): ld_i32@0 = -2, ld_i64@4 (unaligned) = x. r = c*1000 + d.
+    DiffGolden {
+        id: "isab_ld_i32_i64",
+        proposal: "ISA-A",
+        src: "fn isab_ld3264(x: i64) -> i64 { let buf = anew(0); buf = iset_i32(buf, 0 - 2); buf = iset_i64(buf, x); let c = ld_i32(buf, 0); let d = ld_i64(buf, 4); let r = c * 1000 + d; return r; }",
+        runs: &[(&[7], DiffExpect::I64(-1993)), (&[-5], DiffExpect::I64(-2005))],
+        backends: DIFF4_ALL,
+    },
+    // 8 zero bytes, st_i16@0 = x, st_i32@2 = -1: bytes x 00 FF FF FF FF 00 00 -> 0xFFFFFFFF0000 + x.
+    DiffGolden {
+        id: "isab_st_patch",
+        proposal: "ISA-A",
+        src: "fn isab_st(x: i64) -> i64 { let buf = anew(0); buf = iset_i64(buf, 0); buf = st_i16(buf, 0, x); buf = st_i32(buf, 2, 0 - 1); let v = ld_i64(buf, 0); return v; }",
+        runs: &[(&[7], DiffExpect::I64(281474976645127)), (&[0], DiffExpect::I64(281474976645120))],
+        backends: DIFF4_ALL,
+    },
+    // bytes 1 2 x (len 3): ld_i16@2 (2+2 > 3) = 0, ld_i16@-1 = 0, st_i16@2 no-op, slen 3,
+    // ld_i16@1 = x*256 + 2. r = ((a*10 + b)*10 + n)*100000 + c.
+    DiffGolden {
+        id: "isab_bounds",
+        proposal: "ISA-A",
+        src: "fn isab_bounds(x: i64) -> i64 { let buf = anew(0); buf = iset(buf, 1, 2, x); let a = ld_i16(buf, 2); let m = 0 - 1; let b = ld_i16(buf, m); buf = st_i16(buf, 2, 99); let n = slen(buf); let c = ld_i16(buf, 1); let r = ((a * 10 + b) * 10 + n) * 100000 + c; return r; }",
+        runs: &[(&[3], DiffExpect::I64(300770)), (&[0], DiffExpect::I64(300002))],
+        backends: DIFF4_ALL,
+    },
+    // The WIP's own combined golden (MULTIBYTE_LOAD_SRC), re-derived by hand: n=20, a=-300,
+    // b=0x12345678, c=-2, d=x, e=0 (OOB) -> 200700007020 at x=7.
+    DiffGolden {
+        id: "isab_multibyte_wip_golden",
+        proposal: "ISA-A",
+        src: MULTIBYTE_LOAD_SRC,
+        runs: &[(&[7], DiffExpect::I64(200700007020))],
+        backends: DIFF4_ALL,
+    },
     // --- P9: iset_patch_i64 with a negative offset (-8..-1) is a silent no-op on the VM ---
     // Decided in HANDOFF.md 6.4 (no-op, not panic, not error): buf keeps its 8 bytes, slen = 8.
     // AOT behaviour for this input is unspecified, so only the VM is asserted.
@@ -13374,6 +13420,12 @@ pub const OMNI_DIFF4_KNOWN_DIVERGENCES: &[(&str, &str, &str)] = &[
     ("p5_if_neg_nontrit", "stage1", "N2: Stage-1 BR_NEG (lbl_br_neg 16513+) mirrors x86"),
     // P9: VM host panic.
     ("p9_vm_patch_negative_offset", "vm", "N6: ISET mode -9 casts a negative offset to usize; off+8 wraps and buf[off..off+8] panics (1324-1326) instead of the decided silent no-op (HANDOFF.md 6.4)"),
+    // ISA-A/B Option A shapes on Stage-1 (WIP 3b828b8 leaves the Stage-1 image frozen, so these crash).
+    ("isab_ld_i16_signed", "stage1", "SIGSEGV: Stage-1 lbl_iget (3b828b8 omni_rust_bootstrap.rs:16823-16827) decodes one operand and emits the 2-op token-region movzx; the 2 extra operands of 3-op IGET are left in the packet stream (misdecode inferred, not traced)"),
+    ("isab_ld_i32_i64", "stage1", "SIGSEGV, same as isab_ld_i16_signed/stage1 (lbl_iget 3b828b8:16823-16827)"),
+    ("isab_st_patch", "stage1", "SIGSEGV: 3-op IGET as in isab_ld_i16_signed/stage1, and lbl_iset (3b828b8:16829-16845) only dispatches modes -4/-8/-9, so 4-op ISET -2 falls into the byte loop and 4-op ISET -4 into the 3-op append arm (inferred)"),
+    ("isab_bounds", "stage1", "SIGSEGV, same as isab_st_patch/stage1"),
+    ("isab_multibyte_wip_golden", "stage1", "SIGSEGV, same as isab_st_patch/stage1; WIP 13AX records it only (3b828b8 run_multibyte_load_parity_selftests, 'expected until the Stage-1 image is allowed to move')"),
     // C4: surface frontend label numbering (decided cap 16).
     ("lbl16_surface", "vm", "C4 not landed: alloc_lbl starts next_lbl at 1 (3587) and rejects next_lbl > 15 with BUDGET_EXCEEDED (3646-3656)"),
     ("lbl16_surface", "wasm", "C4, see lbl16_surface/vm"),
