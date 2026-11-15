@@ -11760,6 +11760,41 @@ pub const OMNI_ISA_TABLE_SURFACE: &str = include_str!("pure/isa/table.omni");
 pub const OMNI_ISA_TABLE_SELFTEST_SURFACE: &str = include_str!("pure/isa/table_selftest.omni");
 const OMNI_ISA_TABLE_ASM_SCAN_SRC: &str = include_str!("omni_rust_bootstrap.rs");
 
+pub const OMNI_ISA_MNEMONIC_ID_GOLDEN: [&str; 81] = [
+    "CINT", "MOV", "CSTR", "CTRIT", "ARENA", "ANEW", "IGET", "ISET", "SLEN",
+    "SCAT", "SCONC", "S2I", "I2S", "IADD", "ISUB", "IMUL", "IDIV", "IMOD",
+    "INEG", "IABS", "IMIN", "IMAX", "BAND", "BOR", "BXOR", "BNOT", "SHL",
+    "SHR", "CEQ", "CNE", "CLT", "CGT", "TNOT", "TAND", "TOR", "TXOR",
+    "TMAJ", "TCMP", "PACK5", "TPACK5", "UNPACK5", "TUNPACK5", "TDOT", "EGATE", "LOOKAHEAD",
+    "TLOGIC", "SEL_TRIT", "CMOV", "CALL", "CALL_I64", "CALL_TRIT", "CALL_BYTES", "CALL_TRIT_VEC", "CALL_STR",
+    "BORROW_R", "BORROW_W", "MOVE", "SAN_SQL", "SAN_DOM", "SAN_PRM", "FNV1A", "DB_GET", "KV_GET",
+    "DB_QRY", "DB_CNT", "KV_PUT", "DB_PUT", "ROUTE", "HTTP_SRV", "REQ_PAR", "RSP_JSON", "RSP_HTML",
+    "AUTH_VER", "NOP", "DROP", "RET", "LABEL", "JMP", "BR_POS", "BR_NEG", "BR_TRIT",
+];
+
+/// Mnemonic-id freeze (M3 intrinsic table stores these ids): ids 0..80 are pinned to
+/// OMNI_ISA_MNEMONIC_ID_GOLDEN; new mnemonics may only be appended (ids >= 81), never duplicated.
+pub fn check_isa_mnemonic_id_freeze(names: &[String]) -> Result<(), String> {
+    let g = &OMNI_ISA_MNEMONIC_ID_GOLDEN;
+    for (id, want) in g.iter().enumerate() {
+        match names.get(id) {
+            Some(got) if got == want => {}
+            got => {
+                return Err(format!(
+                    "error[LOCKSTEP_MISMATCH] line 1, col 1: isa-table mnemonic id {id} frozen as '{want}' but found {:?} (ids are append-only)",
+                    got
+                ))
+            }
+        }
+    }
+    for (id, n) in names.iter().enumerate().skip(g.len()) {
+        if names[..id].contains(n) {
+            return Err(format!("error[LOCKSTEP_MISMATCH] line 1, col 1: isa-table appended mnemonic id {id} '{n}' duplicates an existing id"));
+        }
+    }
+    Ok(())
+}
+
 /// Rust-side image of one `pure/isa/table.omni` mnemonic row: (name, opcode, ty byte).
 fn isa_table_rust_mnemonic_rows() -> Result<Vec<(String, u16, u16)>, String> {
     let src = OMNI_ISA_TABLE_ASM_SCAN_SRC;
@@ -11942,9 +11977,8 @@ pub fn run_isa_table_drift_selftests() -> Result<(usize, usize), String> {
         other => return Err(format!("isa-table: Omni selftest returned non-bytes {:?}", other)),
     };
     let mn = isa_table_rust_mnemonic_rows()?;
-    if mn.len() != 81 {
-        return Err(format!("isa-table: expected 73 + 8 assembler mnemonics, scanned {}", mn.len()));
-    }
+    let mn_names: Vec<String> = mn.iter().map(|r| r.0.clone()).collect();
+    check_isa_mnemonic_id_freeze(&mn_names)?;
     let n = compare_isa_table_dump(&dump, &mn)?;
     let mut neg = 0usize;
     let base = (12 + 128 * 4 + mn.len() * 6) * 8;
@@ -11962,6 +11996,28 @@ pub fn run_isa_table_drift_selftests() -> Result<(usize, usize), String> {
     match compare_isa_table_dump(&dump, &mn_bad) {
         Err(e) if e.starts_with("error[LOCKSTEP_MISMATCH]") => neg += 1,
         other => return Err(format!("isa-table: Rust-side drift not caught: {:?}", other)),
+    }
+    let mut swap = mn_names.clone();
+    swap.swap(0, 1);
+    let mut removed = mn_names.clone();
+    removed.remove(40);
+    let mut inserted = mn_names.clone();
+    inserted.insert(10, String::from("ZZ_NEW"));
+    for (what, v) in [("swap", swap), ("removal", removed), ("mid-insertion", inserted)] {
+        match check_isa_mnemonic_id_freeze(&v) {
+            Err(e) if e.starts_with("error[LOCKSTEP_MISMATCH]") => neg += 1,
+            other => return Err(format!("isa-table: mnemonic-id {what} not caught: {:?}", other)),
+        }
+    }
+    let mut appended = mn_names.clone();
+    appended.push(String::from("ZZ_NEW"));
+    check_isa_mnemonic_id_freeze(&appended)
+        .map_err(|e| format!("isa-table: mnemonic-id append (id 81) wrongly rejected: {e}"))?;
+    let mut dup = appended.clone();
+    dup.push(String::from("CINT"));
+    match check_isa_mnemonic_id_freeze(&dup) {
+        Err(e) if e.starts_with("error[LOCKSTEP_MISMATCH]") => neg += 1,
+        other => return Err(format!("isa-table: duplicated appended mnemonic not caught: {:?}", other)),
     }
     Ok((n, neg))
 }
@@ -13411,8 +13467,8 @@ fn main(x: i64, y: i64) -> i64 {
 
     // 13BA. M3-03 shared ISA table (`pure/isa/table.omni`) drift lock vs OMNI_ISA_TABLE + assembler mnemonics
     let (n_isa, n_isa_neg) = run_isa_table_drift_selftests()?;
-    if n_isa != 128 * 4 + 81 * 6 || n_isa_neg != 5 {
-        return Err(format!("isa-table drift lock compared {n_isa} fields / {n_isa_neg} negatives (expected 998 / 5)"));
+    if n_isa != 128 * 4 + 81 * 6 || n_isa_neg != 9 {
+        return Err(format!("isa-table drift lock compared {n_isa} fields / {n_isa_neg} negatives (expected 998 / 9)"));
     }
     checks += 2;
 

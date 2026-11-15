@@ -2763,8 +2763,8 @@ fn main(x: i64, y: i64) -> i64 {
 
     // 13BA. M3-03 shared ISA table (`pure/isa/table.omni`) drift lock vs OMNI_ISA_TABLE + assembler mnemonics
     let (n_isa, n_isa_neg) = run_isa_table_drift_selftests()?;
-    if n_isa != 128 * 4 + 81 * 6 || n_isa_neg != 5 {
-        return Err(format!("isa-table drift lock compared {n_isa} fields / {n_isa_neg} negatives (expected 998 / 5)"));
+    if n_isa != 128 * 4 + 81 * 6 || n_isa_neg != 9 {
+        return Err(format!("isa-table drift lock compared {n_isa} fields / {n_isa_neg} negatives (expected 998 / 9)"));
     }
     checks += 2;
 
