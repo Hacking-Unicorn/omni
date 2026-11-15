@@ -289,10 +289,10 @@ impl OmniBinaryVm {
                                     le[..width].copy_from_slice(&buf[o..o + width]);
                                     OmniValue::Int(u64::from_le_bytes(le) as i64)
                                 }
-                                _ => return Err(format!("error[OUT_OF_BOUNDS]: 3-op IGET off {} width {} len {}", off, width, buf.len())),
+                                _ => return Err(String::from(OMNI_OOB_ERROR)),
                             }
                         }
-                        _ => return Err(String::from("error[OUT_OF_BOUNDS]: 3-op IGET offset out of bounds")),
+                        _ => return Err(String::from(OMNI_OOB_ERROR)),
                     }
                 }
                 0x7F0E => {
@@ -351,10 +351,7 @@ impl OmniBinaryVm {
                             let in_bounds = off >= 0
                                 && matches!((off as u64).checked_add(width as u64), Some(end) if end <= buf.len() as u64);
                             if !in_bounds {
-                                return Err(format!(
-                                    "error[OUT_OF_BOUNDS]: 4-op ISET off {} width {} len {}",
-                                    off, width, buf.len()
-                                ));
+                                return Err(String::from(OMNI_OOB_ERROR));
                             }
                             let o = off as usize;
                             buf[o..o + width].copy_from_slice(&(v as u64).to_le_bytes()[..width]);

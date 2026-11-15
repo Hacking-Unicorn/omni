@@ -19,6 +19,12 @@ pub enum BinOperand {
     FieldKV(u16, Box<BinOperand>),
 }
 
+/// ISA-B strict bounds: the one canonical out-of-bounds runtime error. Every backend that runs
+/// ISA-B reports exactly this string (VM `Err`, Wasm trap, native ELF stderr line), and the
+/// `omnic run` CLI and a native ELF both exit with OMNI_OOB_EXIT_STATUS.
+pub const OMNI_OOB_ERROR: &str = "error[OUT_OF_BOUNDS]: buffer access out of bounds";
+pub const OMNI_OOB_EXIT_STATUS: i32 = 1;
+
 #[inline(always)]
 pub fn extract_label_id(op: &BinOperand) -> Option<u16> {
     match *op {

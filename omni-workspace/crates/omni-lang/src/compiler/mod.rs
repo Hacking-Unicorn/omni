@@ -3893,11 +3893,11 @@ pub fn execute_native_elf_i64(elf: &[u8], args: &[i64]) -> Result<i64, String> {
             .output()
             .map_err(|e| format!("failed to run native ELF: {e}"))?;
         let _ = std::fs::remove_file(&path);
-        if out.status.code() == Some(X86_OOB_EXIT_STATUS) && out.stdout.is_empty() {
-            return Err(format!(
-                "error[OUT_OF_BOUNDS]: native ELF trapped (exit {}) on an out-of-bounds heap access",
-                X86_OOB_EXIT_STATUS
-            ));
+        if out.status.code() == Some(OMNI_OOB_EXIT_STATUS)
+            && out.stdout.is_empty()
+            && out.stderr == format!("{}\n", OMNI_OOB_ERROR).as_bytes()
+        {
+            return Err(String::from(OMNI_OOB_ERROR));
         }
         if !out.status.success() || out.stdout.len() < 8 {
             return Err(format!(
@@ -4201,9 +4201,12 @@ pub fn run_isa_b_multibyte_parity_selftests() -> Result<usize, String> {
             #[cfg(all(unix, target_arch = "x86_64"))]
             results.push(("x86", compile_omni_surface_to_x86_64_elf(src, x, 0, 0).and_then(|elf| execute_native_elf_i64(&elf, &[x]))));
             for (be, res) in results {
+                // Byte-identical canonical error on VM, Wasm and x86-64 (x86 maps only an exact
+                // stderr line + exit status); the run path adds a source-map prefix.
                 match res {
-                    Err(e) if e.contains("error[OUT_OF_BOUNDS]") => checks += 1,
-                    other => return Err(format!("ISA-B OOB '{name}' on {be} x={x}: expected error[OUT_OF_BOUNDS], got {other:?}")),
+                    Err(e) if e == OMNI_OOB_ERROR => checks += 1,
+                    Err(e) if be == "run" && e.starts_with("error[OUT_OF_BOUNDS]") && e.ends_with(&OMNI_OOB_ERROR["error[OUT_OF_BOUNDS]: ".len()..]) => checks += 1,
+                    other => return Err(format!("ISA-B OOB '{name}' on {be} x={x}: expected {OMNI_OOB_ERROR:?}, got {other:?}")),
                 }
             }
         }

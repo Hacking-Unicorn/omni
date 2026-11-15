@@ -158,22 +158,33 @@ fn emit_cli_arg_parser(mc: &mut Vec<u8>, argc_min: u8, disp_argv: u8, target_reg
 /// ISA-B strict bounds on x86-64 with rax = buffer length, rcx = off: jumps forward by `skip`
 /// bytes (past the guarded load/store) unless width <= len, off <= len - width (unsigned, so a
 /// negative off fails), and the same against r11 (the current heap length). Clobbers rax.
-/// ISA-B out-of-bounds trap: exit(66) with nothing on stdout. A deterministic runtime error;
-/// `execute_native_elf_i64` reports it as error[OUT_OF_BOUNDS].
-pub const X86_OOB_EXIT_STATUS: i32 = 66;
-const X86_OOB_TRAP: [u8; 12] = [
-    0xBF, 0x42, 0x00, 0x00, 0x00, // mov edi, 66
-    0xB8, 0x3C, 0x00, 0x00, 0x00, // mov eax, 60 (exit)
-    0x0F, 0x05,                   // syscall
-];
+/// ISA-B out-of-bounds trap: write OMNI_OOB_ERROR + "\n" to stderr, nothing to stdout, then
+/// exit(OMNI_OOB_EXIT_STATUS). The message bytes sit inline right after the code.
+fn x86_oob_trap() -> Vec<u8> {
+    let msg_len = OMNI_OOB_ERROR.len() as u32 + 1;
+    let mut t = vec![0x48, 0x8D, 0x35, 29, 0x00, 0x00, 0x00]; // lea rsi, [rip+29] (message)
+    t.push(0xBA);
+    t.extend_from_slice(&msg_len.to_le_bytes()); // mov edx, len
+    t.extend_from_slice(&[0xBF, 0x02, 0x00, 0x00, 0x00]); // mov edi, 2 (stderr)
+    t.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]); // mov eax, 1 (write)
+    t.extend_from_slice(&[0x0F, 0x05]); // syscall
+    t.push(0xBF);
+    t.extend_from_slice(&(OMNI_OOB_EXIT_STATUS as u32).to_le_bytes()); // mov edi, status
+    t.extend_from_slice(&[0xB8, 0x3C, 0x00, 0x00, 0x00]); // mov eax, 60 (exit)
+    t.extend_from_slice(&[0x0F, 0x05]); // syscall
+    t.extend_from_slice(OMNI_OOB_ERROR.as_bytes());
+    t.push(b'\n');
+    t
+}
 
-/// Guarded heap access: bounds check, `access`, then `jmp +12` over the exit(66) trap that every
-/// failed check lands on.
+/// Guarded heap access: bounds check, `access`, then a jmp over the trap that every failed
+/// check lands on.
 fn emit_x86_guarded_heap_access(code: &mut Vec<u8>, width: u8, access: &[u8]) {
+    let trap = x86_oob_trap();
     emit_x86_heap_bounds_check(code, width, access.len() as u8 + 2);
     code.extend_from_slice(access);
-    code.extend_from_slice(&[0xEB, X86_OOB_TRAP.len() as u8]);
-    code.extend_from_slice(&X86_OOB_TRAP);
+    code.extend_from_slice(&[0xEB, trap.len() as u8]);
+    code.extend_from_slice(&trap);
 }
 
 fn emit_x86_heap_bounds_check(code: &mut Vec<u8>, width: u8, skip: u8) {
@@ -416,7 +427,7 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
                     };
                     emit_load_op(&mut code, &ins.operands[0], false); // rax = buffer len
                     emit_load_op(&mut code, &ins.operands[2], true); // rcx = off
-                    emit_x86_guarded_heap_access(&mut code, width, load); // OOB: exit(66)
+                    emit_x86_guarded_heap_access(&mut code, width, load); // OOB: canonical trap
                     if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
                     continue;
                 }
@@ -453,7 +464,7 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
                     && (ins.operands[1] == BinOperand::ImmInt(-2) || ins.operands[1] == BinOperand::ImmInt(-4))
                 {
                     // ISA-B 4-op ISET buf, mode, off, val: LE patch of 2/4 bytes. Out of bounds
-                    // (not 0 <= off && off + width <= len, and <= r11) traps with exit(66).
+                    // (not 0 <= off && off + width <= len, and <= r11) hits the canonical trap.
                     let width: u8 = if ins.operands[1] == BinOperand::ImmInt(-2) { 2 } else { 4 };
                     let store: &[u8] = if width == 2 {
                         &[0x66, 0x89, 0x94, 0x0D, 0x00, 0x00, 0xFE, 0xFF] // mov word [rbp+rcx-0x20000], dx
@@ -464,7 +475,7 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
                     code.extend_from_slice(&[0x48, 0x89, 0xC2]); // mov rdx, rax (val)
                     emit_load_op(&mut code, &ins.operands[0], false); // rax = buffer len
                     emit_load_op(&mut code, &ins.operands[2], true); // rcx = off
-                    emit_x86_guarded_heap_access(&mut code, width, store); // OOB: exit(66)
+                    emit_x86_guarded_heap_access(&mut code, width, store); // OOB: canonical trap
                 } else {
                     for op_b in &ins.operands[1..] {
                         emit_load_op(&mut code, op_b, false);
@@ -1992,7 +2003,7 @@ pub fn execute_wasm_module_i64_with_budgets(
             }
             0x00 => {
                 // `unreachable` is only emitted for ISA-B strict-bounds failures.
-                return Err(String::from("error[OUT_OF_BOUNDS]: Wasm trap (unreachable) on an out-of-bounds buffer access"));
+                return Err(String::from(OMNI_OOB_ERROR));
             }
             other => {
                 return Err(format!("Unsupported Wasm opcode 0x{:02X} in evaluator", other));
