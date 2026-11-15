@@ -14,6 +14,7 @@ pub mod harness;
 pub mod inspect;
 pub mod acceptance;
 pub mod pure_omni;
+pub mod isa_table;
 
 pub use compiler::*;
 pub use ternary::*;
@@ -24,3 +25,4 @@ pub use harness::*;
 pub use inspect::*;
 pub use acceptance::*;
 pub use pure_omni::*;
+pub use isa_table::*;
