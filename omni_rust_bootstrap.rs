@@ -4425,557 +4425,58 @@ impl SurfaceLowerCtx {
 pub fn lookup_omni_stdlib_module(path: &str) -> Option<&'static str> {
     match path {
         "std/prelude.omni" => Some(
-            "#[strict] fn std_clamp(x: i64, lo: i64, hi: i64) -> i64 { let lower: i64 = imax(x, lo); let clamped: i64 = imin(lower, hi); return clamped; }
-#[strict] fn std_abs_diff(a: i64, b: i64) -> i64 { let d: i64 = a - b; let r: i64 = iabs(d); return r; }
-#[strict] fn std_trit_mux(cond: trit, neg_v: i64, zero_v: i64, pos_v: i64) -> i64 { let r: i64 = sel_trit(cond, neg_v, zero_v, pos_v); return r; }
-#[strict] fn std_consensus3(s0: trit, s1: trit, s2: trit) -> trit { let m: trit = tmaj(s0, s1, s2); return m; }",
+            include_str!("std/prelude.omni")
         ),
         "std/math.omni" => Some(
-            "#[strict] fn std_clamp(x: i64, lo: i64, hi: i64) -> i64 { let lower: i64 = imax(x, lo); let clamped: i64 = imin(lower, hi); return clamped; }
-#[strict] fn std_abs_diff(a: i64, b: i64) -> i64 { let d: i64 = a - b; let r: i64 = iabs(d); return r; }
-#[strict] fn std_signum(x: i64) -> i64 { let c: trit = x <=> 0; let s: i64 = sel_trit(c, -1, 0, 1); return s; }
-#[strict] fn std_mad_clamped(x: i64, weight: i64, bias: i64, lo: i64, hi: i64) -> i64 { let raw: i64 = x * weight + bias; let lower: i64 = imax(raw, lo); let res: i64 = imin(lower, hi); return res; }
-#[strict] fn std_sum_range(n: i64) -> i64 { let acc: i64 = 0; let i: i64 = 1; while i <= n { acc += i; i += 1; } return acc; }",
+            include_str!("std/math.omni")
         ),
         "std/trit.omni" => Some(
-            "#[strict] fn std_trit_mux(cond: trit, neg_v: i64, zero_v: i64, pos_v: i64) -> i64 { let r: i64 = sel_trit(cond, neg_v, zero_v, pos_v); return r; }
-#[strict] fn std_consensus3(s0: trit, s1: trit, s2: trit) -> trit { let m: trit = tmaj(s0, s1, s2); return m; }
-#[strict] fn std_trit_quorum5(t0: trit, t1: trit, t2: trit, t3: trit, t4: trit) -> trit { let left: trit = tmaj(t0, t1, t2); let right: trit = tmaj(t2, t3, t4); let out: trit = tmaj(left, t2, right); return out; }
-#[strict] fn std_trit_score(t0: trit, t1: trit, t2: trit, weight: i64) -> i64 { let m: trit = tmaj(t0, t1, t2); let base: i64 = sel_trit(m, -100, 0, 100); return base * weight; }",
+            include_str!("std/trit.omni")
         ),
         "std/http.omni" => Some(
-            "#[strict] fn std_http_is_success(status: i64) -> trit { let ge_200: trit = status >= 200; let lt_300: trit = status < 300; let ok: trit = tand(ge_200, lt_300); return ok; }
-#[strict] fn std_http_pack_response(status: i64, payload: i64) -> i64 { let valid_cmp: trit = status >= 100; let code: i64 = if_pos valid_cmp { status } else { 500 }; return code * 1000000 + payload; }
-#[strict] fn std_http_route_score(method_code: i64, param_id: i64) -> i64 { let m_cmp: trit = method_code <=> 1; let method_bonus: i64 = match_trit m_cmp { neg => 400, zero => 200, pos => 201 }; return method_bonus * 1000000 + param_id; }",
+            include_str!("std/http.omni")
         ),
         "std/pack5.omni" => Some(
-            "#[strict] fn std_pack5_bytes_needed(trit_count: i64) -> i64 { let valid_cmp: trit = trit_count <=> 0; let padded: i64 = trit_count + 4; let bytes: i64 = padded / 5; let out: i64 = if_pos valid_cmp { bytes } else { 0 }; return out; }
-#[strict] fn std_pack5_is_valid_byte(byte_val: i64) -> trit { let ge_zero: trit = byte_val >= 0; let le_max: trit = byte_val <= 242; let ok: trit = tand(ge_zero, le_max); return ok; }
-#[strict] fn std_pack5_dot10_score(dot_raw: i64, scale: i64, threshold: i64) -> i64 { let scaled: i64 = dot_raw * scale; let cmp: trit = scaled <=> threshold; let bonus: i64 = match_trit cmp { neg => -50, zero => 0, pos => 50 }; return scaled + bonus; }
-#[strict] fn std_pack5_cosine_gate(dot_raw: i64, norm_bound: i64) -> trit { let hi_cmp: trit = dot_raw <=> norm_bound; let neg_bound: i64 = 0 - norm_bound; let lo_cmp: trit = dot_raw <=> neg_bound; let gate: trit = tmaj(hi_cmp, lo_cmp, 0t); return gate; }",
+            include_str!("std/pack5.omni")
         ),
         "std/decision.omni" => Some(
-            "#[strict] fn std_decision_band(signal: i64, lo_thresh: i64, hi_thresh: i64) -> trit { let above_hi: trit = signal <=> hi_thresh; let below_lo: trit = signal <=> lo_thresh; let is_high: trit = tand(above_hi, +1t); let is_low: trit = tor(below_lo, -1t); let out: trit = match_trit above_hi { neg => is_low, zero => 0t, pos => is_high }; return out; }
-#[strict] fn std_decision_hysteresis(prev_state: trit, signal: i64, margin: i64) -> trit { let neg_margin: i64 = 0 - margin; let hi_cmp: trit = signal <=> margin; let lo_cmp: trit = signal <=> neg_margin; let next_state: trit = match_trit hi_cmp { neg => match_trit lo_cmp { neg => -1t, zero => prev_state, pos => prev_state }, zero => prev_state, pos => +1t }; return next_state; }
-#[strict] #[cap(AI)] fn std_decision_weighted_hook(signal: i64, bias: i64, neg_out: i64, zero_out: i64, pos_out: i64) -> i64 { let net: i64 = signal + bias; let g: trit = egate(net); let l: trit = tlogic(net); let combined: trit = tmaj(g, l, g); let res: i64 = sel_trit(combined, neg_out, zero_out, pos_out); return res; }
-#[strict] #[cap(AI)] fn std_decision_quorum_hook(s0: i64, s1: i64, s2: i64, threshold: i64) -> trit { let g0: trit = egate(s0 - threshold); let g1: trit = egate(s1 - threshold); let g2: trit = egate(s2 - threshold); let q: trit = tmaj(g0, g1, g2); return q; }",
+            include_str!("std/decision.omni")
         ),
         "std/resource.omni" => Some(
-            "#[strict] fn std_arena_scoped_score(base: i64, weight: i64, offset: i64) -> i64 { let a_scope: arena = arena(1024); let r_view: i64 = borrow_r(a_scope); let prod: i64 = base * weight; let total: i64 = prod + offset + (r_view * 0); drop(r_view); drop(a_scope); return total; }
-#[strict] fn std_budget_headroom(used_units: i64, limit_units: i64) -> i64 { let raw_rem: i64 = limit_units - used_units; let clamped: i64 = imax(raw_rem, 0); return clamped; }
-#[strict] fn std_budget_is_within(used_units: i64, limit_units: i64, safety_margin: i64) -> trit { let effective_used: i64 = used_units + safety_margin; let cmp: trit = effective_used <= limit_units; return cmp; }
-#[strict] fn std_arena_chunk_capacity(total_bytes: i64, chunk_size: i64) -> i64 { let valid_chunk: i64 = imax(chunk_size, 64); let chunks: i64 = total_bytes / valid_chunk; let clamped: i64 = imax(chunks, 1); return clamped; }",
+            include_str!("std/resource.omni")
         ),
         "pure/compiler.omni" | "spec/pure_self_host/omni_selfhost_compiler.omni" => Some(
-            "#[strict]
-fn pure_lex_classify_token(src_len: i64, strict_violation_code: i64, syntax_err_code: i64) -> i64 {
-    let len_cmp: trit = src_len <=> 0;
-    let syn_cmp: trit = syntax_err_code <=> 0;
-    let strict_cmp: trit = strict_violation_code <=> 1;
-    let strict_any: trit = strict_violation_code <=> 0;
-    let strict_res: i64 = match_trit strict_cmp {
-        neg => 0,
-        zero => 2002,
-        pos => 2003
-    };
-    let after_strict: i64 = if_pos strict_any { strict_res } else { 0 };
-    let after_syn: i64 = if_pos syn_cmp { 2001 } else { after_strict };
-    let final_code: i64 = match_trit len_cmp {
-        neg => 2001,
-        zero => 2001,
-        pos => after_syn
-    };
-    return final_code;
-}
-#[strict]
-fn pure_check_include_graph(include_depth: i64, has_cycle: i64, max_depth: i64) -> i64 {
-    let cyc_cmp: trit = has_cycle <=> 0;
-    let dep_cmp: trit = include_depth <=> max_depth;
-    let dep_err: i64 = if_pos dep_cmp { 2008 } else { 0 };
-    let res: i64 = if_pos cyc_cmp { 2008 } else { dep_err };
-    return res;
-}
-#[strict]
-fn pure_check_macro_hygiene(decl_arity: i64, call_arity: i64, unbound_free_vars: i64) -> i64 {
-    let raw_diff: i64 = decl_arity - call_arity;
-    let ar_diff: i64 = iabs(raw_diff);
-    let ar_cmp: trit = ar_diff <=> 0;
-    let fv_cmp: trit = unbound_free_vars <=> 0;
-    let fv_err: i64 = if_pos fv_cmp { 2004 } else { 0 };
-    let res: i64 = if_pos ar_cmp { 2006 } else { fv_err };
-    return res;
-}
-#[strict]
-fn pure_check_call_and_label(unknown_fn_flag: i64, immut_param_flag: i64, unresolved_lbl_flag: i64) -> i64 {
-    let fn_cmp: trit = unknown_fn_flag <=> 0;
-    let im_cmp: trit = immut_param_flag <=> 0;
-    let lb_cmp: trit = unresolved_lbl_flag <=> 0;
-    let lb_err: i64 = if_pos lb_cmp { 2009 } else { 0 };
-    let im_or_lb: i64 = if_pos im_cmp { 2005 } else { lb_err };
-    let res: i64 = if_pos fn_cmp { 2007 } else { im_or_lb };
-    return res;
-}
-#[strict]
-fn pure_verify_function_invariants(missing_cap_bits: i64, taint_violation_kind: i64, arena_balance: i64) -> i64 {
-    let cap_cmp: trit = missing_cap_bits <=> 0;
-    let taint_cmp: trit = taint_violation_kind <=> 1;
-    let taint_any: trit = taint_violation_kind <=> 0;
-    let arena_cmp: trit = arena_balance <=> 0;
-    let taint_code: i64 = match_trit taint_cmp {
-        neg => 0,
-        zero => 1001,
-        pos => 1002
-    };
-    let arena_code: i64 = match_trit arena_cmp {
-        neg => 1005,
-        zero => 0,
-        pos => 1004
-    };
-    let after_taint: i64 = if_pos taint_any { taint_code } else { arena_code };
-    let final_code: i64 = if_pos cap_cmp { 1003 } else { after_taint };
-    return final_code;
-}
-#[strict]
-fn pure_lower_pack5_density(trit_count: i64, max_byte_val: i64) -> i64 {
-    let corrupt_cmp: trit = max_byte_val <=> 242;
-    let packed_bytes: i64 = (trit_count + 4) / 5;
-    let res: i64 = if_pos corrupt_cmp { 3002 } else { packed_bytes };
-    return res;
-}
-#[strict]
-fn pure_compiler_pipeline_main(src_len: i64, missing_cap_bits: i64, taint_or_arena_err: i64) -> i64 {
-    let fe_code: i64 = pure_lex_classify_token(src_len, 0, 0);
-    let inc_code: i64 = pure_check_include_graph(1, 0, 16);
-    let mac_code: i64 = pure_check_macro_hygiene(2, 2, 0);
-    let sem_code: i64 = pure_check_call_and_label(0, 0, 0);
-    let fe_total: i64 = fe_code + inc_code + mac_code + sem_code;
-    let fe_bad: trit = fe_total <=> 0;
-    let ver_code: i64 = pure_verify_function_invariants(missing_cap_bits, taint_or_arena_err, 0);
-    let final_code: i64 = if_pos fe_bad { fe_total } else { ver_code };
-    return final_code;
-}",
+            include_str!("pure/compiler.omni")
         ),
         "pure/verifier.omni" => Some(
-            "#[strict]
-fn omni_pure_verify_opcode_cap(fn_cap_mask: i64, req_cap_mask: i64) -> i64 {
-    let covered: i64 = fn_cap_mask & req_cap_mask;
-    let diff: i64 = req_cap_mask - covered;
-    let cmp: trit = diff <=> 0;
-    let res: i64 = if_pos cmp { 1003 } else { 0 };
-    return res;
-}
-#[strict]
-fn omni_pure_verify_taint_flow(is_ret: i64, is_sink: i64, operand_tainted: i64) -> i64 {
-    let t_cmp: trit = operand_tainted <=> 0;
-    let r_cmp: trit = is_ret <=> 0;
-    let s_cmp: trit = is_sink <=> 0;
-    let sink_err: i64 = if_pos s_cmp { 1002 } else { 0 };
-    let ret_or_sink: i64 = if_pos r_cmp { 1001 } else { sink_err };
-    let out: i64 = if_pos t_cmp { ret_or_sink } else { 0 };
-    return out;
-}
-#[strict]
-fn omni_pure_verify_header(missing_cap_bits: i64, taint_violation_kind: i64, arena_balance: i64) -> i64 {
-    let cap_cmp: trit = missing_cap_bits <=> 0;
-    let taint_cmp: trit = taint_violation_kind <=> 1;
-    let taint_any: trit = taint_violation_kind <=> 0;
-    let arena_cmp: trit = arena_balance <=> 0;
-    let taint_code: i64 = match_trit taint_cmp {
-        neg => 0,
-        zero => 1001,
-        pos => 1002
-    };
-    let arena_code: i64 = match_trit arena_cmp {
-        neg => 1005,
-        zero => 0,
-        pos => 1004
-    };
-    let after_taint: i64 = if_pos taint_any { taint_code } else { arena_code };
-    let final_code: i64 = if_pos cap_cmp { 1003 } else { after_taint };
-    return final_code;
-}",
+            include_str!("pure/verifier.omni")
         ),
         "pure/host_runtime.omni" | "spec/pure_self_host/host_runtime.omni" => Some(
-            "#[strict]
-fn omni_pure_host_check_route_caps(cap_mask: i64, needs_db_r: i64, needs_db_w: i64) -> i64 {
-    let has_net: i64 = cap_mask & 4;
-    let net_cmp: trit = has_net <=> 0;
-    let r_cmp: trit = needs_db_r <=> 0;
-    let w_cmp: trit = needs_db_w <=> 0;
-    let has_r: i64 = cap_mask & 1;
-    let has_w: i64 = cap_mask & 2;
-    let r_ok: i64 = if_pos r_cmp { has_r } else { 1 };
-    let w_ok: i64 = if_pos w_cmp { has_w } else { 1 };
-    let rw_prod: i64 = r_ok * w_ok;
-    let rw_cmp: trit = rw_prod <=> 0;
-    let rw_status: i64 = if_pos rw_cmp { 0 } else { 1003 };
-    let final_status: i64 = if_pos net_cmp { rw_status } else { 1003 };
-    return final_status;
-}
-#[strict]
-fn omni_pure_host_check_taint_sink(param_tainted: i64, auth_verified: i64, is_db_or_rsp_sink: i64) -> i64 {
-    let t_cmp: trit = param_tainted <=> 0;
-    let a_cmp: trit = auth_verified <=> 0;
-    let s_cmp: trit = is_db_or_rsp_sink <=> 0;
-    let unsan: i64 = if_pos a_cmp { 0 } else { 1002 };
-    let sink_err: i64 = if_pos s_cmp { unsan } else { 0 };
-    let out: i64 = if_pos t_cmp { sink_err } else { 0 };
-    return out;
-}
-#[strict]
-fn omni_pure_host_kv_apply(op_code: i64, key_id: i64, val_in: i64) -> i64 {
-    let op_cmp: trit = op_code <=> 2;
-    let q_val: i64 = key_id * 10;
-    let res: i64 = match_trit op_cmp {
-        neg => val_in,
-        zero => val_in,
-        pos => q_val
-    };
-    return res;
-}
-#[strict]
-fn omni_pure_host_dispatch(method_code: i64, status_code: i64, payload: i64) -> i64 {
-    let m_cmp: trit = method_code <=> 0;
-    let s_cmp: trit = status_code <=> 199;
-    let valid_status: i64 = if_pos s_cmp { status_code } else { 500 };
-    let packed: i64 = valid_status * 1000000 + payload;
-    let res: i64 = match_trit m_cmp {
-        neg => 400000000,
-        zero => 404000000,
-        pos => packed
-    };
-    return res;
-}",
+            include_str!("pure/host_runtime.omni")
         ),
         "pure/tooling.omni" => Some(
-            "#[strict]
-fn pure_acceptance_diff_check(rust_words: i64, pure_words: i64, hash_diff: i64) -> i64 {
-    let raw_diff: i64 = rust_words - pure_words;
-    let len_diff: i64 = iabs(raw_diff);
-    let h_diff: i64 = iabs(hash_diff);
-    let total_diff: i64 = len_diff + h_diff;
-    let cmp: trit = total_diff <=> 0;
-    let status: i64 = if_pos cmp { 4001 } else { 0 };
-    return status;
-}
-#[strict]
-fn pure_select_repair_strategy(err_code_id: i64, is_multi_fn: i64) -> i64 {
-    let is_cap: trit = err_code_id <=> 1003;
-    let multi_cmp: trit = is_multi_fn <=> 0;
-    let cap_strat: i64 = if_pos multi_cmp { 2 } else { 1 };
-    let res: i64 = match_trit is_cap {
-        neg => err_code_id - 998,
-        zero => cap_strat,
-        pos => err_code_id - 997
-    };
-    return res;
-}
-#[strict]
-fn pure_inspect_opcode_category(tok: i64) -> i64 {
-    let is_eng: trit = tok < 32256;
-    let is_op: trit = tok >= 32512;
-    let op_or_meta: i64 = if_pos is_op { 6 } else { 4 };
-    let category: i64 = if_pos is_eng { 1 } else { op_or_meta };
-    return category;
-}
-#[strict]
-fn pure_explain_error_stage(err_code_id: i64) -> i64 {
-    let is_ver: trit = err_code_id <= 1005;
-    let is_rt: trit = err_code_id >= 1013;
-    let rt_or_fe: i64 = if_pos is_rt { 3 } else { 2 };
-    let stage: i64 = if_pos is_ver { 1 } else { rt_or_fe };
-    return stage;
-}
-#[strict]
-fn pure_bootstrap_fixed_point_check(gen1_words: i64, gen2_words: i64, elf_hash_diff: i64) -> i64 {
-    let raw_w: i64 = gen1_words - gen2_words;
-    let w_diff: i64 = iabs(raw_w);
-    let e_diff: i64 = iabs(elf_hash_diff);
-    let w_cmp: trit = w_diff <=> 0;
-    let e_cmp: trit = e_diff <=> 0;
-    let elf_status: i64 = if_pos e_cmp { 5002 } else { 0 };
-    let final_status: i64 = if_pos w_cmp { 5001 } else { elf_status };
-    return final_status;
-}
-#[strict]
-fn pure_inspect_module_metrics(fn_count: i64, total_words: i64, union_cap_mask: i64) -> i64 {
-    let f_ok: trit = fn_count > 0;
-    let w_ok: trit = total_words > 0;
-    let valid: trit = tand(f_ok, w_ok);
-    let score: i64 = (fn_count * 100000) + (total_words * 10) + (union_cap_mask & 1023);
-    let out: i64 = if_pos valid { score } else { -1 };
-    return out;
-}
-#[strict]
-fn pure_multi_step_repair_budget(attempt: i64, max_attempts: i64, remaining_errors: i64) -> i64 {
-    let err_cmp: trit = remaining_errors <=> 0;
-    let budget_cmp: trit = attempt <=> max_attempts;
-    let exhausted_or_step: i64 = if_pos budget_cmp { 4002 } else { remaining_errors };
-    let status: i64 = if_pos err_cmp { exhausted_or_step } else { 0 };
-    return status;
-}",
+            include_str!("pure/tooling.omni")
         ),
         "pure/selfhost_suite.omni" => Some(
-            "include \"std/math.omni\";
-include \"std/trit.omni\";
-include \"std/http.omni\";
-include \"pure/compiler.omni\";
-include \"pure/verifier.omni\";
-include \"pure/tooling.omni\";
-include \"pure/host_runtime.omni\";
-macro pure_stage_gate(code) = sel_trit(code <=> 0, 1, 0, 1);
-#[strict]
-fn pure_selfhost_verify_fixed_point(gen1_words: i64, gen2_words: i64, suite_words: i64) -> i64 {
-    let fp_st: i64 = pure_bootstrap_fixed_point_check(gen1_words, gen2_words, 0);
-    let suite_st: i64 = pure_acceptance_diff_check(suite_words, suite_words, 0);
-    let ver_st: i64 = omni_pure_verify_header(0, 0, 0);
-    let math_c: i64 = std_mad_clamped(10, 2, 5, 0, 100);
-    let q: trit = std_trit_quorum5(+1t, +1t, -1t, +1t, +1t);
-    let q_bonus: i64 = std_trit_mux(q, -5, 0, 5);
-    let http_ok: trit = std_http_is_success(200);
-    let http_bonus: i64 = std_trit_mux(http_ok, 0, 0, 10);
-    let err_sum: i64 = fp_st + suite_st + ver_st;
-    let err_cmp: trit = err_sum <=> 0;
-    let ok_score: i64 = math_c + q_bonus + http_bonus;
-    let out: i64 = if_pos err_cmp { err_sum } else { ok_score };
-    return out;
-}
-#[strict]
-#[cap(AI)]
-fn pure_selfhost_suite_entry(src_len: i64, cap_mask: i64, payload: i64) -> i64 {
-    let clamped_len: i64 = std_clamp(src_len, 1, 65536);
-    let comp_status: i64 = pure_compiler_pipeline_main(clamped_len, 0, 0);
-    let host_cap_status: i64 = omni_pure_host_check_route_caps(cap_mask, 1, 1);
-    let diff_status: i64 = pure_acceptance_diff_check(clamped_len, clamped_len, 0);
-    let strat_id: i64 = pure_select_repair_strategy(1003, 1);
-    let op_cat: i64 = pure_inspect_opcode_category(32565);
-    let http_packed: i64 = omni_pure_host_dispatch(1, 200, payload);
-    let delta: i64 = http_packed - 200000000;
-    let gate: trit = egate(delta);
-    let bonus: i64 = std_trit_mux(gate, -10, 0, 10);
-    let errs: i64 = comp_status + host_cap_status + diff_status;
-    let err_cmp: trit = errs <=> 0;
-    let ok_val: i64 = http_packed + strat_id + op_cat + bonus;
-    let res: i64 = if_pos err_cmp { errs } else { ok_val };
-    return res;
-}",
+            include_str!("pure/selfhost_suite.omni")
         ),
         "pure/programs/ternary_neural_router.omni" => Some(
-            "include \"std/math.omni\";
-include \"std/trit.omni\";
-macro router_margin(a, b) = (a * 3) - (b * 2);
-#[strict]
-#[cap(AI)]
-fn route_layer_score(bias: i64, scale: i64) -> i64 {
-    let w_pos: bytes = pack5_bytes([+1t, +1t, 0t, +1t, -1t, +1t, +1t, 0t, +1t, +1t]);
-    let w_neg: bytes = pack5_bytes([-1t, 0t, +1t, -1t, +1t, 0t, -1t, +1t, 0t, -1t]);
-    let d_pos: i64 = pack5_tdot(w_pos, w_pos);
-    let d_cross: i64 = pack5_tdot(w_pos, w_neg);
-    let g_pos: trit = pack5_gate(w_pos);
-    let g_bonus: i64 = std_trit_mux(g_pos, -20, 0, 20);
-    let m: i64 = router_margin(d_pos, d_cross);
-    let raw: i64 = m * scale + bias + g_bonus;
-    let clamped: i64 = std_clamp(raw, -500, 500);
-    return clamped;
-}
-#[strict]
-#[cap(AI)]
-fn route_quorum_gate(score_a: i64, score_b: i64, threshold: i64) -> trit {
-    let da: i64 = score_a - threshold;
-    let db: i64 = score_b - threshold;
-    let sum_ab: i64 = score_a + score_b;
-    let d_sum: i64 = sum_ab - threshold;
-    let ga: trit = egate(da);
-    let gb: trit = egate(db);
-    let gc: trit = tlogic(d_sum);
-    let q: trit = std_trit_quorum5(ga, gb, gc, +1t, ga);
-    return q;
-}
-#[strict]
-#[cap(AI)]
-#[step_budget(10000)]
-#[mem_budget(16384)]
-fn main(input_signal: i64, threshold: i64) -> i64 {
-    let s1: i64 = route_layer_score(input_signal, 4);
-    let half_sig: i64 = input_signal / 2;
-    let s2: i64 = route_layer_score(half_sig, 2);
-    let gate: trit = route_quorum_gate(s1, s2, threshold);
-    let bonus: i64 = std_trit_score(gate, +1t, gate, 3);
-    let total: i64 = s1 + s2 + bonus;
-    return total;
-}",
+            include_str!("pure/programs/ternary_neural_router.omni")
         ),
         "pure/programs/arena_audit_pipeline.omni" => Some(
-            "include \"std/math.omni\";
-include \"std/trit.omni\";
-#[strict]
-#[cap(AI)]
-fn compute_arena_window(limit: i64, stride: i64) -> i64 {
-    let a_main: arena = arena(4096);
-    let r_view: arena = borrow_r(a_main);
-    let acc: i64 = 0;
-    let i: i64 = 1;
-    while i <= limit {
-        let step_val: i64 = std_mad_clamped(i, stride, 3, 0, 200);
-        acc += step_val;
-        i += 1;
-    }
-    let gate_in: i64 = acc - 50;
-    let g: trit = egate(gate_in);
-    let adj: i64 = std_trit_mux(g, -10, 0, 10);
-    drop(r_view);
-    drop(a_main);
-    return acc + adj;
-}
-#[strict]
-#[cap(DB_W, DOM, AI)]
-fn sanitize_and_score_payload(base_score: i64) -> i64 {
-    let raw_lit: str = \"125\";
-    let sql_ok: str = san_sql(raw_lit);
-    let dom_ok: str = san_dom(sql_ok);
-    let prm_ok: str = san_prm(dom_ok);
-    let parsed_n: i64 = s2i(prm_ok);
-    let combined: i64 = base_score + parsed_n;
-    return combined;
-}
-#[strict]
-#[cap(DB_W, DOM, AI)]
-#[step_budget(20000)]
-#[mem_budget(32768)]
-fn main(limit: i64, stride: i64) -> i64 {
-    let clamped_lim: i64 = std_clamp(limit, 1, 20);
-    let win_score: i64 = compute_arena_window(clamped_lim, stride);
-    let final_score: i64 = sanitize_and_score_payload(win_score);
-    return final_score;
-}",
+            include_str!("pure/programs/arena_audit_pipeline.omni")
         ),
         "pure/programs/policy_consensus_engine.omni" => Some(
-            "include \"std/math.omni\";
-include \"std/trit.omni\";
-include \"std/http.omni\";
-include \"pure/verifier.omni\";
-macro risk_delta(val, limit) = val - limit;
-#[strict]
-#[cap(AI)]
-fn evaluate_agent_vote(metric: i64, soft_limit: i64, hard_limit: i64) -> trit {
-    let d_soft: i64 = risk_delta(metric, soft_limit);
-    let d_hard: i64 = risk_delta(metric, hard_limit);
-    let g_soft: trit = egate(d_soft);
-    let g_hard: trit = tlogic(d_hard);
-    let inv_soft: trit = !g_soft;
-    let inv_hard: trit = !g_hard;
-    let vote: trit = std_consensus3(inv_soft, inv_hard, +1t);
-    return vote;
-}
-#[strict]
-#[cap(AI)]
-#[step_budget(15000)]
-#[mem_budget(16384)]
-fn main(load_pct: i64, latency_ms: i64, fn_caps: i64) -> i64 {
-    let cap_err: i64 = omni_pure_verify_opcode_cap(fn_caps, 16);
-    let cap_cmp: trit = cap_err <=> 0;
-    let v_load: trit = evaluate_agent_vote(load_pct, 70, 90);
-    let v_lat: trit = evaluate_agent_vote(latency_ms, 100, 250);
-    let quorum: trit = std_trit_quorum5(v_load, v_lat, +1t, v_load, v_lat);
-    let q_score: i64 = std_trit_score(quorum, v_load, v_lat, 2);
-    let abs_gap: i64 = std_abs_diff(load_pct, latency_ms);
-    let payload: i64 = std_clamp(q_score + abs_gap, 0, 999999);
-    let status: i64 = std_trit_mux(quorum, 503, 202, 200);
-    let http_out: i64 = std_http_pack_response(status, payload);
-    let res: i64 = if_pos cap_cmp { cap_err } else { http_out };
-    return res;
-}",
+            include_str!("pure/programs/policy_consensus_engine.omni")
         ),
         "pure/programs/kv_ledger_service.omni" => Some(
-            "include \"std/math.omni\";
-include \"std/trit.omni\";
-#[strict]
-#[cap(NET, DB_R, DB_W, AUTH, AI)]
-route POST /ledger/:id (req: i64) {
-    let raw_id: i64 = req.param(\"id\");
-    let clean_id: i64 = auth_verify(raw_id);
-    let bounded_id: i64 = std_clamp(clean_id, 1, 10000);
-    let base_deposit: i64 = bounded_id * 10 + 500;
-    let delta: i64 = base_deposit - 600;
-    let g: trit = egate(delta);
-    let tier_bonus: i64 = std_trit_mux(g, 0, 25, 100);
-    let final_balance: i64 = base_deposit + tier_bonus;
-    let saved: i64 = kv_put(bounded_id, final_balance);
-    respond(201, saved);
-}
-#[strict]
-#[cap(NET, DB_R, AUTH)]
-route GET /ledger/:id (req: i64) {
-    let raw_id: i64 = req.param(\"id\");
-    let clean_id: i64 = auth_verify(raw_id);
-    let cur_bal: i64 = db_get(clean_id);
-    let audit_row: i64 = db_query(\"SELECT balance FROM ledger WHERE id = ?\", clean_id);
-    respond(200, cur_bal + audit_row);
-}",
+            include_str!("pure/programs/kv_ledger_service.omni")
         ),
         "pure/programs/compiler_self_audit.omni" => Some(
-            "include \"std/math.omni\";
-include \"std/trit.omni\";
-include \"std/http.omni\";
-include \"pure/compiler.omni\";
-include \"pure/verifier.omni\";
-include \"pure/tooling.omni\";
-include \"pure/host_runtime.omni\";
-#[strict]
-#[cap(AI)]
-#[step_budget(25000)]
-#[mem_budget(32768)]
-fn main(src_words: i64, trit_len: i64, err_probe: i64) -> i64 {
-    let c_st: i64 = pure_compiler_pipeline_main(src_words, 0, 0);
-    let v_st: i64 = omni_pure_verify_header(0, 0, 0);
-    let p5_bytes: i64 = pure_lower_pack5_density(trit_len, 240);
-    let diff_st: i64 = pure_acceptance_diff_check(src_words, src_words, 0);
-    let fp_st: i64 = pure_bootstrap_fixed_point_check(src_words, src_words, 0);
-    let strat: i64 = pure_select_repair_strategy(err_probe, 1);
-    let stg: i64 = pure_explain_error_stage(err_probe);
-    let cat: i64 = pure_inspect_opcode_category(32565);
-    let h_cap: i64 = omni_pure_host_check_route_caps(7, 1, 1);
-    let kv_val: i64 = omni_pure_host_kv_apply(3, 50, 0);
-    let err_total: i64 = c_st + v_st + diff_st + fp_st + h_cap;
-    let err_cmp: trit = err_total <=> 0;
-    let delta: i64 = kv_val - 100;
-    let g: trit = egate(delta);
-    let g_bonus: i64 = std_trit_mux(g, -10, 0, 10);
-    let digest: i64 = (p5_bytes * 1000) + (strat * 100) + (cat * 10) + stg + kv_val + g_bonus;
-    let out: i64 = if_pos err_cmp { err_total } else { digest };
-    return out;
-}",
+            include_str!("pure/programs/compiler_self_audit.omni")
         ),
         "pure/programs/pack5_decision_controller.omni" => Some(
-            "include \"std/pack5.omni\";
-include \"std/decision.omni\";
-include \"std/resource.omni\";
-#[strict]
-#[cap(AI)]
-#[step_budget(24000)]
-#[mem_budget(8192)]
-fn main(signal_a: i64, signal_b: i64, used_steps: i64) -> i64 {
-    let w_vec: bytes = pack5_bytes([+1t, +1t, 0t, +1t, -1t, +1t, +1t, 0t, +1t, +1t]);
-    let w_dot: i64 = pack5_tdot(w_vec, w_vec);
-    let p_bytes: i64 = std_pack5_bytes_needed(50);
-    let b_ok: trit = std_pack5_is_valid_byte(215);
-    let dot_sc: i64 = std_pack5_dot10_score(w_dot, 2, 10);
-    let cos_g: trit = std_pack5_cosine_gate(w_dot, 5);
-    let band_t: trit = std_decision_band(signal_a, 10, 30);
-    let hyst_t: trit = std_decision_hysteresis(band_t, signal_b, 15);
-    let hook_val: i64 = std_decision_weighted_hook(signal_a + signal_b, -20, -100, 0, 100);
-    let quorum_t: trit = std_decision_quorum_hook(signal_a, signal_b, signal_a + 10, 20);
-    let arena_sc: i64 = std_arena_scoped_score(p_bytes, 10, hook_val);
-    let headroom: i64 = std_budget_headroom(used_steps, 1000);
-    let budget_ok: trit = std_budget_is_within(used_steps, 1000, 50);
-    let chunks: i64 = std_arena_chunk_capacity(4096, 512);
-    let gate_all: trit = tmaj(b_ok, cos_g, quorum_t);
-    let hyst_bonus: i64 = sel_trit(hyst_t, -25, 0, 25);
-    let gate_bonus: i64 = sel_trit(gate_all, -10, 0, 40);
-    let total: i64 = dot_sc + arena_sc + (headroom / 10) + chunks + hyst_bonus + gate_bonus;
-    let final_out: i64 = if_pos budget_ok { total } else { -1 };
-    return final_out;
-}",
+            include_str!("pure/programs/pack5_decision_controller.omni")
         ),
         _ => None,
     }

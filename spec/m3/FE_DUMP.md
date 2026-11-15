@@ -64,7 +64,7 @@ Corpus (84 rows):
   - `q8b_label_limit` (16) fails `BUDGET_EXCEEDED:19:14`. **C4 must flip this row** to a compiled stream, regenerated in the C4 commit;
   - `q8e_label_17` (17) fails `BUDGET_EXCEEDED:20:14` and must still fail after C4.
 - `q8a_ssa_limit` (> 192 SSA) fails `BUDGET_EXCEEDED:195:21`.
-- `q6_include_twice` fails `SYNTAX_ERROR:6:53`: the textual include duplicates function definitions (no de-duplication).
+- `q6_include_twice` fails `SYNTAX_ERROR` (`58:43` since M3-16; `6:53` before): the textual include duplicates function definitions (no de-duplication). The coordinate is inside the second pasted copy of `std/math.omni`, so it moved when the embedded literal was replaced by the on-disk file.
 - `q5_macro_order`: a macro used before its definition stays a call, and fails `UNKNOWN_FN:3:12`.
 - `q1_strict_substring` is rejected (`AMBIGUOUS_GRAMMAR:3:13`) only because a comment contains the strict marker.
 
