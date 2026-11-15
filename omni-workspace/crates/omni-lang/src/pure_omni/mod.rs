@@ -2763,6 +2763,9 @@ fn main(x: i64, y: i64) -> i64 {
     // 13M3a. M3-01 frontend lock: canonical token / AST / packet / stream / sourcemap dumps == spec/m3/corpus.tsv, plus one negative fixture per error class
     checks += run_m3_fe_lock_selftests()?;
 
+    // 13M3b. M3-02 gate for pure/m3/: fails closed until m2-lint (M2-03) and the M2-08 depth check land
+    checks += run_m3_gate_selftests()?;
+
     Ok(checks)
 }
 

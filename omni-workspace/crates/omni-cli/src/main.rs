@@ -964,6 +964,9 @@ fn main() {
             "fe-dump" | "--fe-dump" => {
                 std::process::exit(omni_lang::run_m3_fe_dump_cli(&args[2..]));
             }
+            "m3-gate" | "--m3-gate" => {
+                std::process::exit(omni_lang::run_m3_gate_cli(&args[2..]));
+            }
             "agent-driver" | "--agent-driver" => {
                 std::process::exit(run_omni_agent_driver_cli(&args[2..]));
             }

@@ -4801,6 +4801,100 @@ pub fn run_m3_fe_dump_cli(argv: &[String]) -> i32 {
     }
 }
 
+// ==============================================================================
+// M3-02. GATE FOR `pure/m3/`: no recursion, label/SSA budgets, call depth <= 64
+// ==============================================================================
+// The plan points `m2-lint` (M2-03) and the M2-08 module/call-depth check at `pure/m3/*.omni`.
+// Neither tool is on this base (`d2d6c13`): `m2-lint` exists only as uncommitted WIP, and
+// `nyx/m2-foundation` routes the `m2-lint` word to `run_m2_cli` with no handler behind it. M2-08
+// is not written yet. Rather than write a second lint next to Nyx's, this gate FAILS CLOSED:
+// it passes only while `pure/m3/` holds no `.omni` module, and rejects any module until the real
+// tools are wired in here (flip `M3_GATE_TOOLS_WIRED` in the same commit that calls them).
+
+pub const M3_GATE_TOOLS_WIRED: bool = false;
+pub const M3_GATE_MISSING: &str = "m2-lint (M2-03: no recursion, <= 15 labels until C4 / 16 after, <= 192 SSA) and the M2-08 acyclic call-graph / <= 64-frame depth check are not on this base";
+
+/// Gate verdict for a set of `(path, source)` modules. Ok(n) = n modules passed.
+pub fn m3_gate_check(modules: &[(String, String)]) -> Result<usize, String> {
+    if modules.is_empty() {
+        return Ok(0);
+    }
+    let names: Vec<&str> = modules.iter().map(|(p, _)| p.as_str()).collect();
+    if !M3_GATE_TOOLS_WIRED {
+        return Err(format!(
+            "error[M3_GATE_UNAVAILABLE] refusing to pass {} pure/m3 module(s) [{}]: {}",
+            modules.len(),
+            names.join(", "),
+            M3_GATE_MISSING
+        ));
+    }
+    Err(String::from("error[M3_GATE_UNAVAILABLE] gate marked wired but no checker is connected"))
+}
+
+/// Every `*.omni` directly under `dir`, sorted by path. A missing directory is an empty set.
+pub fn m3_gate_collect(dir: &str) -> Result<Vec<(String, String)>, String> {
+    let rd = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let mut out = Vec::new();
+    for ent in rd {
+        let p = ent.map_err(|e| format!("m3-gate: {}", e))?.path();
+        if p.extension().and_then(|x| x.to_str()) == Some("omni") {
+            let s = fs::read_to_string(&p).map_err(|e| format!("m3-gate: cannot read {}: {}", p.display(), e))?;
+            out.push((p.display().to_string(), s));
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// M3-02 selftest: the gate is vacuous on an empty set, fails closed on any module (including a
+/// clean one and a self-recursive one), and, when run from the repo root, gates `pure/m3/` itself.
+pub fn run_m3_gate_selftests() -> Result<usize, String> {
+    let mut checks = 0usize;
+    if m3_gate_check(&[]) != Ok(0) {
+        return Err(String::from("M3 gate: empty module set must pass vacuously"));
+    }
+    checks += 1;
+    let clean = (String::from("pure/m3/clean.omni"), String::from("fn main(x: i64) -> i64 { return x; }"));
+    let rec = (
+        String::from("pure/m3/rec.omni"),
+        String::from("fn f(x: i64) -> i64 { let y = f(x); return y; }\nfn main(x: i64) -> i64 { let r = f(x); return r; }"),
+    );
+    for m in [clean, rec] {
+        match m3_gate_check(&[m.clone()]) {
+            Err(e) if e.contains("M3_GATE_UNAVAILABLE") => checks += 1,
+            other => return Err(format!("M3 gate must fail closed on {}: {:?}", m.0, other)),
+        }
+    }
+    if std::path::Path::new("omni_rust_bootstrap.rs").exists() && std::path::Path::new("spec/m3").is_dir() {
+        let mods = m3_gate_collect("pure/m3")?;
+        m3_gate_check(&mods)?;
+        checks += 1;
+    }
+    Ok(checks)
+}
+
+/// `m3-gate [dir]` (default `pure/m3`): exit 0 only if the gate passes.
+pub fn run_m3_gate_cli(argv: &[String]) -> i32 {
+    let dir = argv.first().map(|s| s.as_str()).unwrap_or("pure/m3");
+    match m3_gate_collect(dir).and_then(|m| m3_gate_check(&m)) {
+        Ok(0) => {
+            println!("[M3-GATE PASS] 0 modules under {} (vacuous; the gate fails closed on any module: {})", dir, M3_GATE_MISSING);
+            0
+        }
+        Ok(n) => {
+            println!("[M3-GATE PASS] {} modules under {}", n, dir);
+            0
+        }
+        Err(e) => {
+            eprintln!("[M3-GATE FAIL] {}", e);
+            1
+        }
+    }
+}
+
 #[cfg(test)]
 mod if_pos_join_slot_tests {
     #[test]
@@ -4808,6 +4902,12 @@ mod if_pos_join_slot_tests {
         let n = super::run_if_pos_join_slot_selftests().expect("if_pos join-slot regression");
         assert!(n >= 20, "expected at least 20 if_pos join-slot checks, got {n}");
         eprintln!("if_pos join-slot checks: {n}");
+    }
+
+    #[test]
+    fn m3_gate_fails_closed() {
+        let n = super::run_m3_gate_selftests().expect("M3-02 gate");
+        assert!(n >= 3, "expected at least 3 M3 gate checks, got {n}");
     }
 
     #[test]
