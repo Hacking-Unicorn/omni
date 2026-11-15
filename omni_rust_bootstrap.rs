@@ -12379,6 +12379,70 @@ pub fn run_byte_readback_parity_selftests() -> Result<usize, String> {
     Ok(checks)
 }
 
+/// Vera P6 (`pack5_flow`): a branch-dependent all-immediate buffer must not be const-folded.
+pub const BUF_FLOW_SRC: &str = "fn pack5_flow_golden(x: i64) -> i64 { let buf = anew(0); let c = x <=> 100; let b2 = if_pos c { iset(buf, 9) } else { iset(buf, 0 - 1, 44) }; let v0 = iget(b2, 0); let v1 = iget(b2, 1); let n = slen(b2); let r = n * 1000000 + v0 * 1000 + v1; return r; }";
+/// x=7 -> else arm [255, 44] -> 2*10^6 + 255*1000 + 44; x=200 -> then arm [9] -> 10^6 + 9000 + 0.
+pub const BUF_FLOW_RUNS: &[(i64, i64)] = &[(7, 2255044), (200, 1009000)];
+/// Vera P7 (`two_bufs`): two ANEW buffers keep independent lengths: 3*10 + 1.
+pub const TWO_BUFS_SRC: &str = "fn twob(x: i64) -> i64 { let a = anew(0); a = iset(a, 1, 2, 3); let b = anew(0); b = iset(b, 4); let la = slen(a); let lb = slen(b); let r = la * 10 + lb; return r; }";
+pub const TWO_BUFS_EXPECTED: i64 = 31;
+/// Value semantics on append: a=[1,2]; b=a++[3]; c=a++[9,x]. la=2 lb=3 lc=4, b[2]=3, c[2]=9,
+/// c[3]=x, a[2]=0 (OOB) -> ((((2*10+3)*10+4)*100+3)*100+9)*1000 + x + 0.
+pub const BUF_COPY_SRC: &str = "fn bufcopy(x: i64) -> i64 { let a = anew(0); a = iset(a, 1, 2); let b = iset(a, 3); let c = iset(a, 9, x); let la = slen(a); let lb = slen(b); let lc = slen(c); let r = ((((la * 10 + lb) * 10 + lc) * 100 + iget(b, 2)) * 100 + iget(c, 2)) * 1000 + iget(c, 3) + iget(a, 2) * 7; return r; }";
+pub const BUF_COPY_X: i64 = 7;
+pub const BUF_COPY_EXPECTED: i64 = 2340309007;
+
+/// 13BB. Per-buffer storage: VM and Wasm must match the hand-derived values for P6, P7 and the
+/// append-copy case; native x86-64 must match P6. x86-64 P7 / copy are RECORD-ONLY: the x86
+/// emitter keeps one global r11 heap length, and changing ANEW/ISET/SLEN there would move the
+/// frozen Stage-1 ELF hash `0xEAFC81F46B482FF8`. Stage-1 is not run here (token-region IGET).
+pub fn run_buffer_flow_parity_selftests() -> Result<usize, String> {
+    let mut checks = 0usize;
+    let vm_run = |src: &str, x: i64| -> Result<i64, String> {
+        let stream = compile_omni_surface_to_u16(src)?;
+        let module = decode_omni_token_stream(&stream)?;
+        let mut vm = OmniBinaryVm::new();
+        match vm.execute_function(&module, 0, vec![OmniValue::Int(x)])? {
+            OmniValue::Int(v) => Ok(v),
+            other => Err(format!("non-Int VM result {other:?}")),
+        }
+    };
+    let mut cases: Vec<(&str, &str, i64, i64)> = BUF_FLOW_RUNS.iter().map(|&(x, want)| ("pack5_flow", BUF_FLOW_SRC, x, want)).collect();
+    cases.push(("two_bufs", TWO_BUFS_SRC, 7, TWO_BUFS_EXPECTED));
+    cases.push(("buf_copy", BUF_COPY_SRC, BUF_COPY_X, BUF_COPY_EXPECTED));
+    for &(name, src, x, want) in &cases {
+        let vm_got = vm_run(src, x)?;
+        if vm_got != want {
+            return Err(format!("{name} VM x={x} got {vm_got} want {want}"));
+        }
+        checks += 1;
+        let wasm_got = execute_omni_surface_wasm_i64(src, &[x])?;
+        if wasm_got != want {
+            return Err(format!("{name} Wasm x={x} got {wasm_got} want {want}"));
+        }
+        checks += 1;
+        let (run_got, path) = execute_omni_surface_aot_first(src, vec![OmniValue::Int(x)])?;
+        if run_got != OmniValue::Int(want) {
+            return Err(format!("{name} `omnic run` path ({path}) x={x} got {run_got:?} want {want}"));
+        }
+        checks += 1;
+        #[cfg(all(unix, target_arch = "x86_64"))]
+        {
+            let elf = compile_omni_surface_to_x86_64_elf(src, x, 0, 0)?;
+            let x86_got = execute_native_elf_i64(&elf, &[x])?;
+            if name == "pack5_flow" {
+                if x86_got != want {
+                    return Err(format!("{name} x86-64 x={x} got {x86_got} want {want}"));
+                }
+                checks += 1;
+            } else {
+                eprintln!("{name} x={x}: VM={vm_got} Wasm={wasm_got} x86={x86_got} (x86 record-only: shared r11 heap)");
+            }
+        }
+    }
+    Ok(checks)
+}
+
 /// Regression: value-returning `if_pos`/`if_neg`/`match_trit` must use a single
 /// contiguous SSA join slot. Branch temps in the first stream-order arm must not
 /// punch a hole before the join dest is defined, and both arms must write that
@@ -13198,8 +13262,11 @@ fn main(x: i64, y: i64) -> i64 {
     // 13AV. Lockstep shadow mode on compile / run / serve
     checks += run_lockstep_shadow_selftests()?;
 
-    // 13AW. Vera P1 byte-readback sibling (VM + Wasm assert; x86/Stage-1 native run)
+    // 13AW. Vera P1 byte-readback sibling (VM + Wasm + x86 assert; Stage-1 record-only)
     checks += run_byte_readback_parity_selftests()?;
+
+    // 13BB. Per-buffer storage: pack5_flow / two_bufs / append-copy (VM + Wasm + run path; x86 P6)
+    checks += run_buffer_flow_parity_selftests()?;
 
     Ok(checks)
 }
@@ -14239,11 +14306,14 @@ fn collect_func_pack5_map(func: &BinFunction) -> BTreeMap<u16, (Vec<u8>, usize, 
                         // Runtime width/patch write: not a compile-time pack5 constant.
                         reg_pack5.remove(&d);
                     } else {
-                        let mut bytes = match ins.operands.first() {
-                            Some(BinOperand::Reg(s)) => reg_pack5.get(s).map(|(b, _, _)| b.clone()).unwrap_or_default(),
-                            _ => Vec::new(),
+                        let (mut bytes, mut complete) = match ins.operands.first() {
+                            Some(BinOperand::Reg(s)) => match reg_pack5.get(s) {
+                                Some((b, _, _)) => (b.clone(), true),
+                                // Unknown source buffer: its bytes are not a compile-time constant.
+                                None => (Vec::new(), false),
+                            },
+                            _ => (Vec::new(), true),
                         };
-                        let mut complete = true;
                         for op_b in &ins.operands[1..] {
                             if let BinOperand::ImmInt(v) = *op_b {
                                 bytes.push((v & 0xFF) as u8);
@@ -14502,6 +14572,11 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
         .filter(|ins| matches!(ins.op_tok, 0x7F0D | 0x7F0F))
         .filter_map(|ins| ins.dest_reg)
         .collect();
+    // The pack5 map is flow-insensitive (last definition in stream order wins), so it is only
+    // trusted for IGET on TritVec / TPACK5 registers, never on a runtime ANEW/ISET buffer.
+    let x86_fold_iget = |r: u16| -> bool {
+        reg_pack5.get(&r).map(|(_, _, is_tv)| *is_tv || !x86_buffer_regs.contains(&r)).unwrap_or(false)
+    };
     let emit_extract_pack5_trit_x86 = |c: &mut Vec<u8>, op: &BinOperand, trit_idx: usize, into_rcx: bool| {
         let mut direct_byte = false;
         if let BinOperand::Reg(r) = *op {
@@ -14547,7 +14622,7 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
                 if let (Some(BinOperand::Reg(r_arr)), Some(idx_op)) =
                     (ins.operands.first(), ins.operands.get(1))
                 {
-                    if let Some((bytes, n_len, is_tv)) = reg_pack5.get(r_arr) {
+                    if let Some((bytes, n_len, is_tv)) = reg_pack5.get(r_arr).filter(|_| x86_fold_iget(*r_arr)) {
                         if let BinOperand::ImmInt(idx) = idx_op {
                             if *idx >= 0 {
                                 if *is_tv {
@@ -14950,6 +15025,145 @@ fn encode_sleb128(mut val: i64) -> Vec<u8> {
 pub const WASM_ISET_MEMORY_PAGES: u32 = 2;
 pub const WASM_ISET_MEMORY_BYTES: i64 = (WASM_ISET_MEMORY_PAGES as i64) * 65536;
 
+/// Wasm buffer values are `(base << 32) | len` into the ISET linear memory, allocated by a
+/// bump pointer (`top`). An append to a buffer that is not the most recent allocation copies it
+/// to `top` first, so earlier values keep their bytes (VM value semantics for appends).
+#[derive(Clone, Copy)]
+struct WasmBufLocals {
+    top: usize,
+    bbase: usize,
+    blen: usize,
+    bidx: usize,
+    s0: usize,
+}
+
+fn wasm_lget(b: &mut Vec<u8>, l: usize) {
+    b.push(0x20);
+    b.extend(encode_uleb128(l));
+}
+
+fn wasm_lset(b: &mut Vec<u8>, l: usize) {
+    b.push(0x21);
+    b.extend(encode_uleb128(l));
+}
+
+fn wasm_i64c(b: &mut Vec<u8>, v: i64) {
+    b.push(0x42);
+    b.extend(encode_sleb128(v));
+}
+
+/// Stack: [v] -> []. bbase = v >> 32, blen = v & 0xFFFF_FFFF.
+fn wasm_buf_split(b: &mut Vec<u8>, l: &WasmBufLocals) {
+    wasm_lset(b, l.s0);
+    wasm_lget(b, l.s0);
+    wasm_i64c(b, 32);
+    b.push(0x87); // i64.shr_s (base < 2^31)
+    wasm_lset(b, l.bbase);
+    wasm_lget(b, l.s0);
+    wasm_i64c(b, 0xFFFF_FFFF);
+    b.push(0x83); // i64.and
+    wasm_lset(b, l.blen);
+}
+
+/// Stack: [] -> [(bbase << 32) | blen].
+fn wasm_buf_join(b: &mut Vec<u8>, l: &WasmBufLocals) {
+    wasm_lget(b, l.bbase);
+    wasm_i64c(b, 32);
+    b.push(0x86); // i64.shl
+    wasm_lget(b, l.blen);
+    b.push(0x84); // i64.or
+}
+
+/// After `wasm_buf_split`: if the buffer does not end at `top`, copy it to `top` (when it fits)
+/// so appends never overwrite bytes another value still refers to.
+fn wasm_buf_make_appendable(b: &mut Vec<u8>, l: &WasmBufLocals) {
+    wasm_lget(b, l.bbase);
+    wasm_lget(b, l.blen);
+    b.push(0x7C);
+    wasm_lget(b, l.top);
+    b.push(0x52); // i64.ne
+    b.extend_from_slice(&[0x04, 0x40]); // if
+    wasm_lget(b, l.top);
+    wasm_lget(b, l.blen);
+    b.push(0x7C);
+    wasm_i64c(b, WASM_ISET_MEMORY_BYTES);
+    b.extend_from_slice(&[0x55, 0x50]); // !(top + blen > MEM)
+    b.extend_from_slice(&[0x04, 0x40]); // if
+    wasm_i64c(b, 0);
+    wasm_lset(b, l.bidx);
+    b.extend_from_slice(&[0x03, 0x40]); // loop
+    wasm_lget(b, l.bidx);
+    wasm_lget(b, l.blen);
+    b.push(0x53); // i64.lt_s
+    b.extend_from_slice(&[0x04, 0x40]); // if
+    wasm_lget(b, l.top);
+    wasm_lget(b, l.bidx);
+    b.push(0x7C);
+    b.push(0xA7);
+    wasm_lget(b, l.bbase);
+    wasm_lget(b, l.bidx);
+    b.push(0x7C);
+    b.push(0xA7);
+    b.extend_from_slice(&[0x2D, 0x00, 0x00]); // i32.load8_u
+    b.extend_from_slice(&[0x3A, 0x00, 0x00]); // i32.store8
+    wasm_lget(b, l.bidx);
+    wasm_i64c(b, 1);
+    b.push(0x7C);
+    wasm_lset(b, l.bidx);
+    b.extend_from_slice(&[0x0C, 0x01]); // br 1 (loop)
+    b.push(0x0B); // end if
+    b.push(0x0B); // end loop
+    wasm_lget(b, l.top);
+    wasm_lset(b, l.bbase);
+    wasm_lget(b, l.top);
+    wasm_lget(b, l.blen);
+    b.push(0x7C);
+    wasm_lset(b, l.top);
+    b.push(0x0B); // end if fits
+    b.push(0x0B); // end if not at top
+}
+
+/// Pushes i32 cond: buffer ends at `top` and `top + width <= MEM`.
+fn wasm_buf_can_append(b: &mut Vec<u8>, l: &WasmBufLocals, width: i64) {
+    wasm_lget(b, l.bbase);
+    wasm_lget(b, l.blen);
+    b.push(0x7C);
+    wasm_lget(b, l.top);
+    b.push(0x51); // i64.eq
+    wasm_lget(b, l.top);
+    wasm_i64c(b, width);
+    b.push(0x7C);
+    wasm_i64c(b, WASM_ISET_MEMORY_BYTES);
+    b.extend_from_slice(&[0x55, 0x50]);
+    b.push(0x71); // i32.and
+}
+
+/// Inside an append `if`: blen += width; top += width.
+fn wasm_buf_bump(b: &mut Vec<u8>, l: &WasmBufLocals, width: i64) {
+    wasm_lget(b, l.blen);
+    wasm_i64c(b, width);
+    b.push(0x7C);
+    wasm_lset(b, l.blen);
+    wasm_lget(b, l.top);
+    wasm_i64c(b, width);
+    b.push(0x7C);
+    wasm_lset(b, l.top);
+}
+
+/// Pushes i32 cond: 0 <= off && off + width <= blen (off in `off_l`). Tested as
+/// off <= blen - width, so a huge off cannot overflow into an in-bounds sum.
+fn wasm_buf_in_bounds(b: &mut Vec<u8>, l: &WasmBufLocals, off_l: usize, width: i64) {
+    wasm_lget(b, off_l);
+    wasm_i64c(b, 0);
+    b.extend_from_slice(&[0x53, 0x50]); // off >= 0
+    wasm_lget(b, off_l);
+    wasm_lget(b, l.blen);
+    wasm_i64c(b, width);
+    b.push(0x7D); // blen - width
+    b.extend_from_slice(&[0x55, 0x50]); // !(off > blen - width)
+    b.push(0x71);
+}
+
 pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
     let module = decode_omni_token_stream(stream)?;
     let func = module.functions.first().ok_or("No function in module")?;
@@ -14976,11 +15190,24 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
         .map(|r| (r - REG_BASE) as usize + 1)
         .max()
         .unwrap_or(0);
-    let num_locals = max_reg_used + 4;
+    let num_locals = max_reg_used + 7;
     let scratch0 = num_params + max_reg_used;
     let scratch1 = num_params + max_reg_used + 1;
-    let buf_len_local = num_params + max_reg_used + 2;
     let pc_local = num_params + max_reg_used + 3;
+    let bl = WasmBufLocals {
+        top: num_params + max_reg_used + 2,
+        bbase: num_params + max_reg_used + 4,
+        blen: num_params + max_reg_used + 5,
+        bidx: num_params + max_reg_used + 6,
+        s0: scratch0,
+    };
+    // Registers that hold an ISET-memory buffer value (defined by ANEW or ISET).
+    let wasm_buffer_regs: std::collections::BTreeSet<u16> = func
+        .instructions
+        .iter()
+        .filter(|ins| matches!(ins.op_tok, 0x7F0D | 0x7F0F))
+        .filter_map(|ins| ins.dest_reg)
+        .collect();
 
     let has_control_flow = func
         .instructions
@@ -15124,11 +15351,11 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
                 emit_wasm_set_dest(b, ins.dest_reg);
             }
             0x7F0D => {
-                b.extend_from_slice(&[0x42, 0x00]);
-                b.push(0x21);
-                b.extend(encode_uleb128(buf_len_local));
+                // New empty buffer at the bump pointer: (top << 32) | 0.
                 if ins.dest_reg.is_some() {
-                    b.extend_from_slice(&[0x42, 0x00]);
+                    wasm_lget(b, bl.top);
+                    wasm_i64c(b, 32);
+                    b.push(0x86);
                     emit_wasm_set_dest(b, ins.dest_reg);
                 }
             }
@@ -15137,7 +15364,13 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
                 if let (Some(BinOperand::Reg(r_arr)), Some(idx_op)) =
                     (ins.operands.first(), ins.operands.get(1))
                 {
-                    if let Some((bytes, n_len, is_tv)) = reg_pack5.get(r_arr) {
+                    // The pack5 map is flow-insensitive (last definition in stream order wins),
+                    // so it is only trusted for TritVec / TPACK5 registers, never for a runtime
+                    // ANEW/ISET buffer (that was the pack5_flow mis-fold).
+                    let fold = reg_pack5
+                        .get(r_arr)
+                        .filter(|(_, _, is_tv)| *is_tv || !wasm_buffer_regs.contains(r_arr));
+                    if let Some((bytes, n_len, is_tv)) = fold {
                         if let BinOperand::ImmInt(idx) = idx_op {
                             if *idx >= 0 {
                                 if *is_tv {
@@ -15172,36 +15405,25 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
                     }
                 }
                 if !handled {
-                    // Runtime ISET-heap byte load. The @PACK5 const / dynamic-index
-                    // path above is unchanged. OOB or missing index yields 0.
-                    if ins.operands.len() >= 2 {
+                    if ins.operands.len() == 2 && matches!(ins.operands[0], BinOperand::Reg(_)) {
+                        // Runtime byte load from this buffer's own region. OOB yields 0.
+                        emit_wasm_op(b, &ins.operands[0]);
+                        wasm_buf_split(b, &bl);
                         emit_wasm_op(b, &ins.operands[1]);
-                        b.push(0x21);
-                        b.extend(encode_uleb128(scratch0));
-                        // in_bounds = (idx >= 0) && (idx < buf_len)
-                        b.push(0x20);
-                        b.extend(encode_uleb128(scratch0));
-                        b.extend_from_slice(&[0x42, 0x00, 0x53, 0x50]); // idx < 0, eqz → >= 0
-                        b.push(0x20);
-                        b.extend(encode_uleb128(scratch0));
-                        b.push(0x20);
-                        b.extend(encode_uleb128(buf_len_local));
-                        b.push(0x53); // idx < buf_len
-                        b.push(0x71); // i32.and
-                        b.push(0x21);
-                        b.extend(encode_uleb128(scratch1));
-                        // addr = idx * in_bounds (0 when OOB, so a dummy load is safe)
-                        b.push(0x20);
-                        b.extend(encode_uleb128(scratch0));
-                        b.push(0x20);
-                        b.extend(encode_uleb128(scratch1));
-                        b.push(0x7E); // i64.mul
+                        wasm_lset(b, scratch0);
+                        wasm_buf_in_bounds(b, &bl, scratch0, 1);
+                        wasm_lset(b, scratch1);
+                        // addr = (base + idx) * in_bounds (0 when OOB, so a dummy load is safe)
+                        wasm_lget(b, bl.bbase);
+                        wasm_lget(b, scratch0);
+                        b.push(0x7C);
+                        wasm_lget(b, scratch1);
+                        b.push(0x7E);
                         b.push(0xA7); // i32.wrap_i64
                         b.extend_from_slice(&[0x2D, 0x00, 0x00]); // i32.load8_u
                         b.push(0xAD); // i64.extend_i32_u
                         b.extend_from_slice(&[0x42, 0x00]);
-                        b.push(0x20);
-                        b.extend(encode_uleb128(scratch1));
+                        wasm_lget(b, scratch1);
                         b.push(0x1B); // select
                         emit_wasm_set_dest(b, ins.dest_reg);
                     } else {
@@ -15212,106 +15434,87 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
             }
             0x7F0F => {
                 let ops = &ins.operands;
-                let emit_can_fit = |b: &mut Vec<u8>, width: i64| {
-                    // (buf_len + width) <= MEM  iff  !((buf_len + width) > MEM)
-                    b.push(0x20);
-                    b.extend(encode_uleb128(buf_len_local));
-                    b.push(0x42);
-                    b.extend(encode_sleb128(width));
-                    b.push(0x7C);
-                    b.push(0x42);
-                    b.extend(encode_sleb128(WASM_ISET_MEMORY_BYTES));
-                    b.extend_from_slice(&[0x55, 0x50]); // gt, eqz
+                // Source buffer value; a non-register source is a fresh empty buffer at `top`.
+                let emit_src = |b: &mut Vec<u8>| {
+                    if matches!(ops.first(), Some(BinOperand::Reg(_))) {
+                        emit_wasm_op(b, &ops[0]);
+                    } else {
+                        wasm_lget(b, bl.top);
+                        wasm_i64c(b, 32);
+                        b.push(0x86);
+                    }
                 };
-                if ops.len() == 3 && ops[1] == BinOperand::ImmInt(-4) {
-                    emit_can_fit(b, 4);
-                    b.extend_from_slice(&[0x04, 0x40]); // if
-                    b.push(0x20);
-                    b.extend(encode_uleb128(buf_len_local));
-                    b.push(0xA7);
+                if ops.len() == 4 && ops[1] == BinOperand::ImmInt(-9) {
+                    // Patch in place: silent no-op unless 0 <= off && off + 8 <= len. Length unchanged.
+                    emit_src(b);
+                    wasm_buf_split(b, &bl);
                     emit_wasm_op(b, &ops[2]);
-                    b.push(0xA7);
-                    b.extend_from_slice(&[0x36, 0x00, 0x00]); // i32.store
-                    b.push(0x20);
-                    b.extend(encode_uleb128(buf_len_local));
-                    b.push(0x42);
-                    b.extend(encode_sleb128(4));
-                    b.push(0x7C);
-                    b.push(0x21);
-                    b.extend(encode_uleb128(buf_len_local));
-                    b.push(0x0B);
-                } else if ops.len() == 3 && ops[1] == BinOperand::ImmInt(-8) {
-                    emit_can_fit(b, 8);
-                    b.extend_from_slice(&[0x04, 0x40]);
-                    b.push(0x20);
-                    b.extend(encode_uleb128(buf_len_local));
-                    b.push(0xA7);
-                    emit_wasm_op(b, &ops[2]);
-                    b.extend_from_slice(&[0x37, 0x00, 0x00]); // i64.store
-                    b.push(0x20);
-                    b.extend(encode_uleb128(buf_len_local));
-                    b.push(0x42);
-                    b.extend(encode_sleb128(8));
-                    b.push(0x7C);
-                    b.push(0x21);
-                    b.extend(encode_uleb128(buf_len_local));
-                    b.push(0x0B);
-                } else if ops.len() == 4 && ops[1] == BinOperand::ImmInt(-9) {
-                    // Silent no-op unless 0 <= off && off + 8 <= buf_len. Length unchanged.
-                    emit_wasm_op(b, &ops[2]);
-                    b.push(0x21);
-                    b.extend(encode_uleb128(scratch0));
+                    wasm_lset(b, scratch0);
                     emit_wasm_op(b, &ops[3]);
-                    b.push(0x21);
-                    b.extend(encode_uleb128(scratch1));
-                    b.push(0x20);
-                    b.extend(encode_uleb128(scratch0));
-                    b.extend_from_slice(&[0x42, 0x00, 0x53, 0x50]); // off >= 0
-                    b.push(0x20);
-                    b.extend(encode_uleb128(scratch0));
-                    b.push(0x42);
-                    b.extend(encode_sleb128(8));
-                    b.push(0x7C);
-                    b.push(0x20);
-                    b.extend(encode_uleb128(buf_len_local));
-                    b.extend_from_slice(&[0x55, 0x50]); // !(off+8 > len)
-                    b.push(0x71);
+                    wasm_lset(b, scratch1);
+                    wasm_buf_in_bounds(b, &bl, scratch0, 8);
                     b.extend_from_slice(&[0x04, 0x40]);
-                    b.push(0x20);
-                    b.extend(encode_uleb128(scratch0));
+                    wasm_lget(b, bl.bbase);
+                    wasm_lget(b, scratch0);
+                    b.push(0x7C);
                     b.push(0xA7);
-                    b.push(0x20);
-                    b.extend(encode_uleb128(scratch1));
+                    wasm_lget(b, scratch1);
                     b.extend_from_slice(&[0x37, 0x00, 0x00]); // i64.store
                     b.push(0x0B);
                 } else {
-                    for op_b in &ops[1..] {
-                        emit_can_fit(b, 1);
-                        b.extend_from_slice(&[0x04, 0x40]);
-                        b.push(0x20);
-                        b.extend(encode_uleb128(buf_len_local));
+                    emit_src(b);
+                    wasm_buf_split(b, &bl);
+                    wasm_buf_make_appendable(b, &bl);
+                    let chunks: Vec<(i64, &BinOperand)> = if ops.len() == 3 && ops[1] == BinOperand::ImmInt(-4) {
+                        vec![(4, &ops[2])]
+                    } else if ops.len() == 3 && ops[1] == BinOperand::ImmInt(-8) {
+                        vec![(8, &ops[2])]
+                    } else {
+                        ops.iter().skip(1).map(|o| (1i64, o)).collect()
+                    };
+                    for (width, op_v) in chunks {
+                        wasm_buf_can_append(b, &bl, width);
+                        b.extend_from_slice(&[0x04, 0x40]); // if
+                        wasm_lget(b, bl.top);
                         b.push(0xA7);
-                        emit_wasm_op(b, op_b);
-                        b.push(0xA7);
-                        b.extend_from_slice(&[0x3A, 0x00, 0x00]); // i32.store8
-                        b.push(0x20);
-                        b.extend(encode_uleb128(buf_len_local));
-                        b.extend_from_slice(&[0x42, 0x01, 0x7C]);
-                        b.push(0x21);
-                        b.extend(encode_uleb128(buf_len_local));
+                        emit_wasm_op(b, op_v);
+                        match width {
+                            1 => {
+                                b.push(0xA7);
+                                b.extend_from_slice(&[0x3A, 0x00, 0x00]); // i32.store8
+                            }
+                            4 => {
+                                b.push(0xA7);
+                                b.extend_from_slice(&[0x36, 0x00, 0x00]); // i32.store
+                            }
+                            _ => b.extend_from_slice(&[0x37, 0x00, 0x00]), // i64.store
+                        }
+                        wasm_buf_bump(b, &bl, width);
                         b.push(0x0B);
                     }
                 }
                 if ins.dest_reg.is_some() {
-                    b.push(0x20);
-                    b.extend(encode_uleb128(buf_len_local));
+                    wasm_buf_join(b, &bl);
                     emit_wasm_set_dest(b, ins.dest_reg);
                 }
             }
             0x7F50 => {
                 if ins.dest_reg.is_some() {
-                    b.push(0x20);
-                    b.extend(encode_uleb128(buf_len_local));
+                    let const_len = match ins.operands.first() {
+                        Some(BinOperand::Reg(r)) if !wasm_buffer_regs.contains(r) => {
+                            reg_pack5.get(r).map(|(bytes, _, _)| bytes.len() as i64)
+                        }
+                        _ => None,
+                    };
+                    if let Some(n) = const_len {
+                        wasm_i64c(b, n);
+                    } else if let Some(op0) = ins.operands.first() {
+                        emit_wasm_op(b, op0);
+                        wasm_i64c(b, 0xFFFF_FFFF);
+                        b.push(0x83);
+                    } else {
+                        wasm_i64c(b, 0);
+                    }
                     emit_wasm_set_dest(b, ins.dest_reg);
                 }
             }

@@ -3933,6 +3933,70 @@ pub fn run_byte_readback_parity_selftests() -> Result<usize, String> {
     Ok(checks)
 }
 
+/// Vera P6 (`pack5_flow`): a branch-dependent all-immediate buffer must not be const-folded.
+pub const BUF_FLOW_SRC: &str = "fn pack5_flow_golden(x: i64) -> i64 { let buf = anew(0); let c = x <=> 100; let b2 = if_pos c { iset(buf, 9) } else { iset(buf, 0 - 1, 44) }; let v0 = iget(b2, 0); let v1 = iget(b2, 1); let n = slen(b2); let r = n * 1000000 + v0 * 1000 + v1; return r; }";
+/// x=7 -> else arm [255, 44] -> 2*10^6 + 255*1000 + 44; x=200 -> then arm [9] -> 10^6 + 9000 + 0.
+pub const BUF_FLOW_RUNS: &[(i64, i64)] = &[(7, 2255044), (200, 1009000)];
+/// Vera P7 (`two_bufs`): two ANEW buffers keep independent lengths: 3*10 + 1.
+pub const TWO_BUFS_SRC: &str = "fn twob(x: i64) -> i64 { let a = anew(0); a = iset(a, 1, 2, 3); let b = anew(0); b = iset(b, 4); let la = slen(a); let lb = slen(b); let r = la * 10 + lb; return r; }";
+pub const TWO_BUFS_EXPECTED: i64 = 31;
+/// Value semantics on append: a=[1,2]; b=a++[3]; c=a++[9,x]. la=2 lb=3 lc=4, b[2]=3, c[2]=9,
+/// c[3]=x, a[2]=0 (OOB) -> ((((2*10+3)*10+4)*100+3)*100+9)*1000 + x + 0.
+pub const BUF_COPY_SRC: &str = "fn bufcopy(x: i64) -> i64 { let a = anew(0); a = iset(a, 1, 2); let b = iset(a, 3); let c = iset(a, 9, x); let la = slen(a); let lb = slen(b); let lc = slen(c); let r = ((((la * 10 + lb) * 10 + lc) * 100 + iget(b, 2)) * 100 + iget(c, 2)) * 1000 + iget(c, 3) + iget(a, 2) * 7; return r; }";
+pub const BUF_COPY_X: i64 = 7;
+pub const BUF_COPY_EXPECTED: i64 = 2340309007;
+
+/// 13BB. Per-buffer storage: VM and Wasm must match the hand-derived values for P6, P7 and the
+/// append-copy case; native x86-64 must match P6. x86-64 P7 / copy are RECORD-ONLY: the x86
+/// emitter keeps one global r11 heap length, and changing ANEW/ISET/SLEN there would move the
+/// frozen Stage-1 ELF hash `0xEAFC81F46B482FF8`. Stage-1 is not run here (token-region IGET).
+pub fn run_buffer_flow_parity_selftests() -> Result<usize, String> {
+    let mut checks = 0usize;
+    let vm_run = |src: &str, x: i64| -> Result<i64, String> {
+        let stream = compile_omni_surface_to_u16(src)?;
+        let module = decode_omni_token_stream(&stream)?;
+        let mut vm = OmniBinaryVm::new();
+        match vm.execute_function(&module, 0, vec![OmniValue::Int(x)])? {
+            OmniValue::Int(v) => Ok(v),
+            other => Err(format!("non-Int VM result {other:?}")),
+        }
+    };
+    let mut cases: Vec<(&str, &str, i64, i64)> = BUF_FLOW_RUNS.iter().map(|&(x, want)| ("pack5_flow", BUF_FLOW_SRC, x, want)).collect();
+    cases.push(("two_bufs", TWO_BUFS_SRC, 7, TWO_BUFS_EXPECTED));
+    cases.push(("buf_copy", BUF_COPY_SRC, BUF_COPY_X, BUF_COPY_EXPECTED));
+    for &(name, src, x, want) in &cases {
+        let vm_got = vm_run(src, x)?;
+        if vm_got != want {
+            return Err(format!("{name} VM x={x} got {vm_got} want {want}"));
+        }
+        checks += 1;
+        let wasm_got = execute_omni_surface_wasm_i64(src, &[x])?;
+        if wasm_got != want {
+            return Err(format!("{name} Wasm x={x} got {wasm_got} want {want}"));
+        }
+        checks += 1;
+        let (run_got, path) = execute_omni_surface_aot_first(src, vec![OmniValue::Int(x)])?;
+        if run_got != OmniValue::Int(want) {
+            return Err(format!("{name} `omnic run` path ({path}) x={x} got {run_got:?} want {want}"));
+        }
+        checks += 1;
+        #[cfg(all(unix, target_arch = "x86_64"))]
+        {
+            let elf = compile_omni_surface_to_x86_64_elf(src, x, 0, 0)?;
+            let x86_got = execute_native_elf_i64(&elf, &[x])?;
+            if name == "pack5_flow" {
+                if x86_got != want {
+                    return Err(format!("{name} x86-64 x={x} got {x86_got} want {want}"));
+                }
+                checks += 1;
+            } else {
+                eprintln!("{name} x={x}: VM={vm_got} Wasm={wasm_got} x86={x86_got} (x86 record-only: shared r11 heap)");
+            }
+        }
+    }
+    Ok(checks)
+}
+
 /// Regression: value-returning `if_pos`/`if_neg`/`match_trit` must use a single
 /// contiguous SSA join slot. Branch temps in the first stream-order arm must not
 /// punch a hole before the join dest is defined, and both arms must write that
