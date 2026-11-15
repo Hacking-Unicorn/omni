@@ -1,0 +1,7 @@
+#[strict]
+fn drop1(x: i64) -> i64 {
+    let a: arena = arena(4096);
+    let res: i64 = x + 42;
+    drop(a);
+    return res;
+}

@@ -1,0 +1,1 @@
+fn trit_clamp_golden(x: i64) -> i64 { let a = tand(x, 3); let b = tor(x, 0 - 3); let c = txor(x, 3); let d = tnot(x); let e = tmaj(x, 0 - 1, 0 - 1); let r = a * 10000 + (b + 2) * 1000 + (c + 2) * 100 + (d + 2) * 10 + (e + 2); return r; }

@@ -1,0 +1,11 @@
+#[strict]
+fn ovr(n: i64) -> i64 {
+    let buf: bytes = anew(0);
+    let i: i64 = 0;
+    let keep: i64 = 1234;
+    while i < n {
+        buf = iset(buf, 255);
+        i += 1;
+    }
+    return keep;
+}

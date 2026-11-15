@@ -1,0 +1,7 @@
+ omni-workspace/crates/omni-aot/src/lib.rs          | 177 ++++++++-
+ .../crates/omni-lang/src/compiler/mod.rs           | 201 ++++++++++
+ .../crates/omni-lang/src/pure_omni/mod.rs          |   3 +
+ .../crates/omni-lang/src/verifier/mod.rs           |   1 +
+ omni-workspace/crates/omni-vm/src/lib.rs           |  43 +++
+ omni_rust_bootstrap.rs                             | 418 ++++++++++++++++++++-
+ 6 files changed, 837 insertions(+), 6 deletions(-)

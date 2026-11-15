@@ -1,0 +1,1 @@
+fn tandi(x: i64) -> i64 { let a = tand(x, 3); return a; }

@@ -1,0 +1,1 @@
+fn b250(x: i64) -> i64 { let buf = anew(0); buf = iset(buf, 250, 1); let n = slen(buf); return n; }

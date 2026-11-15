@@ -1,0 +1,1 @@
+fn twob(x: i64) -> i64 { let a = anew(0); a = iset(a, 1, 2, 3); let b = anew(0); b = iset(b, 4); let la = slen(a); let lb = slen(b); let r = la * 10 + lb; return r; }

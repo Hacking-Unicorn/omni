@@ -1,0 +1,1 @@
+fn txori(x: i64) -> i64 { let a = txor(x, 3); return a; }

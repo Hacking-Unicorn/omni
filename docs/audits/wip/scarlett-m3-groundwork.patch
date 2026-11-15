@@ -1,0 +1,737 @@
+diff --git a/omni-workspace/crates/omni-cli/src/main.rs b/omni-workspace/crates/omni-cli/src/main.rs
+index ff0495f..909a67f 100644
+--- a/omni-workspace/crates/omni-cli/src/main.rs
++++ b/omni-workspace/crates/omni-cli/src/main.rs
+@@ -872,6 +872,13 @@ pub fn run_workspace_selftest() -> Result<usize, String> {
+     if ai_first_checks != m_ai_first_checks {
+         return Err(format!("Monolith vs workspace AI-first selftest count mismatch: {} != {}", m_ai_first_checks, ai_first_checks));
+     }
++    // M3-01: monolith vs workspace canonical frontend dumps, row for row.
++    let m3_ws = omni_lang::m3_fe_lock_rows()?;
++    let m3_mono = monolith::m3_fe_lock_rows()?;
++    if m3_ws != m3_mono {
++        return Err("Monolith vs workspace M3 frontend lock rows mismatch".into());
++    }
++    checks += m3_ws.len();
+     if omni_harness_spec_json() != monolith::omni_harness_spec_json() {
+         return Err("Monolith vs workspace omni_harness_spec_json mismatch".into());
+     }
+@@ -954,6 +961,9 @@ fn main() {
+             "harness" | "--harness" => {
+                 std::process::exit(run_omni_harness_cli(&args[2..]));
+             }
++            "fe-dump" | "--fe-dump" => {
++                std::process::exit(omni_lang::run_m3_fe_dump_cli(&args[2..]));
++            }
+             "agent-driver" | "--agent-driver" => {
+                 std::process::exit(run_omni_agent_driver_cli(&args[2..]));
+             }
+diff --git a/omni-workspace/crates/omni-lang/src/compiler/mod.rs b/omni-workspace/crates/omni-lang/src/compiler/mod.rs
+index 33bffa5..eec52d3 100644
+--- a/omni-workspace/crates/omni-lang/src/compiler/mod.rs
++++ b/omni-workspace/crates/omni-lang/src/compiler/mod.rs
+@@ -4038,6 +4038,326 @@ pub fn run_if_pos_join_slot_selftests() -> Result<usize, String> {
+     Ok(checks)
+ }
+ 
++// ==============================================================================
++// M3-01. CANONICAL FRONTEND DUMPS (`fe-dump`) & THE M3 FRONTEND LOCK
++// ==============================================================================
++// Fixed binary formats the future Omni frontend (`pure/m3/`) is diffed against.
++// Token dump: [M3_TOK_MAGIC, count_lo, count_hi] then per token
++//   [kind, line_lo, line_hi, col_lo, col_hi, v0, v1, v2, v3, nbytes, bytes...]
++//   (v0..v3 = little-endian i64 value: Int value or Trit value, else 0).
++// Sourcemap dump: [M3_SM_MAGIC, n_lo, n_hi] then per entry
++//   [off_lo, off_hi, line_lo, line_hi, col_lo, col_hi], then budget, default and pack5 spans.
++// Errors are compared as `CLASS:line:col` (message text is not part of the lock).
++// The lock covers the closed suite modules (strict, as the suite compiles them), the
++// verifier engine, the acceptance goldens on disk (minus the cwd-dependent
++// `neg_circular_include`) and `spec/m3/fixtures/*.omni` (quirks Q1-Q8).
++
++pub const M3_FE_DUMP_VERSION: &str = "omni-m3-fe-dump-v1";
++pub const M3_TOK_MAGIC: u16 = 0x4D33;
++pub const M3_SM_MAGIC: u16 = 0x4D53;
++pub const M3_TK_IDENT: u16 = 1;
++pub const M3_TK_INT: u16 = 2;
++pub const M3_TK_TRIT: u16 = 3;
++pub const M3_TK_STR: u16 = 4;
++pub const M3_TK_AT: u16 = 5;
++pub const M3_TK_SYM: u16 = 6;
++pub const M3_TK_OP: u16 = 7;
++pub const M3_TK_HASH: u16 = 8;
++
++pub const M3_FE_LOCK_TSV: &str = include_str!("../../../../../spec/m3/corpus.tsv");
++
++pub const M3_FE_LOOKUP_CORPUS: [&str; 18] = [
++    "std/prelude.omni",
++    "std/math.omni",
++    "std/trit.omni",
++    "std/http.omni",
++    "std/pack5.omni",
++    "std/decision.omni",
++    "std/resource.omni",
++    "pure/compiler.omni",
++    "pure/verifier.omni",
++    "pure/host_runtime.omni",
++    "pure/tooling.omni",
++    "pure/selfhost_suite.omni",
++    "pure/programs/ternary_neural_router.omni",
++    "pure/programs/arena_audit_pipeline.omni",
++    "pure/programs/policy_consensus_engine.omni",
++    "pure/programs/kv_ledger_service.omni",
++    "pure/programs/compiler_self_audit.omni",
++    "pure/programs/pack5_decision_controller.omni",
++];
++
++pub const M3_FE_FILE_CORPUS: &[(&str, &str)] = &[
++    ("golden/arena_lifecycle_golden.omni", include_str!("../../../../../spec/acceptance/goldens/arena_lifecycle_golden.omni")),
++    ("golden/asm_roundtrip.omni", include_str!("../../../../../spec/acceptance/goldens/asm_roundtrip.omni")),
++    ("golden/br_neg_arith_golden.omni", include_str!("../../../../../spec/acceptance/goldens/br_neg_arith_golden.omni")),
++    ("golden/br_pos_golden.omni", include_str!("../../../../../spec/acceptance/goldens/br_pos_golden.omni")),
++    ("golden/branch_loop_golden.omni", include_str!("../../../../../spec/acceptance/goldens/branch_loop_golden.omni")),
++    ("golden/byte_buf_golden.omni", include_str!("../../../../../spec/acceptance/goldens/byte_buf_golden.omni")),
++    ("golden/custom_non_seed_alu.omni", include_str!("../../../../../spec/acceptance/goldens/custom_non_seed_alu.omni")),
++    ("golden/decision_hook_golden.omni", include_str!("../../../../../spec/acceptance/goldens/decision_hook_golden.omni")),
++    ("golden/iabs_golden.omni", include_str!("../../../../../spec/acceptance/goldens/iabs_golden.omni")),
++    ("golden/idiv_zero.omni", include_str!("../../../../../spec/acceptance/goldens/idiv_zero.omni")),
++    ("golden/match_trit_golden.omni", include_str!("../../../../../spec/acceptance/goldens/match_trit_golden.omni")),
++    ("golden/multi_fn_weighted_term.omni", include_str!("../../../../../spec/acceptance/goldens/multi_fn_weighted_term.omni")),
++    ("golden/neg_ambiguous_grammar.omni", include_str!("../../../../../spec/acceptance/goldens/neg_ambiguous_grammar.omni")),
++    ("golden/neg_arity_mismatch.omni", include_str!("../../../../../spec/acceptance/goldens/neg_arity_mismatch.omni")),
++    ("golden/neg_bad_type.omni", include_str!("../../../../../spec/acceptance/goldens/neg_bad_type.omni")),
++    ("golden/neg_borrow_conflict.omni", include_str!("../../../../../spec/acceptance/goldens/neg_borrow_conflict.omni")),
++    ("golden/neg_budget_exceeded.omni", include_str!("../../../../../spec/acceptance/goldens/neg_budget_exceeded.omni")),
++    ("golden/neg_corrupt_pack5.omni", include_str!("../../../../../spec/acceptance/goldens/neg_corrupt_pack5.omni")),
++    ("golden/neg_immut_param.omni", include_str!("../../../../../spec/acceptance/goldens/neg_immut_param.omni")),
++    ("golden/neg_linear_leak.omni", include_str!("../../../../../spec/acceptance/goldens/neg_linear_leak.omni")),
++    ("golden/neg_missing_cap.omni", include_str!("../../../../../spec/acceptance/goldens/neg_missing_cap.omni")),
++    ("golden/neg_syntax_error.omni", include_str!("../../../../../spec/acceptance/goldens/neg_syntax_error.omni")),
++    ("golden/neg_taint_on_ret.omni", include_str!("../../../../../spec/acceptance/goldens/neg_taint_on_ret.omni")),
++    ("golden/neg_taint_sink.omni", include_str!("../../../../../spec/acceptance/goldens/neg_taint_sink.omni")),
++    ("golden/neg_undef_var.omni", include_str!("../../../../../spec/acceptance/goldens/neg_undef_var.omni")),
++    ("golden/neg_unknown_fn.omni", include_str!("../../../../../spec/acceptance/goldens/neg_unknown_fn.omni")),
++    ("golden/neg_unresolved_label.omni", include_str!("../../../../../spec/acceptance/goldens/neg_unresolved_label.omni")),
++    ("golden/nested_branch_golden.omni", include_str!("../../../../../spec/acceptance/goldens/nested_branch_golden.omni")),
++    ("golden/pack5_direct_aot.omni", include_str!("../../../../../spec/acceptance/goldens/pack5_direct_aot.omni")),
++    ("golden/pack5_trit_vec_golden.omni", include_str!("../../../../../spec/acceptance/goldens/pack5_trit_vec_golden.omni")),
++    ("golden/route_db_query_golden.omni", include_str!("../../../../../spec/acceptance/goldens/route_db_query_golden.omni")),
++    ("golden/route_kv_golden.omni", include_str!("../../../../../spec/acceptance/goldens/route_kv_golden.omni")),
++    ("golden/seed0_risk.omni", include_str!("../../../../../spec/acceptance/goldens/seed0_risk.omni")),
++    ("golden/seed4_consensus.omni", include_str!("../../../../../spec/acceptance/goldens/seed4_consensus.omni")),
++    ("golden/seed6_clamp.omni", include_str!("../../../../../spec/acceptance/goldens/seed6_clamp.omni")),
++    ("golden/sel_mix.omni", include_str!("../../../../../spec/acceptance/goldens/sel_mix.omni")),
++    ("golden/shl_65.omni", include_str!("../../../../../spec/acceptance/goldens/shl_65.omni")),
++    ("golden/stdlib_macro_pipeline_golden.omni", include_str!("../../../../../spec/acceptance/goldens/stdlib_macro_pipeline_golden.omni")),
++    ("golden/while_sum_even_golden.omni", include_str!("../../../../../spec/acceptance/goldens/while_sum_even_golden.omni")),
++    ("m3fix/q1_nonstrict_control.omni", include_str!("../../../../../spec/m3/fixtures/q1_nonstrict_control.omni")),
++    ("m3fix/q1_strict_substring.omni", include_str!("../../../../../spec/m3/fixtures/q1_strict_substring.omni")),
++    ("m3fix/q2_trit_text.omni", include_str!("../../../../../spec/m3/fixtures/q2_trit_text.omni")),
++    ("m3fix/q3_neg_fold.omni", include_str!("../../../../../spec/m3/fixtures/q3_neg_fold.omni")),
++    ("m3fix/q4_le_ge.omni", include_str!("../../../../../spec/m3/fixtures/q4_le_ge.omni")),
++    ("m3fix/q5_macro_after_def.omni", include_str!("../../../../../spec/m3/fixtures/q5_macro_after_def.omni")),
++    ("m3fix/q5_macro_order.omni", include_str!("../../../../../spec/m3/fixtures/q5_macro_order.omni")),
++    ("m3fix/q6_include_once.omni", include_str!("../../../../../spec/m3/fixtures/q6_include_once.omni")),
++    ("m3fix/q6_include_twice.omni", include_str!("../../../../../spec/m3/fixtures/q6_include_twice.omni")),
++    ("m3fix/q7_fn_ids.omni", include_str!("../../../../../spec/m3/fixtures/q7_fn_ids.omni")),
++    ("m3fix/q8a_ssa_limit.omni", include_str!("../../../../../spec/m3/fixtures/q8a_ssa_limit.omni")),
++    ("m3fix/q8b_label_limit.omni", include_str!("../../../../../spec/m3/fixtures/q8b_label_limit.omni")),
++    ("m3fix/q8c_label_ok.omni", include_str!("../../../../../spec/m3/fixtures/q8c_label_ok.omni")),
++];
++
++fn m3_push_u32(out: &mut Vec<u16>, v: usize) -> Result<(), String> {
++    if v > u32::MAX as usize {
++        return Err(format!("fe-dump value {} exceeds u32", v));
++    }
++    out.push((v & 0xFFFF) as u16);
++    out.push(((v >> 16) & 0xFFFF) as u16);
++    Ok(())
++}
++
++/// Canonical token dump of `tokenize_omni_surface_inner` (same strictness rule as the compiler).
++pub fn m3_dump_tokens(src: &str, strict: bool) -> Result<Vec<u16>, String> {
++    let effective_strict = strict || src.contains("#[strict]");
++    let toks = tokenize_omni_surface_inner(src, effective_strict)?;
++    let mut out = vec![M3_TOK_MAGIC];
++    m3_push_u32(&mut out, toks.len())?;
++    for t in &toks {
++        let (kind, val, text): (u16, i64, &str) = match &t.tok {
++            SurfaceTok::Ident(s) => (M3_TK_IDENT, 0, s.as_str()),
++            SurfaceTok::Int(v) => (M3_TK_INT, *v, ""),
++            SurfaceTok::Trit(s, v) => (M3_TK_TRIT, *v as i64, s.as_str()),
++            SurfaceTok::StrLit(s) => (M3_TK_STR, 0, s.as_str()),
++            SurfaceTok::AtIdent(s) => (M3_TK_AT, 0, s.as_str()),
++            SurfaceTok::Sym(s) => (M3_TK_SYM, 0, s.as_str()),
++            SurfaceTok::Op(s) => (M3_TK_OP, 0, s.as_str()),
++            SurfaceTok::Hash => (M3_TK_HASH, 0, ""),
++        };
++        out.push(kind);
++        m3_push_u32(&mut out, t.line)?;
++        m3_push_u32(&mut out, t.col)?;
++        let uv = val as u64;
++        for k in 0..4 {
++            out.push(((uv >> (16 * k)) & 0xFFFF) as u16);
++        }
++        let bytes = text.as_bytes();
++        if bytes.len() > 0xFFFF {
++            return Err(String::from("fe-dump token text longer than 65535 bytes"));
++        }
++        out.push(bytes.len() as u16);
++        for b in bytes {
++            out.push(*b as u16);
++        }
++    }
++    Ok(out)
++}
++
++/// Canonical dump of `compile_omni_surface_to_u16_with_sourcemap`: (u16 stream, sourcemap words).
++pub fn m3_dump_stream(src: &str, strict: bool) -> Result<(Vec<u16>, Vec<u16>), String> {
++    let (stream, sm) = compile_omni_surface_to_u16_with_sourcemap(src, strict)?;
++    let mut smw = vec![M3_SM_MAGIC];
++    m3_push_u32(&mut smw, sm.offset_to_span.len())?;
++    for (off, (l, c)) in &sm.offset_to_span {
++        m3_push_u32(&mut smw, *off)?;
++        m3_push_u32(&mut smw, *l)?;
++        m3_push_u32(&mut smw, *c)?;
++    }
++    m3_push_u32(&mut smw, sm.budget_span.0)?;
++    m3_push_u32(&mut smw, sm.budget_span.1)?;
++    m3_push_u32(&mut smw, sm.default_span.0)?;
++    m3_push_u32(&mut smw, sm.default_span.1)?;
++    match sm.pack5_span {
++        Some((l, c)) => {
++            smw.push(1);
++            m3_push_u32(&mut smw, l)?;
++            m3_push_u32(&mut smw, c)?;
++        }
++        None => smw.push(0),
++    }
++    Ok((stream, smw))
++}
++
++/// `error[CLASS] line L, col C: ...` -> `CLASS:L:C` (anything else -> `OTHER`).
++pub fn m3_error_key(e: &str) -> String {
++    let class = match (e.find("error["), e.find(']')) {
++        (Some(a), Some(b)) if b > a + 6 => &e[a + 6..b],
++        _ => return String::from("OTHER"),
++    };
++    let num_after = |pat: &str| -> Option<usize> {
++        let i = e.find(pat)? + pat.len();
++        let digits: String = e[i..].chars().take_while(|ch| ch.is_ascii_digit()).collect();
++        digits.parse::<usize>().ok()
++    };
++    match (num_after("line "), num_after("col ")) {
++        (Some(l), Some(c)) => format!("{}:{}:{}", class, l, c),
++        _ => format!("{}:?:?", class),
++    }
++}
++
++fn m3_words_fnv(w: &[u16]) -> String {
++    format!("{}:0x{:016X}", w.len(), fnv1a_64_hash(&encode_u16_stream_to_bytes(w)))
++}
++
++/// The token dump with every line/col zeroed: equal iff kinds, values and texts are equal.
++pub fn m3_strip_token_spans(dump: &[u16]) -> Vec<u16> {
++    let mut out = dump.to_vec();
++    let mut i = 3usize;
++    while i + 10 <= out.len() {
++        for k in 1..5 {
++            out[i + k] = 0;
++        }
++        let n = out[i + 9] as usize;
++        i += 10 + n;
++    }
++    out
++}
++
++/// One lock row: `name<TAB>strict<TAB>tok=..<TAB>out=..`.
++pub fn m3_fe_lock_row(name: &str, src: &str, strict: bool) -> String {
++    let tok = match m3_dump_tokens(src, strict) {
++        Ok(t) => format!("tok={}:tokv={}", m3_words_fnv(&t), m3_words_fnv(&m3_strip_token_spans(&t))),
++        Err(e) => format!("tok=ERR:{}", m3_error_key(&e)),
++    };
++    let out = match m3_dump_stream(src, strict) {
++        Ok((s, sm)) => format!("out={}:sm={}", m3_words_fnv(&s), m3_words_fnv(&sm)),
++        Err(e) => format!("out=ERR:{}", m3_error_key(&e)),
++    };
++    format!("{}\t{}\t{}\t{}", name, if strict { 1 } else { 0 }, tok, out)
++}
++
++/// Every lock row, in manifest order.
++pub fn m3_fe_lock_rows() -> Result<Vec<String>, String> {
++    let mut rows = Vec::new();
++    for key in M3_FE_LOOKUP_CORPUS.iter() {
++        let src = lookup_omni_stdlib_module(key)
++            .ok_or_else(|| format!("M3 lock: missing built-in module '{}'", key))?;
++        rows.push(m3_fe_lock_row(&format!("lookup/{}", key), src, true));
++    }
++    rows.push(m3_fe_lock_row("engine/pure/verifier_engine.omni", crate::verifier::OMNI_VERIFIER_ENGINE_SURFACE, false));
++    for (name, src) in M3_FE_FILE_CORPUS.iter() {
++        rows.push(m3_fe_lock_row(name, src, false));
++    }
++    Ok(rows)
++}
++
++/// M3-01 lock: the Rust frontend's canonical dumps must equal `spec/m3/corpus.tsv` row for row.
++pub fn run_m3_fe_lock_selftests() -> Result<usize, String> {
++    let rows = m3_fe_lock_rows()?;
++    let want: Vec<&str> = M3_FE_LOCK_TSV
++        .lines()
++        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
++        .collect();
++    if want.len() != rows.len() {
++        return Err(format!("M3 frontend lock: {} rows computed, {} locked", rows.len(), want.len()));
++    }
++    for (got, exp) in rows.iter().zip(want.iter()) {
++        if got.as_str() != *exp {
++            return Err(format!("M3 frontend lock mismatch:\n  got  {}\n  want {}", got, exp));
++        }
++    }
++    Ok(rows.len())
++}
++
++/// `fe-dump lock` | `fe-dump tokens|stream <file.omni> <out.bin> [--strict]` (M3-01).
++/// `tokens` writes the canonical token dump; `stream` writes the u16 stream, then
++/// `<out.bin>.sm` with the sourcemap dump. Both as little-endian u16 words.
++/// Includes are resolved the same way as an in-memory compile (built-in modules, then the cwd).
++pub fn run_m3_fe_dump_cli(argv: &[String]) -> i32 {
++    let strict = argv.iter().any(|a| a == "--strict");
++    let rest: Vec<&String> = argv.iter().filter(|a| a.as_str() != "--strict").collect();
++    match rest.first().map(|s| s.as_str()) {
++        Some("lock") => match m3_fe_lock_rows() {
++            Ok(rows) => {
++                println!("# {} lock rows: name, strict, tok=words:fnv1a64:tokv=span-free words:fnv1a64 | ERR:CLASS:line:col, out=words:fnv1a64:sm=words:fnv1a64 | ERR:CLASS:line:col", M3_FE_DUMP_VERSION);
++                for r in rows {
++                    println!("{}", r);
++                }
++                0
++            }
++            Err(e) => {
++                eprintln!("[FE-DUMP FAIL] {}", e);
++                1
++            }
++        },
++        Some(mode @ ("tokens" | "stream")) if rest.len() >= 3 => {
++            let src = match fs::read_to_string(rest[1].as_str()) {
++                Ok(s) => s,
++                Err(e) => {
++                    eprintln!("[FE-DUMP FAIL] cannot read '{}': {}", rest[1], e);
++                    return 1;
++                }
++            };
++            let res = if mode == "tokens" {
++                m3_dump_tokens(&src, strict).map(|t| (t, None))
++            } else {
++                m3_dump_stream(&src, strict).map(|(s, sm)| (s, Some(sm)))
++            };
++            match res {
++                Ok((words, sm)) => {
++                    if let Err(e) = fs::write(rest[2].as_str(), encode_u16_stream_to_bytes(&words)) {
++                        eprintln!("[FE-DUMP FAIL] write: {}", e);
++                        return 1;
++                    }
++                    let mut msg = format!("[FE-DUMP] {} {} words={}", mode, rest[1], m3_words_fnv(&words));
++                    if let Some(smw) = sm {
++                        let p = format!("{}.sm", rest[2]);
++                        if let Err(e) = fs::write(&p, encode_u16_stream_to_bytes(&smw)) {
++                            eprintln!("[FE-DUMP FAIL] write: {}", e);
++                            return 1;
++                        }
++                        msg.push_str(&format!(" sm={}", m3_words_fnv(&smw)));
++                    }
++                    println!("{}", msg);
++                    0
++                }
++                Err(e) => {
++                    println!("[FE-DUMP] {} {} ERR:{}", mode, rest[1], m3_error_key(&e));
++                    1
++                }
++            }
++        }
++        _ => {
++            eprintln!("usage: fe-dump lock | fe-dump (tokens|stream) <file.omni> <out.bin> [--strict]");
++            2
++        }
++    }
++}
++
+ #[cfg(test)]
+ mod if_pos_join_slot_tests {
+     #[test]
+@@ -4047,6 +4367,12 @@ mod if_pos_join_slot_tests {
+         eprintln!("if_pos join-slot checks: {n}");
+     }
+ 
++    #[test]
++    fn m3_fe_lock() {
++        let n = super::run_m3_fe_lock_selftests().expect("M3-01 frontend lock");
++        assert!(n >= 70, "expected at least 70 M3 lock rows, got {n}");
++    }
++
+     #[test]
+     fn byte_readback_parity_vera_p1() {
+         let n = super::run_byte_readback_parity_selftests().expect("Vera P1 byte readback");
+diff --git a/omni-workspace/crates/omni-lang/src/pure_omni/mod.rs b/omni-workspace/crates/omni-lang/src/pure_omni/mod.rs
+index d5ca0c6..d770ec0 100644
+--- a/omni-workspace/crates/omni-lang/src/pure_omni/mod.rs
++++ b/omni-workspace/crates/omni-lang/src/pure_omni/mod.rs
+@@ -2760,6 +2760,9 @@ fn main(x: i64, y: i64) -> i64 {
+     // 13AW. Vera P1 byte-readback sibling (VM + Wasm assert; x86/Stage-1 native run)
+     checks += run_byte_readback_parity_selftests()?;
+ 
++    // 13AX. M3-01 frontend lock: canonical token / stream / sourcemap dumps == spec/m3/corpus.tsv
++    checks += run_m3_fe_lock_selftests()?;
++
+     Ok(checks)
+ }
+ 
+diff --git a/omni_rust_bootstrap.rs b/omni_rust_bootstrap.rs
+index 2049380..0a6c481 100644
+--- a/omni_rust_bootstrap.rs
++++ b/omni_rust_bootstrap.rs
+@@ -5794,6 +5794,326 @@ pub fn execute_omni_surface_wasm_i64(src: &str, args: &[i64]) -> Result<i64, Str
+     execute_wasm_module_i64_with_budgets(&wasm, args, step_b, mem_b)
+ }
+ 
++// ==============================================================================
++// M3-01. CANONICAL FRONTEND DUMPS (`fe-dump`) & THE M3 FRONTEND LOCK
++// ==============================================================================
++// Fixed binary formats the future Omni frontend (`pure/m3/`) is diffed against.
++// Token dump: [M3_TOK_MAGIC, count_lo, count_hi] then per token
++//   [kind, line_lo, line_hi, col_lo, col_hi, v0, v1, v2, v3, nbytes, bytes...]
++//   (v0..v3 = little-endian i64 value: Int value or Trit value, else 0).
++// Sourcemap dump: [M3_SM_MAGIC, n_lo, n_hi] then per entry
++//   [off_lo, off_hi, line_lo, line_hi, col_lo, col_hi], then budget, default and pack5 spans.
++// Errors are compared as `CLASS:line:col` (message text is not part of the lock).
++// The lock covers the closed suite modules (strict, as the suite compiles them), the
++// verifier engine, the acceptance goldens on disk (minus the cwd-dependent
++// `neg_circular_include`) and `spec/m3/fixtures/*.omni` (quirks Q1-Q8).
++
++pub const M3_FE_DUMP_VERSION: &str = "omni-m3-fe-dump-v1";
++pub const M3_TOK_MAGIC: u16 = 0x4D33;
++pub const M3_SM_MAGIC: u16 = 0x4D53;
++pub const M3_TK_IDENT: u16 = 1;
++pub const M3_TK_INT: u16 = 2;
++pub const M3_TK_TRIT: u16 = 3;
++pub const M3_TK_STR: u16 = 4;
++pub const M3_TK_AT: u16 = 5;
++pub const M3_TK_SYM: u16 = 6;
++pub const M3_TK_OP: u16 = 7;
++pub const M3_TK_HASH: u16 = 8;
++
++pub const M3_FE_LOCK_TSV: &str = include_str!("spec/m3/corpus.tsv");
++
++pub const M3_FE_LOOKUP_CORPUS: [&str; 18] = [
++    "std/prelude.omni",
++    "std/math.omni",
++    "std/trit.omni",
++    "std/http.omni",
++    "std/pack5.omni",
++    "std/decision.omni",
++    "std/resource.omni",
++    "pure/compiler.omni",
++    "pure/verifier.omni",
++    "pure/host_runtime.omni",
++    "pure/tooling.omni",
++    "pure/selfhost_suite.omni",
++    "pure/programs/ternary_neural_router.omni",
++    "pure/programs/arena_audit_pipeline.omni",
++    "pure/programs/policy_consensus_engine.omni",
++    "pure/programs/kv_ledger_service.omni",
++    "pure/programs/compiler_self_audit.omni",
++    "pure/programs/pack5_decision_controller.omni",
++];
++
++pub const M3_FE_FILE_CORPUS: &[(&str, &str)] = &[
++    ("golden/arena_lifecycle_golden.omni", include_str!("spec/acceptance/goldens/arena_lifecycle_golden.omni")),
++    ("golden/asm_roundtrip.omni", include_str!("spec/acceptance/goldens/asm_roundtrip.omni")),
++    ("golden/br_neg_arith_golden.omni", include_str!("spec/acceptance/goldens/br_neg_arith_golden.omni")),
++    ("golden/br_pos_golden.omni", include_str!("spec/acceptance/goldens/br_pos_golden.omni")),
++    ("golden/branch_loop_golden.omni", include_str!("spec/acceptance/goldens/branch_loop_golden.omni")),
++    ("golden/byte_buf_golden.omni", include_str!("spec/acceptance/goldens/byte_buf_golden.omni")),
++    ("golden/custom_non_seed_alu.omni", include_str!("spec/acceptance/goldens/custom_non_seed_alu.omni")),
++    ("golden/decision_hook_golden.omni", include_str!("spec/acceptance/goldens/decision_hook_golden.omni")),
++    ("golden/iabs_golden.omni", include_str!("spec/acceptance/goldens/iabs_golden.omni")),
++    ("golden/idiv_zero.omni", include_str!("spec/acceptance/goldens/idiv_zero.omni")),
++    ("golden/match_trit_golden.omni", include_str!("spec/acceptance/goldens/match_trit_golden.omni")),
++    ("golden/multi_fn_weighted_term.omni", include_str!("spec/acceptance/goldens/multi_fn_weighted_term.omni")),
++    ("golden/neg_ambiguous_grammar.omni", include_str!("spec/acceptance/goldens/neg_ambiguous_grammar.omni")),
++    ("golden/neg_arity_mismatch.omni", include_str!("spec/acceptance/goldens/neg_arity_mismatch.omni")),
++    ("golden/neg_bad_type.omni", include_str!("spec/acceptance/goldens/neg_bad_type.omni")),
++    ("golden/neg_borrow_conflict.omni", include_str!("spec/acceptance/goldens/neg_borrow_conflict.omni")),
++    ("golden/neg_budget_exceeded.omni", include_str!("spec/acceptance/goldens/neg_budget_exceeded.omni")),
++    ("golden/neg_corrupt_pack5.omni", include_str!("spec/acceptance/goldens/neg_corrupt_pack5.omni")),
++    ("golden/neg_immut_param.omni", include_str!("spec/acceptance/goldens/neg_immut_param.omni")),
++    ("golden/neg_linear_leak.omni", include_str!("spec/acceptance/goldens/neg_linear_leak.omni")),
++    ("golden/neg_missing_cap.omni", include_str!("spec/acceptance/goldens/neg_missing_cap.omni")),
++    ("golden/neg_syntax_error.omni", include_str!("spec/acceptance/goldens/neg_syntax_error.omni")),
++    ("golden/neg_taint_on_ret.omni", include_str!("spec/acceptance/goldens/neg_taint_on_ret.omni")),
++    ("golden/neg_taint_sink.omni", include_str!("spec/acceptance/goldens/neg_taint_sink.omni")),
++    ("golden/neg_undef_var.omni", include_str!("spec/acceptance/goldens/neg_undef_var.omni")),
++    ("golden/neg_unknown_fn.omni", include_str!("spec/acceptance/goldens/neg_unknown_fn.omni")),
++    ("golden/neg_unresolved_label.omni", include_str!("spec/acceptance/goldens/neg_unresolved_label.omni")),
++    ("golden/nested_branch_golden.omni", include_str!("spec/acceptance/goldens/nested_branch_golden.omni")),
++    ("golden/pack5_direct_aot.omni", include_str!("spec/acceptance/goldens/pack5_direct_aot.omni")),
++    ("golden/pack5_trit_vec_golden.omni", include_str!("spec/acceptance/goldens/pack5_trit_vec_golden.omni")),
++    ("golden/route_db_query_golden.omni", include_str!("spec/acceptance/goldens/route_db_query_golden.omni")),
++    ("golden/route_kv_golden.omni", include_str!("spec/acceptance/goldens/route_kv_golden.omni")),
++    ("golden/seed0_risk.omni", include_str!("spec/acceptance/goldens/seed0_risk.omni")),
++    ("golden/seed4_consensus.omni", include_str!("spec/acceptance/goldens/seed4_consensus.omni")),
++    ("golden/seed6_clamp.omni", include_str!("spec/acceptance/goldens/seed6_clamp.omni")),
++    ("golden/sel_mix.omni", include_str!("spec/acceptance/goldens/sel_mix.omni")),
++    ("golden/shl_65.omni", include_str!("spec/acceptance/goldens/shl_65.omni")),
++    ("golden/stdlib_macro_pipeline_golden.omni", include_str!("spec/acceptance/goldens/stdlib_macro_pipeline_golden.omni")),
++    ("golden/while_sum_even_golden.omni", include_str!("spec/acceptance/goldens/while_sum_even_golden.omni")),
++    ("m3fix/q1_nonstrict_control.omni", include_str!("spec/m3/fixtures/q1_nonstrict_control.omni")),
++    ("m3fix/q1_strict_substring.omni", include_str!("spec/m3/fixtures/q1_strict_substring.omni")),
++    ("m3fix/q2_trit_text.omni", include_str!("spec/m3/fixtures/q2_trit_text.omni")),
++    ("m3fix/q3_neg_fold.omni", include_str!("spec/m3/fixtures/q3_neg_fold.omni")),
++    ("m3fix/q4_le_ge.omni", include_str!("spec/m3/fixtures/q4_le_ge.omni")),
++    ("m3fix/q5_macro_after_def.omni", include_str!("spec/m3/fixtures/q5_macro_after_def.omni")),
++    ("m3fix/q5_macro_order.omni", include_str!("spec/m3/fixtures/q5_macro_order.omni")),
++    ("m3fix/q6_include_once.omni", include_str!("spec/m3/fixtures/q6_include_once.omni")),
++    ("m3fix/q6_include_twice.omni", include_str!("spec/m3/fixtures/q6_include_twice.omni")),
++    ("m3fix/q7_fn_ids.omni", include_str!("spec/m3/fixtures/q7_fn_ids.omni")),
++    ("m3fix/q8a_ssa_limit.omni", include_str!("spec/m3/fixtures/q8a_ssa_limit.omni")),
++    ("m3fix/q8b_label_limit.omni", include_str!("spec/m3/fixtures/q8b_label_limit.omni")),
++    ("m3fix/q8c_label_ok.omni", include_str!("spec/m3/fixtures/q8c_label_ok.omni")),
++];
++
++fn m3_push_u32(out: &mut Vec<u16>, v: usize) -> Result<(), String> {
++    if v > u32::MAX as usize {
++        return Err(format!("fe-dump value {} exceeds u32", v));
++    }
++    out.push((v & 0xFFFF) as u16);
++    out.push(((v >> 16) & 0xFFFF) as u16);
++    Ok(())
++}
++
++/// Canonical token dump of `tokenize_omni_surface_inner` (same strictness rule as the compiler).
++pub fn m3_dump_tokens(src: &str, strict: bool) -> Result<Vec<u16>, String> {
++    let effective_strict = strict || src.contains("#[strict]");
++    let toks = tokenize_omni_surface_inner(src, effective_strict)?;
++    let mut out = vec![M3_TOK_MAGIC];
++    m3_push_u32(&mut out, toks.len())?;
++    for t in &toks {
++        let (kind, val, text): (u16, i64, &str) = match &t.tok {
++            SurfaceTok::Ident(s) => (M3_TK_IDENT, 0, s.as_str()),
++            SurfaceTok::Int(v) => (M3_TK_INT, *v, ""),
++            SurfaceTok::Trit(s, v) => (M3_TK_TRIT, *v as i64, s.as_str()),
++            SurfaceTok::StrLit(s) => (M3_TK_STR, 0, s.as_str()),
++            SurfaceTok::AtIdent(s) => (M3_TK_AT, 0, s.as_str()),
++            SurfaceTok::Sym(s) => (M3_TK_SYM, 0, s.as_str()),
++            SurfaceTok::Op(s) => (M3_TK_OP, 0, s.as_str()),
++            SurfaceTok::Hash => (M3_TK_HASH, 0, ""),
++        };
++        out.push(kind);
++        m3_push_u32(&mut out, t.line)?;
++        m3_push_u32(&mut out, t.col)?;
++        let uv = val as u64;
++        for k in 0..4 {
++            out.push(((uv >> (16 * k)) & 0xFFFF) as u16);
++        }
++        let bytes = text.as_bytes();
++        if bytes.len() > 0xFFFF {
++            return Err(String::from("fe-dump token text longer than 65535 bytes"));
++        }
++        out.push(bytes.len() as u16);
++        for b in bytes {
++            out.push(*b as u16);
++        }
++    }
++    Ok(out)
++}
++
++/// Canonical dump of `compile_omni_surface_to_u16_with_sourcemap`: (u16 stream, sourcemap words).
++pub fn m3_dump_stream(src: &str, strict: bool) -> Result<(Vec<u16>, Vec<u16>), String> {
++    let (stream, sm) = compile_omni_surface_to_u16_with_sourcemap(src, strict)?;
++    let mut smw = vec![M3_SM_MAGIC];
++    m3_push_u32(&mut smw, sm.offset_to_span.len())?;
++    for (off, (l, c)) in &sm.offset_to_span {
++        m3_push_u32(&mut smw, *off)?;
++        m3_push_u32(&mut smw, *l)?;
++        m3_push_u32(&mut smw, *c)?;
++    }
++    m3_push_u32(&mut smw, sm.budget_span.0)?;
++    m3_push_u32(&mut smw, sm.budget_span.1)?;
++    m3_push_u32(&mut smw, sm.default_span.0)?;
++    m3_push_u32(&mut smw, sm.default_span.1)?;
++    match sm.pack5_span {
++        Some((l, c)) => {
++            smw.push(1);
++            m3_push_u32(&mut smw, l)?;
++            m3_push_u32(&mut smw, c)?;
++        }
++        None => smw.push(0),
++    }
++    Ok((stream, smw))
++}
++
++/// `error[CLASS] line L, col C: ...` -> `CLASS:L:C` (anything else -> `OTHER`).
++pub fn m3_error_key(e: &str) -> String {
++    let class = match (e.find("error["), e.find(']')) {
++        (Some(a), Some(b)) if b > a + 6 => &e[a + 6..b],
++        _ => return String::from("OTHER"),
++    };
++    let num_after = |pat: &str| -> Option<usize> {
++        let i = e.find(pat)? + pat.len();
++        let digits: String = e[i..].chars().take_while(|ch| ch.is_ascii_digit()).collect();
++        digits.parse::<usize>().ok()
++    };
++    match (num_after("line "), num_after("col ")) {
++        (Some(l), Some(c)) => format!("{}:{}:{}", class, l, c),
++        _ => format!("{}:?:?", class),
++    }
++}
++
++fn m3_words_fnv(w: &[u16]) -> String {
++    format!("{}:0x{:016X}", w.len(), fnv1a_64_hash(&encode_u16_stream_to_bytes(w)))
++}
++
++/// The token dump with every line/col zeroed: equal iff kinds, values and texts are equal.
++pub fn m3_strip_token_spans(dump: &[u16]) -> Vec<u16> {
++    let mut out = dump.to_vec();
++    let mut i = 3usize;
++    while i + 10 <= out.len() {
++        for k in 1..5 {
++            out[i + k] = 0;
++        }
++        let n = out[i + 9] as usize;
++        i += 10 + n;
++    }
++    out
++}
++
++/// One lock row: `name<TAB>strict<TAB>tok=..<TAB>out=..`.
++pub fn m3_fe_lock_row(name: &str, src: &str, strict: bool) -> String {
++    let tok = match m3_dump_tokens(src, strict) {
++        Ok(t) => format!("tok={}:tokv={}", m3_words_fnv(&t), m3_words_fnv(&m3_strip_token_spans(&t))),
++        Err(e) => format!("tok=ERR:{}", m3_error_key(&e)),
++    };
++    let out = match m3_dump_stream(src, strict) {
++        Ok((s, sm)) => format!("out={}:sm={}", m3_words_fnv(&s), m3_words_fnv(&sm)),
++        Err(e) => format!("out=ERR:{}", m3_error_key(&e)),
++    };
++    format!("{}\t{}\t{}\t{}", name, if strict { 1 } else { 0 }, tok, out)
++}
++
++/// Every lock row, in manifest order.
++pub fn m3_fe_lock_rows() -> Result<Vec<String>, String> {
++    let mut rows = Vec::new();
++    for key in M3_FE_LOOKUP_CORPUS.iter() {
++        let src = lookup_omni_stdlib_module(key)
++            .ok_or_else(|| format!("M3 lock: missing built-in module '{}'", key))?;
++        rows.push(m3_fe_lock_row(&format!("lookup/{}", key), src, true));
++    }
++    rows.push(m3_fe_lock_row("engine/pure/verifier_engine.omni", OMNI_VERIFIER_ENGINE_SURFACE, false));
++    for (name, src) in M3_FE_FILE_CORPUS.iter() {
++        rows.push(m3_fe_lock_row(name, src, false));
++    }
++    Ok(rows)
++}
++
++/// M3-01 lock: the Rust frontend's canonical dumps must equal `spec/m3/corpus.tsv` row for row.
++pub fn run_m3_fe_lock_selftests() -> Result<usize, String> {
++    let rows = m3_fe_lock_rows()?;
++    let want: Vec<&str> = M3_FE_LOCK_TSV
++        .lines()
++        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
++        .collect();
++    if want.len() != rows.len() {
++        return Err(format!("M3 frontend lock: {} rows computed, {} locked", rows.len(), want.len()));
++    }
++    for (got, exp) in rows.iter().zip(want.iter()) {
++        if got.as_str() != *exp {
++            return Err(format!("M3 frontend lock mismatch:\n  got  {}\n  want {}", got, exp));
++        }
++    }
++    Ok(rows.len())
++}
++
++/// `fe-dump lock` | `fe-dump tokens|stream <file.omni> <out.bin> [--strict]` (M3-01).
++/// `tokens` writes the canonical token dump; `stream` writes the u16 stream, then
++/// `<out.bin>.sm` with the sourcemap dump. Both as little-endian u16 words.
++/// Includes are resolved the same way as an in-memory compile (built-in modules, then the cwd).
++pub fn run_m3_fe_dump_cli(argv: &[String]) -> i32 {
++    let strict = argv.iter().any(|a| a == "--strict");
++    let rest: Vec<&String> = argv.iter().filter(|a| a.as_str() != "--strict").collect();
++    match rest.first().map(|s| s.as_str()) {
++        Some("lock") => match m3_fe_lock_rows() {
++            Ok(rows) => {
++                println!("# {} lock rows: name, strict, tok=words:fnv1a64:tokv=span-free words:fnv1a64 | ERR:CLASS:line:col, out=words:fnv1a64:sm=words:fnv1a64 | ERR:CLASS:line:col", M3_FE_DUMP_VERSION);
++                for r in rows {
++                    println!("{}", r);
++                }
++                0
++            }
++            Err(e) => {
++                eprintln!("[FE-DUMP FAIL] {}", e);
++                1
++            }
++        },
++        Some(mode @ ("tokens" | "stream")) if rest.len() >= 3 => {
++            let src = match fs::read_to_string(rest[1].as_str()) {
++                Ok(s) => s,
++                Err(e) => {
++                    eprintln!("[FE-DUMP FAIL] cannot read '{}': {}", rest[1], e);
++                    return 1;
++                }
++            };
++            let res = if mode == "tokens" {
++                m3_dump_tokens(&src, strict).map(|t| (t, None))
++            } else {
++                m3_dump_stream(&src, strict).map(|(s, sm)| (s, Some(sm)))
++            };
++            match res {
++                Ok((words, sm)) => {
++                    if let Err(e) = fs::write(rest[2].as_str(), encode_u16_stream_to_bytes(&words)) {
++                        eprintln!("[FE-DUMP FAIL] write: {}", e);
++                        return 1;
++                    }
++                    let mut msg = format!("[FE-DUMP] {} {} words={}", mode, rest[1], m3_words_fnv(&words));
++                    if let Some(smw) = sm {
++                        let p = format!("{}.sm", rest[2]);
++                        if let Err(e) = fs::write(&p, encode_u16_stream_to_bytes(&smw)) {
++                            eprintln!("[FE-DUMP FAIL] write: {}", e);
++                            return 1;
++                        }
++                        msg.push_str(&format!(" sm={}", m3_words_fnv(&smw)));
++                    }
++                    println!("{}", msg);
++                    0
++                }
++                Err(e) => {
++                    println!("[FE-DUMP] {} {} ERR:{}", mode, rest[1], m3_error_key(&e));
++                    1
++                }
++            }
++        }
++        _ => {
++            eprintln!("usage: fe-dump lock | fe-dump (tokens|stream) <file.omni> <out.bin> [--strict]");
++            2
++        }
++    }
++}
++
+ // ==============================================================================
+ // 7C. VERSION-LOCKED MODEL HARNESS (`omni-harness`) & STRUCTURED DIAGNOSTICS
+ // ==============================================================================
+@@ -13194,6 +13514,9 @@ fn main(x: i64, y: i64) -> i64 {
+     // 13AW. Vera P1 byte-readback sibling (VM + Wasm assert; x86/Stage-1 native run)
+     checks += run_byte_readback_parity_selftests()?;
+ 
++    // 13AX. M3-01 frontend lock: canonical token / stream / sourcemap dumps == spec/m3/corpus.tsv
++    checks += run_m3_fe_lock_selftests()?;
++
+     Ok(checks)
+ }
+ 
+@@ -18578,6 +18901,9 @@ fn main() {
+                 );
+                 return;
+             }
++            "fe-dump" | "--fe-dump" => {
++                std::process::exit(run_m3_fe_dump_cli(&cli_args[2..]));
++            }
+             "fixed-point" | "--fixed-point" => {
+                 let s1_u16 = build_step7_stage1_compiler_stream();
+                 let bc_bytes = encode_u16_stream_to_bytes(&s1_u16);

@@ -1,0 +1,1 @@
+fn brn(x: i64) -> i64 { let r = if_neg x { 100 } else { 200 }; return r; }

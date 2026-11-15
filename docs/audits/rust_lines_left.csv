@@ -1,0 +1,25 @@
+scope,subsystem,files,rust_lines_8160842,rust_lines_74a215c,omni_counterpart,status,stays_in_stage0_seed,ported,parity_checked_4_backends,rust_deleted,notes
+workspace,frontend/compiler,omni-lang/src/compiler/mod.rs,3901,3903,"pure/m3/ (planned, milestone3_frontend_design.md); pure/compiler.omni is a 7-fn scalar kernel, not a frontend",not started,no (replaced by committed m3 seed image),no,no,no,"~558 of these lines are embedded .omni string literals (lookup_omni_stdlib_module, compiler/mod.rs:2423-2980 @74a215c)"
+workspace,pure_omni kernels/bootstrap,omni-lang/src/pure_omni/mod.rs,2869,2872,"pure/*.omni + std/*.omni (scalar kernels) and Phase A-D const sources",Rust harness around toy kernels,no,n/a,n/a,no,"Holds the frozen 159/824/14559/19731 checks (pure_omni/mod.rs:1592,1982)"
+workspace,verifier,"omni-lang/src/verifier/mod.rs; omni-verifier/src/lib.rs",1037,1279,pure/verifier_engine.omni (58 fns),ported; lockstep shadow on compile/run/serve at 74a215c,no,yes,partial (77-case differential + lockstep; 4-backend not shown),no,"+242 lines at 74a215c are the lockstep shadow (verifier/mod.rs:578-~720; engine runs on the VM only, verifier/mod.rs:474-500)"
+workspace,assembler/ISA/IR,"omni-assembler/src/lib.rs; omni-isa/src/lib.rs; omni-ir/src/lib.rs",1088,1088,"pure/m2/decode.omni (M2-04, planned); pure/m3/isa.omni + pure/m3/packet.omni (M3-03/04, planned)",not started,ISA table + decoder: yes (VM needs them); assembler: no,no,no,no,
+workspace,VM,"omni-vm/src/lib.rs; omni-lang/src/ternary/mod.rs",712,712,none planned (the VM is the seed),n/a,yes,n/a,n/a,no,
+workspace,AOT x86/Wasm,omni-aot/src/lib.rs,2199,2199,pure/m2/ (M2-11..M2-16 planned),not started,no after M2 (open: Stage-1 legacy stream),no,no,no,"Includes the Stage-1 builder (legacy 16-label exemption)"
+workspace,host runtime + serve/HTTP/DB,omni-lang/src/host/mod.rs,1119,1119,"pure/host_runtime.omni (scalar kernels); full port planned, in core on purpose",toy kernels only,thin syscall/socket shim only,no,no,no,
+workspace,Repair Agent,omni-lang/src/repair_agent/mod.rs,1456,1456,"pure_select_repair_strategy kernel only; full port planned, in core on purpose",toy kernel only,no,no,no,no,
+workspace,CLI,"omni-cli/src/main.rs; omni-cli/src/lib.rs; omni-cli/src/bin/*.rs; omni-lang/src/lib.rs",1331,1331,none yet,not started,thin launcher only,no,no,no,
+workspace,harness/acceptance/inspect,"omni-lang/src/harness/mod.rs; acceptance/mod.rs; inspect/mod.rs",1021,1021,"pure_acceptance_diff_check / pure_inspect_* kernels only",toy kernels only,no (dev/test tooling),no,no,no,
+workspace,WORKSPACE TOTAL,20 files,16733,16980,,,,,,,
+monolith,whole file,omni_rust_bootstrap.rs,18379,18611,"mirror of the workspace + extra ML steps",kept in lockstep with workspace (every Rust change mirrored),no,n/a,n/a,no,"Retiring it is mirror deletion, not porting"
+monolith-detail,ISA table + decoder + assembler,"omni_rust_bootstrap.rs:1-739, 1762-2023",1001,,see workspace row,,,,,,section banners @8160842; approximate
+monolith-detail,verifier (+ engine glue),"omni_rust_bootstrap.rs:740-1039, 11453-12992",1840,,see workspace row,,,,,,
+monolith-detail,VM,omni_rust_bootstrap.rs:1040-1761,722,,,,,,,,
+monolith-detail,frontend/compiler,omni_rust_bootstrap.rs:2024-5795,3772,,,,,,,,
+monolith-detail,harness/acceptance/inspect/selftests,"omni_rust_bootstrap.rs:5796-6052, 8469-9174, 16242-17946",2668,,,,,,,,
+monolith-detail,Repair Agent / agent driver,omni_rust_bootstrap.rs:6053-7489,1437,,,,,,,,
+monolith-detail,host runtime + HTTP/DB,omni_rust_bootstrap.rs:7490-8468,979,,,,,,,,
+monolith-detail,pure_omni phases,omni_rust_bootstrap.rs:9175-11452,2278,,,,,,,,
+monolith-detail,ML steps 2-5 (transpiler/tokenizer/model/GRPO; monolith only),omni_rust_bootstrap.rs:12993-13826,834,,none,,no,,,,
+monolith-detail,AOT x86/Wasm + Stage-1,omni_rust_bootstrap.rs:13827-16241,2415,,,,,,,,
+monolith-detail,CLI main,omni_rust_bootstrap.rs:17947-18379,433,,,,,,,,
+total,ALL RUST,21 files,35112,35591,,,,,,,"85,700 = pre-cleanup count on main at b3d42dd, includes duplicate trees"

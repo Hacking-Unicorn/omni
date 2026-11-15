@@ -1,0 +1,1 @@
+fn tori(x: i64) -> i64 { let a = tor(x, 0 - 3); return a; }

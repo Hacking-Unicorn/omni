@@ -1,0 +1,5 @@
+ omni-workspace/crates/omni-cli/src/main.rs         |  10 +
+ .../crates/omni-lang/src/compiler/mod.rs           | 326 +++++++++++++++++++++
+ .../crates/omni-lang/src/pure_omni/mod.rs          |   3 +
+ omni_rust_bootstrap.rs                             | 326 +++++++++++++++++++++
+ 4 files changed, 665 insertions(+)

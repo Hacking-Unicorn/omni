@@ -1,0 +1,1 @@
+fn mod0b(x: i64) -> i64 { let c = x <=> 5; let r = x % 0; let s = r + 0; return s; }
