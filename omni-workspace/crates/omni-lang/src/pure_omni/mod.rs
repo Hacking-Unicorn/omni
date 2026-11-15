@@ -2760,6 +2760,9 @@ fn main(x: i64, y: i64) -> i64 {
     // 13AW. Vera P1 byte-readback sibling (VM + Wasm assert; x86/Stage-1 native run)
     checks += run_byte_readback_parity_selftests()?;
 
+    // 13AX. 3-op IGET / 4-op ISET patches (VM + Wasm + x86 assert; Stage-1 recorded)
+    checks += run_multibyte_load_parity_selftests()?;
+
     Ok(checks)
 }
 

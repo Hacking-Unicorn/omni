@@ -27,7 +27,10 @@ fn collect_func_pack5_map(func: &BinFunction) -> BTreeMap<u16, (Vec<u8>, usize, 
             0x7F0F => {
                 let is_typed_write = (ins.operands.len() == 3
                     && (ins.operands[1] == BinOperand::ImmInt(-4) || ins.operands[1] == BinOperand::ImmInt(-8)))
-                    || (ins.operands.len() == 4 && ins.operands[1] == BinOperand::ImmInt(-9));
+                    || (ins.operands.len() == 4
+                        && (ins.operands[1] == BinOperand::ImmInt(-9)
+                            || ins.operands[1] == BinOperand::ImmInt(-2)
+                            || ins.operands[1] == BinOperand::ImmInt(-4)));
                 if let Some(d) = ins.dest_reg {
                     if is_typed_write {
                         // Runtime width/patch write: not a compile-time pack5 constant.
@@ -315,6 +318,45 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
                 if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
             }
             0x7F0E => {
+                if ins.operands.len() == 3 {
+                    let width: i32 = match ins.operands[1] {
+                        BinOperand::ImmInt(-2) => 2,
+                        BinOperand::ImmInt(-4) => 4,
+                        BinOperand::ImmInt(-8) => 8,
+                        _ => 0,
+                    };
+                    if width == 0 {
+                        return Err(String::from(
+                            "error[BAD_TYPE]: 3-op IGET mode must be -2, -4, or -8",
+                        ));
+                    }
+                    // rcx = off; bounds: 0 <= off && off+w <= r11 && off+w <= 128KiB
+                    emit_load_op(&mut code, &ins.operands[2], true);
+                    code.extend_from_slice(&[0x48, 0x8D, 0x81]); // lea rax, [rcx+w]
+                    code.extend_from_slice(&width.to_le_bytes());
+                    code.extend_from_slice(&[0x48, 0x83, 0xF9, 0x00]); // cmp rcx, 0
+                    // i16 movsx = 9 bytes, i32 movsxd = 8, i64 mov = 8
+                    let load_len: u8 = match width {
+                        2 => 9,
+                        _ => 8,
+                    };
+                    code.extend_from_slice(&[0x7C, load_len + 15]); // jl oob
+                    code.extend_from_slice(&[0x4C, 0x39, 0xD8, 0x77, load_len + 10]); // cmp rax,r11; ja oob
+                    code.extend_from_slice(&[0x48, 0x3D]);
+                    code.extend_from_slice(&(0x20000i32).to_le_bytes());
+                    code.extend_from_slice(&[0x77, load_len + 2]); // ja oob
+                    match width {
+                        2 => code.extend_from_slice(&[0x48, 0x0F, 0xBF, 0x84, 0x0D, 0x00, 0x00, 0xFE, 0xFF]), // movsx rax, word
+                        4 => code.extend_from_slice(&[0x48, 0x63, 0x84, 0x0D, 0x00, 0x00, 0xFE, 0xFF]), // movsxd rax, dword
+                        _ => code.extend_from_slice(&[0x48, 0x8B, 0x84, 0x0D, 0x00, 0x00, 0xFE, 0xFF]), // mov rax, qword
+                    }
+                    code.extend_from_slice(&[0xEB, 0x02]); // jmp done
+                    code.extend_from_slice(&[0x31, 0xC0]); // oob: xor eax,eax
+                    if let Some(d) = ins.dest_reg {
+                        emit_store_rax(&mut code, d);
+                    }
+                    continue;
+                }
                 if let (Some(BinOperand::Reg(r_arr)), Some(idx_op)) =
                     (ins.operands.first(), ins.operands.get(1))
                 {
@@ -369,6 +411,27 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
                     emit_load_op(&mut code, &ins.operands[2], true);
                     emit_load_op(&mut code, &ins.operands[3], false);
                     code.extend_from_slice(&[0x48, 0x89, 0x84, 0x0D, 0x00, 0x00, 0xFE, 0xFF]);
+                } else if ins.operands.len() == 4
+                    && (ins.operands[1] == BinOperand::ImmInt(-2) || ins.operands[1] == BinOperand::ImmInt(-4))
+                {
+                    let width: i32 = if ins.operands[1] == BinOperand::ImmInt(-2) { 2 } else { 4 };
+                    let store_len: u8 = if width == 2 { 8 } else { 7 };
+                    emit_load_op(&mut code, &ins.operands[3], false); // rax = val
+                    code.extend_from_slice(&[0x48, 0x89, 0xC2]); // mov rdx, rax
+                    emit_load_op(&mut code, &ins.operands[2], true); // rcx = off
+                    code.extend_from_slice(&[0x48, 0x8D, 0x81]);
+                    code.extend_from_slice(&width.to_le_bytes());
+                    code.extend_from_slice(&[0x48, 0x83, 0xF9, 0x00]);
+                    code.extend_from_slice(&[0x7C, store_len + 13]); // jl skip
+                    code.extend_from_slice(&[0x4C, 0x39, 0xD8, 0x77, store_len + 8]);
+                    code.extend_from_slice(&[0x48, 0x3D]);
+                    code.extend_from_slice(&(0x20000i32).to_le_bytes());
+                    code.extend_from_slice(&[0x77, store_len]);
+                    if width == 2 {
+                        code.extend_from_slice(&[0x66, 0x89, 0x94, 0x0D, 0x00, 0x00, 0xFE, 0xFF]); // mov word [rbp+rcx-0x20000], dx
+                    } else {
+                        code.extend_from_slice(&[0x89, 0x94, 0x0D, 0x00, 0x00, 0xFE, 0xFF]); // mov dword [...], edx
+                    }
                 } else {
                     for op_b in &ins.operands[1..] {
                         emit_load_op(&mut code, op_b, false);
@@ -891,6 +954,70 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
             }
             0x7F0E => {
                 let mut handled = false;
+                if ins.operands.len() == 3 {
+                    let width: i64 = match ins.operands[1] {
+                        BinOperand::ImmInt(-2) => 2,
+                        BinOperand::ImmInt(-4) => 4,
+                        BinOperand::ImmInt(-8) => 8,
+                        _ => 0,
+                    };
+                    if width == 0 {
+                        b.extend_from_slice(&[0x42, 0x00]);
+                        emit_wasm_set_dest(b, ins.dest_reg);
+                        handled = true;
+                    } else {
+                    // 3-op IGET always reads the ISET heap and never the pack5 map.
+                    emit_wasm_op(b, &ins.operands[2]);
+                    b.push(0x21);
+                    b.extend(encode_uleb128(scratch0));
+                    // in_bounds = off >= 0 && !(off+w > len) && !(off+w > MEM)
+                    b.push(0x20);
+                    b.extend(encode_uleb128(scratch0));
+                    b.extend_from_slice(&[0x42, 0x00, 0x53, 0x50]); // off >= 0
+                    b.push(0x20);
+                    b.extend(encode_uleb128(scratch0));
+                    b.push(0x42);
+                    b.extend(encode_sleb128(width));
+                    b.push(0x7C);
+                    b.push(0x20);
+                    b.extend(encode_uleb128(buf_len_local));
+                    b.extend_from_slice(&[0x55, 0x50]); // !(off+w > len)
+                    b.push(0x71);
+                    b.push(0x20);
+                    b.extend(encode_uleb128(scratch0));
+                    b.push(0x42);
+                    b.extend(encode_sleb128(width));
+                    b.push(0x7C);
+                    b.push(0x42);
+                    b.extend(encode_sleb128(WASM_ISET_MEMORY_BYTES));
+                    b.extend_from_slice(&[0x55, 0x50]);
+                    b.push(0x71);
+                    b.push(0x21);
+                    b.extend(encode_uleb128(scratch1));
+                    // addr = off * in_bounds (0 when OOB)
+                    b.push(0x20);
+                    b.extend(encode_uleb128(scratch0));
+                    b.push(0x20);
+                    b.extend(encode_uleb128(scratch1));
+                    b.push(0x7E);
+                    b.push(0xA7); // i32.wrap_i64
+                    match width {
+                        2 => b.extend_from_slice(&[0x2F, 0x00, 0x00]), // i32.load16_s
+                        4 => b.extend_from_slice(&[0x28, 0x00, 0x00]), // i32.load
+                        _ => b.extend_from_slice(&[0x29, 0x00, 0x00]), // i64.load
+                    }
+                    if width != 8 {
+                        b.push(0xAC); // i64.extend_i32_s
+                    }
+                    b.extend_from_slice(&[0x42, 0x00]);
+                    b.push(0x20);
+                    b.extend(encode_uleb128(scratch1));
+                    b.push(0x1B); // select loaded vs 0
+                    emit_wasm_set_dest(b, ins.dest_reg);
+                    handled = true;
+                    }
+                }
+                if !handled {
                 if let (Some(BinOperand::Reg(r_arr)), Some(idx_op)) =
                     (ins.operands.first(), ins.operands.get(1))
                 {
@@ -966,6 +1093,7 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
                         emit_wasm_set_dest(b, ins.dest_reg);
                     }
                 }
+                }
             }
             0x7F0F => {
                 let ops = &ins.operands;
@@ -1040,6 +1168,42 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
                     b.push(0x20);
                     b.extend(encode_uleb128(scratch1));
                     b.extend_from_slice(&[0x37, 0x00, 0x00]); // i64.store
+                    b.push(0x0B);
+                } else if ops.len() == 4
+                    && (ops[1] == BinOperand::ImmInt(-2) || ops[1] == BinOperand::ImmInt(-4))
+                {
+                    let width: i64 = if ops[1] == BinOperand::ImmInt(-2) { 2 } else { 4 };
+                    emit_wasm_op(b, &ops[2]);
+                    b.push(0x21);
+                    b.extend(encode_uleb128(scratch0));
+                    emit_wasm_op(b, &ops[3]);
+                    b.push(0x21);
+                    b.extend(encode_uleb128(scratch1));
+                    b.push(0x20);
+                    b.extend(encode_uleb128(scratch0));
+                    b.extend_from_slice(&[0x42, 0x00, 0x53, 0x50]); // off >= 0
+                    b.push(0x20);
+                    b.extend(encode_uleb128(scratch0));
+                    b.push(0x42);
+                    b.extend(encode_sleb128(width));
+                    b.push(0x7C);
+                    b.push(0x20);
+                    b.extend(encode_uleb128(buf_len_local));
+                    b.extend_from_slice(&[0x55, 0x50]);
+                    b.push(0x71);
+                    b.extend_from_slice(&[0x04, 0x40]);
+                    b.push(0x20);
+                    b.extend(encode_uleb128(scratch0));
+                    b.push(0xA7);
+                    b.push(0x20);
+                    b.extend(encode_uleb128(scratch1));
+                    if width == 2 {
+                        b.push(0xA7);
+                        b.extend_from_slice(&[0x3B, 0x00, 0x00]); // i32.store16
+                    } else {
+                        b.push(0xA7);
+                        b.extend_from_slice(&[0x36, 0x00, 0x00]); // i32.store
+                    }
                     b.push(0x0B);
                 } else {
                     for op_b in &ops[1..] {
@@ -1655,10 +1819,14 @@ pub fn execute_wasm_module_i64_with_budgets(
                 let a = stack.pop().ok_or("Wasm stack underflow on i64.extend_i32_u")?;
                 stack.push((a as u32) as i64);
             }
-            0x2D | 0x28 | 0x29 | 0x36 | 0x37 | 0x3A => {
+            0xAC => {
+                let a = stack.pop().ok_or("Wasm stack underflow on i64.extend_i32_s")?;
+                stack.push(a as i32 as i64);
+            }
+            0x2D | 0x2F | 0x28 | 0x29 | 0x36 | 0x37 | 0x3A | 0x3B => {
                 let _align = decode_uleb128(body, &mut bpos)?;
                 let offset = decode_uleb128(body, &mut bpos)?;
-                let is_store = matches!(op, 0x36 | 0x37 | 0x3A);
+                let is_store = matches!(op, 0x36 | 0x37 | 0x3A | 0x3B);
                 let val = if is_store {
                     stack.pop().ok_or("Wasm stack underflow on store value")?
                 } else {
@@ -1668,6 +1836,7 @@ pub fn execute_wasm_module_i64_with_budgets(
                 let addr = (addr_i as u32 as u64).saturating_add(offset as u64) as usize;
                 let width: usize = match op {
                     0x2D | 0x3A => 1,
+                    0x2F | 0x3B => 2,
                     0x28 | 0x36 => 4,
                     _ => 8,
                 };
@@ -1680,6 +1849,7 @@ pub fn execute_wasm_module_i64_with_budgets(
                     }
                     match op {
                         0x3A => memory[addr] = val as u8,
+                        0x3B => memory[addr..addr + 2].copy_from_slice(&(val as u16).to_le_bytes()),
                         0x36 => memory[addr..addr + 4].copy_from_slice(&(val as u32).to_le_bytes()),
                         _ => memory[addr..addr + 8].copy_from_slice(&(val as u64).to_le_bytes()),
                     }
@@ -1688,6 +1858,7 @@ pub fn execute_wasm_module_i64_with_budgets(
                 } else {
                     let loaded = match op {
                         0x2D => memory[addr] as i64,
+                        0x2F => i16::from_le_bytes(memory[addr..addr + 2].try_into().unwrap()) as i64,
                         0x28 => i32::from_le_bytes(memory[addr..addr + 4].try_into().unwrap()) as i64,
                         _ => i64::from_le_bytes(memory[addr..addr + 8].try_into().unwrap()),
                     };

@@ -1286,6 +1286,29 @@ impl OmniBinaryVm {
                     OmniValue::Bytes(Vec::with_capacity(64))
                 }
                 0x7F0E => {
+                    if ins.operands.len() == 3 {
+                        let width = match ins.operands[1] {
+                            BinOperand::ImmInt(-2) => 2usize,
+                            BinOperand::ImmInt(-4) => 4usize,
+                            BinOperand::ImmInt(-8) => 8usize,
+                            _ => 0,
+                        };
+                        let off = Self::eval_as_i64(&ins.operands[2], &regs).unwrap_or(-1);
+                        match Self::eval_op(&ins.operands[0], &regs) {
+                            OmniValue::Bytes(buf)
+                                if width > 0 && off >= 0 && (off as usize).saturating_add(width) <= buf.len() =>
+                            {
+                                let o = off as usize;
+                                let v = match width {
+                                    2 => i16::from_le_bytes(buf[o..o + 2].try_into().unwrap()) as i64,
+                                    4 => i32::from_le_bytes(buf[o..o + 4].try_into().unwrap()) as i64,
+                                    _ => i64::from_le_bytes(buf[o..o + 8].try_into().unwrap()),
+                                };
+                                OmniValue::Int(v)
+                            }
+                            _ => OmniValue::Int(0),
+                        }
+                    } else {
                     let arr_val = Self::eval_op(&ins.operands[0], &regs);
                     let idx_val = Self::eval_op(&ins.operands[1], &regs);
                     match (arr_val, idx_val) {
@@ -1300,6 +1323,7 @@ impl OmniBinaryVm {
                             OmniValue::Int(pack5_get_trit(&packed, i as usize).map_err(String::from)? as i64)
                         }
                         _ => OmniValue::Int(0),
+                    }
                     }
                 }
                 0x7F0F => {
@@ -1324,6 +1348,25 @@ impl OmniBinaryVm {
                             let u_off = off as usize;
                             if u_off + 8 <= buf.len() {
                                 buf[u_off..u_off + 8].copy_from_slice(&(v as u64).to_le_bytes());
+                            }
+                        }
+                    } else if ins.operands.len() == 4
+                        && (ins.operands[1] == BinOperand::ImmInt(-2) || ins.operands[1] == BinOperand::ImmInt(-4))
+                    {
+                        let width = if ins.operands[1] == BinOperand::ImmInt(-2) { 2usize } else { 4usize };
+                        if let (Some(off), Some(v)) = (
+                            Self::eval_as_i64(&ins.operands[2], &regs),
+                            Self::eval_as_i64(&ins.operands[3], &regs),
+                        ) {
+                            if off >= 0 {
+                                let u_off = off as usize;
+                                if u_off.saturating_add(width) <= buf.len() {
+                                    if width == 2 {
+                                        buf[u_off..u_off + 2].copy_from_slice(&(v as i16).to_le_bytes());
+                                    } else {
+                                        buf[u_off..u_off + 4].copy_from_slice(&(v as i32).to_le_bytes());
+                                    }
+                                }
                             }
                         }
                     } else {
@@ -3930,6 +3973,51 @@ impl SurfaceLowerCtx {
                 }
                 let m = if low == "sel_trit" { "SEL_TRIT" } else { "CMOV" };
                 Ok(format!("{} {} {} {} {}", m, op_args[0], op_args[1], op_args[2], op_args[3]))
+            }
+            "ld_i16" => {
+                if op_args.len() != 2 {
+                    return Err(format!(
+                        "error[ARITY_MISMATCH] line {}, col {}: Intrinsic 'ld_i16' expects 2 arguments, got {}",
+                        line, col, op_args.len()
+                    ));
+                }
+                Ok(format!("IGET {} -2 {}", op_args[0], op_args[1]))
+            }
+            "ld_i32" => {
+                if op_args.len() != 2 {
+                    return Err(format!(
+                        "error[ARITY_MISMATCH] line {}, col {}: Intrinsic 'ld_i32' expects 2 arguments, got {}",
+                        line, col, op_args.len()
+                    ));
+                }
+                Ok(format!("IGET {} -4 {}", op_args[0], op_args[1]))
+            }
+            "ld_i64" => {
+                if op_args.len() != 2 {
+                    return Err(format!(
+                        "error[ARITY_MISMATCH] line {}, col {}: Intrinsic 'ld_i64' expects 2 arguments, got {}",
+                        line, col, op_args.len()
+                    ));
+                }
+                Ok(format!("IGET {} -8 {}", op_args[0], op_args[1]))
+            }
+            "st_i16" => {
+                if op_args.len() != 3 {
+                    return Err(format!(
+                        "error[ARITY_MISMATCH] line {}, col {}: Intrinsic 'st_i16' expects 3 arguments, got {}",
+                        line, col, op_args.len()
+                    ));
+                }
+                Ok(format!("ISET {} -2 {} {}", op_args[0], op_args[1], op_args[2]))
+            }
+            "st_i32" => {
+                if op_args.len() != 3 {
+                    return Err(format!(
+                        "error[ARITY_MISMATCH] line {}, col {}: Intrinsic 'st_i32' expects 3 arguments, got {}",
+                        line, col, op_args.len()
+                    ));
+                }
+                Ok(format!("ISET {} -4 {} {}", op_args[0], op_args[1], op_args[2]))
             }
             "iset_i32" => {
                 if op_args.len() != 2 {
@@ -11998,6 +12086,7 @@ pub fn run_verifier_engine_diff_selftests() -> Result<usize, String> {
         ("sql_taint", "#[cap(DB_R)] fn main(id: i64 @untrusted) -> i64 { let r = db_query(\"SELECT * FROM users WHERE id = ?\", id); return r; }"),
         ("uncalled_tainted_helper", "fn bad_helper(u: i64 @untrusted) -> i64 { return u; }\nfn main(x: i64) -> i64 { return x + 1; }"),
         ("ok_bytes", "fn main(x: i64) -> i64 { let b: bytes = anew(0); b = iset(b, 1); let n: i64 = slen(b); return n + x; }"),
+        ("ok_multibyte_ld", "fn main(x: i64) -> i64 { let b: bytes = anew(0); b = iset_i32(b, x); b = st_i16(b, 0, x); let v: i64 = ld_i32(b, 0); return v; }"),
     ];
     for &(name, src) in surfaces {
         match compile_omni_surface_to_u16(src) {
@@ -12367,6 +12456,155 @@ pub fn run_byte_readback_parity_selftests() -> Result<usize, String> {
     {
         eprintln!(
             "Vera P1 x={BYTE_READBACK_X}: VM={BYTE_READBACK_EXPECTED} Wasm={wasm_got} x86=skipped Stage-1=skipped"
+        );
+    }
+    Ok(checks)
+}
+
+
+/// 3-op IGET (`ld_i16`/`ld_i32`/`ld_i64`) and 4-op ISET patches (`st_i16`/`st_i32`)
+/// must read/write the ISET heap with strict bounds, bypass pack5, and sign-extend
+/// narrow loads. Asserted on VM, Wasm, and native x86. Stage-1 is executed and
+/// recorded but not required to match: its frozen IGET/ISET handlers always emit
+/// the 2-op token-region load / 3-op append / -9 patch shapes, and teaching it
+/// the new forms would move `0x677F57AE71D28FED` / `0xEAFC81F46B482FF8`.
+pub const MULTIBYTE_LOAD_SRC: &str = "fn multibyte_load_golden(x: i64) -> i64 { let buf = anew(0); buf = iset(buf, 10, 20, 30, 40, 50, 60, 70, 80); buf = iset_i32(buf, 0 - 2); buf = iset_i64(buf, x); buf = st_i16(buf, 0, 0 - 300); buf = st_i32(buf, 4, 305419896); let a = ld_i16(buf, 0); let b = ld_i32(buf, 4); let c = ld_i32(buf, 8); let d = ld_i64(buf, 12); let e = ld_i16(buf, 100); buf = st_i16(buf, 100, 99); let n = slen(buf); let r = (((((n * 10000 + (a + 1000)) * 10 + (b - 305419896)) * 10 + (c + 2)) * 10 + d) * 10 + e) * 100 + n; return r; }";
+pub const MULTIBYTE_LOAD_X: i64 = 7;
+pub const MULTIBYTE_LOAD_EXPECTED: i64 = 200700007020;
+
+fn stream_has_redefined_iset_iget_shapes(stream: &[u16], name: &str) -> Result<(), String> {
+    let module = decode_omni_token_stream(stream)?;
+    for (fi, func) in module.functions.iter().enumerate() {
+        for (ii, ins) in func.instructions.iter().enumerate() {
+            if ins.op_tok == 0x7F0E && ins.operands.len() == 3 {
+                return Err(format!(
+                    "frozen stream '{name}' fn {fi} ins {ii} has 3-op IGET (new shape must not appear in locked streams)"
+                ));
+            }
+            if ins.op_tok == 0x7F0F
+                && ins.operands.len() == 4
+                && (ins.operands[1] == BinOperand::ImmInt(-2) || ins.operands[1] == BinOperand::ImmInt(-4))
+            {
+                return Err(format!(
+                    "frozen stream '{name}' fn {fi} ins {ii} has 4-op ISET -2/-4 (new patch shape must not appear in locked streams)"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Pin 3-op IGET / 4-op ISET patch semantics and prove frozen streams do not use them.
+pub fn run_multibyte_load_parity_selftests() -> Result<usize, String> {
+    let mut checks = 0usize;
+
+    let buf_stream = compile_omni_surface_to_u16(BYTE_BUF_GOLDEN_SRC)
+        .map_err(|e| format!("byte_buf_golden failed to compile: {e}"))?;
+    if buf_stream.len() != BYTE_BUF_GOLDEN_LOCKED_TOKENS {
+        return Err(format!(
+            "byte_buf_golden token count {} != locked {}",
+            buf_stream.len(),
+            BYTE_BUF_GOLDEN_LOCKED_TOKENS
+        ));
+    }
+    checks += 1;
+    stream_has_redefined_iset_iget_shapes(&buf_stream, "byte_buf_golden")?;
+    checks += 1;
+
+    let stage1 = build_step7_stage1_compiler_stream();
+    stream_has_redefined_iset_iget_shapes(&stage1, "build_step7_stage1_compiler_stream")?;
+    checks += 1;
+
+    let stream = compile_omni_surface_to_u16(MULTIBYTE_LOAD_SRC)
+        .map_err(|e| format!("multibyte_load_golden failed to compile: {e}"))?;
+    for rep in verify_u16_stream(&stream)? {
+        if !rep.passed {
+            return Err(format!(
+                "multibyte_load_golden failed binary verify (fn #{}): {:?}",
+                rep.fn_idx, rep.errors
+            ));
+        }
+    }
+    checks += 1;
+
+    let module = decode_omni_token_stream(&stream)?;
+    let mut saw_3op_iget = 0usize;
+    let mut saw_4op_iset = 0usize;
+    for func in &module.functions {
+        for ins in &func.instructions {
+            if ins.op_tok == 0x7F0E && ins.operands.len() == 3 {
+                saw_3op_iget += 1;
+            }
+            if ins.op_tok == 0x7F0F
+                && ins.operands.len() == 4
+                && (ins.operands[1] == BinOperand::ImmInt(-2) || ins.operands[1] == BinOperand::ImmInt(-4))
+            {
+                saw_4op_iset += 1;
+            }
+        }
+    }
+    if saw_3op_iget < 5 || saw_4op_iset < 3 {
+        return Err(format!(
+            "multibyte_load_golden lowering missing new shapes: 3-op IGET={saw_3op_iget} 4-op ISET -2/-4={saw_4op_iset}"
+        ));
+    }
+    checks += 1;
+
+    let mut vm = OmniBinaryVm::new();
+    let vm_got = vm.execute_function(&module, 0, vec![OmniValue::Int(MULTIBYTE_LOAD_X)])?;
+    if vm_got != OmniValue::Int(MULTIBYTE_LOAD_EXPECTED) {
+        return Err(format!(
+            "multibyte load VM x={MULTIBYTE_LOAD_X} got {vm_got:?} want {MULTIBYTE_LOAD_EXPECTED}"
+        ));
+    }
+    checks += 1;
+
+    let wasm_got = execute_omni_surface_wasm_i64(MULTIBYTE_LOAD_SRC, &[MULTIBYTE_LOAD_X])?;
+    if wasm_got != MULTIBYTE_LOAD_EXPECTED {
+        return Err(format!(
+            "multibyte load Wasm x={MULTIBYTE_LOAD_X} got {wasm_got} want {MULTIBYTE_LOAD_EXPECTED}"
+        ));
+    }
+    checks += 1;
+
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    {
+        let elf = compile_omni_surface_to_x86_64_elf(MULTIBYTE_LOAD_SRC, MULTIBYTE_LOAD_X, 0, 0)?;
+        let x86_got = execute_native_elf_i64(&elf, &[MULTIBYTE_LOAD_X])?;
+        if x86_got != MULTIBYTE_LOAD_EXPECTED {
+            return Err(format!(
+                "multibyte load x86-64 x={MULTIBYTE_LOAD_X} got {x86_got} want {MULTIBYTE_LOAD_EXPECTED}"
+            ));
+        }
+        checks += 1;
+
+        match compile_omni_surface_via_stage1_to_elf(MULTIBYTE_LOAD_SRC, MULTIBYTE_LOAD_X, 0, 0) {
+            Ok(s1_elf) => match execute_native_elf_i64(&s1_elf, &[MULTIBYTE_LOAD_X]) {
+                Ok(s1_got) => {
+                    eprintln!(
+                        "multibyte load x={MULTIBYTE_LOAD_X}: VM={MULTIBYTE_LOAD_EXPECTED} Wasm={wasm_got} x86={x86_got} Stage-1={s1_got} (Stage-1 not required to match; frozen IGET/ISET handlers)"
+                    );
+                    checks += 1;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "multibyte load x={MULTIBYTE_LOAD_X}: VM={MULTIBYTE_LOAD_EXPECTED} Wasm={wasm_got} x86={x86_got} Stage-1=failed ({e}) (expected until the Stage-1 image is allowed to move)"
+                    );
+                    checks += 1;
+                }
+            },
+            Err(e) => {
+                eprintln!(
+                    "multibyte load x={MULTIBYTE_LOAD_X}: VM={MULTIBYTE_LOAD_EXPECTED} Wasm={wasm_got} x86={x86_got} Stage-1=compile-failed ({e}) (expected until the Stage-1 image is allowed to move)"
+                );
+                checks += 1;
+            }
+        }
+    }
+    #[cfg(not(all(unix, target_arch = "x86_64")))]
+    {
+        eprintln!(
+            "multibyte load x={MULTIBYTE_LOAD_X}: VM={MULTIBYTE_LOAD_EXPECTED} Wasm={wasm_got} x86=skipped Stage-1=skipped"
         );
     }
     Ok(checks)
@@ -13193,6 +13431,9 @@ fn main(x: i64, y: i64) -> i64 {
 
     // 13AW. Vera P1 byte-readback sibling (VM + Wasm assert; x86/Stage-1 native run)
     checks += run_byte_readback_parity_selftests()?;
+
+    // 13AX. 3-op IGET / 4-op ISET patches (VM + Wasm + x86 assert; Stage-1 recorded)
+    checks += run_multibyte_load_parity_selftests()?;
 
     Ok(checks)
 }
@@ -14226,7 +14467,10 @@ fn collect_func_pack5_map(func: &BinFunction) -> BTreeMap<u16, (Vec<u8>, usize, 
             0x7F0F => {
                 let is_typed_write = (ins.operands.len() == 3
                     && (ins.operands[1] == BinOperand::ImmInt(-4) || ins.operands[1] == BinOperand::ImmInt(-8)))
-                    || (ins.operands.len() == 4 && ins.operands[1] == BinOperand::ImmInt(-9));
+                    || (ins.operands.len() == 4
+                        && (ins.operands[1] == BinOperand::ImmInt(-9)
+                            || ins.operands[1] == BinOperand::ImmInt(-2)
+                            || ins.operands[1] == BinOperand::ImmInt(-4)));
                 if let Some(d) = ins.dest_reg {
                     if is_typed_write {
                         // Runtime width/patch write: not a compile-time pack5 constant.
@@ -14528,6 +14772,45 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
                 if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
             }
             0x7F0E => {
+                if ins.operands.len() == 3 {
+                    let width: i32 = match ins.operands[1] {
+                        BinOperand::ImmInt(-2) => 2,
+                        BinOperand::ImmInt(-4) => 4,
+                        BinOperand::ImmInt(-8) => 8,
+                        _ => 0,
+                    };
+                    if width == 0 {
+                        return Err(String::from(
+                            "error[BAD_TYPE]: 3-op IGET mode must be -2, -4, or -8",
+                        ));
+                    }
+                    // rcx = off; bounds: 0 <= off && off+w <= r11 && off+w <= 128KiB
+                    emit_load_op(&mut code, &ins.operands[2], true);
+                    code.extend_from_slice(&[0x48, 0x8D, 0x81]); // lea rax, [rcx+w]
+                    code.extend_from_slice(&width.to_le_bytes());
+                    code.extend_from_slice(&[0x48, 0x83, 0xF9, 0x00]); // cmp rcx, 0
+                    // i16 movsx = 9 bytes, i32 movsxd = 8, i64 mov = 8
+                    let load_len: u8 = match width {
+                        2 => 9,
+                        _ => 8,
+                    };
+                    code.extend_from_slice(&[0x7C, load_len + 15]); // jl oob
+                    code.extend_from_slice(&[0x4C, 0x39, 0xD8, 0x77, load_len + 10]); // cmp rax,r11; ja oob
+                    code.extend_from_slice(&[0x48, 0x3D]);
+                    code.extend_from_slice(&(0x20000i32).to_le_bytes());
+                    code.extend_from_slice(&[0x77, load_len + 2]); // ja oob
+                    match width {
+                        2 => code.extend_from_slice(&[0x48, 0x0F, 0xBF, 0x84, 0x0D, 0x00, 0x00, 0xFE, 0xFF]), // movsx rax, word
+                        4 => code.extend_from_slice(&[0x48, 0x63, 0x84, 0x0D, 0x00, 0x00, 0xFE, 0xFF]), // movsxd rax, dword
+                        _ => code.extend_from_slice(&[0x48, 0x8B, 0x84, 0x0D, 0x00, 0x00, 0xFE, 0xFF]), // mov rax, qword
+                    }
+                    code.extend_from_slice(&[0xEB, 0x02]); // jmp done
+                    code.extend_from_slice(&[0x31, 0xC0]); // oob: xor eax,eax
+                    if let Some(d) = ins.dest_reg {
+                        emit_store_rax(&mut code, d);
+                    }
+                    continue;
+                }
                 if let (Some(BinOperand::Reg(r_arr)), Some(idx_op)) =
                     (ins.operands.first(), ins.operands.get(1))
                 {
@@ -14582,6 +14865,27 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
                     emit_load_op(&mut code, &ins.operands[2], true);
                     emit_load_op(&mut code, &ins.operands[3], false);
                     code.extend_from_slice(&[0x48, 0x89, 0x84, 0x0D, 0x00, 0x00, 0xFE, 0xFF]);
+                } else if ins.operands.len() == 4
+                    && (ins.operands[1] == BinOperand::ImmInt(-2) || ins.operands[1] == BinOperand::ImmInt(-4))
+                {
+                    let width: i32 = if ins.operands[1] == BinOperand::ImmInt(-2) { 2 } else { 4 };
+                    let store_len: u8 = if width == 2 { 8 } else { 7 };
+                    emit_load_op(&mut code, &ins.operands[3], false); // rax = val
+                    code.extend_from_slice(&[0x48, 0x89, 0xC2]); // mov rdx, rax
+                    emit_load_op(&mut code, &ins.operands[2], true); // rcx = off
+                    code.extend_from_slice(&[0x48, 0x8D, 0x81]);
+                    code.extend_from_slice(&width.to_le_bytes());
+                    code.extend_from_slice(&[0x48, 0x83, 0xF9, 0x00]);
+                    code.extend_from_slice(&[0x7C, store_len + 13]); // jl skip
+                    code.extend_from_slice(&[0x4C, 0x39, 0xD8, 0x77, store_len + 8]);
+                    code.extend_from_slice(&[0x48, 0x3D]);
+                    code.extend_from_slice(&(0x20000i32).to_le_bytes());
+                    code.extend_from_slice(&[0x77, store_len]);
+                    if width == 2 {
+                        code.extend_from_slice(&[0x66, 0x89, 0x94, 0x0D, 0x00, 0x00, 0xFE, 0xFF]); // mov word [rbp+rcx-0x20000], dx
+                    } else {
+                        code.extend_from_slice(&[0x89, 0x94, 0x0D, 0x00, 0x00, 0xFE, 0xFF]); // mov dword [...], edx
+                    }
                 } else {
                     for op_b in &ins.operands[1..] {
                         emit_load_op(&mut code, op_b, false);
@@ -15104,6 +15408,70 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
             }
             0x7F0E => {
                 let mut handled = false;
+                if ins.operands.len() == 3 {
+                    let width: i64 = match ins.operands[1] {
+                        BinOperand::ImmInt(-2) => 2,
+                        BinOperand::ImmInt(-4) => 4,
+                        BinOperand::ImmInt(-8) => 8,
+                        _ => 0,
+                    };
+                    if width == 0 {
+                        b.extend_from_slice(&[0x42, 0x00]);
+                        emit_wasm_set_dest(b, ins.dest_reg);
+                        handled = true;
+                    } else {
+                    // 3-op IGET always reads the ISET heap and never the pack5 map.
+                    emit_wasm_op(b, &ins.operands[2]);
+                    b.push(0x21);
+                    b.extend(encode_uleb128(scratch0));
+                    // in_bounds = off >= 0 && !(off+w > len) && !(off+w > MEM)
+                    b.push(0x20);
+                    b.extend(encode_uleb128(scratch0));
+                    b.extend_from_slice(&[0x42, 0x00, 0x53, 0x50]); // off >= 0
+                    b.push(0x20);
+                    b.extend(encode_uleb128(scratch0));
+                    b.push(0x42);
+                    b.extend(encode_sleb128(width));
+                    b.push(0x7C);
+                    b.push(0x20);
+                    b.extend(encode_uleb128(buf_len_local));
+                    b.extend_from_slice(&[0x55, 0x50]); // !(off+w > len)
+                    b.push(0x71);
+                    b.push(0x20);
+                    b.extend(encode_uleb128(scratch0));
+                    b.push(0x42);
+                    b.extend(encode_sleb128(width));
+                    b.push(0x7C);
+                    b.push(0x42);
+                    b.extend(encode_sleb128(WASM_ISET_MEMORY_BYTES));
+                    b.extend_from_slice(&[0x55, 0x50]);
+                    b.push(0x71);
+                    b.push(0x21);
+                    b.extend(encode_uleb128(scratch1));
+                    // addr = off * in_bounds (0 when OOB)
+                    b.push(0x20);
+                    b.extend(encode_uleb128(scratch0));
+                    b.push(0x20);
+                    b.extend(encode_uleb128(scratch1));
+                    b.push(0x7E);
+                    b.push(0xA7); // i32.wrap_i64
+                    match width {
+                        2 => b.extend_from_slice(&[0x2F, 0x00, 0x00]), // i32.load16_s
+                        4 => b.extend_from_slice(&[0x28, 0x00, 0x00]), // i32.load
+                        _ => b.extend_from_slice(&[0x29, 0x00, 0x00]), // i64.load
+                    }
+                    if width != 8 {
+                        b.push(0xAC); // i64.extend_i32_s
+                    }
+                    b.extend_from_slice(&[0x42, 0x00]);
+                    b.push(0x20);
+                    b.extend(encode_uleb128(scratch1));
+                    b.push(0x1B); // select loaded vs 0
+                    emit_wasm_set_dest(b, ins.dest_reg);
+                    handled = true;
+                    }
+                }
+                if !handled {
                 if let (Some(BinOperand::Reg(r_arr)), Some(idx_op)) =
                     (ins.operands.first(), ins.operands.get(1))
                 {
@@ -15179,6 +15547,7 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
                         emit_wasm_set_dest(b, ins.dest_reg);
                     }
                 }
+                }
             }
             0x7F0F => {
                 let ops = &ins.operands;
@@ -15253,6 +15622,42 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
                     b.push(0x20);
                     b.extend(encode_uleb128(scratch1));
                     b.extend_from_slice(&[0x37, 0x00, 0x00]); // i64.store
+                    b.push(0x0B);
+                } else if ops.len() == 4
+                    && (ops[1] == BinOperand::ImmInt(-2) || ops[1] == BinOperand::ImmInt(-4))
+                {
+                    let width: i64 = if ops[1] == BinOperand::ImmInt(-2) { 2 } else { 4 };
+                    emit_wasm_op(b, &ops[2]);
+                    b.push(0x21);
+                    b.extend(encode_uleb128(scratch0));
+                    emit_wasm_op(b, &ops[3]);
+                    b.push(0x21);
+                    b.extend(encode_uleb128(scratch1));
+                    b.push(0x20);
+                    b.extend(encode_uleb128(scratch0));
+                    b.extend_from_slice(&[0x42, 0x00, 0x53, 0x50]); // off >= 0
+                    b.push(0x20);
+                    b.extend(encode_uleb128(scratch0));
+                    b.push(0x42);
+                    b.extend(encode_sleb128(width));
+                    b.push(0x7C);
+                    b.push(0x20);
+                    b.extend(encode_uleb128(buf_len_local));
+                    b.extend_from_slice(&[0x55, 0x50]);
+                    b.push(0x71);
+                    b.extend_from_slice(&[0x04, 0x40]);
+                    b.push(0x20);
+                    b.extend(encode_uleb128(scratch0));
+                    b.push(0xA7);
+                    b.push(0x20);
+                    b.extend(encode_uleb128(scratch1));
+                    if width == 2 {
+                        b.push(0xA7);
+                        b.extend_from_slice(&[0x3B, 0x00, 0x00]); // i32.store16
+                    } else {
+                        b.push(0xA7);
+                        b.extend_from_slice(&[0x36, 0x00, 0x00]); // i32.store
+                    }
                     b.push(0x0B);
                 } else {
                     for op_b in &ops[1..] {
@@ -15868,10 +16273,14 @@ pub fn execute_wasm_module_i64_with_budgets(
                 let a = stack.pop().ok_or("Wasm stack underflow on i64.extend_i32_u")?;
                 stack.push((a as u32) as i64);
             }
-            0x2D | 0x28 | 0x29 | 0x36 | 0x37 | 0x3A => {
+            0xAC => {
+                let a = stack.pop().ok_or("Wasm stack underflow on i64.extend_i32_s")?;
+                stack.push(a as i32 as i64);
+            }
+            0x2D | 0x2F | 0x28 | 0x29 | 0x36 | 0x37 | 0x3A | 0x3B => {
                 let _align = decode_uleb128(body, &mut bpos)?;
                 let offset = decode_uleb128(body, &mut bpos)?;
-                let is_store = matches!(op, 0x36 | 0x37 | 0x3A);
+                let is_store = matches!(op, 0x36 | 0x37 | 0x3A | 0x3B);
                 let val = if is_store {
                     stack.pop().ok_or("Wasm stack underflow on store value")?
                 } else {
@@ -15881,6 +16290,7 @@ pub fn execute_wasm_module_i64_with_budgets(
                 let addr = (addr_i as u32 as u64).saturating_add(offset as u64) as usize;
                 let width: usize = match op {
                     0x2D | 0x3A => 1,
+                    0x2F | 0x3B => 2,
                     0x28 | 0x36 => 4,
                     _ => 8,
                 };
@@ -15893,6 +16303,7 @@ pub fn execute_wasm_module_i64_with_budgets(
                     }
                     match op {
                         0x3A => memory[addr] = val as u8,
+                        0x3B => memory[addr..addr + 2].copy_from_slice(&(val as u16).to_le_bytes()),
                         0x36 => memory[addr..addr + 4].copy_from_slice(&(val as u32).to_le_bytes()),
                         _ => memory[addr..addr + 8].copy_from_slice(&(val as u64).to_le_bytes()),
                     }
@@ -15901,6 +16312,7 @@ pub fn execute_wasm_module_i64_with_budgets(
                 } else {
                     let loaded = match op {
                         0x2D => memory[addr] as i64,
+                        0x2F => i16::from_le_bytes(memory[addr..addr + 2].try_into().unwrap()) as i64,
                         0x28 => i32::from_le_bytes(memory[addr..addr + 4].try_into().unwrap()) as i64,
                         _ => i64::from_le_bytes(memory[addr..addr + 8].try_into().unwrap()),
                     };

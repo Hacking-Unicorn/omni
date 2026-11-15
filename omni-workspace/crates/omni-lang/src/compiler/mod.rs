@@ -1929,6 +1929,51 @@ impl SurfaceLowerCtx {
                 let m = if low == "sel_trit" { "SEL_TRIT" } else { "CMOV" };
                 Ok(format!("{} {} {} {} {}", m, op_args[0], op_args[1], op_args[2], op_args[3]))
             }
+            "ld_i16" => {
+                if op_args.len() != 2 {
+                    return Err(format!(
+                        "error[ARITY_MISMATCH] line {}, col {}: Intrinsic 'ld_i16' expects 2 arguments, got {}",
+                        line, col, op_args.len()
+                    ));
+                }
+                Ok(format!("IGET {} -2 {}", op_args[0], op_args[1]))
+            }
+            "ld_i32" => {
+                if op_args.len() != 2 {
+                    return Err(format!(
+                        "error[ARITY_MISMATCH] line {}, col {}: Intrinsic 'ld_i32' expects 2 arguments, got {}",
+                        line, col, op_args.len()
+                    ));
+                }
+                Ok(format!("IGET {} -4 {}", op_args[0], op_args[1]))
+            }
+            "ld_i64" => {
+                if op_args.len() != 2 {
+                    return Err(format!(
+                        "error[ARITY_MISMATCH] line {}, col {}: Intrinsic 'ld_i64' expects 2 arguments, got {}",
+                        line, col, op_args.len()
+                    ));
+                }
+                Ok(format!("IGET {} -8 {}", op_args[0], op_args[1]))
+            }
+            "st_i16" => {
+                if op_args.len() != 3 {
+                    return Err(format!(
+                        "error[ARITY_MISMATCH] line {}, col {}: Intrinsic 'st_i16' expects 3 arguments, got {}",
+                        line, col, op_args.len()
+                    ));
+                }
+                Ok(format!("ISET {} -2 {} {}", op_args[0], op_args[1], op_args[2]))
+            }
+            "st_i32" => {
+                if op_args.len() != 3 {
+                    return Err(format!(
+                        "error[ARITY_MISMATCH] line {}, col {}: Intrinsic 'st_i32' expects 3 arguments, got {}",
+                        line, col, op_args.len()
+                    ));
+                }
+                Ok(format!("ISET {} -4 {} {}", op_args[0], op_args[1], op_args[2]))
+            }
             "iset_i32" => {
                 if op_args.len() != 2 {
                     return Err(format!(
@@ -3926,6 +3971,155 @@ pub fn run_byte_readback_parity_selftests() -> Result<usize, String> {
     Ok(checks)
 }
 
+
+/// 3-op IGET (`ld_i16`/`ld_i32`/`ld_i64`) and 4-op ISET patches (`st_i16`/`st_i32`)
+/// must read/write the ISET heap with strict bounds, bypass pack5, and sign-extend
+/// narrow loads. Asserted on VM, Wasm, and native x86. Stage-1 is executed and
+/// recorded but not required to match: its frozen IGET/ISET handlers always emit
+/// the 2-op token-region load / 3-op append / -9 patch shapes, and teaching it
+/// the new forms would move `0x677F57AE71D28FED` / `0xEAFC81F46B482FF8`.
+pub const MULTIBYTE_LOAD_SRC: &str = "fn multibyte_load_golden(x: i64) -> i64 { let buf = anew(0); buf = iset(buf, 10, 20, 30, 40, 50, 60, 70, 80); buf = iset_i32(buf, 0 - 2); buf = iset_i64(buf, x); buf = st_i16(buf, 0, 0 - 300); buf = st_i32(buf, 4, 305419896); let a = ld_i16(buf, 0); let b = ld_i32(buf, 4); let c = ld_i32(buf, 8); let d = ld_i64(buf, 12); let e = ld_i16(buf, 100); buf = st_i16(buf, 100, 99); let n = slen(buf); let r = (((((n * 10000 + (a + 1000)) * 10 + (b - 305419896)) * 10 + (c + 2)) * 10 + d) * 10 + e) * 100 + n; return r; }";
+pub const MULTIBYTE_LOAD_X: i64 = 7;
+pub const MULTIBYTE_LOAD_EXPECTED: i64 = 200700007020;
+
+fn stream_has_redefined_iset_iget_shapes(stream: &[u16], name: &str) -> Result<(), String> {
+    let module = decode_omni_token_stream(stream)?;
+    for (fi, func) in module.functions.iter().enumerate() {
+        for (ii, ins) in func.instructions.iter().enumerate() {
+            if ins.op_tok == 0x7F0E && ins.operands.len() == 3 {
+                return Err(format!(
+                    "frozen stream '{name}' fn {fi} ins {ii} has 3-op IGET (new shape must not appear in locked streams)"
+                ));
+            }
+            if ins.op_tok == 0x7F0F
+                && ins.operands.len() == 4
+                && (ins.operands[1] == BinOperand::ImmInt(-2) || ins.operands[1] == BinOperand::ImmInt(-4))
+            {
+                return Err(format!(
+                    "frozen stream '{name}' fn {fi} ins {ii} has 4-op ISET -2/-4 (new patch shape must not appear in locked streams)"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Pin 3-op IGET / 4-op ISET patch semantics and prove frozen streams do not use them.
+pub fn run_multibyte_load_parity_selftests() -> Result<usize, String> {
+    let mut checks = 0usize;
+
+    let buf_stream = compile_omni_surface_to_u16(BYTE_BUF_GOLDEN_SRC)
+        .map_err(|e| format!("byte_buf_golden failed to compile: {e}"))?;
+    if buf_stream.len() != BYTE_BUF_GOLDEN_LOCKED_TOKENS {
+        return Err(format!(
+            "byte_buf_golden token count {} != locked {}",
+            buf_stream.len(),
+            BYTE_BUF_GOLDEN_LOCKED_TOKENS
+        ));
+    }
+    checks += 1;
+    stream_has_redefined_iset_iget_shapes(&buf_stream, "byte_buf_golden")?;
+    checks += 1;
+
+    let stage1 = build_step7_stage1_compiler_stream();
+    stream_has_redefined_iset_iget_shapes(&stage1, "build_step7_stage1_compiler_stream")?;
+    checks += 1;
+
+    let stream = compile_omni_surface_to_u16(MULTIBYTE_LOAD_SRC)
+        .map_err(|e| format!("multibyte_load_golden failed to compile: {e}"))?;
+    for rep in verify_u16_stream(&stream)? {
+        if !rep.passed {
+            return Err(format!(
+                "multibyte_load_golden failed binary verify (fn #{}): {:?}",
+                rep.fn_idx, rep.errors
+            ));
+        }
+    }
+    checks += 1;
+
+    let module = decode_omni_token_stream(&stream)?;
+    let mut saw_3op_iget = 0usize;
+    let mut saw_4op_iset = 0usize;
+    for func in &module.functions {
+        for ins in &func.instructions {
+            if ins.op_tok == 0x7F0E && ins.operands.len() == 3 {
+                saw_3op_iget += 1;
+            }
+            if ins.op_tok == 0x7F0F
+                && ins.operands.len() == 4
+                && (ins.operands[1] == BinOperand::ImmInt(-2) || ins.operands[1] == BinOperand::ImmInt(-4))
+            {
+                saw_4op_iset += 1;
+            }
+        }
+    }
+    if saw_3op_iget < 5 || saw_4op_iset < 3 {
+        return Err(format!(
+            "multibyte_load_golden lowering missing new shapes: 3-op IGET={saw_3op_iget} 4-op ISET -2/-4={saw_4op_iset}"
+        ));
+    }
+    checks += 1;
+
+    let mut vm = OmniBinaryVm::new();
+    let vm_got = vm.execute_function(&module, 0, vec![OmniValue::Int(MULTIBYTE_LOAD_X)])?;
+    if vm_got != OmniValue::Int(MULTIBYTE_LOAD_EXPECTED) {
+        return Err(format!(
+            "multibyte load VM x={MULTIBYTE_LOAD_X} got {vm_got:?} want {MULTIBYTE_LOAD_EXPECTED}"
+        ));
+    }
+    checks += 1;
+
+    let wasm_got = execute_omni_surface_wasm_i64(MULTIBYTE_LOAD_SRC, &[MULTIBYTE_LOAD_X])?;
+    if wasm_got != MULTIBYTE_LOAD_EXPECTED {
+        return Err(format!(
+            "multibyte load Wasm x={MULTIBYTE_LOAD_X} got {wasm_got} want {MULTIBYTE_LOAD_EXPECTED}"
+        ));
+    }
+    checks += 1;
+
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    {
+        let elf = compile_omni_surface_to_x86_64_elf(MULTIBYTE_LOAD_SRC, MULTIBYTE_LOAD_X, 0, 0)?;
+        let x86_got = execute_native_elf_i64(&elf, &[MULTIBYTE_LOAD_X])?;
+        if x86_got != MULTIBYTE_LOAD_EXPECTED {
+            return Err(format!(
+                "multibyte load x86-64 x={MULTIBYTE_LOAD_X} got {x86_got} want {MULTIBYTE_LOAD_EXPECTED}"
+            ));
+        }
+        checks += 1;
+
+        match compile_omni_surface_via_stage1_to_elf(MULTIBYTE_LOAD_SRC, MULTIBYTE_LOAD_X, 0, 0) {
+            Ok(s1_elf) => match execute_native_elf_i64(&s1_elf, &[MULTIBYTE_LOAD_X]) {
+                Ok(s1_got) => {
+                    eprintln!(
+                        "multibyte load x={MULTIBYTE_LOAD_X}: VM={MULTIBYTE_LOAD_EXPECTED} Wasm={wasm_got} x86={x86_got} Stage-1={s1_got} (Stage-1 not required to match; frozen IGET/ISET handlers)"
+                    );
+                    checks += 1;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "multibyte load x={MULTIBYTE_LOAD_X}: VM={MULTIBYTE_LOAD_EXPECTED} Wasm={wasm_got} x86={x86_got} Stage-1=failed ({e}) (expected until the Stage-1 image is allowed to move)"
+                    );
+                    checks += 1;
+                }
+            },
+            Err(e) => {
+                eprintln!(
+                    "multibyte load x={MULTIBYTE_LOAD_X}: VM={MULTIBYTE_LOAD_EXPECTED} Wasm={wasm_got} x86={x86_got} Stage-1=compile-failed ({e}) (expected until the Stage-1 image is allowed to move)"
+                );
+                checks += 1;
+            }
+        }
+    }
+    #[cfg(not(all(unix, target_arch = "x86_64")))]
+    {
+        eprintln!(
+            "multibyte load x={MULTIBYTE_LOAD_X}: VM={MULTIBYTE_LOAD_EXPECTED} Wasm={wasm_got} x86=skipped Stage-1=skipped"
+        );
+    }
+    Ok(checks)
+}
+
 /// Regression: value-returning `if_pos`/`if_neg`/`match_trit` must use a single
 /// contiguous SSA join slot. Branch temps in the first stream-order arm must not
 /// punch a hole before the join dest is defined, and both arms must write that
@@ -4053,5 +4247,12 @@ mod if_pos_join_slot_tests {
         assert!(n >= 3, "expected at least 3 byte-readback checks, got {n}");
         let (x86, s1) = super::last_byte_readback_native_results();
         eprintln!("byte_readback checks={n} x86={x86:?} stage1={s1:?}");
+    }
+
+    #[test]
+    fn multibyte_load_parity() {
+        let n = super::run_multibyte_load_parity_selftests().expect("multibyte load parity");
+        assert!(n >= 6, "expected at least 6 multibyte-load checks, got {n}");
+        eprintln!("multibyte_load checks={n}");
     }
 }

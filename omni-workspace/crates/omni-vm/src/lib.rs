@@ -270,6 +270,29 @@ impl OmniBinaryVm {
                     OmniValue::Bytes(Vec::with_capacity(64))
                 }
                 0x7F0E => {
+                    if ins.operands.len() == 3 {
+                        let width = match ins.operands[1] {
+                            BinOperand::ImmInt(-2) => 2usize,
+                            BinOperand::ImmInt(-4) => 4usize,
+                            BinOperand::ImmInt(-8) => 8usize,
+                            _ => 0,
+                        };
+                        let off = Self::eval_as_i64(&ins.operands[2], &regs).unwrap_or(-1);
+                        match Self::eval_op(&ins.operands[0], &regs) {
+                            OmniValue::Bytes(buf)
+                                if width > 0 && off >= 0 && (off as usize).saturating_add(width) <= buf.len() =>
+                            {
+                                let o = off as usize;
+                                let v = match width {
+                                    2 => i16::from_le_bytes(buf[o..o + 2].try_into().unwrap()) as i64,
+                                    4 => i32::from_le_bytes(buf[o..o + 4].try_into().unwrap()) as i64,
+                                    _ => i64::from_le_bytes(buf[o..o + 8].try_into().unwrap()),
+                                };
+                                OmniValue::Int(v)
+                            }
+                            _ => OmniValue::Int(0),
+                        }
+                    } else {
                     let arr_val = Self::eval_op(&ins.operands[0], &regs);
                     let idx_val = Self::eval_op(&ins.operands[1], &regs);
                     match (arr_val, idx_val) {
@@ -284,6 +307,7 @@ impl OmniBinaryVm {
                             OmniValue::Int(pack5_get_trit(&packed, i as usize).map_err(String::from)? as i64)
                         }
                         _ => OmniValue::Int(0),
+                    }
                     }
                 }
                 0x7F0F => {
@@ -309,6 +333,25 @@ impl OmniBinaryVm {
                             let u_off = off as usize;
                             if u_off + 8 <= buf.len() {
                                 buf[u_off..u_off + 8].copy_from_slice(&(v as u64).to_le_bytes());
+                            }
+                        }
+                    } else if ins.operands.len() == 4
+                        && (ins.operands[1] == BinOperand::ImmInt(-2) || ins.operands[1] == BinOperand::ImmInt(-4))
+                    {
+                        let width = if ins.operands[1] == BinOperand::ImmInt(-2) { 2usize } else { 4usize };
+                        if let (Some(off), Some(v)) = (
+                            Self::eval_as_i64(&ins.operands[2], &regs),
+                            Self::eval_as_i64(&ins.operands[3], &regs),
+                        ) {
+                            if off >= 0 {
+                                let u_off = off as usize;
+                                if u_off.saturating_add(width) <= buf.len() {
+                                    if width == 2 {
+                                        buf[u_off..u_off + 2].copy_from_slice(&(v as i16).to_le_bytes());
+                                    } else {
+                                        buf[u_off..u_off + 4].copy_from_slice(&(v as i32).to_le_bytes());
+                                    }
+                                }
                             }
                         }
                     } else {
