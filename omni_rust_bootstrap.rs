@@ -1028,6 +1028,9 @@ pub const MAX_VM_CALL_DEPTH: usize = 64;
 pub const OMNI_DB_QRY_MISS: i64 = -1;
 /// Documented `DB_GET` (0x7F64) not-found value (Boss Lady decision 2026-11-14). Never `key*10`.
 pub const OMNI_DB_GET_MISS: i64 = -1;
+/// Fixed KV key cap (Boss Lady 2026-11-14): 8192 distinct keys, the `pure/host_kv.omni` arena size
+/// (0x1B0000..0x1EFFFF at 32 B). The 8193rd new key is `BUDGET_EXCEEDED`; overwrites still succeed.
+pub const OMNI_VM_KV_MAX_KEYS: usize = 8192;
 
 pub struct OmniBinaryVm {
     pub tables: HashMap<u16, Vec<BTreeMap<u16, OmniValue>>>,
@@ -1530,13 +1533,21 @@ impl OmniBinaryVm {
                     OmniValue::Int(cnt as i64)
                 }
                 0x7F6B => {
-                    self.charge_memory(16)?;
                     if ins.operands.len() >= 2 {
                         let key = Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0);
                         let val = Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0);
+                        // A new distinct key past OMNI_VM_KV_MAX_KEYS fails before the charge; overwrites still work.
+                        if self.kv_store.len() >= OMNI_VM_KV_MAX_KEYS && !self.kv_store.contains_key(&key) {
+                            return Err(format!(
+                                "error[BUDGET_EXCEEDED]: VM KV store key cap exceeded ({} distinct keys, max {})",
+                                self.kv_store.len(), OMNI_VM_KV_MAX_KEYS
+                            ));
+                        }
+                        self.charge_memory(16)?;
                         self.kv_store.insert(key, val);
                         OmniValue::Int(val)
                     } else {
+                        self.charge_memory(16)?;
                         OmniValue::Int(0)
                     }
                 }
@@ -12010,7 +12021,6 @@ pub const HKV_OP_DEL: i64 = 7;
 pub const HKV_TAG_VOID: i64 = 0;
 pub const HKV_TAG_INT: i64 = 1;
 pub const HKV_TAG_BUDGET: i64 = 2;
-pub const HKV_TAG_CAPACITY: i64 = 3;
 /// Arena capacity of the KV region 0x1B0000..0x1EFFFF at 32 B per entry.
 pub const HKV_MAX_ENTRIES: i64 = (0x1F0000 - 0x1B0000) / 32;
 
@@ -12249,8 +12259,8 @@ pub fn run_host_kv_lockstep_selftests() -> Result<usize, String> {
     if ssa > 192 || lbl > 15 {
         return Err(format!("host_kv.omni exceeds limits: max SSA {ssa} (<= 192), max labels {lbl} (<= 15)"));
     }
-    if HKV_MAX_ENTRIES != 8192 {
-        return Err(format!("host_kv arena capacity {HKV_MAX_ENTRIES} != 8192"));
+    if HKV_MAX_ENTRIES as usize != OMNI_VM_KV_MAX_KEYS {
+        return Err(format!("host_kv arena capacity {HKV_MAX_ENTRIES} != OMNI_VM_KV_MAX_KEYS {OMNI_VM_KV_MAX_KEYS}"));
     }
     checks += 1;
 
@@ -12321,16 +12331,16 @@ pub fn run_host_kv_lockstep_selftests() -> Result<usize, String> {
     }
     checks += 1;
 
-    // 6. Omni arena capacity: a new key past cap is tag 3 with the store and charge unchanged.
-    //    The Rust BTreeMap has no capacity, so lockstep must flag this documented divergence.
+    // 6. The program-header cap below OMNI_VM_KV_MAX_KEYS is an Omni-only test knob: a new key past it
+    //    is BUDGET_EXCEEDED with store and charge unchanged, and lockstep must flag the divergence.
     let cap_ops: Vec<(i64, i64, i64)> = (1..=5).map(|k| (HKV_OP_PUT, k, k)).chain([(HKV_OP_PUT, 2, 22), (HKV_OP_CNT, 0, 0)]).collect();
     let oc = host_kv_observe_omni(&cap_ops, 4, budget)?;
-    if oc.results[4] != (HKV_TAG_CAPACITY, 0) || oc.results[5] != (1, 22) || oc.count != 4 || oc.mem_used != 5 * 16 || oc.results[6] != (1, 4) {
-        return Err(format!("host_kv capacity case mismatch: {:?} count {} mem {}", oc.results, oc.count, oc.mem_used));
+    if oc.results[4] != (HKV_TAG_BUDGET, 0) || oc.results[5] != (1, 22) || oc.count != 4 || oc.mem_used != 5 * 16 || oc.results[6] != (1, 4) {
+        return Err(format!("host_kv header-cap case mismatch: {:?} count {} mem {}", oc.results, oc.count, oc.mem_used));
     }
     match lockstep_shadow_kv(&cap_ops, 4, budget) {
         Err(e) if e.contains("error[LOCKSTEP_MISMATCH]") && e.contains("path=kv") => {}
-        other => return Err(format!("host_kv capacity divergence not flagged by lockstep: {other:?}")),
+        other => return Err(format!("host_kv header-cap divergence not flagged by lockstep: {other:?}")),
     }
     checks += 1;
 
@@ -12355,6 +12365,36 @@ pub fn run_host_kv_lockstep_selftests() -> Result<usize, String> {
     match host_kv_lockstep_compare("kv", &r, &d) {
         Err(e) if e.contains("error[LOCKSTEP_MISMATCH]") && e.contains("op#0") => {}
         other => return Err(format!("host_kv miss-value drift not caught: {other:?}")),
+    }
+    checks += 1;
+
+    // 9. Fixed 8192-key cap (OMNI_VM_KV_MAX_KEYS) in lockstep: per-op agreement at 8190, 8191 (shifting
+    //    insert at full size), 8192 and the 8193rd new key (BUDGET_EXCEEDED, store and charge unchanged),
+    //    then overwrites at the cap still succeed.
+    let max = OMNI_VM_KV_MAX_KEYS as i64;
+    let mut big: Vec<(i64, i64, i64)> = (0..max - 2).map(|i| (HKV_OP_PUT, i * 2, i)).collect();
+    big.extend_from_slice(&[
+        (HKV_OP_CNT, 0, 0),
+        (HKV_OP_PUT, 1, -7),
+        (HKV_OP_CNT, 0, 0),
+        (HKV_OP_PUT, 3, 33),
+        (HKV_OP_CNT, 0, 0),
+        (HKV_OP_PUT, 5, 55),
+        (HKV_OP_GET1, 5, 0),
+        (HKV_OP_CNT, 0, 0),
+        (HKV_OP_PUT, 1, 11),
+        (HKV_OP_PUT, (max - 3) * 2, 99),
+        (HKV_OP_GET1, 1, 0),
+        (HKV_OP_CNT, 0, 0),
+    ]);
+    let o = lockstep_shadow_kv(&big, HKV_MAX_ENTRIES, budget)?;
+    let n = (max - 2) as usize;
+    let tail_want: Vec<(i64, i64)> = vec![
+        (1, max - 2), (1, -7), (1, max - 1), (1, 33), (1, max), (HKV_TAG_BUDGET, 0), (1, -1), (1, max),
+        (1, 11), (1, 99), (1, 11), (1, max),
+    ];
+    if o.results[n..] != tail_want[..] || o.count != max || o.mem_used != (max + 2) * 16 || o.image.iter().any(|&(k, _)| k == 5) {
+        return Err(format!("host_kv 8192-key cap case mismatch: tail {:?} count {} mem {}", &o.results[n..], o.count, o.mem_used));
     }
     checks += 1;
 
@@ -18898,7 +18938,7 @@ fn main(a: i64) -> i64 {
         // Machine-Readable Error Codes, Full-Stack Route + DB/KV Host ABI, and Version-Locked Harness
         checks_passed += run_ai_first_surface_selftests()?;
 
-        // 13AX. Port-plan step 9 KV slice: `pure/host_kv.omni` vs Rust VM KV lockstep (VM-only)
+        // 13BE. Port-plan step 9 KV slice: `pure/host_kv.omni` vs Rust VM KV lockstep (VM-only)
         checks_passed += run_host_kv_lockstep_selftests()?;
     }
 

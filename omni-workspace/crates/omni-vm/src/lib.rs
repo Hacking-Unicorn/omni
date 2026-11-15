@@ -30,6 +30,9 @@ pub const MAX_VM_CALL_DEPTH: usize = 64;
 pub const OMNI_DB_QRY_MISS: i64 = -1;
 /// Documented `DB_GET` (0x7F64) not-found value (Boss Lady decision 2026-11-14). Never `key*10`.
 pub const OMNI_DB_GET_MISS: i64 = -1;
+/// Fixed KV key cap (Boss Lady 2026-11-14): 8192 distinct keys, the `pure/host_kv.omni` arena size
+/// (0x1B0000..0x1EFFFF at 32 B). The 8193rd new key is `BUDGET_EXCEEDED`; overwrites still succeed.
+pub const OMNI_VM_KV_MAX_KEYS: usize = 8192;
 
 pub struct OmniBinaryVm {
     pub tables: HashMap<u16, Vec<BTreeMap<u16, OmniValue>>>,
@@ -520,13 +523,21 @@ impl OmniBinaryVm {
                     OmniValue::Int(cnt as i64)
                 }
                 0x7F6B => {
-                    self.charge_memory(16)?;
                     if ins.operands.len() >= 2 {
                         let key = Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0);
                         let val = Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0);
+                        // A new distinct key past OMNI_VM_KV_MAX_KEYS fails before the charge; overwrites still work.
+                        if self.kv_store.len() >= OMNI_VM_KV_MAX_KEYS && !self.kv_store.contains_key(&key) {
+                            return Err(format!(
+                                "error[BUDGET_EXCEEDED]: VM KV store key cap exceeded ({} distinct keys, max {})",
+                                self.kv_store.len(), OMNI_VM_KV_MAX_KEYS
+                            ));
+                        }
+                        self.charge_memory(16)?;
                         self.kv_store.insert(key, val);
                         OmniValue::Int(val)
                     } else {
+                        self.charge_memory(16)?;
                         OmniValue::Int(0)
                     }
                 }

@@ -16,14 +16,15 @@
 // window; band addresses are compile-time constants:
 //   state[0..64)    <-> control block 0x100100..0x10013F (KV words)
 //   state[64+32*i]  <-> KV entry i at 0x1B0000 + 32*i (key, tag, value, pad)
-//   capacity        = (0x1F0000 - 0x1B0000) / 32 = 8192 entries
+//   capacity        = (0x1F0000 - 0x1B0000) / 32 = 8192 entries = OMNI_VM_KV_MAX_KEYS
 // Control words: 0 count, 1 mem_used, 2 mem_budget, 3 cap, 4 res_tag, 5 res_val.
 //
 // Program (i64 LE words): cap, mem_budget, n_ops, then n_ops x (op, a, b).
 // ops: 1 KV_PUT(a,b) 2 DB_GET(a) 3 DB_QRY(a,b) 4 DB_QRY(a) 5 DB_GET(a,b)
 //      6 DB_CNT 7 DB_DEL(a)
 // Output (i64 LE words): n_ops x (tag, val), count, mem_used, count x (key, val).
-// tags: 0 Void, 1 Int, 2 BUDGET_EXCEEDED (VM memory budget), 3 KV_CAPACITY.
+// tags: 0 Void, 1 Int, 2 BUDGET_EXCEEDED (VM memory budget, or a new distinct key
+// past the 8192-key cap; store and charge unchanged, same as Rust OMNI_VM_KV_MAX_KEYS).
 // ==============================================================================
 
 #[strict]
@@ -240,9 +241,7 @@ fn hkv_shift_up(st: bytes, pos: i64, count: i64) -> bytes {
 }
 
 #[strict]
-fn hkv_insert_new(st: bytes, key: i64, val: i64) -> bytes {
-    let count: i64 = hkv_ctl_get(st, 0);
-    let pos: i64 = hkv_lower_bound(st, key);
+fn hkv_insert_at(st: bytes, pos: i64, count: i64, key: i64, val: i64) -> bytes {
     let a: bytes = hkv_grow_one(st);
     let b: bytes = hkv_shift_up(a, pos, count);
     let c: bytes = hkv_write_entry(b, pos, key, val);
@@ -251,14 +250,14 @@ fn hkv_insert_new(st: bytes, key: i64, val: i64) -> bytes {
 }
 
 #[strict]
-fn hkv_put_new(st: bytes, key: i64, val: i64, next_used: i64) -> bytes {
+fn hkv_put_new(st: bytes, key: i64, val: i64, next_used: i64, pos: i64, count: i64) -> bytes {
     let w: bytes = st;
-    let full: i64 = 1 - hkv_is_lt(hkv_ctl_get(w, 0), hkv_ctl_get(w, 3));
+    let full: i64 = 1 - hkv_is_lt(count, hkv_ctl_get(w, 3));
     let c: trit = full <=> 0;
     let out: bytes = if_pos c {
-        hkv_set_result(w, 3, 0)
+        hkv_set_result(w, 2, 0)
     } else {
-        let a: bytes = hkv_insert_new(w, key, val);
+        let a: bytes = hkv_insert_at(w, pos, count, key, val);
         let b: bytes = hkv_ctl_set(a, 1, next_used);
         let r: bytes = hkv_set_result(b, 1, val);
         r
@@ -269,16 +268,17 @@ fn hkv_put_new(st: bytes, key: i64, val: i64, next_used: i64) -> bytes {
 #[strict]
 fn hkv_put_store(st: bytes, key: i64, val: i64, next_used: i64) -> bytes {
     let w: bytes = st;
-    let idx: i64 = hkv_find(w, key);
-    let found: i64 = 1 - hkv_is_lt(idx, 0);
+    let pos: i64 = hkv_lower_bound(w, key);
+    let count: i64 = hkv_ctl_get(w, 0);
+    let found: i64 = hkv_is_lt(pos, count) * hkv_is_eq(hkv_key_at(w, pos), key);
     let c: trit = found <=> 0;
     let out: bytes = if_pos c {
-        let a: bytes = iset_patch_i64(w, hkv_ent_off(idx) + 16, val);
+        let a: bytes = iset_patch_i64(w, hkv_ent_off(pos) + 16, val);
         let b: bytes = hkv_ctl_set(a, 1, next_used);
         let r: bytes = hkv_set_result(b, 1, val);
         r
     } else {
-        hkv_put_new(w, key, val, next_used)
+        hkv_put_new(w, key, val, next_used, pos, count)
     };
     return out;
 }
