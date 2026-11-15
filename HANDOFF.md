@@ -269,3 +269,9 @@ Everything that was in `/workspace/audits/` is under `docs/audits/`, including `
 ## 13. Verification of this docs-only commit
 
 `acceptance-diff` 39 PASS (exit 0) on a `rustc -O` monolith of `d2d6c13`, which is the code parent of this branch. No code path in that binary is affected by the files added here.
+
+## 14. Status log
+
+Append one line per pushed commit: date (America/New_York), owner, branch@SHA, what was gated, result.
+
+- 2026-11-14 20:13 EST — Vera Parity — `vera/parity-goldens@49091f2` (base `d2d6c13` = current `isa/multibyte-loads` tip, fast-forward from `d257cb0`; no rebase needed, no XPASS removals). New: true 16-label surface case `lbl16_surface` (xfail on all 4 until C4; the d257cb0 case of that name actually had 17 labels and is now `lbl17_surface`), `lbl17_asm_ids_0_16` must-reject, P9 now expects the §6.4 no-op (slen 8). Gate, harness cherry-picked locally (selftest / acceptance-diff / diff4 pass-xfail-xpass-fail / 5 hashes): harness 580 / 39 / 78-39-0-0 / ok; `wip/isa-a-continuation@3b828b8` 589 / 39 / 78-39-0-0 / ok (13AX 3-op loads agree on VM/Wasm/x86, Stage-1 SIGSEGV, recorded only; x86/Stage-1 P1 still xfail); `scarlett/m3-groundwork@6234c0c` 580 / 39 / 78-39-0-0 / ok; `nyx/m2-foundation@abea5ff` selftest FAIL / 39 / 76-39-0-2 / ok (the 2 FAILs are `p1_byte_readback` and `p1_iget_runtime_value` on Wasm, because the branch lacks `d2d6c13`; m2-frozen/lock/census/labels exit 0); `docs/handoff` has no code delta from `d2d6c13`, so it is equivalent to the harness row.
