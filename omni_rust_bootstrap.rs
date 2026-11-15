@@ -13265,14 +13265,23 @@ pub const OMNI_DIFF4_GOLDENS: &[DiffGolden] = &[
         runs: &[(&[5], DiffExpect::I64(521)), (&[-5], DiffExpect::I64(210)), (&[0], DiffExpect::I64(210))],
         backends: DIFF4_ALL,
     },
-    // Same program with a 7th if_pos = 16 surface labels. Today the surface frontend rejects it
-    // (alloc_lbl: `next_lbl > 15` -> error[BUDGET_EXCEEDED], next_lbl starts at 1).
-    // OPEN DECISION (16 vs 15 labels per fn): if the cap is raised to 16 at the frontend, this
-    // expectation becomes I64(528) for x=5 (28 + 500) and I64(280) for x=-5.
+    // Exactly 16 surface labels: 5 value if_pos (2 each) + 2 while (3 each) = 16 (ids 1..16 today).
+    // Decided cap is 16 (C4, HANDOFF.md 6.3): x=5 -> 15 + 505 = 520; x=-5, 0 -> 150.
+    // Until C4 lands the frontend rejects it (alloc_lbl: next_lbl starts at 1, `next_lbl > 15`),
+    // so every backend is a known divergence and C4 must XPASS all four.
     DiffGolden {
         id: "lbl16_surface",
         proposal: "label-cap",
-        src: "fn lbl16(x: i64) -> i64 { let c = x <=> 0; let a1 = if_pos c { 1 } else { 10 }; let a2 = if_pos c { 2 } else { 20 }; let a3 = if_pos c { 3 } else { 30 }; let a4 = if_pos c { 4 } else { 40 }; let a5 = if_pos c { 5 } else { 50 }; let a6 = if_pos c { 6 } else { 60 }; let a7 = if_pos c { 7 } else { 70 }; let acc = 0; let i = 0; while i < x { acc += 100; i += 1; } let r = a1 + a2 + a3 + a4 + a5 + a6 + a7 + acc; return r; }",
+        src: "fn lbl16(x: i64) -> i64 { let c = x <=> 0; let a1 = if_pos c { 1 } else { 10 }; let a2 = if_pos c { 2 } else { 20 }; let a3 = if_pos c { 3 } else { 30 }; let a4 = if_pos c { 4 } else { 40 }; let a5 = if_pos c { 5 } else { 50 }; let acc = 0; let i = 0; while i < x { acc += 100; i += 1; } let j = 0; while j < x { acc += 1; j += 1; } let r = a1 + a2 + a3 + a4 + a5 + acc; return r; }",
+        runs: &[(&[5], DiffExpect::I64(520)), (&[-5], DiffExpect::I64(150)), (&[0], DiffExpect::I64(150))],
+        backends: DIFF4_ALL,
+    },
+    // 17 surface labels: 7 value if_pos + 1 while = 17. Must be rejected before and after C4.
+    // (This program was named lbl16_surface at d257cb0; it actually allocates 17 labels.)
+    DiffGolden {
+        id: "lbl17_surface",
+        proposal: "label-cap",
+        src: "fn lbl17(x: i64) -> i64 { let c = x <=> 0; let a1 = if_pos c { 1 } else { 10 }; let a2 = if_pos c { 2 } else { 20 }; let a3 = if_pos c { 3 } else { 30 }; let a4 = if_pos c { 4 } else { 40 }; let a5 = if_pos c { 5 } else { 50 }; let a6 = if_pos c { 6 } else { 60 }; let a7 = if_pos c { 7 } else { 70 }; let acc = 0; let i = 0; while i < x { acc += 100; i += 1; } let r = a1 + a2 + a3 + a4 + a5 + a6 + a7 + acc; return r; }",
         runs: &[(&[5], DiffExpect::Rejected("BUDGET_EXCEEDED")), (&[-5], DiffExpect::Rejected("BUDGET_EXCEEDED"))],
         backends: DIFF4_ALL,
     },
@@ -13295,13 +13304,23 @@ pub const OMNI_DIFF4_GOLDENS: &[DiffGolden] = &[
         runs: &[(&[5], DiffExpect::I64(521)), (&[-5], DiffExpect::I64(210))],
         backends: DIFF4_ALL,
     },
-    // --- P9: iset_patch_i64 with a negative offset must be a structured error on the VM ---
+    // 17 labels in assembly (ids 0..16): id 16 has no label token (0x7EF0..0x7EFF), so the
+    // assembler must reject it on every backend, before and after C4.
+    DiffGolden {
+        id: "lbl17_asm_ids_0_16",
+        proposal: "label-cap",
+        src: "#asm\nPARAM $0 I64 SAFE\nRET_TY I64\nJMP 16\nLABEL 16\nJMP 0\nLABEL 0\n%0 = TCMP $0 0\nBR_POS %0 1\n%1 = CINT 10\nJMP 2\nLABEL 1\n%1 = CINT 1\nLABEL 2\nBR_POS %0 3\n%2 = CINT 20\nJMP 4\nLABEL 3\n%2 = CINT 2\nLABEL 4\nBR_POS %0 5\n%3 = CINT 30\nJMP 6\nLABEL 5\n%3 = CINT 3\nLABEL 6\nBR_POS %0 7\n%4 = CINT 40\nJMP 8\nLABEL 7\n%4 = CINT 4\nLABEL 8\nBR_POS %0 9\n%5 = CINT 50\nJMP 10\nLABEL 9\n%5 = CINT 5\nLABEL 10\nBR_POS %0 11\n%6 = CINT 60\nJMP 12\nLABEL 11\n%6 = CINT 6\nLABEL 12\n%7 = CINT 0\n%8 = CINT 0\nLABEL 13\n%9 = CLT %8 $0\nBR_POS %9 14\nJMP 15\nLABEL 14\n%7 = IADD %7 100\n%8 = IADD %8 1\nJMP 13\nLABEL 15\n%10 = IADD %1 %2\n%11 = IADD %10 %3\n%12 = IADD %11 %4\n%13 = IADD %12 %5\n%14 = IADD %13 %6\n%15 = IADD %14 %7\nRET %15\n",
+        runs: &[(&[5], DiffExpect::Rejected("Label id > 15"))],
+        backends: DIFF4_ALL,
+    },
+    // --- P9: iset_patch_i64 with a negative offset (-8..-1) is a silent no-op on the VM ---
+    // Decided in HANDOFF.md 6.4 (no-op, not panic, not error): buf keeps its 8 bytes, slen = 8.
     // AOT behaviour for this input is unspecified, so only the VM is asserted.
     DiffGolden {
         id: "p9_vm_patch_negative_offset",
         proposal: "P9",
         src: "fn patchn(x: i64) -> i64 { let buf = anew(0); buf = iset_i64(buf, 5); let off = 0 - 3; buf = iset_patch_i64(buf, off, 77); let n = slen(buf); return n; }",
-        runs: &[(&[7], DiffExpect::StructuredErr)],
+        runs: &[(&[7], DiffExpect::I64(8))],
         backends: &["vm"],
     },
 ];
@@ -13354,7 +13373,12 @@ pub const OMNI_DIFF4_KNOWN_DIVERGENCES: &[(&str, &str, &str)] = &[
     ("p5_if_neg_nontrit", "x86", "N2: x86 BR_NEG emits cmp rax,-1; je (14793-14800)"),
     ("p5_if_neg_nontrit", "stage1", "N2: Stage-1 BR_NEG (lbl_br_neg 16513+) mirrors x86"),
     // P9: VM host panic.
-    ("p9_vm_patch_negative_offset", "vm", "N6: ISET mode -9 casts a negative offset to usize; off+8 wraps and buf[off..off+8] panics (1324-1326) instead of returning error[...]"),
+    ("p9_vm_patch_negative_offset", "vm", "N6: ISET mode -9 casts a negative offset to usize; off+8 wraps and buf[off..off+8] panics (1324-1326) instead of the decided silent no-op (HANDOFF.md 6.4)"),
+    // C4: surface frontend label numbering (decided cap 16).
+    ("lbl16_surface", "vm", "C4 not landed: alloc_lbl starts next_lbl at 1 (3587) and rejects next_lbl > 15 with BUDGET_EXCEEDED (3646-3656)"),
+    ("lbl16_surface", "wasm", "C4, see lbl16_surface/vm"),
+    ("lbl16_surface", "x86", "C4, see lbl16_surface/vm"),
+    ("lbl16_surface", "stage1", "C4, see lbl16_surface/vm"),
 ];
 
 pub fn omni_diff4_known_divergence(id: &str, backend: &str) -> Option<&'static str> {
@@ -13385,12 +13409,13 @@ pub fn run_omni_diff4_suite() -> Result<Vec<(&'static str, &'static str, DiffVer
         for (ri, (args, _)) in g.runs.iter().enumerate() {
             let rep = match run_four_backend_differential(g.src, args, &format!("{}_{}", g.id, ri)) {
                 Ok(r) => r,
-                Err(e) if g.runs.iter().any(|(_, w)| matches!(w, DiffExpect::Rejected(_))) => FourBackendReport {
+                // A frontend/assembler/verifier rejection is observed on every backend and graded
+                // like any other result (FAIL unless expected or listed as a known divergence).
+                Err(e) => FourBackendReport {
                     u16_len: 0,
                     obs: OMNI_DIFF4_BACKENDS.iter().map(|b| (*b, DiffObs::Rejected(e.clone()))).collect(),
                     stage1_elf_eq_host: None,
                 },
-                Err(e) => return Err(format!("diff4 golden '{}' frontend/verify failed: {e}", g.id)),
             };
             reports.push(rep);
         }
