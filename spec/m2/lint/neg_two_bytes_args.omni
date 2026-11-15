@@ -1,0 +1,12 @@
+// L3 LINEAR_BYTES: at most one bytes argument per CALL.
+fn both(a: bytes, b: bytes) -> i64 {
+    let n: i64 = slen(a);
+    let m: i64 = slen(b);
+    let r: i64 = n + m;
+    return r;
+}
+fn main(x: i64) -> i64 {
+    let w: bytes = anew(0);
+    let r: i64 = both(w, w);
+    return r;
+}

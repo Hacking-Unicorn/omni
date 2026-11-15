@@ -1,0 +1,9 @@
+// L1 + L3: the measured hazard `w = sel_trit(c, w, w, iset(w, 15, x))`.
+// Natively the iset appends to the shared arena on every path; the VM discards it.
+fn main(c: i64, x: i64) -> i64 {
+    let w: bytes = anew(0);
+    let t: trit = c <=> 0;
+    w = sel_trit(t, w, w, iset(w, 15, x));
+    let n: i64 = slen(w);
+    return n;
+}
