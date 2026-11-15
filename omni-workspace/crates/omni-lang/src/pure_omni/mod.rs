@@ -2229,6 +2229,10 @@ pub fn run_ai_first_surface_selftests() -> Result<usize, String> {
     if kv_val != OmniValue::Int(200_000_777) || kv_backend != "vm" {
         return Err(format!("route GET /users/:id kv golden mismatch: {:?} via {}", kv_val, kv_backend));
     }
+    let route_get_miss = "route GET /users/:id (req: i64) @cap(net, db_r) {\n    let id = req.param(\"id\");\n    let row = db_get(id);\n    respond(200, row);\n}";
+    if execute_omni_surface_program(route_get_miss, vec![OmniValue::Int(42)])? != OmniValue::Int(200_000_000 + OMNI_DB_GET_MISS) {
+        return Err(String::from("route GET /users/:id db_get miss golden mismatch (want HTTP 200 row -1 = OMNI_DB_GET_MISS)"));
+    }
     let route_q = "route GET /users/:id (req: i64) @cap(net, db_r) {\n    let id = req.param(\"id\");\n    let row = db_query(\"SELECT * FROM users WHERE id = ?\", id);\n    respond(200, row);\n}";
     if execute_omni_surface_program(route_q, vec![OmniValue::Int(42)])? != OmniValue::Int(200_000_000 + OMNI_DB_QRY_MISS) {
         return Err(String::from("route GET /users/:id db_query miss golden mismatch (want HTTP 200 row -1 = OMNI_DB_QRY_MISS)"));
@@ -2241,7 +2245,7 @@ pub fn run_ai_first_surface_selftests() -> Result<usize, String> {
     if !route_u16.iter().any(|&t| t == 0x7F6C) || !route_u16.iter().any(|&t| t == 0x7F65) || !route_u16.iter().any(|&t| t == 0x7F6E) {
         return Err(String::from("route lowering did not emit ROUTE/DB_QRY/RSP_JSON host opcodes"));
     }
-    checks += 3;
+    checks += 4;
     expect_omni_error_code("route_no_caps", execute_omni_surface_program("route GET /users/:id (req: i64) {\n    let id = req.param(\"id\");\n    let row = db_get(id);\n    respond(200, row);\n}", vec![OmniValue::Int(42)]), "MISSING_CAP")?;
     expect_omni_error_code("route_no_db_r", execute_omni_surface_program("route GET /users/:id (req: i64) @cap(net) {\n    let id = req.param(\"id\");\n    let row = db_get(id);\n    respond(200, row);\n}", vec![OmniValue::Int(42)]), "MISSING_CAP")?;
     expect_omni_error_code("route_no_db_w", execute_omni_surface_program("#[cap(NET, DB_R)] route POST /users/:id (req: i64) {\n    let id = req.param(\"id\");\n    let saved = kv_put(id, 1);\n    respond(201, saved);\n}", vec![OmniValue::Int(42)]), "MISSING_CAP")?;

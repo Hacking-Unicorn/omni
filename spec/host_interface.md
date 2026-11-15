@@ -32,7 +32,7 @@ Every operation on `OmniNarrowHost` takes the caller's verified `CapMask` as its
 
 | Opcode | Mnemonic | Surface Form | Implementation over `OmniNarrowHost` |
 |---|---|---|---|
-| `0x7F64` | `DB_GET` | `db_get(k)` / `kv_get(k)` | Reads in-memory KV state populated via `load_omni_kv_via_narrow_host` (`host_file_open` + `host_file_read` + `host_file_close`) |
+| `0x7F64` | `DB_GET` | `db_get(k)` / `kv_get(k)` | Reads in-memory KV state populated via `load_omni_kv_via_narrow_host` (`host_file_open` + `host_file_read` + `host_file_close`). Miss returns `-1` (`OMNI_DB_GET_MISS`), never a key-derived value. |
 | `0x7F65` | `DB_QRY` | `db_query(sql, p)` | Evaluates parameterized query over KV state loaded via `OmniNarrowHost` (requires `@SAFE` parameter). Miss returns `-1` (`OMNI_DB_QRY_MISS`), never a key-derived value. |
 | `0x7F68` | `DB_CNT` | `db_count(k)` | Counts matching KV entries loaded via `OmniNarrowHost` |
 | `0x7F6B` | `KV_PUT` | `kv_put(k, v)` | Updates KV state and persists via `save_omni_kv_via_narrow_host` (`host_file_open(..., true)` + `host_file_write` + `host_file_close`) |
