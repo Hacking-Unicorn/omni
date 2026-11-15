@@ -1,0 +1,72 @@
+// pure/isa/table_selftest.omni: VM entry for run_isa_table_drift_selftests; concatenated after pure/isa/table.omni.
+
+#[strict]
+fn isa_st_ops(t: bytes, b: i64, o: bytes) -> bytes {
+    let w: bytes = o;
+    let i: i64 = 0;
+    while 128 - i <=> 0 {
+        w = iset_i64(w, isa_op_tok(t, b, i));
+        w = iset_i64(w, isa_op_cap(t, b, i));
+        w = iset_i64(w, isa_op_flags(t, b, i));
+        w = iset_i64(w, isa_op_index(isa_op_tok(t, b, i)));
+        i = i + 1;
+    }
+    return w;
+}
+
+#[strict]
+fn isa_st_mns(t: bytes, b: i64, o: bytes) -> bytes {
+    let w: bytes = o;
+    let m: i64 = 0;
+    while 81 - m <=> 0 {
+        w = iset_i64(w, isa_mn_op(t, b, m));
+        w = iset_i64(w, isa_mn_ty(t, b, m, 32643));
+        w = iset_i64(w, isa_mn_ty(t, b, m, 32646));
+        w = iset_i64(w, isa_mn_shape(t, b, m));
+        w = iset_i64(w, isa_mn_len(t, b, m));
+        w = iset_i64(w, isa_mn_find(t, b, t, isa_mn_rec(b, m) + 3, isa_mn_len(t, b, m)));
+        m = m + 1;
+    }
+    return w;
+}
+
+#[strict]
+fn isa_st_hdr(x: i64, a: bytes) -> bytes {
+    let o: bytes = anew(0);
+    o = iset_i64(o, isa_op_count(x));
+    o = iset_i64(o, isa_mn_count(x));
+    o = iset_i64(o, isa_op_index(32511));
+    o = iset_i64(o, isa_op_index(32640));
+    o = iset_i64(o, isa_band_base(x));
+    o = iset_i64(o, isa_rodata_rel(x));
+    o = iset_i64(o, isa_op_off(x));
+    o = iset_i64(o, isa_tbl_len(x));
+    o = iset_i64(o, isa_intr_rel(x));
+    o = iset_i64(o, isa_intr_end_rel(x));
+    o = iset_i64(o, slen(a));
+    return o;
+}
+
+#[strict]
+fn isa_st_main(x: i64) -> bytes {
+    let a: bytes = anew(0);
+    let i: i64 = 0;
+    while 512 - i <=> 0 {
+        a = iset_i64(a, 0);
+        i = i + 1;
+    }
+    let b: i64 = slen(a);
+    a = isa_tbl_append(a);
+    let o: bytes = isa_st_hdr(x, a);
+    o = iset_i64(o, b);
+    o = isa_st_ops(a, b, o);
+    o = isa_st_mns(a, b, o);
+    let t: bytes = isa_tbl_build(x);
+    let n: i64 = slen(t);
+    i = 0;
+    while n - i <=> 0 {
+        o = iset(o, iget(t, i));
+        i = i + 1;
+    }
+    return o;
+}

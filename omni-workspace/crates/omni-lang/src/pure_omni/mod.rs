@@ -17,6 +17,7 @@ use crate::repair_agent::*;
 use crate::harness::*;
 use crate::inspect::*;
 use crate::acceptance::*;
+use crate::isa_table::*;
 
 // ==============================================================================
 // 7I. PHASE A: PURE-OMNI SURFACE FRONTEND (`omni-pure-frontend-v1.0.0`)
@@ -2759,6 +2760,13 @@ fn main(x: i64, y: i64) -> i64 {
 
     // 13AW. Vera P1 byte-readback sibling (VM + Wasm assert; x86/Stage-1 native run)
     checks += run_byte_readback_parity_selftests()?;
+
+    // 13BA. M3-03 shared ISA table (`pure/isa/table.omni`) drift lock vs OMNI_ISA_TABLE + assembler mnemonics
+    let (n_isa, n_isa_neg) = run_isa_table_drift_selftests()?;
+    if n_isa != 128 * 4 + 81 * 6 || n_isa_neg != 5 {
+        return Err(format!("isa-table drift lock compared {n_isa} fields / {n_isa_neg} negatives (expected 998 / 5)"));
+    }
+    checks += 2;
 
     Ok(checks)
 }
