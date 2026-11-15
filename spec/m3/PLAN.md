@@ -108,7 +108,7 @@ M3 band (offsets are relative to `0x80000`). Every mutable field is u16/u32/u64 
 |---|---|---|---|
 | `0x00000-0x007FF` | 2 KiB | globals: 256 × i64 (pass, src cursor, line/col, strict, fn index, next_reg, next_lbl, error code/line/col, pool tops, stack tops, out_len) | fixed |
 | `0x00800-0x00FFF` | 2 KiB | rodata: 256-B char-class table, keyword ids, type-name table | init |
-| `0x01000-0x01FFF` | 4 KiB | rodata: mnemonic table (128 × 16 B: opcode, result ty, operand class) + intrinsic table (~110 × 16 B: name ref, mnemonic id, arity, class) | init |
+| `0x01000-0x01FFF` | 4 KiB | rodata: 128 × 8 B opcode table + 81 real mnemonics × 16 B (`pure/isa/table.omni` at `raven/isa-core-port` `bf7f212`; ids 0..80 frozen, new ids only appended at 81+; 81-row deviation from the original 128 × 16 B plan, approved by Boss Lady) + intrinsic table (111 slots × 16 B available, floor 110: name ref, mnemonic id, arity, class). Free room: (4096 − 81×16 − 128×8) / 16 = 111. | init |
 | `0x02000-0x02FFF` | 4 KiB | rodata string pool (keywords, intrinsic names) | init |
 | `0x03000-0x04FFF` | 8 KiB | **parse stack**: 512 frames × 16 B `{state u16, prec u16, node u32, aux u32, line u16, col u16}` | depth ≤ 512, else `NEST_LIMIT` (O-6) |
 | `0x05000-0x06FFF` | 8 KiB | **lowering work stack**: 512 × 16 B `{node u32, phase u16, dest u16, aux u32, lbl u16, pad}` | ≤ 512 |
@@ -122,6 +122,11 @@ M3 band (offsets are relative to `0x80000`). Every mutable field is u16/u32/u64 
 | `0x1C000-0x1DFFF` | 8 KiB | macro AST pool (persistent): 512 nodes | ≤ 512 |
 | `0x1E000-0x1FFFF` | 8 KiB | sourcemap staging: 2048 × `{line u16, col u16}` per pkt | per module |
 | `0x20000-…` | grows | **output**: header `{stream_words u32, sm_entries u32}`, then the stream, then the sourcemap. Append-only; fn/module length words back-patched with 4-op `ISET -2/-4`. | `0x20000 + out ≤ cap`, checked on every append |
+
+
+**Intrinsic headroom.** The floor of 110 leaves only 1 slot of headroom. M3-11 must count its exact intrinsic names before coding. If there are more than 111, the overflow moves to a new rodata block, decided in DECISIONS.
+
+**13BA coverage.** Only the workspace copy of 13BA reads the real `omni-isa` / `omni-assembler` crates; the monolith copy checks against mirror tables inside the monolith.
 
 The pre-filled prefix is 128 KiB. That was chosen on purpose: Nyx measured that a 256 KiB VM fill takes about 0.72 s, because the VM clones on every register read (§8 R-2).
 
