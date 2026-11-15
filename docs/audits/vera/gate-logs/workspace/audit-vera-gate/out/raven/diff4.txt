@@ -1,0 +1,195 @@
+PASS  p1_byte_readback                 vm    
+PASS  p1_byte_readback                 wasm  
+XFAIL p1_byte_readback                 x86    -- x86 2-op IGET loads u16 words from the argv[1] token region [rbp+rax*2-0x2E000] (IGET arm 14530-14573), not the ISET heap [rbp+r11-0x20000] (ISET arm 14574+)
+        args=[7] want=I64(8796075198218) got=i64 7696581394432 (exit 0, stdout 0000000000070000)
+        args=[200] want=I64(8796075247626) got=i64 7696581394432 (exit 0, stdout 0000000000070000)
+        args=[300] want=I64(8796075207690) got=i64 7696581394432 (exit 0, stdout 0000000000070000)
+        args=[-1] want=I64(8796075261706) got=i64 7696581394432 (exit 0, stdout 0000000000070000)
+XFAIL p1_byte_readback                 stage1 -- Stage-1 IGET mirrors the x86 token-region load (lbl_iget 16411-16416)
+        args=[7] want=I64(8796075198218) got=i64 7696581394432 (exit 0, stdout 0000000000070000)
+        args=[200] want=I64(8796075247626) got=i64 7696581394432 (exit 0, stdout 0000000000070000)
+        args=[300] want=I64(8796075207690) got=i64 7696581394432 (exit 0, stdout 0000000000070000)
+        args=[-1] want=I64(8796075261706) got=i64 7696581394432 (exit 0, stdout 0000000000070000)
+PASS  p1_iget_runtime_value            vm    
+PASS  p1_iget_runtime_value            wasm  
+XFAIL p1_iget_runtime_value            x86    -- same as p1_byte_readback/x86
+        args=[7] want=I64(7) got=i64 0 (exit 0, stdout 0000000000000000)
+        args=[200] want=I64(200) got=i64 0 (exit 0, stdout 0000000000000000)
+XFAIL p1_iget_runtime_value            stage1 -- same as p1_byte_readback/stage1
+        args=[7] want=I64(7) got=i64 0 (exit 0, stdout 0000000000000000)
+        args=[200] want=I64(200) got=i64 0 (exit 0, stdout 0000000000000000)
+PASS  p1_buffer_dump_const             vm    
+XFAIL p1_buffer_dump_const             wasm   -- Wasm has no bytes-return ABI: compile_pure_u16_to_wasm (14923) never checks ret_ty and RET (15413/15491) returns the buffer-length local as i64
+        args=[7] want=Bytes([10, 20, 240, 254, 255, 255, 255]) got=i64 7 (exit 0, stdout 0700000000000000)
+PASS  p1_buffer_dump_const             x86   
+PASS  p1_buffer_dump_const             stage1
+PASS  p1_buffer_dump_param             vm    
+XFAIL p1_buffer_dump_param             wasm   -- same as p1_buffer_dump_const/wasm
+        args=[7] want=Bytes([10, 7, 240, 254, 255, 255, 255]) got=i64 7 (exit 0, stdout 0700000000000000)
+XFAIL p1_buffer_dump_param             x86    -- N12: TY_BYTES-return prologue sets r12=0 (14405-14406), so p0 is the input array, not arg0; the dump has b1=0 instead of x
+        args=[7] want=Bytes([10, 7, 240, 254, 255, 255, 255]) got=bytes[7] [10, 0, 240, 254, 255, 255, 255] (exit 0, stdout 0a00f0feffffff)
+XFAIL p1_buffer_dump_param             stage1 -- N12: Stage-1 copies the TY_BYTES-return prologue (lbl_ty_bytes_pr 16089+), same r12=0
+        args=[7] want=Bytes([10, 7, 240, 254, 255, 255, 255]) got=bytes[7] [10, 0, 240, 254, 255, 255, 255] (exit 0, stdout 0a00f0feffffff)
+PASS  p6_pack5_flow                    vm    
+XFAIL p6_pack5_flow                    wasm   -- N4: still 2009000 after d2d6c13; an all-immediate but branch-dependent buffer is still folded by the flow-insensitive collect_func_pack5_map (14217) as a complete compile-time constant (mechanism inferred from output)
+        args=[7] want=I64(2255044) got=i64 2009000 (exit 0, stdout a8a71e0000000000)
+XFAIL p6_pack5_flow                    x86    -- N4: x86 IGET const path uses the same flow-insensitive map (14217)
+        args=[7] want=I64(2255044) got=i64 2009000 (exit 0, stdout a8a71e0000000000)
+XFAIL p6_pack5_flow                    stage1 -- Stage-1 IGET reads the token region (lbl_iget 16411); no fold
+        args=[7] want=I64(2255044) got=i64 2000000 (exit 0, stdout 80841e0000000000)
+PASS  p7_two_buffers                   vm    
+XFAIL p7_two_buffers                   wasm   -- single buf_len_local shared by every ANEW buffer (ANEW 15096, ISET 15183+)
+        args=[7] want=I64(31) got=i64 11 (exit 0, stdout 0b00000000000000)
+XFAIL p7_two_buffers                   x86    -- single global r11 length shared by every ANEW buffer (ISET arm 14574+)
+        args=[7] want=I64(31) got=i64 11 (exit 0, stdout 0b00000000000000)
+XFAIL p7_two_buffers                   stage1 -- single global r11 length (lbl_iset 16417+)
+        args=[7] want=I64(31) got=i64 11 (exit 0, stdout 0b00000000000000)
+PASS  p2_drop1                         vm    
+PASS  p2_drop1                         wasm  
+PASS  p2_drop1                         x86   
+XFAIL p2_drop1                         stage1 -- Stage-1 no-dest dispatch (16222-16241) has no DROP 0x7F05 arm; the dest-form fallthrough (16243-16247) reads r_cur=pos+4 inside the next packet and swallows RET -> SIGSEGV
+        args=[7] want=I64(49) got=SIGNAL 11
+        args=[-42] want=I64(0) got=SIGNAL 11
+PASS  p2_drop3                         vm    
+PASS  p2_drop3                         wasm  
+PASS  p2_drop3                         x86   
+XFAIL p2_drop3                         stage1 -- same as p2_drop1: odd DROP count before RET swallows RET -> SIGSEGV
+        args=[7] want=I64(49) got=SIGNAL 11
+PASS  p2_drop2_arena_lifecycle         vm    
+PASS  p2_drop2_arena_lifecycle         wasm  
+PASS  p2_drop2_arena_lifecycle         x86   
+PASS  p2_drop2_arena_lifecycle         stage1
+PASS  p11_while_sum_even               vm    
+PASS  p11_while_sum_even               wasm  
+PASS  p11_while_sum_even               x86   
+PASS  p11_while_sum_even               stage1
+PASS  p11_if_pos_arith_else_temps      vm    
+PASS  p11_if_pos_arith_else_temps      wasm  
+PASS  p11_if_pos_arith_else_temps      x86   
+PASS  p11_if_pos_arith_else_temps      stage1
+PASS  p11_if_pos_nested_complex_else   vm    
+PASS  p11_if_pos_nested_complex_else   wasm  
+PASS  p11_if_pos_nested_complex_else   x86   
+PASS  p11_if_pos_nested_complex_else   stage1
+PASS  p11_match_trit_complex_neg       vm    
+PASS  p11_match_trit_complex_neg       wasm  
+PASS  p11_match_trit_complex_neg       x86   
+PASS  p11_match_trit_complex_neg       stage1
+PASS  p11_pack5_direct_aot             vm    
+PASS  p11_pack5_direct_aot             wasm  
+PASS  p11_pack5_direct_aot             x86   
+XFAIL p11_pack5_direct_aot             stage1 -- Stage-1 opcode dispatch (16243-16520) has no TPACK5/TUNPACK5/TDOT/EGATE arms; values fall into the generic copy path
+        args=[] want=I64(2422) got=i64 120 (exit 0, stdout 7800000000000000)
+PASS  p11_pack5_trit_vec               vm    
+PASS  p11_pack5_trit_vec               wasm  
+PASS  p11_pack5_trit_vec               x86   
+XFAIL p11_pack5_trit_vec               stage1 -- same as p11_pack5_direct_aot/stage1 (pack5/tdot/egate) plus no IGET const fold
+        args=[] want=I64(2455) got=i64 2004 (exit 0, stdout d407000000000000)
+PASS  p11_decision_hook                vm    
+PASS  p11_decision_hook                wasm  
+PASS  p11_decision_hook                x86   
+XFAIL p11_decision_hook                stage1 -- Stage-1 has no EGATE 0x7F35 arm; egate(delta) is emitted as a copy of delta
+        args=[30, 10] want=I64(1) got=i64 20 (exit 0, stdout 1400000000000000)
+        args=[5, 20] want=I64(-1) got=i64 -15 (exit 0, stdout f1ffffffffffffff)
+        args=[12, 12] want=I64(0) got=i64 0 (exit 0, stdout 0000000000000000)
+PASS  p3_imod_rdx_clobber              vm    
+PASS  p3_imod_rdx_clobber              wasm  
+XFAIL p3_imod_rdx_clobber              x86    -- N1: IMOD guard (14667-14675) jumps over cqo/idiv for b==0 and MIN/-1, then mov rax,rdx copies a stale rdx (TCMP leaves rdx=trit)
+        args=[7] want=I64(0) got=i64 11 (exit 0, stdout 0b00000000000000)
+XFAIL p3_imod_rdx_clobber              stage1 -- N1: Stage-1 IMOD (lbl_imod 16343+) emits the same guard + mov rax,rdx
+        args=[7] want=I64(0) got=i64 11 (exit 0, stdout 0b00000000000000)
+PASS  p3_imod_zero_after_tcmp          vm    
+PASS  p3_imod_zero_after_tcmp          wasm  
+XFAIL p3_imod_zero_after_tcmp          x86    -- N1, see p3_imod_rdx_clobber/x86
+        args=[7] want=I64(0) got=i64 1 (exit 0, stdout 0100000000000000)
+XFAIL p3_imod_zero_after_tcmp          stage1 -- N1, see p3_imod_rdx_clobber/stage1
+        args=[7] want=I64(0) got=i64 1 (exit 0, stdout 0100000000000000)
+PASS  p3_imod_min_neg1_after_tcmp      vm    
+PASS  p3_imod_min_neg1_after_tcmp      wasm  
+XFAIL p3_imod_min_neg1_after_tcmp      x86    -- N1, see p3_imod_rdx_clobber/x86
+        args=[7] want=I64(0) got=i64 1 (exit 0, stdout 0100000000000000)
+XFAIL p3_imod_min_neg1_after_tcmp      stage1 -- N1, see p3_imod_rdx_clobber/stage1
+        args=[7] want=I64(0) got=i64 1 (exit 0, stdout 0100000000000000)
+PASS  p3_imod_control_no_tcmp          vm    
+PASS  p3_imod_control_no_tcmp          wasm  
+PASS  p3_imod_control_no_tcmp          x86   
+PASS  p3_imod_control_no_tcmp          stage1
+PASS  p4_trit_clamp                    vm    
+XFAIL p4_trit_clamp                    wasm   -- N3: Wasm TNOT/TAND/TOR/TXOR/TMAJ do not clamp i64 operands (15332, 15352-15357)
+        args=[7] want=I64(13111) got=i64 37053 (exit 0, stdout bd90000000000000)
+XFAIL p4_trit_clamp                    x86    -- N3: x86 TAND/TOR share IMIN/IMAX (14714), TNOT shares INEG (14676); no clamp
+        args=[7] want=I64(13111) got=i64 37053 (exit 0, stdout bd90000000000000)
+XFAIL p4_trit_clamp                    stage1 -- N3: Stage-1 shares the same arms (16293, 16310); no clamp
+        args=[7] want=I64(13111) got=i64 37053 (exit 0, stdout bd90000000000000)
+PASS  p5_if_pos_nontrit                vm    
+XFAIL p5_if_pos_nontrit                wasm   -- N2: Wasm BR_POS compares == 1 (15451-15460); VM clamps via eval_as_trit (1115, 1213-1218)
+        args=[7] want=I64(100) got=i64 200 (exit 0, stdout c800000000000000)
+        args=[1] want=I64(100) got=i64 100 (exit 0, stdout 6400000000000000)
+        args=[0] want=I64(200) got=i64 200 (exit 0, stdout c800000000000000)
+        args=[-7] want=I64(200) got=i64 200 (exit 0, stdout c800000000000000)
+XFAIL p5_if_pos_nontrit                x86    -- N2: x86 BR_POS emits cmp rax,1; je (14793-14800)
+        args=[7] want=I64(100) got=i64 200 (exit 0, stdout c800000000000000)
+        args=[1] want=I64(100) got=i64 100 (exit 0, stdout 6400000000000000)
+        args=[0] want=I64(200) got=i64 200 (exit 0, stdout c800000000000000)
+        args=[-7] want=I64(200) got=i64 200 (exit 0, stdout c800000000000000)
+XFAIL p5_if_pos_nontrit                stage1 -- N2: Stage-1 BR_POS (lbl_br_pos 16504+) emits the same cmp rax,1
+        args=[7] want=I64(100) got=i64 200 (exit 0, stdout c800000000000000)
+        args=[1] want=I64(100) got=i64 100 (exit 0, stdout 6400000000000000)
+        args=[0] want=I64(200) got=i64 200 (exit 0, stdout c800000000000000)
+        args=[-7] want=I64(200) got=i64 200 (exit 0, stdout c800000000000000)
+PASS  p5_if_neg_nontrit                vm    
+XFAIL p5_if_neg_nontrit                wasm   -- N2: Wasm BR_NEG compares == -1 (15451-15460)
+        args=[-7] want=I64(100) got=i64 200 (exit 0, stdout c800000000000000)
+        args=[-1] want=I64(100) got=i64 100 (exit 0, stdout 6400000000000000)
+        args=[7] want=I64(200) got=i64 200 (exit 0, stdout c800000000000000)
+XFAIL p5_if_neg_nontrit                x86    -- N2: x86 BR_NEG emits cmp rax,-1; je (14793-14800)
+        args=[-7] want=I64(100) got=i64 200 (exit 0, stdout c800000000000000)
+        args=[-1] want=I64(100) got=i64 100 (exit 0, stdout 6400000000000000)
+        args=[7] want=I64(200) got=i64 200 (exit 0, stdout c800000000000000)
+XFAIL p5_if_neg_nontrit                stage1 -- N2: Stage-1 BR_NEG (lbl_br_neg 16513+) mirrors x86
+        args=[-7] want=I64(100) got=i64 200 (exit 0, stdout c800000000000000)
+        args=[-1] want=I64(100) got=i64 100 (exit 0, stdout 6400000000000000)
+        args=[7] want=I64(200) got=i64 200 (exit 0, stdout c800000000000000)
+PASS  lbl15_surface                    vm    
+PASS  lbl15_surface                    wasm  
+PASS  lbl15_surface                    x86   
+PASS  lbl15_surface                    stage1
+XFAIL lbl16_surface                    vm     -- C4 not landed: alloc_lbl starts next_lbl at 1 (3587) and rejects next_lbl > 15 with BUDGET_EXCEEDED (3646-3656)
+        args=[5] want=I64(520) got=REJECTED error[BUDGET_EXCEEDED] line 1, col 300: Surface function exceeded 15 basic-block labels
+        args=[-5] want=I64(150) got=REJECTED error[BUDGET_EXCEEDED] line 1, col 300: Surface function exceeded 15 basic-block labels
+        args=[0] want=I64(150) got=REJECTED error[BUDGET_EXCEEDED] line 1, col 300: Surface function exceeded 15 basic-block labels
+XFAIL lbl16_surface                    wasm   -- C4, see lbl16_surface/vm
+        args=[5] want=I64(520) got=REJECTED error[BUDGET_EXCEEDED] line 1, col 300: Surface function exceeded 15 basic-block labels
+        args=[-5] want=I64(150) got=REJECTED error[BUDGET_EXCEEDED] line 1, col 300: Surface function exceeded 15 basic-block labels
+        args=[0] want=I64(150) got=REJECTED error[BUDGET_EXCEEDED] line 1, col 300: Surface function exceeded 15 basic-block labels
+XFAIL lbl16_surface                    x86    -- C4, see lbl16_surface/vm
+        args=[5] want=I64(520) got=REJECTED error[BUDGET_EXCEEDED] line 1, col 300: Surface function exceeded 15 basic-block labels
+        args=[-5] want=I64(150) got=REJECTED error[BUDGET_EXCEEDED] line 1, col 300: Surface function exceeded 15 basic-block labels
+        args=[0] want=I64(150) got=REJECTED error[BUDGET_EXCEEDED] line 1, col 300: Surface function exceeded 15 basic-block labels
+XFAIL lbl16_surface                    stage1 -- C4, see lbl16_surface/vm
+        args=[5] want=I64(520) got=REJECTED error[BUDGET_EXCEEDED] line 1, col 300: Surface function exceeded 15 basic-block labels
+        args=[-5] want=I64(150) got=REJECTED error[BUDGET_EXCEEDED] line 1, col 300: Surface function exceeded 15 basic-block labels
+        args=[0] want=I64(150) got=REJECTED error[BUDGET_EXCEEDED] line 1, col 300: Surface function exceeded 15 basic-block labels
+PASS  lbl17_surface                    vm    
+PASS  lbl17_surface                    wasm  
+PASS  lbl17_surface                    x86   
+PASS  lbl17_surface                    stage1
+PASS  lbl16_asm_ids_0_15               vm    
+PASS  lbl16_asm_ids_0_15               wasm  
+PASS  lbl16_asm_ids_0_15               x86   
+PASS  lbl16_asm_ids_0_15               stage1
+PASS  lbl15_asm_ids_0_14               vm    
+PASS  lbl15_asm_ids_0_14               wasm  
+PASS  lbl15_asm_ids_0_14               x86   
+PASS  lbl15_asm_ids_0_14               stage1
+PASS  lbl17_asm_ids_0_16               vm    
+PASS  lbl17_asm_ids_0_16               wasm  
+PASS  lbl17_asm_ids_0_16               x86   
+PASS  lbl17_asm_ids_0_16               stage1
+XFAIL p9_vm_patch_negative_offset      vm     -- N6: ISET mode -9 casts a negative offset to usize; off+8 wraps and buf[off..off+8] panics (1324-1326) instead of the decided silent no-op (HANDOFF.md 6.4)
+        args=[7] want=I64(8) got=PANIC slice index starts at 18446744073709551613 but ends at 5
+[BACKEND-DIFF SUITE] 117 graded: 78 pass, 39 xfail, 0 xpass, 0 fail, 0 skipped
+
+real	0m2.629s
+user	0m1.133s
+sys	0m0.017s

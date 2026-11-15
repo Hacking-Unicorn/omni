@@ -1,0 +1,2 @@
+[PURE-OMNI-DIFF PASS] 47 differential acceptance, self-host fixed-point (gen1 == gen2), narrow-host HTTP/KV, and agent-repair checks passed (omni-pure-frontend-v1.0.0 / omni-pure-driver-v1.0.0 / omni-pure-kernel-v1.0.0 / omni-pure-host-v1.0.0 / omni-pure-selfhost-v1.0.0).
+rc=0

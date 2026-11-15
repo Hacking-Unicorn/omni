@@ -1,0 +1,1 @@
+fn st(x: i64) -> i64 { let r = sel_trit(x, 1, 2, 3); return r; }

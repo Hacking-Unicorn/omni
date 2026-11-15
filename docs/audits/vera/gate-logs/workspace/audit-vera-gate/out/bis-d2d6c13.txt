@@ -1,0 +1,4 @@
+Vera P1 x=7: VM=8796075198218 Wasm=8796075198218 x86=7696581394432 Stage-1=7696581394432
+Vera P1 x=7: VM=8796075198218 Wasm=8796075198218 x86=7696581394432 Stage-1=7696581394432
+[WORKSPACE SELFTEST PASS] 406 differential checks passed (monolith vs omni-isa, omni-ir, omni-verifier, omni-vm, omni-assembler, omni-lang, omni-aot).
+rc=0

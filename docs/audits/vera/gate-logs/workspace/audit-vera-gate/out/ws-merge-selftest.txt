@@ -1,0 +1,8 @@
+Vera P1 x=7: VM=8796075198218 Wasm=8796075198218 x86=8796075198218 Stage-1=7696581394432 (Stage-1 record-only: frozen token-region IGET)
+two_bufs x=7: VM=31 Wasm=31 x86=11 (x86 record-only: shared r11 heap)
+buf_copy x=7: VM=2340309007 Wasm=2340309007 x86=5550303009 (x86 record-only: shared r11 heap)
+Vera P1 x=7: VM=8796075198218 Wasm=8796075198218 x86=8796075198218 Stage-1=7696581394432 (Stage-1 record-only: frozen token-region IGET)
+two_bufs x=7: VM=31 Wasm=31 x86=11 (x86 record-only: shared r11 heap)
+buf_copy x=7: VM=2340309007 Wasm=2340309007 x86=5550303009 (x86 record-only: shared r11 heap)
+[WORKSPACE SELFTEST PASS] 420 differential checks passed (monolith vs omni-isa, omni-ir, omni-verifier, omni-vm, omni-assembler, omni-lang, omni-aot).
+rc=0

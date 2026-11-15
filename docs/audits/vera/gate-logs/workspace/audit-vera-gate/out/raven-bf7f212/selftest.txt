@@ -1,0 +1,6 @@
+Vera P1 x=7: VM=8796075198218 Wasm=8796075198218 x86=7696581394432 Stage-1=7696581394432
+[SELFTEST PASS] 446 unit, negative-verifier, AOT/Wasm-64bit, Stage-1 control-flow, and 64-corpus differential checks passed.
+
+real	1m42.605s
+user	1m34.621s
+sys	0m0.025s

@@ -1,0 +1,1 @@
+fn pack5_flow_golden(x: i64) -> i64 { let buf = anew(0); let c = x <=> 100; let b2 = if_pos c { iset(buf, 9) } else { iset(buf, 0 - 1, 44) }; let v0 = iget(b2, 0); let v1 = iget(b2, 1); let n = slen(b2); let r = n * 1000000 + v0 * 1000 + v1; return r; }

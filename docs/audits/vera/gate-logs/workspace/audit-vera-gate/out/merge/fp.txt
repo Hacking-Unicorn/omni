@@ -1,0 +1,1 @@
+[FIXED-POINT PASS] omni_self_compiler.omni_bc=39462 B (FNV-1a64=0x677F57AE71D28FED) | omni_stage1_self_compiler.elf=106242 B (FNV-1a64=0xEAFC81F46B482FF8) == omni_stage2_self_compiler.elf=106242 B (FNV-1a64=0xEAFC81F46B482FF8) | diff=0 bytes

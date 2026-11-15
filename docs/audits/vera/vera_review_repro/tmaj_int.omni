@@ -1,0 +1,1 @@
+fn tmaji(x: i64) -> i64 { let a = tmaj(x, 0 - 1, 0 - 1); return a; }

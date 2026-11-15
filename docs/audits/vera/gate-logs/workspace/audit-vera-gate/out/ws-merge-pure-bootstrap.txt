@@ -1,0 +1,2 @@
+{"ok":true,"version":"omni-pure-selfhost-v1.0.0","gen1_words":159,"gen2_words":159,"bc_equal":true,"bc_fnv1a64":"0x23B8D17257CCA9C4","elf_bytes":824,"elf_equal":true,"elf_fnv1a64":"0xE221085777B8AC47","suite_words":14559,"suite_fnv1a64":"0x78462AE4C81DF408","stdlib_modules":7,"core_modules":5,"real_programs":6,"total_pure_modules":18}
+rc=0

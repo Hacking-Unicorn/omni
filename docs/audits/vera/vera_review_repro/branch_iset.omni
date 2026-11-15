@@ -1,0 +1,1 @@
+fn briset(x: i64) -> i64 { let buf = anew(0); let c = x <=> 100; let b2 = if_pos c { iset(buf, 9) } else { buf }; let n = slen(b2); let v = iget(b2, 0); let r = n * 100 + v; return r; }

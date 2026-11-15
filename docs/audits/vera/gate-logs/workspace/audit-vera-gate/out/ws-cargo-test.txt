@@ -1,0 +1,140 @@
+   Compiling omni-vm v0.2.0 (/workspace/audit-vera-bis-08fcdbe/omni-workspace/crates/omni-vm)
+   Compiling omni-aot v0.2.0 (/workspace/audit-vera-bis-08fcdbe/omni-workspace/crates/omni-aot)
+   Compiling omni-lang v0.2.0 (/workspace/audit-vera-bis-08fcdbe/omni-workspace/crates/omni-lang)
+   Compiling omni-cli v0.2.0 (/workspace/audit-vera-bis-08fcdbe/omni-workspace/crates/omni-cli)
+   Compiling omni-assembler v0.2.0 (/workspace/audit-vera-bis-08fcdbe/omni-workspace/crates/omni-assembler)
+   Compiling omni-verifier v0.2.0 (/workspace/audit-vera-bis-08fcdbe/omni-workspace/crates/omni-verifier)
+   Compiling omni-ir v0.2.0 (/workspace/audit-vera-bis-08fcdbe/omni-workspace/crates/omni-ir)
+   Compiling omni-isa v0.2.0 (/workspace/audit-vera-bis-08fcdbe/omni-workspace/crates/omni-isa)
+    Finished `release` profile [optimized] target(s) in 22.13s
+     Running unittests src/lib.rs (/workspace/audit-vera-gate/target-08fcdbe/release/deps/omni_aot-8316f47e7413310c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/workspace/audit-vera-gate/target-08fcdbe/release/deps/omni_assembler-b076ba667035bb3d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/workspace/audit-vera-gate/target-08fcdbe/release/deps/omni_cli-30e10e96d74e142a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/omni-agent-driver.rs (/workspace/audit-vera-gate/target-08fcdbe/release/deps/omni_agent_driver-1acee3e9969e8b02)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/omni-harness.rs (/workspace/audit-vera-gate/target-08fcdbe/release/deps/omni_harness-6e2fed36e5c04a41)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (/workspace/audit-vera-gate/target-08fcdbe/release/deps/omnic-94e40cca6aea5e08)
+
+running 6 tests
+test tests::acceptance_diff_suite ... ok
+test tests::monolith_selftest_matrix has been running for over 60 seconds
+test tests::pure_bootstrap_fixed_point has been running for over 60 seconds
+test tests::pure_omni_diff_suite has been running for over 60 seconds
+test tests::verifier_engine_diff_suite has been running for over 60 seconds
+test tests::workspace_selftest_matrix has been running for over 60 seconds
+test tests::workspace_selftest_matrix ... ok
+test tests::monolith_selftest_matrix ... ok
+test tests::pure_bootstrap_fixed_point ... ok
+test tests::pure_omni_diff_suite ... ok
+test tests::verifier_engine_diff_suite ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 418.88s
+
+     Running unittests src/lib.rs (/workspace/audit-vera-gate/target-08fcdbe/release/deps/omni_ir-f7dd5061684ce138)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/workspace/audit-vera-gate/target-08fcdbe/release/deps/omni_isa-6c21f3d16826d13d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/workspace/audit-vera-gate/target-08fcdbe/release/deps/omni_lang-6958e9038045f34c)
+
+running 5 tests
+test verifier::verifier_engine_tests::verifier_engine_compiles_and_passes_rust_verify ... ok
+test compiler::if_pos_join_slot_tests::byte_readback_parity_vera_p1 ... ok
+test verifier::verifier_engine_tests::lockstep_shadow_mode_regression ... ok
+test verifier::verifier_engine_tests::verifier_engine_matches_rust_on_core_cases ... ok
+test compiler::if_pos_join_slot_tests::if_pos_join_slot_regression ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.64s
+
+     Running unittests src/lib.rs (/workspace/audit-vera-gate/target-08fcdbe/release/deps/omni_verifier-8b9516834cb16a2b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/workspace/audit-vera-gate/target-08fcdbe/release/deps/omni_vm-4f2fa9f4acc29626)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests omni_aot
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests omni_assembler
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests omni_cli
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests omni_ir
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests omni_isa
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests omni_lang
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests omni_verifier
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests omni_vm
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+rc=0

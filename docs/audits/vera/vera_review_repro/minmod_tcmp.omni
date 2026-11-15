@@ -1,0 +1,1 @@
+fn minmodt(x: i64) -> i64 { let c = x <=> 5; let one = x - x + 1; let m = one << 63; let n = 0 - one; let r = m % n; return r; }

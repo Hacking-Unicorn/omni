@@ -1,0 +1,1 @@
+fn imod_clobber_golden(x: i64) -> i64 { let z = x - x; let c = x <=> 5; let r0 = x % z; let one = z + 1; let m = one << 63; let n = z - one; let c2 = x <=> 5; let r1 = m % n; let r = r0 * 10 + r1; return r; }

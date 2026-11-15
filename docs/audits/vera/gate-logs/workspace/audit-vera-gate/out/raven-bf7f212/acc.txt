@@ -1,0 +1,5 @@
+[ACCEPTANCE-DIFF PASS] 39 positive and negative executable specification goldens matched bit-for-bit (omni-acceptance-suite-v1.0.0).
+
+real	0m9.338s
+user	0m9.312s
+sys	0m0.008s

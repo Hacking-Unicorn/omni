@@ -1,0 +1,1 @@
+fn mulo(x: i64) -> i64 { let one = x - x + 1; let m = one << 62; let r = m * 4; let s = r + m; return s; }

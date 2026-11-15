@@ -1,0 +1,5 @@
+stage1_bc   words=19731 bytes=39462 fnv=0x677F57AE71D28FED
+stage1_elf  bytes=106242 fnv=0xEAFC81F46B482FF8
+phaseD_bc   words=159 fnv=0x23B8D17257CCA9C4 g1==g2:true
+phaseD_elf  bytes=824 fnv=0xE221085777B8AC47 g1==g2:true
+suite       words=14559 fnv=0x78462AE4C81DF408
