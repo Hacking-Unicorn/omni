@@ -3695,13 +3695,16 @@ impl SurfaceLowerCtx {
     }
 
     fn alloc_lbl(&mut self, line: usize, col: usize) -> Result<u16, String> {
-        if self.next_lbl > 15 {
+        // C4: 16 labels per function (token ids 0..15). Ids are handed out 1..15 first and the
+        // 16th label gets id 0, so every function with <= 15 labels keeps its exact bytes (no
+        // frozen hash moves). The 17th label is rejected.
+        if self.next_lbl > 16 {
             return Err(format!(
-                "error[BUDGET_EXCEEDED] line {}, col {}: Surface function exceeded 15 basic-block labels",
+                "error[BUDGET_EXCEEDED] line {}, col {}: Surface function exceeded 16 basic-block labels",
                 line, col
             ));
         }
-        let l = self.next_lbl;
+        let l = if self.next_lbl == 16 { 0 } else { self.next_lbl };
         self.next_lbl += 1;
         Ok(l)
     }
@@ -12725,6 +12728,75 @@ pub fn run_isa_b_multibyte_parity_selftests() -> Result<usize, String> {
     Ok(checks)
 }
 
+/// C4 label cap (16 per function). Sources match Vera's diff4 `lbl16_surface` / `lbl17_surface`.
+/// 16 labels: 5 value if_pos (2 each) + 2 while (3 each). r = sum(if_pos c {k} else {10k}, k=1..5)
+/// + 100*max(x,0) + max(x,0): x=5 -> 15 + 500 + 5 = 520; x=-5 -> 150.
+pub const LBL16_SURFACE_SRC: &str = "fn lbl16(x: i64) -> i64 { let c = x <=> 0; let a1 = if_pos c { 1 } else { 10 }; let a2 = if_pos c { 2 } else { 20 }; let a3 = if_pos c { 3 } else { 30 }; let a4 = if_pos c { 4 } else { 40 }; let a5 = if_pos c { 5 } else { 50 }; let acc = 0; let i = 0; while i < x { acc += 100; i += 1; } let j = 0; while j < x { acc += 1; j += 1; } let r = a1 + a2 + a3 + a4 + a5 + acc; return r; }";
+pub const LBL16_SURFACE_RUNS: &[(i64, i64)] = &[(5, 520), (-5, 150)];
+/// 17 labels: 7 value if_pos + 1 while. Must be rejected.
+pub const LBL17_SURFACE_SRC: &str = "fn lbl17(x: i64) -> i64 { let c = x <=> 0; let a1 = if_pos c { 1 } else { 10 }; let a2 = if_pos c { 2 } else { 20 }; let a3 = if_pos c { 3 } else { 30 }; let a4 = if_pos c { 4 } else { 40 }; let a5 = if_pos c { 5 } else { 50 }; let a6 = if_pos c { 6 } else { 60 }; let a7 = if_pos c { 7 } else { 70 }; let acc = 0; let i = 0; while i < x { acc += 100; i += 1; } let r = a1 + a2 + a3 + a4 + a5 + a6 + a7 + acc; return r; }";
+
+/// 13BE. C4: a 16-label surface function compiles (16th label = id 0) and runs identically on
+/// VM, Wasm, native x86-64 and Stage-1 (Stage-1 ELF == host ELF); a 17-label function is
+/// rejected with error[BUDGET_EXCEEDED].
+pub fn run_label_cap_16_selftests() -> Result<usize, String> {
+    let mut checks = 0usize;
+    let stream = compile_omni_surface_to_u16(LBL16_SURFACE_SRC)?;
+    let module = decode_omni_token_stream(&stream)?;
+    let mut ids: Vec<u16> = Vec::new();
+    for ins in &module.functions[0].instructions {
+        if ins.op_tok == 0x7F40 {
+            if let Some(l) = ins.operands.first().and_then(extract_label_id) {
+                // Label operands carry the raw token 0x7EF0 + id.
+                ids.push(l.wrapping_sub(0x7EF0));
+            }
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    if ids != (0u16..16).collect::<Vec<u16>>() {
+        return Err(format!("lbl16: expected label ids 0..15, got {ids:?}"));
+    }
+    checks += 1;
+    for &(x, want) in LBL16_SURFACE_RUNS {
+        let mut vm = OmniBinaryVm::new();
+        let vm_got = vm.execute_function(&module, 0, vec![OmniValue::Int(x)])?;
+        if vm_got != OmniValue::Int(want) {
+            return Err(format!("lbl16 VM x={x} got {vm_got:?} want {want}"));
+        }
+        checks += 1;
+        let wasm_got = execute_omni_surface_wasm_i64(LBL16_SURFACE_SRC, &[x])?;
+        if wasm_got != want {
+            return Err(format!("lbl16 Wasm x={x} got {wasm_got} want {want}"));
+        }
+        checks += 1;
+        #[cfg(all(unix, target_arch = "x86_64"))]
+        {
+            let elf = compile_omni_surface_to_x86_64_elf(LBL16_SURFACE_SRC, x, 0, 0)?;
+            let x86_got = execute_native_elf_i64(&elf, &[x])?;
+            if x86_got != want {
+                return Err(format!("lbl16 x86-64 x={x} got {x86_got} want {want}"));
+            }
+            checks += 1;
+            let s1 = compile_omni_surface_via_stage1_to_elf(LBL16_SURFACE_SRC, x, 0, 0)?;
+            if s1 != elf {
+                return Err(format!("lbl16 x={x}: Stage-1 ELF != host ELF"));
+            }
+            let s1_got = execute_native_elf_i64(&s1, &[x])?;
+            if s1_got != want {
+                return Err(format!("lbl16 Stage-1 x={x} got {s1_got} want {want}"));
+            }
+            checks += 1;
+        }
+    }
+    match compile_omni_surface_to_u16(LBL17_SURFACE_SRC) {
+        Err(e) if e.contains("error[BUDGET_EXCEEDED]") && e.contains("16 basic-block labels") => checks += 1,
+        Err(e) => return Err(format!("lbl17: wrong rejection {e}")),
+        Ok(_) => return Err(String::from("lbl17: a 17-label function compiled; it must be rejected")),
+    }
+    Ok(checks)
+}
+
 /// Regression: value-returning `if_pos`/`if_neg`/`match_trit` must use a single
 /// contiguous SSA join slot. Branch temps in the first stream-order arm must not
 /// punch a hole before the join dest is defined, and both arms must write that
@@ -13552,6 +13624,9 @@ fn main(x: i64, y: i64) -> i64 {
 
     // 13BC. ISA-B 3-op IGET / 4-op ISET patches (VM + Wasm + run + x86 assert; Stage-1 must reject)
     checks += run_isa_b_multibyte_parity_selftests()?;
+
+    // 13BE. C4 label cap 16: 16-label surface fn on VM / Wasm / x86-64 / Stage-1; 17 rejected
+    checks += run_label_cap_16_selftests()?;
 
     Ok(checks)
 }

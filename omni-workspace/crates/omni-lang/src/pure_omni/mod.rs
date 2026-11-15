@@ -2766,6 +2766,9 @@ fn main(x: i64, y: i64) -> i64 {
     // 13BC. ISA-B 3-op IGET / 4-op ISET patches (VM + Wasm + run + x86 assert; Stage-1 must reject)
     checks += run_isa_b_multibyte_parity_selftests()?;
 
+    // 13BE. C4 label cap 16: 16-label surface fn on VM / Wasm / x86-64 / Stage-1; 17 rejected
+    checks += run_label_cap_16_selftests()?;
+
     Ok(checks)
 }
 
