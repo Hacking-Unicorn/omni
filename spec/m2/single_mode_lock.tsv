@@ -100,7 +100,7 @@ golden:pack5_trit_vec_golden	u16	113	0x533A5CD4EAFFF638
 golden:pack5_trit_vec_golden	x86_000	1875	0xC2D94F2A93CBE7FF
 golden:pack5_trit_vec_golden	x86_454090	1875	0x54895613AC553094
 golden:pack5_trit_vec_golden	wasm	724	0xD157EDEAE2BF8595
-golden:route_db_query_golden	u16	50	0x36C288283412E310
+golden:route_db_query_golden	u16	58	0x690CF62FB7AB1EFB
 golden:route_db_query_golden	x86_000	REJECT
 golden:route_db_query_golden	x86_454090	REJECT
 golden:route_db_query_golden	wasm	REJECT

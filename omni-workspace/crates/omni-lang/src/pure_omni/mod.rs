@@ -2230,21 +2230,29 @@ pub fn run_ai_first_surface_selftests() -> Result<usize, String> {
     if kv_val != OmniValue::Int(200_000_777) || kv_backend != "vm" {
         return Err(format!("route GET /users/:id kv golden mismatch: {:?} via {}", kv_val, kv_backend));
     }
+    let route_get_miss = "route GET /users/:id (req: i64) @cap(net, db_r) {\n    let id = req.param(\"id\");\n    let row = db_get(id);\n    respond(200, row);\n}";
+    if execute_omni_surface_program(route_get_miss, vec![OmniValue::Int(42)])? != OmniValue::Int(200_000_000 + OMNI_DB_GET_MISS) {
+        return Err(String::from("route GET /users/:id db_get miss golden mismatch (want HTTP 200 row -1 = OMNI_DB_GET_MISS)"));
+    }
     let route_q = "route GET /users/:id (req: i64) @cap(net, db_r) {\n    let id = req.param(\"id\");\n    let row = db_query(\"SELECT * FROM users WHERE id = ?\", id);\n    respond(200, row);\n}";
-    if execute_omni_surface_program(route_q, vec![OmniValue::Int(42)])? != OmniValue::Int(200_000_420) {
-        return Err(String::from("route GET /users/:id db_query golden mismatch (want HTTP 200 row 420)"));
+    if execute_omni_surface_program(route_q, vec![OmniValue::Int(42)])? != OmniValue::Int(200_000_000 + OMNI_DB_QRY_MISS) {
+        return Err(String::from("route GET /users/:id db_query miss golden mismatch (want HTTP 200 row -1 = OMNI_DB_QRY_MISS)"));
+    }
+    let route_q_hit = "route GET /users/:id (req: i64) @cap(net, db_r, db_w) {\n    let id = req.param(\"id\");\n    let saved = kv_put(id, 420);\n    let row = db_query(\"SELECT * FROM users WHERE id = ?\", id);\n    respond(200, row);\n}";
+    if execute_omni_surface_program(route_q_hit, vec![OmniValue::Int(42)])? != OmniValue::Int(200_000_420) {
+        return Err(String::from("route GET /users/:id db_query hit golden mismatch (want HTTP 200 row 420)"));
     }
     let route_u16 = compile_omni_surface_to_u16(route_q)?;
     if !route_u16.iter().any(|&t| t == 0x7F6C) || !route_u16.iter().any(|&t| t == 0x7F65) || !route_u16.iter().any(|&t| t == 0x7F6E) {
         return Err(String::from("route lowering did not emit ROUTE/DB_QRY/RSP_JSON host opcodes"));
     }
-    checks += 2;
+    checks += 4;
     expect_omni_error_code("route_no_caps", execute_omni_surface_program("route GET /users/:id (req: i64) {\n    let id = req.param(\"id\");\n    let row = db_get(id);\n    respond(200, row);\n}", vec![OmniValue::Int(42)]), "MISSING_CAP")?;
     expect_omni_error_code("route_no_db_r", execute_omni_surface_program("route GET /users/:id (req: i64) @cap(net) {\n    let id = req.param(\"id\");\n    let row = db_get(id);\n    respond(200, row);\n}", vec![OmniValue::Int(42)]), "MISSING_CAP")?;
     expect_omni_error_code("route_no_db_w", execute_omni_surface_program("#[cap(NET, DB_R)] route POST /users/:id (req: i64) {\n    let id = req.param(\"id\");\n    let saved = kv_put(id, 1);\n    respond(201, saved);\n}", vec![OmniValue::Int(42)]), "MISSING_CAP")?;
     expect_omni_error_code("sql_injection", execute_omni_surface_program("#[cap(DB_R)] fn main(id: i64 @untrusted) -> i64 { let r = db_query(\"SELECT * FROM users WHERE id = ?\", id); return r; }", vec![OmniValue::Int(5)]), "TAINT_SINK")?;
     let authed = "#[cap(DB_R, AUTH)] fn main(id: i64 @untrusted) -> i64 { let ok = auth_verify(id); let r = db_query(\"SELECT * FROM users WHERE id = ?\", ok); return r; }";
-    if execute_omni_surface_program(authed, vec![OmniValue::Int(5)])? != OmniValue::Int(50) {
+    if execute_omni_surface_program(authed, vec![OmniValue::Int(5)])? != OmniValue::Int(OMNI_DB_QRY_MISS) {
         return Err(String::from("auth_verify sanitizer did not clear @untrusted for db_query"));
     }
     checks += 5;
@@ -2330,7 +2338,7 @@ pub fn run_ai_first_surface_selftests() -> Result<usize, String> {
     }
     checks += 1;
 
-    // Repair case 3: TAINT_SINK on db_query -> sanitizes query parameter and adds AUTH capability
+    // Repair case 3: TAINT_SINK on db_query -> sanitizes query parameter and adds AUTH capability (empty KV: DB_QRY miss = -1)
     let rep_sink = run_omni_agent_repair_loop(
         "#[cap(DB_R)]\nfn main(id: i64 @untrusted) -> i64 {\n    let r: i64 = db_query(\"SELECT * FROM users WHERE id = ?\", id);\n    return r;\n}",
         vec![OmniValue::Int(42)],
@@ -2338,7 +2346,7 @@ pub fn run_ai_first_surface_selftests() -> Result<usize, String> {
         3,
         OMNI_HARNESS_CONTRACT_VERSION,
     )?;
-    if !rep_sink.ok || rep_sink.attempts.len() != 2 || !rep_sink.final_json.contains("\"result\":\"420\"") {
+    if !rep_sink.ok || rep_sink.attempts.len() != 2 || !rep_sink.final_json.contains("\"result\":\"-1\"") {
         return Err(format!("Agent driver TAINT_SINK repair failed: {:?}", rep_sink));
     }
     checks += 1;

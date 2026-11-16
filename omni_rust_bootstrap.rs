@@ -1030,6 +1030,13 @@ pub enum OmniValue {
 pub const DEFAULT_VM_STEP_LIMIT: u64 = 50_000_000;
 pub const DEFAULT_VM_MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_VM_CALL_DEPTH: usize = 64;
+/// Documented `DB_QRY` (0x7F65) not-found value (Boss Lady decision; HANDOFF.md §6.7). Never `key*10`.
+pub const OMNI_DB_QRY_MISS: i64 = -1;
+/// Documented `DB_GET` (0x7F64) not-found value (Boss Lady decision 2026-11-14). Never `key*10`.
+pub const OMNI_DB_GET_MISS: i64 = -1;
+/// Fixed KV key cap (Boss Lady 2026-11-14): 8192 distinct keys, the `pure/host_kv.omni` arena size
+/// (0x1B0000..0x1EFFFF at 32 B). The 8193rd new key is `BUDGET_EXCEEDED`; overwrites still succeed.
+pub const OMNI_VM_KV_MAX_KEYS: usize = 8192;
 
 pub struct OmniBinaryVm {
     pub tables: HashMap<u16, Vec<BTreeMap<u16, OmniValue>>>,
@@ -1717,20 +1724,24 @@ impl OmniBinaryVm {
                     } else { OmniValue::Void }
                 }
                 0x7F64 | 0x7F65 => {
+                    // DB_QRY (0x7F65) miss = OMNI_DB_QRY_MISS (-1); DB_GET (0x7F64) miss = OMNI_DB_GET_MISS (-1).
+                    let is_qry = ins.op_tok == 0x7F65;
                     if ins.operands.len() == 1 {
                         let key = Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0);
-                        let val = self.kv_store.get(&key).copied().unwrap_or(key.wrapping_mul(10));
+                        let miss = if is_qry { OMNI_DB_QRY_MISS } else { OMNI_DB_GET_MISS };
+                        let val = self.kv_store.get(&key).copied().unwrap_or(miss);
                         OmniValue::Int(val)
                     } else if ins.operands.len() >= 2 {
                         let tbl = Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0);
                         let key = Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0);
                         let composite_key = tbl.wrapping_mul(1_000_000).wrapping_add(key);
+                        let miss = if is_qry { OMNI_DB_QRY_MISS } else { OMNI_DB_GET_MISS };
                         let val = self
                             .kv_store
                             .get(&composite_key)
                             .or_else(|| self.kv_store.get(&key))
                             .copied()
-                            .unwrap_or(key.wrapping_mul(10));
+                            .unwrap_or(miss);
                         OmniValue::Int(val)
                     } else {
                         OmniValue::Int(0)
@@ -1741,13 +1752,21 @@ impl OmniBinaryVm {
                     OmniValue::Int(cnt as i64)
                 }
                 0x7F6B => {
-                    self.charge_memory(16)?;
                     if ins.operands.len() >= 2 {
                         let key = Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0);
                         let val = Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0);
+                        // A new distinct key past OMNI_VM_KV_MAX_KEYS fails before the charge; overwrites still work.
+                        if self.kv_store.len() >= OMNI_VM_KV_MAX_KEYS && !self.kv_store.contains_key(&key) {
+                            return Err(format!(
+                                "error[BUDGET_EXCEEDED]: VM KV store key cap exceeded ({} distinct keys, max {})",
+                                self.kv_store.len(), OMNI_VM_KV_MAX_KEYS
+                            ));
+                        }
+                        self.charge_memory(16)?;
                         self.kv_store.insert(key, val);
                         OmniValue::Int(val)
                     } else {
+                        self.charge_memory(16)?;
                         OmniValue::Int(0)
                     }
                 }
@@ -9232,7 +9251,9 @@ pub fn run_omni_acceptance_diff(candidate_cmd: Option<&str>) -> Result<usize, St
         ("arena_lifecycle_golden", "#[strict]\nfn arena_lifecycle_golden(x: i64) -> i64 {\n    let a: arena = arena(4096);\n    let r: arena = borrow_r(a);\n    let res: i64 = x + 42;\n    drop(r);\n    drop(a);\n    return res;\n}", None, &["8"], "50", "aot"),
         ("pack5_direct_aot", "#[strict]\n#[cap(AI)]\nfn pack5_direct_aot() -> i64 {\n    let raw: bytes = pack5_bytes([+1t, -1t, 0t, +1t, +1t, -1t, 0t, -1t, +1t, +1t]);\n    let dot: i64 = pack5_tdot(raw, raw);\n    let g: trit = pack5_gate(raw);\n    let tv: trit_vec = unpack5(raw, 10);\n    let t0: i64 = pack5_get(tv, 0);\n    let t1: i64 = pack5_get(tv, 1);\n    let b_len: i64 = pack5_len(raw);\n    let bonus: i64 = if_pos g { 2000 } else { 0 };\n    return bonus + dot * 50 + b_len * 10 + (t0 - t1);\n}", None, &[], "2422", "aot"),
         ("route_kv_golden", "#[strict]\n#[cap(NET, DB_R, DB_W)]\nroute GET /users/:id (req: i64) {\n    let id: i64 = req.param(\"id\");\n    let saved: i64 = kv_put(id, 777);\n    let row: i64 = db_get(id);\n    respond(200, row);\n}", None, &["42"], "200000777", "vm"),
-        ("route_db_query_golden", "#[strict]\n#[cap(NET, DB_R)]\nroute GET /users/:id (req: i64) {\n    let id: i64 = req.param(\"id\");\n    let row: i64 = db_query(\"SELECT * FROM users WHERE id = ?\", id);\n    respond(200, row);\n}", None, &["42"], "200000420", "vm"),
+        ("route_db_query_golden", "#[strict]\n#[cap(NET, DB_R, DB_W)]\nroute GET /users/:id (req: i64) {\n    let id: i64 = req.param(\"id\");\n    let saved: i64 = kv_put(id, 420);\n    let row: i64 = db_query(\"SELECT * FROM users WHERE id = ?\", id);\n    respond(200, row);\n}", None, &["42"], "200000420", "vm"),
+        ("route_db_get_miss_golden", "#[strict]\n#[cap(NET, DB_R)]\nroute GET /users/:id (req: i64) {\n    let id: i64 = req.param(\"id\");\n    let row: i64 = db_get(id);\n    respond(200, row);\n}", None, &["42"], "199999999", "vm"),
+        ("route_db_query_miss_golden", "#[strict]\n#[cap(NET, DB_R)]\nroute GET /users/:id (req: i64) {\n    let id: i64 = req.param(\"id\");\n    let row: i64 = db_query(\"SELECT * FROM users WHERE id = ?\", id);\n    respond(200, row);\n}", None, &["42"], "199999999", "vm"),
         ("stdlib_macro_pipeline_golden", "include \"std/prelude.omni\";\nmacro weighted_diff(lhs, rhs, scale) = (lhs - rhs) * scale;\n#[strict]\n#[cap(AI)]\nfn main(x: i64, lo: i64, hi: i64) -> i64 {\n    let c: i64 = std_clamp(x, lo, hi);\n    let d: i64 = weighted_diff(c, lo, 3);\n    let g: trit = egate(d - 50);\n    let bonus: i64 = std_trit_mux(g, -10, 0, 10);\n    return d + bonus;\n}", None, &["45", "10", "40"], "100", "vm"),
     ];
 
@@ -12356,6 +12377,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static LOCKSTEP_COMPILE_COUNT: AtomicU64 = AtomicU64::new(0);
 static LOCKSTEP_RUN_COUNT: AtomicU64 = AtomicU64::new(0);
 static LOCKSTEP_SERVE_COUNT: AtomicU64 = AtomicU64::new(0);
+static LOCKSTEP_KV_COUNT: AtomicU64 = AtomicU64::new(0);
 static LOCKSTEP_LAST_RUST_NS: AtomicU64 = AtomicU64::new(0);
 static LOCKSTEP_LAST_SHADOW_NS: AtomicU64 = AtomicU64::new(0);
 
@@ -12369,6 +12391,7 @@ fn lockstep_counter(path: &str) -> &'static AtomicU64 {
         "compile" => &LOCKSTEP_COMPILE_COUNT,
         "run" => &LOCKSTEP_RUN_COUNT,
         "serve" => &LOCKSTEP_SERVE_COUNT,
+        "kv" => &LOCKSTEP_KV_COUNT,
         _ => &LOCKSTEP_RUN_COUNT,
     }
 }
@@ -12377,6 +12400,7 @@ pub fn reset_lockstep_counters() {
     LOCKSTEP_COMPILE_COUNT.store(0, Ordering::SeqCst);
     LOCKSTEP_RUN_COUNT.store(0, Ordering::SeqCst);
     LOCKSTEP_SERVE_COUNT.store(0, Ordering::SeqCst);
+    LOCKSTEP_KV_COUNT.store(0, Ordering::SeqCst);
 }
 
 pub fn lockstep_invocation_count(path: &str) -> u64 {
@@ -12565,6 +12589,407 @@ pub fn run_lockstep_shadow_selftests() -> Result<usize, String> {
         return Err(String::from("lockstep overhead measurement produced a zero shadow time"));
     }
     checks += 1;
+    Ok(checks)
+}
+
+// ==============================================================================
+// PURE-OMNI HOST KV (port-plan step 9, KV slice) + KV LOCKSTEP SHADOW
+// `pure/host_kv.omni` is loaded by this test code only. It is not in
+// PURE_OMNI_CORE_SUITE_MODULES or the embedded stdlib, so no frozen hash moves.
+// The Rust side drives the real `OmniBinaryVm` KV arms (1504-1542); Rust stays
+// authoritative and is not removed. VM-only: DB/KV opcodes have no AOT path.
+// ==============================================================================
+
+pub const OMNI_HOST_KV_VERSION: &str = "omni-host-kv-v0.1.0";
+pub const OMNI_HOST_KV_SURFACE: &str = include_str!("pure/host_kv.omni");
+/// Op codes of the shared KV op stream (see `pure/host_kv.omni` header).
+pub const HKV_OP_PUT: i64 = 1;
+pub const HKV_OP_GET1: i64 = 2;
+pub const HKV_OP_QRY2: i64 = 3;
+pub const HKV_OP_QRY1: i64 = 4;
+pub const HKV_OP_GET2: i64 = 5;
+pub const HKV_OP_CNT: i64 = 6;
+pub const HKV_OP_DEL: i64 = 7;
+pub const HKV_TAG_VOID: i64 = 0;
+pub const HKV_TAG_INT: i64 = 1;
+pub const HKV_TAG_BUDGET: i64 = 2;
+/// Arena capacity of the KV region 0x1B0000..0x1EFFFF at 32 B per entry.
+pub const HKV_MAX_ENTRIES: i64 = (0x1F0000 - 0x1B0000) / 32;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostKvObservation {
+    pub results: Vec<(i64, i64)>,
+    pub count: i64,
+    pub mem_used: i64,
+    pub image: Vec<(i64, i64)>,
+}
+
+fn host_kv_module_from_src(src: &str) -> Result<BinModule, String> {
+    with_lockstep_suspended(|| {
+        let u16_stream = compile_omni_surface_strict_to_u16(src)?;
+        let decoded = decode_omni_token_stream(&u16_stream)?;
+        for f in &decoded.functions {
+            let rep = verify_binary_function(f);
+            if !rep.passed {
+                return Err(format!("host_kv.omni failed Rust binary verification (fn #{}): {:?}", f.fn_idx, rep.errors));
+            }
+        }
+        Ok(decoded)
+    })
+}
+
+fn host_kv_entry(m: &BinModule) -> Result<u16, String> {
+    if m.functions.iter().any(|f| f.fn_idx == 0) {
+        return Ok(0);
+    }
+    m.functions.last().map(|f| f.fn_idx).ok_or_else(|| String::from("host_kv.omni has no functions"))
+}
+
+/// `(max SSA dests, max LABELs)` over every function of a decoded module.
+pub fn module_max_ssa_and_labels(m: &BinModule) -> (usize, usize) {
+    let mut max_ssa = 0usize;
+    let mut max_lbl = 0usize;
+    for f in &m.functions {
+        let mut dests: Vec<u16> = f.instructions.iter().filter_map(|i| i.dest_reg).collect();
+        dests.sort_unstable();
+        dests.dedup();
+        let lbl = f.instructions.iter().filter(|i| i.op_tok == 0x7F40).count();
+        max_ssa = max_ssa.max(dests.len());
+        max_lbl = max_lbl.max(lbl);
+    }
+    (max_ssa, max_lbl)
+}
+
+fn host_kv_encode_program(ops: &[(i64, i64, i64)], cap: i64, mem_budget: i64) -> Vec<u8> {
+    let mut b = Vec::with_capacity(24 + ops.len() * 24);
+    for w in [cap, mem_budget, ops.len() as i64] {
+        b.extend_from_slice(&w.to_le_bytes());
+    }
+    for &(op, a, x) in ops {
+        for w in [op, a, x] {
+            b.extend_from_slice(&w.to_le_bytes());
+        }
+    }
+    b
+}
+
+fn host_kv_parse_output(buf: &[u8], n_ops: usize) -> Result<HostKvObservation, String> {
+    if buf.len() % 8 != 0 {
+        return Err(format!("host_kv.omni returned {} bytes (not a multiple of 8)", buf.len()));
+    }
+    let w: Vec<i64> = buf.chunks_exact(8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect();
+    if w.len() < n_ops * 2 + 2 {
+        return Err(format!("host_kv.omni output truncated ({} words)", w.len()));
+    }
+    let results = (0..n_ops).map(|i| (w[i * 2], w[i * 2 + 1])).collect();
+    let count = w[n_ops * 2];
+    let mem_used = w[n_ops * 2 + 1];
+    let need = n_ops * 2 + 2 + (count.max(0) as usize) * 2;
+    if count < 0 || w.len() != need {
+        return Err(format!("host_kv.omni image length mismatch (count {count}, words {})", w.len()));
+    }
+    let image = (0..count as usize).map(|i| (w[n_ops * 2 + 2 + i * 2], w[n_ops * 2 + 3 + i * 2])).collect();
+    Ok(HostKvObservation { results, count, mem_used, image })
+}
+
+fn host_kv_run_omni_module(m: &BinModule, ops: &[(i64, i64, i64)], cap: i64, mem_budget: i64) -> Result<HostKvObservation, String> {
+    let entry = host_kv_entry(m)?;
+    let mut vm = OmniBinaryVm::new();
+    let prog = host_kv_encode_program(ops, cap, mem_budget);
+    match vm.execute_function(m, entry, vec![OmniValue::Bytes(prog)])? {
+        OmniValue::Bytes(buf) => host_kv_parse_output(&buf, ops.len()),
+        other => Err(format!("host_kv.omni returned a non-bytes value: {other:?}")),
+    }
+}
+
+fn host_kv_omni_module() -> Result<&'static BinModule, String> {
+    use std::sync::OnceLock;
+    static KV: OnceLock<Result<BinModule, String>> = OnceLock::new();
+    match KV.get_or_init(|| host_kv_module_from_src(OMNI_HOST_KV_SURFACE)) {
+        Ok(m) => Ok(m),
+        Err(e) => Err(e.clone()),
+    }
+}
+
+/// Omni side: `pure/host_kv.omni` run on the VM over the op stream.
+pub fn host_kv_observe_omni(ops: &[(i64, i64, i64)], cap: i64, mem_budget: i64) -> Result<HostKvObservation, String> {
+    host_kv_run_omni_module(host_kv_omni_module()?, ops, cap, mem_budget)
+}
+
+fn host_kv_rust_programs() -> Result<&'static Vec<BinModule>, String> {
+    use std::sync::OnceLock;
+    static P: OnceLock<Result<Vec<BinModule>, String>> = OnceLock::new();
+    let r = P.get_or_init(|| {
+        let caps = cap_bit(CAP_ID_DB_R) | cap_bit(CAP_ID_DB_W);
+        let body = [
+            "%0 = KV_PUT $0 $1",
+            "%0 = DB_GET $0",
+            "%0 = DB_QRY $0 $1",
+            "%0 = DB_QRY $0",
+            "%0 = DB_GET $0 $1",
+            "%0 = DB_CNT $0",
+            "%0 = DB_GET $0",
+        ];
+        let mut out = Vec::new();
+        for (i, ins) in body.iter().enumerate() {
+            let asm = format!("CAP_MASK {caps}\nPARAM $0 I64\nPARAM $1 I64\nRET_TY I64\n{ins}\nRET %0\n");
+            let mut u = assemble_omni_text_to_u16(&asm)?;
+            if i == 6 {
+                // DB_DEL 0x7F67 has no assembler mnemonic; it is the DB_GET packet with the op token swapped.
+                let p = u.iter().position(|&t| t == 0x7F64).ok_or_else(|| String::from("DB_GET token not found"))?;
+                u[p] = 0x7F67;
+            }
+            out.push(decode_omni_token_stream(&u)?);
+        }
+        Ok(out)
+    });
+    match r {
+        Ok(v) => Ok(v),
+        Err(e) => Err(e.clone()),
+    }
+}
+
+/// Rust side: the real `OmniBinaryVm` KV arms (one persistent VM, one tiny module per op).
+/// The Rust store is unbounded (`BTreeMap`); `cap` applies to the Omni arena only.
+pub fn host_kv_observe_rust(ops: &[(i64, i64, i64)], mem_budget: i64) -> Result<HostKvObservation, String> {
+    let progs = host_kv_rust_programs()?;
+    let mut vm = OmniBinaryVm::with_budgets(DEFAULT_VM_STEP_LIMIT, mem_budget.max(0) as usize);
+    let mut results = Vec::with_capacity(ops.len());
+    for &(op, a, b) in ops {
+        if !(HKV_OP_PUT..=HKV_OP_DEL).contains(&op) {
+            results.push((HKV_TAG_VOID, 0));
+            continue;
+        }
+        let m = &progs[(op - 1) as usize];
+        let obs = match with_lockstep_suspended(|| vm.execute_function(m, 0, vec![OmniValue::Int(a), OmniValue::Int(b)])) {
+            Ok(OmniValue::Int(v)) => (HKV_TAG_INT, v),
+            Ok(OmniValue::Void) => (HKV_TAG_VOID, 0),
+            Ok(other) => return Err(format!("Rust VM KV op {op} returned {other:?}")),
+            Err(e) if e.contains("BUDGET_EXCEEDED") => (HKV_TAG_BUDGET, 0),
+            Err(e) => return Err(e),
+        };
+        results.push(obs);
+    }
+    let image: Vec<(i64, i64)> = vm.kv_store.iter().map(|(&k, &v)| (k, v)).collect();
+    Ok(HostKvObservation { results, count: image.len() as i64, mem_used: vm.allocated_bytes as i64, image })
+}
+
+fn host_kv_inject_disagreement(o: &HostKvObservation) -> HostKvObservation {
+    let mut out = o.clone();
+    if let Some(r) = out.results.first_mut() {
+        r.1 = r.1.wrapping_add(1);
+    } else {
+        out.count = out.count.wrapping_add(1);
+    }
+    out
+}
+
+fn host_kv_first_divergence(r: &HostKvObservation, o: &HostKvObservation) -> Option<String> {
+    for (i, (a, b)) in r.results.iter().zip(o.results.iter()).enumerate() {
+        if a != b {
+            return Some(format!("op#{i} rust={a:?} omni={b:?}"));
+        }
+    }
+    if r.results.len() != o.results.len() {
+        return Some(format!("result count rust={} omni={}", r.results.len(), o.results.len()));
+    }
+    if r.count != o.count || r.mem_used != o.mem_used {
+        return Some(format!("count/mem rust=({}, {}) omni=({}, {})", r.count, r.mem_used, o.count, o.mem_used));
+    }
+    if r.image != o.image {
+        return Some(format!("image rust={:?} omni={:?}", r.image, o.image));
+    }
+    None
+}
+
+fn host_kv_lockstep_compare(path: &str, rust: &HostKvObservation, omni: &HostKvObservation) -> Result<(), String> {
+    match host_kv_first_divergence(rust, omni) {
+        None => Ok(()),
+        Some(d) => Err(format!(
+            "error[LOCKSTEP_MISMATCH] line 1, col 1: path={path}: Rust VM KV and Omni host_kv disagree: {d}"
+        )),
+    }
+}
+
+/// Execution lockstep for the KV store: same op stream through the Rust VM KV arms and
+/// `pure/host_kv.omni`; any disagreement is `error[LOCKSTEP_MISMATCH]` (path=kv).
+pub fn lockstep_shadow_kv(ops: &[(i64, i64, i64)], cap: i64, mem_budget: i64) -> Result<HostKvObservation, String> {
+    let rust = host_kv_observe_rust(ops, mem_budget)?;
+    let mut omni = host_kv_observe_omni(ops, cap, mem_budget)?;
+    if LOCKSTEP_INJECT_PATH.with(|c| c.get()) == Some("kv") {
+        omni = host_kv_inject_disagreement(&omni);
+    }
+    lockstep_counter("kv").fetch_add(1, Ordering::SeqCst);
+    host_kv_lockstep_compare("kv", &rust, &omni)?;
+    Ok(rust)
+}
+
+fn host_kv_lcg_stream(seed: u64, n: usize, key_space: i64) -> Vec<(i64, i64, i64)> {
+    let mut s = seed;
+    let mut next = || {
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (s >> 33) as i64
+    };
+    (0..n)
+        .map(|_| {
+            let op = 1 + next() % 7;
+            let a = next() % key_space - key_space / 2;
+            let b = if op == HKV_OP_PUT { next() - (1 << 30) } else { next() % 4 };
+            (op, a, b)
+        })
+        .collect()
+}
+
+/// Port-plan step 9 KV slice: Omni host_kv vs Rust VM KV in lockstep, plus drift injection.
+pub fn run_host_kv_lockstep_selftests() -> Result<usize, String> {
+    let mut checks = 0usize;
+    let budget = DEFAULT_VM_MEMORY_BUDGET_BYTES as i64;
+
+    // 1. Module compiles strict, verifies, and stays inside 192 SSA / 15 labels per fn.
+    let m = host_kv_omni_module()?;
+    let (ssa, lbl) = module_max_ssa_and_labels(m);
+    if ssa > 192 || lbl > 15 {
+        return Err(format!("host_kv.omni exceeds limits: max SSA {ssa} (<= 192), max labels {lbl} (<= 15)"));
+    }
+    if HKV_MAX_ENTRIES as usize != OMNI_VM_KV_MAX_KEYS {
+        return Err(format!("host_kv arena capacity {HKV_MAX_ENTRIES} != OMNI_VM_KV_MAX_KEYS {OMNI_VM_KV_MAX_KEYS}"));
+    }
+    checks += 1;
+
+    // 2. Golden stream: hits, misses (-1), stored -1 vs miss, overwrite, negative and extreme keys,
+    //    composite tbl*1e6+key hit / fallback / miss, both operand forms, DB_CNT, DB_DEL (Void no-op).
+    let golden: Vec<(i64, i64, i64)> = vec![
+        (HKV_OP_GET1, 42, 0),
+        (HKV_OP_QRY2, 42, 0),
+        (HKV_OP_PUT, 42, 420),
+        (HKV_OP_GET1, 42, 0),
+        (HKV_OP_QRY1, 42, 0),
+        (HKV_OP_PUT, 7, -1),
+        (HKV_OP_GET1, 7, 0),
+        (HKV_OP_GET1, 8, 0),
+        (HKV_OP_PUT, -5, 55),
+        (HKV_OP_PUT, i64::MIN, 1),
+        (HKV_OP_PUT, i64::MAX, 2),
+        (HKV_OP_PUT, 42, 421),
+        (HKV_OP_GET1, 42, 0),
+        (HKV_OP_PUT, 3_000_042, 9),
+        (HKV_OP_QRY2, 3, 42),
+        (HKV_OP_GET2, 4, 42),
+        (HKV_OP_GET2, 4, 43),
+        (HKV_OP_QRY2, 0, i64::MIN),
+        (HKV_OP_CNT, 0, 0),
+        (HKV_OP_DEL, 42, 0),
+        (HKV_OP_GET1, 42, 0),
+        (HKV_OP_CNT, 0, 0),
+        (99, 1, 1),
+    ];
+    let g = lockstep_shadow_kv(&golden, HKV_MAX_ENTRIES, budget)?;
+    let want: Vec<(i64, i64)> = vec![
+        (1, OMNI_DB_GET_MISS), (1, OMNI_DB_QRY_MISS), (1, 420), (1, 420), (1, 420), (1, -1), (1, -1), (1, -1),
+        (1, 55), (1, 1), (1, 2), (1, 421), (1, 421), (1, 9), (1, 9), (1, 421), (1, -1), (1, 1), (1, 6),
+        (0, 0), (1, 421), (1, 6), (0, 0),
+    ];
+    if g.results != want || g.count != 6 || g.mem_used != 7 * 16 {
+        return Err(format!("host_kv golden mismatch: got {:?} count {} mem {}", g.results, g.count, g.mem_used));
+    }
+    checks += 1;
+
+    // 3. Out-of-order inserts land sorted (signed order) and agree.
+    let shuffled: Vec<(i64, i64, i64)> = [9i64, -3, 100, 0, -100, 50, 7, 8, -1, 1]
+        .iter()
+        .map(|&k| (HKV_OP_PUT, k, k * 3))
+        .collect();
+    let s = lockstep_shadow_kv(&shuffled, HKV_MAX_ENTRIES, budget)?;
+    if s.image.windows(2).any(|w| w[0].0 >= w[1].0) || s.count != 10 {
+        return Err(format!("host_kv image not strictly sorted: {:?}", s.image));
+    }
+    checks += 1;
+
+    // 4. VM memory budget: KV_PUT charges 16 B even on overwrite (1533); a 48 B budget fails the 4th put.
+    let bud: Vec<(i64, i64, i64)> = vec![
+        (HKV_OP_PUT, 1, 10), (HKV_OP_PUT, 1, 11), (HKV_OP_PUT, 2, 20), (HKV_OP_PUT, 3, 30),
+        (HKV_OP_GET1, 3, 0), (HKV_OP_GET1, 1, 0), (HKV_OP_CNT, 0, 0),
+    ];
+    let b = lockstep_shadow_kv(&bud, HKV_MAX_ENTRIES, 48)?;
+    if b.results[3] != (HKV_TAG_BUDGET, 0) || b.results[4] != (1, -1) || b.results[5] != (1, 11) || b.mem_used != 48 {
+        return Err(format!("host_kv budget case mismatch: {:?} mem {}", b.results, b.mem_used));
+    }
+    checks += 1;
+
+    // 5. Pseudo-random streams (small key space so overwrites and composite hits occur).
+    for seed in [1u64, 7, 4242] {
+        let ops = host_kv_lcg_stream(seed, 200, 64);
+        lockstep_shadow_kv(&ops, HKV_MAX_ENTRIES, budget)?;
+    }
+    checks += 1;
+
+    // 6. The program-header cap below OMNI_VM_KV_MAX_KEYS is an Omni-only test knob: a new key past it
+    //    is BUDGET_EXCEEDED with store and charge unchanged, and lockstep must flag the divergence.
+    let cap_ops: Vec<(i64, i64, i64)> = (1..=5).map(|k| (HKV_OP_PUT, k, k)).chain([(HKV_OP_PUT, 2, 22), (HKV_OP_CNT, 0, 0)]).collect();
+    let oc = host_kv_observe_omni(&cap_ops, 4, budget)?;
+    if oc.results[4] != (HKV_TAG_BUDGET, 0) || oc.results[5] != (1, 22) || oc.count != 4 || oc.mem_used != 5 * 16 || oc.results[6] != (1, 4) {
+        return Err(format!("host_kv header-cap case mismatch: {:?} count {} mem {}", oc.results, oc.count, oc.mem_used));
+    }
+    match lockstep_shadow_kv(&cap_ops, 4, budget) {
+        Err(e) if e.contains("error[LOCKSTEP_MISMATCH]") && e.contains("path=kv") => {}
+        other => return Err(format!("host_kv header-cap divergence not flagged by lockstep: {other:?}")),
+    }
+    checks += 1;
+
+    // 7. Injected observation drift on path=kv must be caught.
+    set_lockstep_inject_path(Some("kv"));
+    let inj = lockstep_shadow_kv(&golden, HKV_MAX_ENTRIES, budget);
+    set_lockstep_inject_path(None);
+    match inj {
+        Err(e) if e.contains("error[LOCKSTEP_MISMATCH]") && e.contains("path=kv") => {}
+        other => return Err(format!("host_kv injected drift not caught: {other:?}")),
+    }
+    checks += 1;
+
+    // 8. Injected semantic drift: an Omni twin whose miss value is -2 must be caught on the golden stream.
+    let marker = "let miss: i64 = 0 - 1;";
+    if OMNI_HOST_KV_SURFACE.matches(marker).count() != 1 {
+        return Err(String::from("host_kv.omni miss marker not unique"));
+    }
+    let drift = host_kv_module_from_src(&OMNI_HOST_KV_SURFACE.replace(marker, "let miss: i64 = 0 - 2;"))?;
+    let r = host_kv_observe_rust(&golden, budget)?;
+    let d = host_kv_run_omni_module(&drift, &golden, HKV_MAX_ENTRIES, budget)?;
+    match host_kv_lockstep_compare("kv", &r, &d) {
+        Err(e) if e.contains("error[LOCKSTEP_MISMATCH]") && e.contains("op#0") => {}
+        other => return Err(format!("host_kv miss-value drift not caught: {other:?}")),
+    }
+    checks += 1;
+
+    // 9. Fixed 8192-key cap (OMNI_VM_KV_MAX_KEYS) in lockstep: per-op agreement at 8190, 8191 (shifting
+    //    insert at full size), 8192 and the 8193rd new key (BUDGET_EXCEEDED, store and charge unchanged),
+    //    then overwrites at the cap still succeed.
+    let max = OMNI_VM_KV_MAX_KEYS as i64;
+    let mut big: Vec<(i64, i64, i64)> = (0..max - 2).map(|i| (HKV_OP_PUT, i * 2, i)).collect();
+    big.extend_from_slice(&[
+        (HKV_OP_CNT, 0, 0),
+        (HKV_OP_PUT, 1, -7),
+        (HKV_OP_CNT, 0, 0),
+        (HKV_OP_PUT, 3, 33),
+        (HKV_OP_CNT, 0, 0),
+        (HKV_OP_PUT, 5, 55),
+        (HKV_OP_GET1, 5, 0),
+        (HKV_OP_CNT, 0, 0),
+        (HKV_OP_PUT, 1, 11),
+        (HKV_OP_PUT, (max - 3) * 2, 99),
+        (HKV_OP_GET1, 1, 0),
+        (HKV_OP_CNT, 0, 0),
+    ]);
+    let o = lockstep_shadow_kv(&big, HKV_MAX_ENTRIES, budget)?;
+    let n = (max - 2) as usize;
+    let tail_want: Vec<(i64, i64)> = vec![
+        (1, max - 2), (1, -7), (1, max - 1), (1, 33), (1, max), (HKV_TAG_BUDGET, 0), (1, -1), (1, max),
+        (1, 11), (1, 99), (1, 11), (1, max),
+    ];
+    if o.results[n..] != tail_want[..] || o.count != max || o.mem_used != (max + 2) * 16 || o.image.iter().any(|&(k, _)| k == 5) {
+        return Err(format!("host_kv 8192-key cap case mismatch: tail {:?} count {} mem {}", &o.results[n..], o.count, o.mem_used));
+    }
+    checks += 1;
+
     Ok(checks)
 }
 
@@ -14527,21 +14952,29 @@ pub fn run_ai_first_surface_selftests() -> Result<usize, String> {
     if kv_val != OmniValue::Int(200_000_777) || kv_backend != "vm" {
         return Err(format!("route GET /users/:id kv golden mismatch: {:?} via {}", kv_val, kv_backend));
     }
+    let route_get_miss = "route GET /users/:id (req: i64) @cap(net, db_r) {\n    let id = req.param(\"id\");\n    let row = db_get(id);\n    respond(200, row);\n}";
+    if execute_omni_surface_program(route_get_miss, vec![OmniValue::Int(42)])? != OmniValue::Int(200_000_000 + OMNI_DB_GET_MISS) {
+        return Err(String::from("route GET /users/:id db_get miss golden mismatch (want HTTP 200 row -1 = OMNI_DB_GET_MISS)"));
+    }
     let route_q = "route GET /users/:id (req: i64) @cap(net, db_r) {\n    let id = req.param(\"id\");\n    let row = db_query(\"SELECT * FROM users WHERE id = ?\", id);\n    respond(200, row);\n}";
-    if execute_omni_surface_program(route_q, vec![OmniValue::Int(42)])? != OmniValue::Int(200_000_420) {
-        return Err(String::from("route GET /users/:id db_query golden mismatch (want HTTP 200 row 420)"));
+    if execute_omni_surface_program(route_q, vec![OmniValue::Int(42)])? != OmniValue::Int(200_000_000 + OMNI_DB_QRY_MISS) {
+        return Err(String::from("route GET /users/:id db_query miss golden mismatch (want HTTP 200 row -1 = OMNI_DB_QRY_MISS)"));
+    }
+    let route_q_hit = "route GET /users/:id (req: i64) @cap(net, db_r, db_w) {\n    let id = req.param(\"id\");\n    let saved = kv_put(id, 420);\n    let row = db_query(\"SELECT * FROM users WHERE id = ?\", id);\n    respond(200, row);\n}";
+    if execute_omni_surface_program(route_q_hit, vec![OmniValue::Int(42)])? != OmniValue::Int(200_000_420) {
+        return Err(String::from("route GET /users/:id db_query hit golden mismatch (want HTTP 200 row 420)"));
     }
     let route_u16 = compile_omni_surface_to_u16(route_q)?;
     if !route_u16.iter().any(|&t| t == 0x7F6C) || !route_u16.iter().any(|&t| t == 0x7F65) || !route_u16.iter().any(|&t| t == 0x7F6E) {
         return Err(String::from("route lowering did not emit ROUTE/DB_QRY/RSP_JSON host opcodes"));
     }
-    checks += 2;
+    checks += 4;
     expect_omni_error_code("route_no_caps", execute_omni_surface_program("route GET /users/:id (req: i64) {\n    let id = req.param(\"id\");\n    let row = db_get(id);\n    respond(200, row);\n}", vec![OmniValue::Int(42)]), "MISSING_CAP")?;
     expect_omni_error_code("route_no_db_r", execute_omni_surface_program("route GET /users/:id (req: i64) @cap(net) {\n    let id = req.param(\"id\");\n    let row = db_get(id);\n    respond(200, row);\n}", vec![OmniValue::Int(42)]), "MISSING_CAP")?;
     expect_omni_error_code("route_no_db_w", execute_omni_surface_program("#[cap(NET, DB_R)] route POST /users/:id (req: i64) {\n    let id = req.param(\"id\");\n    let saved = kv_put(id, 1);\n    respond(201, saved);\n}", vec![OmniValue::Int(42)]), "MISSING_CAP")?;
     expect_omni_error_code("sql_injection", execute_omni_surface_program("#[cap(DB_R)] fn main(id: i64 @untrusted) -> i64 { let r = db_query(\"SELECT * FROM users WHERE id = ?\", id); return r; }", vec![OmniValue::Int(5)]), "TAINT_SINK")?;
     let authed = "#[cap(DB_R, AUTH)] fn main(id: i64 @untrusted) -> i64 { let ok = auth_verify(id); let r = db_query(\"SELECT * FROM users WHERE id = ?\", ok); return r; }";
-    if execute_omni_surface_program(authed, vec![OmniValue::Int(5)])? != OmniValue::Int(50) {
+    if execute_omni_surface_program(authed, vec![OmniValue::Int(5)])? != OmniValue::Int(OMNI_DB_QRY_MISS) {
         return Err(String::from("auth_verify sanitizer did not clear @untrusted for db_query"));
     }
     checks += 5;
@@ -14627,7 +15060,7 @@ pub fn run_ai_first_surface_selftests() -> Result<usize, String> {
     }
     checks += 1;
 
-    // Repair case 3: TAINT_SINK on db_query -> sanitizes query parameter and adds AUTH capability
+    // Repair case 3: TAINT_SINK on db_query -> sanitizes query parameter and adds AUTH capability (empty KV: DB_QRY miss = -1)
     let rep_sink = run_omni_agent_repair_loop(
         "#[cap(DB_R)]\nfn main(id: i64 @untrusted) -> i64 {\n    let r: i64 = db_query(\"SELECT * FROM users WHERE id = ?\", id);\n    return r;\n}",
         vec![OmniValue::Int(42)],
@@ -14635,7 +15068,7 @@ pub fn run_ai_first_surface_selftests() -> Result<usize, String> {
         3,
         OMNI_HARNESS_CONTRACT_VERSION,
     )?;
-    if !rep_sink.ok || rep_sink.attempts.len() != 2 || !rep_sink.final_json.contains("\"result\":\"420\"") {
+    if !rep_sink.ok || rep_sink.attempts.len() != 2 || !rep_sink.final_json.contains("\"result\":\"-1\"") {
         return Err(format!("Agent driver TAINT_SINK repair failed: {:?}", rep_sink));
     }
     checks += 1;
@@ -20834,6 +21267,9 @@ fn main(a: i64) -> i64 {
         // count check (omni-cli main.rs:870-873) still compares like with like.
         checks_passed += run_cross_backend_effect_golden_selftests()?;
         checks_passed += run_if_pos_join_slot_stage1_selftests()?;
+
+        // 13AZ. Port-plan step 9 KV slice: `pure/host_kv.omni` vs Rust VM KV lockstep (VM-only)
+        checks_passed += run_host_kv_lockstep_selftests()?;
     }
 
     // M2. Milestone 2 foundation guards (spec/m2/): frozen hashes, byte lock, census, labels, lint, decoder.
