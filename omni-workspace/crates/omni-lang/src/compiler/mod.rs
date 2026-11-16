@@ -3801,8 +3801,8 @@ pub fn compile_omni_surface_via_stage1_to_elf(
     }
 }
 
-/// Host-side gate in front of the frozen Stage-1 compiler image: operand shapes its templates
-/// do not implement are rejected with a structured error instead of being mis-compiled
+/// Host-side gate in front of the frozen Stage-1 compiler image: operand shapes and opcodes its
+/// templates do not implement are rejected with a structured error instead of being mis-compiled
 /// (the image itself is frozen, so this changes no Stage-1 bytes).
 pub fn stage1_reject_unsupported_shapes(func: &BinFunction) -> Result<(), String> {
     for (ii, ins) in func.instructions.iter().enumerate() {
@@ -3818,6 +3818,25 @@ pub fn stage1_reject_unsupported_shapes(func: &BinFunction) -> Result<(), String
             return Err(format!(
                 "error[UNSUPPORTED]: Stage-1 does not implement 4-op ISET -2/-4 (st_u16/st_u32) (ins {ii})"
             ));
+        }
+        match ins.op_tok {
+            0x7F05 => {
+                return Err(format!(
+                    "error[UNSUPPORTED]: Stage-1 does not implement DROP 0x7F05 (ins {ii})"
+                ));
+            }
+            0x7F14 => {
+                return Err(format!(
+                    "error[UNSUPPORTED]: Stage-1 does not implement IMOD 0x7F14 safely (ins {ii})"
+                ));
+            }
+            0x7F30 | 0x7F31 | 0x7F34 | 0x7F35 | 0x7F3F => {
+                return Err(format!(
+                    "error[UNSUPPORTED]: Stage-1 does not implement pack5/ternary-AI opcode 0x{:04X} (ins {ii})",
+                    ins.op_tok
+                ));
+            }
+            _ => {}
         }
     }
     Ok(())

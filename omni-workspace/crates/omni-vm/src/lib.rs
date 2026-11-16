@@ -446,9 +446,11 @@ impl OmniBinaryVm {
                             Self::eval_as_i64(&ins.operands[2], &regs),
                             Self::eval_as_i64(&ins.operands[3], &regs),
                         ) {
-                            let u_off = off as usize;
-                            if u_off + 8 <= buf.len() {
-                                buf[u_off..u_off + 8].copy_from_slice(&(v as u64).to_le_bytes());
+                            if off >= 0 {
+                                let u_off = off as usize;
+                                if u_off.checked_add(8).map(|end| end <= buf.len()).unwrap_or(false) {
+                                    buf[u_off..u_off + 8].copy_from_slice(&(v as u64).to_le_bytes());
+                                }
                             }
                         }
                     } else if ins.operands.len() == 4

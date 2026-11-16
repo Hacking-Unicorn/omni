@@ -2769,6 +2769,99 @@ fn main(x: i64, y: i64) -> i64 {
     // 13BE. C4 label cap 16: 16-label surface fn on VM / Wasm / x86-64 / Stage-1; 17 rejected
     checks += run_label_cap_16_selftests()?;
 
+    // 13BF. C1 frozen-hash pin: 5 frozen artifacts (Phase D bc/elf, 18-module suite, Stage-1 bc/elf)
+    checks += run_frozen_hash_pin_selftests()?;
+
+    // 13BG. C2 Stage-1 up-front rejection of unsupported opcodes (DROP, IMOD, pack5/ternary-AI)
+    checks += run_stage1_unsupported_gate_selftests()?;
+
+    Ok(checks)
+}
+
+pub const FROZEN_PHASE_D_BC_WORDS: usize = 159;
+pub const FROZEN_PHASE_D_BC_FNV1A64: u64 = 0x23B8D17257CCA9C4;
+pub const FROZEN_PHASE_D_ELF_BYTES: usize = 824;
+pub const FROZEN_PHASE_D_ELF_FNV1A64: u64 = 0xE221085777B8AC47;
+pub const FROZEN_CORE_SUITE_WORDS: usize = 14_559;
+pub const FROZEN_CORE_SUITE_FNV1A64: u64 = 0x78462AE4C81DF408;
+pub const FROZEN_STAGE1_ELF_BYTES: usize = 106_242;
+pub const FROZEN_STAGE1_ELF_FNV1A64: u64 = 0xEAFC81F46B482FF8;
+pub const FROZEN_STAGE1_BC_WORDS: usize = 19_731;
+pub const FROZEN_STAGE1_BC_FNV1A64: u64 = 0x677F57AE71D28FED;
+
+/// 13BF. C1: Pin the 5 frozen FNV-1a64 hashes and exact sizes (`HANDOFF.md` §3).
+pub fn run_frozen_hash_pin_selftests() -> Result<usize, String> {
+    let mut checks = 0usize;
+    let (g1_u16, g2_u16, g1_elf, g2_elf) = run_phase_d_pure_omni_selfhost_bootstrap()?;
+    let g1_bc_bytes = encode_u16_stream_to_bytes(&g1_u16);
+    let g1_bc_hash = fnv1a_64_hash(&g1_bc_bytes);
+    if g1_u16.len() != FROZEN_PHASE_D_BC_WORDS || g2_u16.len() != FROZEN_PHASE_D_BC_WORDS || g1_bc_hash != FROZEN_PHASE_D_BC_FNV1A64 {
+        return Err(format!(
+            "C1 frozen hash mismatch on Phase D .omni_bc: got {} words / 0x{:016X}, want {} words / 0x{:016X}",
+            g1_u16.len(), g1_bc_hash, FROZEN_PHASE_D_BC_WORDS, FROZEN_PHASE_D_BC_FNV1A64
+        ));
+    }
+    checks += 1;
+
+    let g1_elf_hash = fnv1a_64_hash(&g1_elf);
+    if g1_elf.len() != FROZEN_PHASE_D_ELF_BYTES || g2_elf.len() != FROZEN_PHASE_D_ELF_BYTES || g1_elf_hash != FROZEN_PHASE_D_ELF_FNV1A64 {
+        return Err(format!(
+            "C1 frozen hash mismatch on Phase D ELF: got {} B / 0x{:016X}, want {} B / 0x{:016X}",
+            g1_elf.len(), g1_elf_hash, FROZEN_PHASE_D_ELF_BYTES, FROZEN_PHASE_D_ELF_FNV1A64
+        ));
+    }
+    checks += 1;
+
+    let suite_u16 = build_pure_omni_core_suite_stream()?;
+    let suite_bytes = encode_u16_stream_to_bytes(&suite_u16);
+    let suite_hash = fnv1a_64_hash(&suite_bytes);
+    if suite_u16.len() != FROZEN_CORE_SUITE_WORDS || suite_hash != FROZEN_CORE_SUITE_FNV1A64 {
+        return Err(format!(
+            "C1 frozen hash mismatch on 18-module core suite: got {} words / 0x{:016X}, want {} words / 0x{:016X}",
+            suite_u16.len(), suite_hash, FROZEN_CORE_SUITE_WORDS, FROZEN_CORE_SUITE_FNV1A64
+        ));
+    }
+    checks += 1;
+
+    let s1_u16 = build_step7_stage1_compiler_stream();
+    let s1_bc_bytes = encode_u16_stream_to_bytes(&s1_u16);
+    let s1_bc_hash = fnv1a_64_hash(&s1_bc_bytes);
+    if s1_u16.len() != FROZEN_STAGE1_BC_WORDS || s1_bc_hash != FROZEN_STAGE1_BC_FNV1A64 {
+        return Err(format!(
+            "C1 frozen hash mismatch on Stage-1 .omni_bc: got {} words / 0x{:016X}, want {} words / 0x{:016X}",
+            s1_u16.len(), s1_bc_hash, FROZEN_STAGE1_BC_WORDS, FROZEN_STAGE1_BC_FNV1A64
+        ));
+    }
+    checks += 1;
+
+    let s1_elf = compile_pure_u16_to_x86_64_elf_with_args(&s1_u16, 45, 40, 90)?;
+    let s1_elf_hash = fnv1a_64_hash(&s1_elf);
+    if s1_elf.len() != FROZEN_STAGE1_ELF_BYTES || s1_elf_hash != FROZEN_STAGE1_ELF_FNV1A64 {
+        return Err(format!(
+            "C1 frozen hash mismatch on Stage-1 ELF: got {} B / 0x{:016X}, want {} B / 0x{:016X}",
+            s1_elf.len(), s1_elf_hash, FROZEN_STAGE1_ELF_BYTES, FROZEN_STAGE1_ELF_FNV1A64
+        ));
+    }
+    checks += 1;
+
+    Ok(checks)
+}
+
+/// 13BG. C2: Stage-1 rejects DROP, IMOD, and pack5/ternary-AI ops up front with error[UNSUPPORTED].
+pub fn run_stage1_unsupported_gate_selftests() -> Result<usize, String> {
+    let mut checks = 0usize;
+    let cases: &[(&str, &str)] = &[
+        ("drop", "#[strict]\nfn f(x: i64) -> i64 { let a: arena = arena(64); drop(a); return x; }"),
+        ("imod", "fn f(x: i64) -> i64 { let r = x % 3; return r; }"),
+        ("egate", "#[cap(AI)] fn f(x: i64) -> trit { let g = egate(x); return g; }"),
+        ("pack5", "#[strict]\n#[cap(AI)]\nfn f() -> i64 { let raw: bytes = pack5_bytes([+1t, -1t, 0t, +1t, +1t]); let d: i64 = pack5_tdot(raw, raw); return d; }"),
+    ];
+    for &(name, src) in cases {
+        match compile_omni_surface_via_stage1_to_elf(src, 7, 0, 0) {
+            Err(e) if e.contains("error[UNSUPPORTED]") => checks += 1,
+            other => return Err(format!("C2 Stage-1 unsupported gate '{name}': expected error[UNSUPPORTED], got {other:?}")),
+        }
+    }
     Ok(checks)
 }
 

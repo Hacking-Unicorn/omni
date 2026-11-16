@@ -1467,9 +1467,11 @@ impl OmniBinaryVm {
                             Self::eval_as_i64(&ins.operands[2], &regs),
                             Self::eval_as_i64(&ins.operands[3], &regs),
                         ) {
-                            let u_off = off as usize;
-                            if u_off + 8 <= buf.len() {
-                                buf[u_off..u_off + 8].copy_from_slice(&(v as u64).to_le_bytes());
+                            if off >= 0 {
+                                let u_off = off as usize;
+                                if u_off.checked_add(8).map(|end| end <= buf.len()).unwrap_or(false) {
+                                    buf[u_off..u_off + 8].copy_from_slice(&(v as u64).to_le_bytes());
+                                }
                             }
                         }
                     } else if ins.operands.len() == 4
@@ -6023,8 +6025,8 @@ pub fn compile_omni_surface_via_stage1_to_elf(
     }
 }
 
-/// Host-side gate in front of the frozen Stage-1 compiler image: operand shapes its templates
-/// do not implement are rejected with a structured error instead of being mis-compiled
+/// Host-side gate in front of the frozen Stage-1 compiler image: operand shapes and opcodes its
+/// templates do not implement are rejected with a structured error instead of being mis-compiled
 /// (the image itself is frozen, so this changes no Stage-1 bytes).
 pub fn stage1_reject_unsupported_shapes(func: &BinFunction) -> Result<(), String> {
     for (ii, ins) in func.instructions.iter().enumerate() {
@@ -6040,6 +6042,25 @@ pub fn stage1_reject_unsupported_shapes(func: &BinFunction) -> Result<(), String
             return Err(format!(
                 "error[UNSUPPORTED]: Stage-1 does not implement 4-op ISET -2/-4 (st_u16/st_u32) (ins {ii})"
             ));
+        }
+        match ins.op_tok {
+            0x7F05 => {
+                return Err(format!(
+                    "error[UNSUPPORTED]: Stage-1 does not implement DROP 0x7F05 (ins {ii})"
+                ));
+            }
+            0x7F14 => {
+                return Err(format!(
+                    "error[UNSUPPORTED]: Stage-1 does not implement IMOD 0x7F14 safely (ins {ii})"
+                ));
+            }
+            0x7F30 | 0x7F31 | 0x7F34 | 0x7F35 | 0x7F3F => {
+                return Err(format!(
+                    "error[UNSUPPORTED]: Stage-1 does not implement pack5/ternary-AI opcode 0x{:04X} (ins {ii})",
+                    ins.op_tok
+                ));
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -13807,20 +13828,22 @@ pub const OMNI_DIFF4_KNOWN_DIVERGENCES: &[(&str, &str, &str)] = &[
     ("p6_pack5_flow", "stage1", "Stage-1 IGET reads the token region (lbl_iget 16411); no fold"),
     ("p7_two_buffers", "x86", "single global r11 length shared by every ANEW buffer (ISET arm 14574+)"),
     ("p7_two_buffers", "stage1", "single global r11 length (lbl_iset 16417+)"),
-    // P2: Stage-1 DROP misdecode.
-    ("p2_drop1", "stage1", "Stage-1 no-dest dispatch (16222-16241) has no DROP 0x7F05 arm; the dest-form fallthrough (16243-16247) reads r_cur=pos+4 inside the next packet and swallows RET -> SIGSEGV"),
-    ("p2_drop3", "stage1", "same as p2_drop1: odd DROP count before RET swallows RET -> SIGSEGV"),
-    // P10: Stage-1 has no TPACK5/TUNPACK5/TDOT/EGATE/TLOGIC arms.
-    ("p11_pack5_direct_aot", "stage1", "Stage-1 opcode dispatch (16243-16520) has no TPACK5/TUNPACK5/TDOT/EGATE arms; values fall into the generic copy path"),
-    ("p11_pack5_trit_vec", "stage1", "same as p11_pack5_direct_aot/stage1 (pack5/tdot/egate) plus no IGET const fold"),
-    ("p11_decision_hook", "stage1", "Stage-1 has no EGATE 0x7F35 arm; egate(delta) is emitted as a copy of delta"),
-    // P3: IMOD stale rdx.
+    // P2: Stage-1 DROP misdecode / C2 up-front rejection.
+    ("p2_drop1", "stage1", "Stage-1 is frozen; rejects DROP 0x7F05 with error[UNSUPPORTED] (C2)"),
+    ("p2_drop3", "stage1", "Stage-1 is frozen; rejects DROP 0x7F05 with error[UNSUPPORTED] (C2)"),
+    ("p2_drop2_arena_lifecycle", "stage1", "Stage-1 is frozen; rejects DROP 0x7F05 with error[UNSUPPORTED] (C2)"),
+    // P10: Stage-1 has no TPACK5/TUNPACK5/TDOT/EGATE/TLOGIC arms (C2 up-front rejection).
+    ("p11_pack5_direct_aot", "stage1", "Stage-1 is frozen; rejects TPACK5/TUNPACK5/TDOT/EGATE with error[UNSUPPORTED] (C2)"),
+    ("p11_pack5_trit_vec", "stage1", "Stage-1 is frozen; rejects TPACK5/TDOT/EGATE with error[UNSUPPORTED] (C2)"),
+    ("p11_decision_hook", "stage1", "Stage-1 is frozen; rejects EGATE 0x7F35 with error[UNSUPPORTED] (C2)"),
+    // P3: IMOD stale rdx / C2 up-front rejection on Stage-1.
     ("p3_imod_rdx_clobber", "x86", "N1: IMOD guard (14667-14675) jumps over cqo/idiv for b==0 and MIN/-1, then mov rax,rdx copies a stale rdx (TCMP leaves rdx=trit)"),
-    ("p3_imod_rdx_clobber", "stage1", "N1: Stage-1 IMOD (lbl_imod 16343+) emits the same guard + mov rax,rdx"),
+    ("p3_imod_rdx_clobber", "stage1", "Stage-1 is frozen; rejects IMOD 0x7F14 with error[UNSUPPORTED] (C2)"),
     ("p3_imod_zero_after_tcmp", "x86", "N1, see p3_imod_rdx_clobber/x86"),
-    ("p3_imod_zero_after_tcmp", "stage1", "N1, see p3_imod_rdx_clobber/stage1"),
+    ("p3_imod_zero_after_tcmp", "stage1", "Stage-1 is frozen; rejects IMOD 0x7F14 with error[UNSUPPORTED] (C2)"),
     ("p3_imod_min_neg1_after_tcmp", "x86", "N1, see p3_imod_rdx_clobber/x86"),
-    ("p3_imod_min_neg1_after_tcmp", "stage1", "N1, see p3_imod_rdx_clobber/stage1"),
+    ("p3_imod_min_neg1_after_tcmp", "stage1", "Stage-1 is frozen; rejects IMOD 0x7F14 with error[UNSUPPORTED] (C2)"),
+    ("p3_imod_control_no_tcmp", "stage1", "Stage-1 is frozen; rejects IMOD 0x7F14 with error[UNSUPPORTED] (C2)"),
     // P4: trit ops without clamping (spec.md:53).
     ("p4_trit_clamp", "wasm", "N3: Wasm TNOT/TAND/TOR/TXOR/TMAJ do not clamp i64 operands (15332, 15352-15357)"),
     ("p4_trit_clamp", "x86", "N3: x86 TAND/TOR share IMIN/IMAX (14714), TNOT shares INEG (14676); no clamp"),
@@ -13832,8 +13855,6 @@ pub const OMNI_DIFF4_KNOWN_DIVERGENCES: &[(&str, &str, &str)] = &[
     ("p5_if_neg_nontrit", "wasm", "N2: Wasm BR_NEG compares == -1 (15451-15460)"),
     ("p5_if_neg_nontrit", "x86", "N2: x86 BR_NEG emits cmp rax,-1; je (14793-14800)"),
     ("p5_if_neg_nontrit", "stage1", "N2: Stage-1 BR_NEG (lbl_br_neg 16513+) mirrors x86"),
-    // P9: VM host panic.
-    ("p9_vm_patch_negative_offset", "vm", "N6: ISET mode -9 casts a negative offset to usize; off+8 wraps and buf[off..off+8] panics (1324-1326) instead of the decided silent no-op (HANDOFF.md 6.4)"),
     // ISA-B shapes on Stage-1: Stage-1 is frozen and rejects ISA-B up front with error[UNSUPPORTED].
     ("isab_ld_u16_unsigned", "stage1", "Stage-1 is frozen; rejects ISA-B 3-op IGET with error[UNSUPPORTED]"),
     ("isab_ld_u32_u64", "stage1", "Stage-1 is frozen; rejects ISA-B 3-op IGET with error[UNSUPPORTED]"),
@@ -14775,6 +14796,99 @@ fn main(x: i64, y: i64) -> i64 {
     // 13BE. C4 label cap 16: 16-label surface fn on VM / Wasm / x86-64 / Stage-1; 17 rejected
     checks += run_label_cap_16_selftests()?;
 
+    // 13BF. C1 frozen-hash pin: 5 frozen artifacts (Phase D bc/elf, 18-module suite, Stage-1 bc/elf)
+    checks += run_frozen_hash_pin_selftests()?;
+
+    // 13BG. C2 Stage-1 up-front rejection of unsupported opcodes (DROP, IMOD, pack5/ternary-AI)
+    checks += run_stage1_unsupported_gate_selftests()?;
+
+    Ok(checks)
+}
+
+pub const FROZEN_PHASE_D_BC_WORDS: usize = 159;
+pub const FROZEN_PHASE_D_BC_FNV1A64: u64 = 0x23B8D17257CCA9C4;
+pub const FROZEN_PHASE_D_ELF_BYTES: usize = 824;
+pub const FROZEN_PHASE_D_ELF_FNV1A64: u64 = 0xE221085777B8AC47;
+pub const FROZEN_CORE_SUITE_WORDS: usize = 14_559;
+pub const FROZEN_CORE_SUITE_FNV1A64: u64 = 0x78462AE4C81DF408;
+pub const FROZEN_STAGE1_ELF_BYTES: usize = 106_242;
+pub const FROZEN_STAGE1_ELF_FNV1A64: u64 = 0xEAFC81F46B482FF8;
+pub const FROZEN_STAGE1_BC_WORDS: usize = 19_731;
+pub const FROZEN_STAGE1_BC_FNV1A64: u64 = 0x677F57AE71D28FED;
+
+/// 13BF. C1: Pin the 5 frozen FNV-1a64 hashes and exact sizes (`HANDOFF.md` §3).
+pub fn run_frozen_hash_pin_selftests() -> Result<usize, String> {
+    let mut checks = 0usize;
+    let (g1_u16, g2_u16, g1_elf, g2_elf) = run_phase_d_pure_omni_selfhost_bootstrap()?;
+    let g1_bc_bytes = encode_u16_stream_to_bytes(&g1_u16);
+    let g1_bc_hash = fnv1a_64_hash(&g1_bc_bytes);
+    if g1_u16.len() != FROZEN_PHASE_D_BC_WORDS || g2_u16.len() != FROZEN_PHASE_D_BC_WORDS || g1_bc_hash != FROZEN_PHASE_D_BC_FNV1A64 {
+        return Err(format!(
+            "C1 frozen hash mismatch on Phase D .omni_bc: got {} words / 0x{:016X}, want {} words / 0x{:016X}",
+            g1_u16.len(), g1_bc_hash, FROZEN_PHASE_D_BC_WORDS, FROZEN_PHASE_D_BC_FNV1A64
+        ));
+    }
+    checks += 1;
+
+    let g1_elf_hash = fnv1a_64_hash(&g1_elf);
+    if g1_elf.len() != FROZEN_PHASE_D_ELF_BYTES || g2_elf.len() != FROZEN_PHASE_D_ELF_BYTES || g1_elf_hash != FROZEN_PHASE_D_ELF_FNV1A64 {
+        return Err(format!(
+            "C1 frozen hash mismatch on Phase D ELF: got {} B / 0x{:016X}, want {} B / 0x{:016X}",
+            g1_elf.len(), g1_elf_hash, FROZEN_PHASE_D_ELF_BYTES, FROZEN_PHASE_D_ELF_FNV1A64
+        ));
+    }
+    checks += 1;
+
+    let suite_u16 = build_pure_omni_core_suite_stream()?;
+    let suite_bytes = encode_u16_stream_to_bytes(&suite_u16);
+    let suite_hash = fnv1a_64_hash(&suite_bytes);
+    if suite_u16.len() != FROZEN_CORE_SUITE_WORDS || suite_hash != FROZEN_CORE_SUITE_FNV1A64 {
+        return Err(format!(
+            "C1 frozen hash mismatch on 18-module core suite: got {} words / 0x{:016X}, want {} words / 0x{:016X}",
+            suite_u16.len(), suite_hash, FROZEN_CORE_SUITE_WORDS, FROZEN_CORE_SUITE_FNV1A64
+        ));
+    }
+    checks += 1;
+
+    let s1_u16 = build_step7_stage1_compiler_stream();
+    let s1_bc_bytes = encode_u16_stream_to_bytes(&s1_u16);
+    let s1_bc_hash = fnv1a_64_hash(&s1_bc_bytes);
+    if s1_u16.len() != FROZEN_STAGE1_BC_WORDS || s1_bc_hash != FROZEN_STAGE1_BC_FNV1A64 {
+        return Err(format!(
+            "C1 frozen hash mismatch on Stage-1 .omni_bc: got {} words / 0x{:016X}, want {} words / 0x{:016X}",
+            s1_u16.len(), s1_bc_hash, FROZEN_STAGE1_BC_WORDS, FROZEN_STAGE1_BC_FNV1A64
+        ));
+    }
+    checks += 1;
+
+    let s1_elf = compile_pure_u16_to_x86_64_elf_with_args(&s1_u16, 45, 40, 90)?;
+    let s1_elf_hash = fnv1a_64_hash(&s1_elf);
+    if s1_elf.len() != FROZEN_STAGE1_ELF_BYTES || s1_elf_hash != FROZEN_STAGE1_ELF_FNV1A64 {
+        return Err(format!(
+            "C1 frozen hash mismatch on Stage-1 ELF: got {} B / 0x{:016X}, want {} B / 0x{:016X}",
+            s1_elf.len(), s1_elf_hash, FROZEN_STAGE1_ELF_BYTES, FROZEN_STAGE1_ELF_FNV1A64
+        ));
+    }
+    checks += 1;
+
+    Ok(checks)
+}
+
+/// 13BG. C2: Stage-1 rejects DROP, IMOD, and pack5/ternary-AI ops up front with error[UNSUPPORTED].
+pub fn run_stage1_unsupported_gate_selftests() -> Result<usize, String> {
+    let mut checks = 0usize;
+    let cases: &[(&str, &str)] = &[
+        ("drop", "#[strict]\nfn f(x: i64) -> i64 { let a: arena = arena(64); drop(a); return x; }"),
+        ("imod", "fn f(x: i64) -> i64 { let r = x % 3; return r; }"),
+        ("egate", "#[cap(AI)] fn f(x: i64) -> trit { let g = egate(x); return g; }"),
+        ("pack5", "#[strict]\n#[cap(AI)]\nfn f() -> i64 { let raw: bytes = pack5_bytes([+1t, -1t, 0t, +1t, +1t]); let d: i64 = pack5_tdot(raw, raw); return d; }"),
+    ];
+    for &(name, src) in cases {
+        match compile_omni_surface_via_stage1_to_elf(src, 7, 0, 0) {
+            Err(e) if e.contains("error[UNSUPPORTED]") => checks += 1,
+            other => return Err(format!("C2 Stage-1 unsupported gate '{name}': expected error[UNSUPPORTED], got {other:?}")),
+        }
+    }
     Ok(checks)
 }
 
@@ -20151,16 +20265,17 @@ RET %4
             if execute_omni_surface_program(arena_ok_surf, vec![OmniValue::Int(8)])? != OmniValue::Int(50) {
                 return Err(String::from("Surface arena_lifecycle_golden execution mismatch"));
             }
-            // P11/P2: also the real VM, the native x86-64 ELF and the native Stage-1 ELF. Two DROPs pass
-            // on Stage-1 only by luck (the misdecode eats the 2nd DROP, not RET); the odd-count crash is
-            // tracked as p2_drop1/p2_drop3 stage1 in OMNI_DIFF4_KNOWN_DIVERGENCES.
+            // P11/P2/C2: also the real VM and native x86-64 ELF. Stage-1 rejects DROP 0x7F05 up front
+            // with error[UNSUPPORTED] (C2; p2_drop1/p2_drop2_arena_lifecycle/p2_drop3 in diff4).
             if execute_omni_surface_program_with_budgets(arena_ok_surf, vec![OmniValue::Int(8)], None, None)? != OmniValue::Int(50) {
                 return Err(String::from("Surface arena_lifecycle_golden VM mismatch"));
             }
             let arena_host = compile_omni_surface_to_x86_64_elf(arena_ok_surf, 8, 0, 0)?;
             expect_native_elf_i64(&arena_host, "arena_lifecycle_x86", 50, "arena_lifecycle_golden x86-64")?;
-            let arena_s1 = compile_omni_surface_via_stage1_to_elf(arena_ok_surf, 8, 0, 0)?;
-            expect_native_elf_i64(&arena_s1, "arena_lifecycle_s1", 50, "arena_lifecycle_golden Stage-1")?;
+            match compile_omni_surface_via_stage1_to_elf(arena_ok_surf, 8, 0, 0) {
+                Err(e) if e.contains("error[UNSUPPORTED]") => {}
+                other => return Err(format!("arena_lifecycle_golden Stage-1 expected error[UNSUPPORTED] on DROP, got {other:?}")),
+            }
 
             let arena_leak_surf = "
                 fn bad_surface_arena_leak(x: i64) -> i64 {
@@ -20524,25 +20639,39 @@ fn main() {
                 fs::write("omni_self_compiler.omni_bc", &bc_bytes).expect("Failed to write omni_self_compiler.omni_bc");
                 let s1_elf = compile_pure_u16_to_x86_64_elf_with_args(&s1_u16, 45, 40, 90).expect("Stage-1 AOT failed");
                 fs::write("omni_stage1_self_compiler.elf", &s1_elf).expect("Failed to write omni_stage1_self_compiler.elf");
-                #[cfg(unix)]
-                {
+                #[cfg(all(unix, target_arch = "x86_64"))]
+                let s2_elf = {
                     use std::os::unix::fs::PermissionsExt;
                     let mut p = fs::metadata("omni_stage1_self_compiler.elf").unwrap().permissions();
                     p.set_mode(0o755);
                     fs::set_permissions("omni_stage1_self_compiler.elf", p).unwrap();
-                }
-                let out = std::process::Command::new("./omni_stage1_self_compiler.elf")
-                    .arg("omni_self_compiler.omni_bc")
-                    .output()
-                    .expect("Failed to run ./omni_stage1_self_compiler.elf");
-                assert!(out.status.success(), "Stage-1 self-compilation exited non-zero");
-                fs::write("omni_stage2_self_compiler.elf", &out.stdout).expect("Failed to write omni_stage2_self_compiler.elf");
-                assert_elf_bit_exact(&s1_elf, &out.stdout, "Stage-1 == Stage-2 Fixed Point");
+                    let out = std::process::Command::new("./omni_stage1_self_compiler.elf")
+                        .arg("omni_self_compiler.omni_bc")
+                        .output()
+                        .expect("Failed to run ./omni_stage1_self_compiler.elf");
+                    assert!(out.status.success(), "Stage-1 self-compilation exited non-zero");
+                    out.stdout
+                };
+                #[cfg(not(all(unix, target_arch = "x86_64")))]
+                let s2_elf = {
+                    let s1_mod = decode_omni_token_stream(&s1_u16).expect("Failed to decode Stage-1 stream");
+                    let mut vm = OmniBinaryVm::new();
+                    match vm.execute_function(
+                        &s1_mod,
+                        0,
+                        vec![OmniValue::U16Array(s1_u16.clone()), OmniValue::Int(45), OmniValue::Int(40), OmniValue::Int(90)],
+                    ).expect("Stage-1 VM self-compilation failed") {
+                        OmniValue::Bytes(b) => b,
+                        other => panic!("Expected Bytes from Stage-1 self-compilation, got {:?}", other),
+                    }
+                };
+                fs::write("omni_stage2_self_compiler.elf", &s2_elf).expect("Failed to write omni_stage2_self_compiler.elf");
+                assert_elf_bit_exact(&s1_elf, &s2_elf, "Stage-1 == Stage-2 Fixed Point");
                 println!(
                     "[FIXED-POINT PASS] omni_self_compiler.omni_bc={} B (FNV-1a64=0x{:016X}) | omni_stage1_self_compiler.elf={} B (FNV-1a64=0x{:016X}) == omni_stage2_self_compiler.elf={} B (FNV-1a64=0x{:016X}) | diff=0 bytes",
                     bc_bytes.len(), fnv1a_64_hash(&bc_bytes),
                     s1_elf.len(), fnv1a_64_hash(&s1_elf),
-                    out.stdout.len(), fnv1a_64_hash(&out.stdout)
+                    s2_elf.len(), fnv1a_64_hash(&s2_elf)
                 );
                 return;
             }
