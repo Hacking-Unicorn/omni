@@ -1076,6 +1076,7 @@ pub fn run_host_sandbox_selftests() -> Result<usize, String> {
 
     // 4. Symlink escape is rejected.
     {
+        #[allow(unused_mut)]
         let mut host = StdNarrowHostAdapter::with_sandbox_root(&root);
         let outside = tmp.join("outside_secret");
         if let Err(e) = std::fs::write(&outside, b"secret") {

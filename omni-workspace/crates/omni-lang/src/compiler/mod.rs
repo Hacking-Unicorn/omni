@@ -4196,6 +4196,7 @@ pub fn run_isa_b_multibyte_parity_selftests() -> Result<usize, String> {
         let oob_mod = decode_omni_token_stream(&oob_stream)?;
         for x in [3i64, -3] {
             let mut vm = OmniBinaryVm::new();
+            #[allow(unused_mut)]
             let mut results: Vec<(&str, Result<i64, String>)> = vec![
                 ("vm", vm.execute_function(&oob_mod, 0, vec![OmniValue::Int(x)]).map(|v| match v { OmniValue::Int(n) => n, _ => 0 })),
                 ("wasm", execute_omni_surface_wasm_i64(src, &[x])),

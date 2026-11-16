@@ -1041,6 +1041,7 @@ pub struct OmniBinaryVm {
     pub memory_budget_bytes: usize,
     pub allocated_bytes: usize,
     pub call_depth: usize,
+    pub verified_fns: u64,
 }
 
 impl OmniBinaryVm {
@@ -1055,6 +1056,7 @@ impl OmniBinaryVm {
             memory_budget_bytes: DEFAULT_VM_MEMORY_BUDGET_BYTES,
             allocated_bytes: 0,
             call_depth: 0,
+            verified_fns: 0,
         }
     }
 
@@ -1069,6 +1071,7 @@ impl OmniBinaryVm {
             memory_budget_bytes,
             allocated_bytes: 0,
             call_depth: 0,
+            verified_fns: 0,
         }
     }
 
@@ -1080,6 +1083,7 @@ impl OmniBinaryVm {
         self.steps_executed = 0;
         self.allocated_bytes = 0;
         self.call_depth = 0;
+        self.verified_fns = 0;
     }
 
     #[inline]
@@ -1110,18 +1114,38 @@ impl OmniBinaryVm {
         }
     }
 
-    fn eval_as_i64(op: &BinOperand, regs: &[OmniValue; 224]) -> Option<i64> {
-        match Self::eval_op(op, regs) {
-            OmniValue::Int(v) => Some(v),
-            OmniValue::Trit(t) => Some(t as i64),
+    #[inline]
+    fn eval_op_ref<'a>(op: &BinOperand, regs: &'a [OmniValue; 224]) -> Option<&'a OmniValue> {
+        match op {
+            BinOperand::Reg(t) | BinOperand::Param(t) => token_to_slot(*t).map(|s| &regs[s]),
             _ => None,
         }
     }
 
+    #[inline]
+    fn eval_as_i64(op: &BinOperand, regs: &[OmniValue; 224]) -> Option<i64> {
+        match op {
+            BinOperand::Reg(t) | BinOperand::Param(t) => match token_to_slot(*t).map(|s| &regs[s]) {
+                Some(OmniValue::Int(v)) => Some(*v),
+                Some(OmniValue::Trit(t)) => Some(*t as i64),
+                _ => None,
+            },
+            BinOperand::ImmInt(v) => Some(*v),
+            BinOperand::ImmTrit(t) => Some(*t as i64),
+            _ => None,
+        }
+    }
+
+    #[inline]
     fn eval_as_trit(op: &BinOperand, regs: &[OmniValue; 224]) -> Option<i8> {
-        match Self::eval_op(op, regs) {
-            OmniValue::Trit(t) => Some(t.clamp(-1, 1)),
-            OmniValue::Int(v) => Some(v.clamp(-1, 1) as i8),
+        match op {
+            BinOperand::Reg(t) | BinOperand::Param(t) => match token_to_slot(*t).map(|s| &regs[s]) {
+                Some(OmniValue::Trit(t)) => Some((*t).clamp(-1, 1)),
+                Some(OmniValue::Int(v)) => Some((*v).clamp(-1, 1) as i8),
+                _ => None,
+            },
+            BinOperand::ImmTrit(t) => Some((*t).clamp(-1, 1)),
+            BinOperand::ImmInt(v) => Some((*v).clamp(-1, 1) as i8),
             _ => None,
         }
     }
@@ -1132,45 +1156,85 @@ impl OmniBinaryVm {
         fn_idx: u16,
         args: Vec<OmniValue>,
     ) -> Result<OmniValue, String> {
+        let mut no_restore: [(usize, OmniValue); 0] = [];
+        self.execute_function_inner(module, fn_idx, args, 0, &mut no_restore)
+    }
+
+    fn execute_function_inner(
+        &mut self,
+        module: &BinModule,
+        fn_idx: u16,
+        args: Vec<OmniValue>,
+        owned_params: u32,
+        restore_borrowed: &mut [(usize, OmniValue)],
+    ) -> Result<OmniValue, String> {
+        if self.call_depth == 0 {
+            self.verified_fns = 0;
+        }
         if self.call_depth >= MAX_VM_CALL_DEPTH {
             return Err(format!(
                 "error[BUDGET_EXCEEDED]: VM call stack depth budget exceeded ({} >= {})",
                 self.call_depth, MAX_VM_CALL_DEPTH
             ));
         }
-        let func = module
-            .functions
-            .iter()
-            .find(|f| f.fn_idx == fn_idx)
-            .ok_or_else(|| format!("Function index {} not found", fn_idx))?;
+        let func = if let Some(f) = module.functions.get(fn_idx as usize).filter(|f| f.fn_idx == fn_idx) {
+            f
+        } else {
+            module
+                .functions
+                .iter()
+                .find(|f| f.fn_idx == fn_idx)
+                .ok_or_else(|| format!("Function index {} not found", fn_idx))?
+        };
 
-        let rep = verify_binary_function(func);
-        if !rep.passed {
-            return Err(format!("Binary verification failed: {:?}", rep.errors));
+        let fn_bit = if (fn_idx as usize) < 64 { 1u64 << fn_idx } else { 0 };
+        if fn_bit == 0 || (self.verified_fns & fn_bit) == 0 {
+            let rep = verify_binary_function(func);
+            if !rep.passed {
+                return Err(format!("Binary verification failed: {:?}", rep.errors));
+            }
+            self.verified_fns |= fn_bit;
         }
 
         let mut regs: [OmniValue; 224] = std::array::from_fn(|_| OmniValue::Void);
-        for (i, &(par_tok, _, _)) in func.params.iter().enumerate() {
-            if let (Some(slot), Some(val)) = (token_to_slot(par_tok), args.get(i)) {
-                regs[slot] = val.clone();
+        for (&(par_tok, _, _), val) in func.params.iter().zip(args.into_iter()) {
+            if let Some(slot) = token_to_slot(par_tok) {
+                regs[slot] = val;
             }
         }
 
-        let mut label_pcs = [usize::MAX; 256];
-        for (idx_i, cand) in func.instructions.iter().enumerate() {
-            if cand.op_tok == 0x7F40 {
-                if let Some(lid) = cand.operands.first().and_then(extract_label_id) {
-                    if (lid as usize) < 256 {
-                        label_pcs[lid as usize] = idx_i + 1;
+        let mut label_pcs: Option<[usize; 256]> = None;
+        let resolve_lbl = |lbl: u16, lp: &mut Option<[usize; 256]>| -> Option<usize> {
+            let table = lp.get_or_insert_with(|| {
+                let mut t = [usize::MAX; 256];
+                for (idx_i, cand) in func.instructions.iter().enumerate() {
+                    if cand.op_tok == 0x7F40 {
+                        if let Some(lid) = cand.operands.first().and_then(extract_label_id) {
+                            if (lid as usize) < 256 {
+                                t[lid as usize] = idx_i + 1;
+                            }
+                        }
                     }
                 }
+                t
+            });
+            if (lbl as usize) < 256 && table[lbl as usize] != usize::MAX {
+                Some(table[lbl as usize])
+            } else {
+                func.instructions
+                    .iter()
+                    .position(|cand| cand.op_tok == 0x7F40 && cand.operands.first().and_then(extract_label_id) == Some(lbl))
+                    .map(|p| p + 1)
             }
-        }
+        };
 
         let mut pc = 0usize;
         while pc < func.instructions.len() {
             self.steps_executed = self.steps_executed.saturating_add(1);
             if self.steps_executed > self.step_limit {
+                for &mut (p_idx, ref mut out_v) in restore_borrowed.iter_mut() {
+                    *out_v = std::mem::replace(&mut regs[192 + p_idx], OmniValue::Void);
+                }
                 return Err(format!("error[BUDGET_EXCEEDED]: VM fuel/step budget exceeded ({} > {})", self.steps_executed, self.step_limit));
             }
             let ins = &func.instructions[pc];
@@ -1178,14 +1242,7 @@ impl OmniBinaryVm {
                 0x7F00 | 0x7F40 | 0x7F46 => { pc += 1; continue; }
                 0x7F41 => {
                     if let Some(target_lbl) = ins.operands.first().and_then(extract_label_id) {
-                        let next_pc = if (target_lbl as usize) < 256 && label_pcs[target_lbl as usize] != usize::MAX {
-                            Some(label_pcs[target_lbl as usize])
-                        } else {
-                            func.instructions.iter().position(|cand| {
-                                cand.op_tok == 0x7F40 && cand.operands.first().and_then(extract_label_id) == Some(target_lbl)
-                            }).map(|p| p + 1)
-                        };
-                        if let Some(tp) = next_pc {
+                        if let Some(tp) = resolve_lbl(target_lbl, &mut label_pcs) {
                             pc = tp;
                             continue;
                         }
@@ -1201,14 +1258,7 @@ impl OmniBinaryVm {
                         ins.operands.get(3).and_then(extract_label_id),
                     ) {
                         let chosen = if c < 0 { l_neg } else if c == 0 { l_zero } else { l_pos };
-                        let next_pc = if (chosen as usize) < 256 && label_pcs[chosen as usize] != usize::MAX {
-                            Some(label_pcs[chosen as usize])
-                        } else {
-                            func.instructions.iter().position(|cand| {
-                                cand.op_tok == 0x7F40 && cand.operands.first().and_then(extract_label_id) == Some(chosen)
-                            }).map(|p| p + 1)
-                        };
-                        if let Some(tp) = next_pc {
+                        if let Some(tp) = resolve_lbl(chosen, &mut label_pcs) {
                             pc = tp;
                             continue;
                         }
@@ -1223,14 +1273,7 @@ impl OmniBinaryVm {
                         ins.operands.get(1).and_then(extract_label_id),
                     ) {
                         if c == want {
-                            let next_pc = if (target_lbl as usize) < 256 && label_pcs[target_lbl as usize] != usize::MAX {
-                                Some(label_pcs[target_lbl as usize])
-                            } else {
-                                func.instructions.iter().position(|cand| {
-                                    cand.op_tok == 0x7F40 && cand.operands.first().and_then(extract_label_id) == Some(target_lbl)
-                                }).map(|p| p + 1)
-                            };
-                            if let Some(tp) = next_pc {
+                            if let Some(tp) = resolve_lbl(target_lbl, &mut label_pcs) {
                                 pc = tp;
                                 continue;
                             }
@@ -1263,7 +1306,21 @@ impl OmniBinaryVm {
                     pc += 1;
                     continue;
                 }
-                0x7F4A => return Ok(Self::eval_op(&ins.operands[0], &regs)),
+                0x7F4A => {
+                    let ret_val = match &ins.operands[0] {
+                        BinOperand::Reg(t) => {
+                            token_to_slot(*t).map(|s| std::mem::replace(&mut regs[s], OmniValue::Void)).unwrap_or(OmniValue::Void)
+                        }
+                        BinOperand::Param(t) if (owned_params & (1u32 << (*t - PAR_BASE))) != 0 => {
+                            token_to_slot(*t).map(|s| std::mem::replace(&mut regs[s], OmniValue::Void)).unwrap_or(OmniValue::Void)
+                        }
+                        other => Self::eval_op(other, &regs),
+                    };
+                    for &mut (p_idx, ref mut out_v) in restore_borrowed.iter_mut() {
+                        *out_v = std::mem::replace(&mut regs[192 + p_idx], OmniValue::Void);
+                    }
+                    return Ok(ret_val);
+                }
                 _ => {}
             }
 
@@ -1279,7 +1336,26 @@ impl OmniBinaryVm {
                     OmniValue::Arena { .. } => OmniValue::Arena { capacity: 0, active: true },
                     other => other,
                 },
-                0x7F04 | 0x7F06 | 0x7F09 => Self::eval_op(&ins.operands[0], &regs),
+                0x7F04 | 0x7F06 | 0x7F09 => match &ins.operands[0] {
+                    BinOperand::Reg(t)
+                        if !func.instructions[..=pc].iter().any(|c| c.op_tok == 0x7F40)
+                            && !func.instructions[pc + 1..].iter().any(|later| {
+                                later.operands.iter().any(|op| matches!(op, BinOperand::Reg(ot) if ot == t))
+                            }) =>
+                    {
+                        token_to_slot(*t).map(|s| std::mem::replace(&mut regs[s], OmniValue::Void)).unwrap_or(OmniValue::Void)
+                    }
+                    BinOperand::Param(t)
+                        if (owned_params & (1u32 << (*t - PAR_BASE))) != 0
+                            && !func.instructions[..=pc].iter().any(|c| c.op_tok == 0x7F40)
+                            && !func.instructions[pc + 1..].iter().any(|later| {
+                                later.operands.iter().any(|op| matches!(op, BinOperand::Param(ot) if ot == t))
+                            }) =>
+                    {
+                        token_to_slot(*t).map(|s| std::mem::replace(&mut regs[s], OmniValue::Void)).unwrap_or(OmniValue::Void)
+                    }
+                    other => Self::eval_op(other, &regs),
+                },
                 0x7F08 => {
                     let v = Self::eval_op(&ins.operands[0], &regs);
                     if let OmniValue::Str(ref s) = v {
@@ -1302,8 +1378,8 @@ impl OmniBinaryVm {
                         _ => return Err(String::from("error[BAD_TYPE]: 3-op IGET mode must be -2, -4, or -8")),
                     };
                     let off = Self::eval_as_i64(&ins.operands[2], &regs);
-                    match (Self::eval_op(&ins.operands[0], &regs), off) {
-                        (OmniValue::Bytes(buf), Some(off)) if off >= 0 => {
+                    match (Self::eval_op_ref(&ins.operands[0], &regs), off) {
+                        (Some(OmniValue::Bytes(buf)), Some(off)) if off >= 0 => {
                             match (off as u64).checked_add(width as u64) {
                                 Some(end) if end <= buf.len() as u64 => {
                                     let o = off as usize;
@@ -1318,26 +1394,64 @@ impl OmniBinaryVm {
                     }
                 }
                 0x7F0E => {
-                    let arr_val = Self::eval_op(&ins.operands[0], &regs);
-                    let idx_val = Self::eval_op(&ins.operands[1], &regs);
-                    match (arr_val, idx_val) {
-                        (OmniValue::U16Array(arr), OmniValue::Int(i)) if i >= 0 && (i as usize) < arr.len() => {
+                    let idx_opt = Self::eval_as_i64(&ins.operands[1], &regs);
+                    match (Self::eval_op_ref(&ins.operands[0], &regs), idx_opt) {
+                        (Some(OmniValue::U16Array(arr)), Some(i)) if i >= 0 && (i as usize) < arr.len() => {
                             OmniValue::Int(arr[i as usize] as i64)
                         }
-                        (OmniValue::Bytes(buf), OmniValue::Int(i)) if i >= 0 && (i as usize) < buf.len() => {
+                        (Some(OmniValue::Bytes(buf)), Some(i)) if i >= 0 && (i as usize) < buf.len() => {
                             OmniValue::Int(buf[i as usize] as i64)
                         }
-                        (OmniValue::TritVec(tv), OmniValue::Int(i)) if i >= 0 && (i as usize) < tv.len() => {
-                            let packed = pack5_encode(&tv);
+                        (Some(OmniValue::TritVec(tv)), Some(i)) if i >= 0 && (i as usize) < tv.len() => {
+                            let packed = pack5_encode(tv);
                             OmniValue::Int(pack5_get_trit(&packed, i as usize).map_err(String::from)? as i64)
                         }
                         _ => OmniValue::Int(0),
                     }
                 }
                 0x7F0F => {
-                    let mut buf = match Self::eval_op(&ins.operands[0], &regs) {
-                        OmniValue::Bytes(b) => b,
-                        _ => Vec::new(),
+                    let src_tok = match ins.operands.first() {
+                        Some(BinOperand::Reg(t) | BinOperand::Param(t)) => Some(*t),
+                        _ => None,
+                    };
+                    let not_in_rest_ops = !ins.operands[1..].iter().any(|op| match op {
+                        BinOperand::Reg(t) | BinOperand::Param(t) => Some(*t) == src_tok,
+                        _ => false,
+                    });
+                    let can_take_owned_param = match src_tok {
+                        Some(pt) if (PAR_BASE..=PAR_MAX).contains(&pt) && (owned_params & (1u32 << (pt - PAR_BASE))) != 0 => {
+                            not_in_rest_ops
+                                && !func.instructions[pc + 1..].iter().any(|later| {
+                                    later.operands.iter().any(|op| matches!(op, BinOperand::Param(t) if *t == pt))
+                                })
+                        }
+                        _ => false,
+                    };
+                    let can_take_last_use = match src_tok {
+                        Some(t) if (REG_BASE..=REG_MAX).contains(&t) || ((PAR_BASE..=PAR_MAX).contains(&t) && (owned_params & (1u32 << (t - PAR_BASE))) != 0) => {
+                            not_in_rest_ops
+                                && !func.instructions[..=pc].iter().any(|c| c.op_tok == 0x7F40)
+                                && !func.instructions[pc + 1..].iter().any(|later| {
+                                    later.operands.iter().any(|op| matches!(op, BinOperand::Reg(ot) | BinOperand::Param(ot) if *ot == t))
+                                })
+                        }
+                        _ => false,
+                    };
+                    let can_take_in_place = (ins.dest_reg.is_some() && ins.dest_reg == src_tok && not_in_rest_ops) || can_take_owned_param || can_take_last_use;
+                    let mut buf = if can_take_in_place {
+                        if let Some(slot) = src_tok.and_then(token_to_slot) {
+                            match std::mem::replace(&mut regs[slot], OmniValue::Void) {
+                                OmniValue::Bytes(b) => b,
+                                _ => Vec::new(),
+                            }
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        match Self::eval_op(&ins.operands[0], &regs) {
+                            OmniValue::Bytes(b) => b,
+                            _ => Vec::new(),
+                        }
                     };
                     let prev_len = buf.len();
                     if ins.operands.len() == 3 && ins.operands[1] == BinOperand::ImmInt(-4) {
@@ -1403,11 +1517,11 @@ impl OmniBinaryVm {
                 0x7F21 => if let Some(a) = Self::eval_as_i64(&ins.operands[0], &regs) { OmniValue::Int(!a) } else { OmniValue::Int(0) },
                 0x7F22 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a.wrapping_shl((b & 63) as u32)) } else { OmniValue::Int(0) },
                 0x7F23 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a.wrapping_shr((b & 63) as u32)) } else { OmniValue::Int(0) },
-                0x7F50 => match Self::eval_op(&ins.operands[0], &regs) {
-                    OmniValue::Bytes(b) => OmniValue::Int(b.len() as i64),
-                    OmniValue::Str(s) => OmniValue::Int(s.len() as i64),
-                    OmniValue::U16Array(a) => OmniValue::Int(a.len() as i64),
-                    OmniValue::TritVec(t) => OmniValue::Int(t.len() as i64),
+                0x7F50 => match Self::eval_op_ref(&ins.operands[0], &regs) {
+                    Some(OmniValue::Bytes(b)) => OmniValue::Int(b.len() as i64),
+                    Some(OmniValue::Str(s)) => OmniValue::Int(s.len() as i64),
+                    Some(OmniValue::U16Array(a)) => OmniValue::Int(a.len() as i64),
+                    Some(OmniValue::TritVec(t)) => OmniValue::Int(t.len() as i64),
                     _ => OmniValue::Int(0),
                 },
                 0x7F51 => {
@@ -1518,10 +1632,62 @@ impl OmniBinaryVm {
                 }
                 0x7F48 => {
                     if let BinOperand::FnRef(callee_idx) = ins.operands[0] {
-                        let call_args: Vec<OmniValue> = ins.operands[1..].iter().map(|op| Self::eval_op(op, &regs)).collect();
+                        let dest_tok = ins.dest_reg;
+                        let n_call_ops = ins.operands.len().saturating_sub(1);
+                        let mut call_args: Vec<OmniValue> = Vec::with_capacity(n_call_ops);
+                        let mut callee_owned: u32 = 0;
+                        let mut restore_pairs: [(usize, OmniValue); 8] = std::array::from_fn(|_| (0, OmniValue::Void));
+                        let mut caller_slots: [usize; 8] = [0; 8];
+                        let mut n_borrowed = 0usize;
+                        for (idx_op, op) in ins.operands[1..].iter().enumerate() {
+                            let arg_val = match op {
+                                BinOperand::Reg(t) | BinOperand::Param(t)
+                                    if idx_op < 32
+                                        && !ins.operands[1..].iter().enumerate().any(|(j, other)| {
+                                            j != idx_op && matches!(other, BinOperand::Reg(ot) | BinOperand::Param(ot) if ot == t)
+                                        }) =>
+                                {
+                                    if let Some(s) = token_to_slot(*t) {
+                                        if Some(*t) == dest_tok {
+                                            callee_owned |= 1u32 << idx_op;
+                                            std::mem::replace(&mut regs[s], OmniValue::Void)
+                                        } else if matches!(regs[s], OmniValue::Bytes(_) | OmniValue::U16Array(_)) {
+                                            let is_owned_src = (REG_BASE..=REG_MAX).contains(t)
+                                                || ((PAR_BASE..=PAR_MAX).contains(t) && (owned_params & (1u32 << (*t - PAR_BASE))) != 0);
+                                            let dead_after = is_owned_src
+                                                && !func.instructions[..=pc].iter().any(|c| c.op_tok == 0x7F40)
+                                                && !func.instructions[pc + 1..].iter().any(|later| {
+                                                    later.operands.iter().any(|op_l| matches!(op_l, BinOperand::Reg(ot) | BinOperand::Param(ot) if ot == t))
+                                                });
+                                            if dead_after {
+                                                callee_owned |= 1u32 << idx_op;
+                                                std::mem::replace(&mut regs[s], OmniValue::Void)
+                                            } else if n_borrowed < 8 {
+                                                let moved = std::mem::replace(&mut regs[s], OmniValue::Void);
+                                                restore_pairs[n_borrowed] = (idx_op, OmniValue::Void);
+                                                caller_slots[n_borrowed] = s;
+                                                n_borrowed += 1;
+                                                moved
+                                            } else {
+                                                regs[s].clone()
+                                            }
+                                        } else {
+                                            regs[s].clone()
+                                        }
+                                    } else {
+                                        OmniValue::Void
+                                    }
+                                }
+                                _ => Self::eval_op(op, &regs),
+                            };
+                            call_args.push(arg_val);
+                        }
                         self.call_depth += 1;
-                        let call_res = self.execute_function(module, callee_idx, call_args);
+                        let call_res = self.execute_function_inner(module, callee_idx, call_args, callee_owned, &mut restore_pairs[..n_borrowed]);
                         self.call_depth = self.call_depth.saturating_sub(1);
+                        for k in 0..n_borrowed {
+                            regs[caller_slots[k]] = std::mem::replace(&mut restore_pairs[k].1, OmniValue::Void);
+                        }
                         call_res?
                     } else { OmniValue::Void }
                 }
@@ -1723,6 +1889,9 @@ impl OmniBinaryVm {
                 }
             }
             pc += 1;
+        }
+        for &mut (p_idx, ref mut out_v) in restore_borrowed.iter_mut() {
+            *out_v = std::mem::replace(&mut regs[192 + p_idx], OmniValue::Void);
         }
         Ok(OmniValue::Void)
     }
@@ -12327,6 +12496,7 @@ pub fn run_host_sandbox_selftests() -> Result<usize, String> {
 
     // 4. Symlink escape is rejected.
     {
+        #[allow(unused_mut)]
         let mut host = StdNarrowHostAdapter::with_sandbox_root(&root);
         let outside = tmp.join("outside_secret");
         if let Err(e) = std::fs::write(&outside, b"secret") {
@@ -12694,6 +12864,7 @@ pub fn run_isa_b_multibyte_parity_selftests() -> Result<usize, String> {
         let oob_mod = decode_omni_token_stream(&oob_stream)?;
         for x in [3i64, -3] {
             let mut vm = OmniBinaryVm::new();
+            #[allow(unused_mut)]
             let mut results: Vec<(&str, Result<i64, String>)> = vec![
                 ("vm", vm.execute_function(&oob_mod, 0, vec![OmniValue::Int(x)]).map(|v| match v { OmniValue::Int(n) => n, _ => 0 })),
                 ("wasm", execute_omni_surface_wasm_i64(src, &[x])),
