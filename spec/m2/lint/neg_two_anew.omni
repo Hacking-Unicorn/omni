@@ -1,0 +1,9 @@
+// L2 ANEW_COUNT: exactly one arena per module (a second ANEW would reset the native arena).
+fn main(x: i64) -> i64 {
+    let a: bytes = anew(0);
+    let b: bytes = anew(0);
+    let n: i64 = slen(a);
+    let m: i64 = slen(b);
+    let r: i64 = n + m + x;
+    return r;
+}

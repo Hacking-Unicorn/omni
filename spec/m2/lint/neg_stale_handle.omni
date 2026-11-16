@@ -1,0 +1,9 @@
+// L3 LINEAR_BYTES: `w` is consumed by the iset into `x`, then read again.
+fn main(a: i64) -> i64 {
+    let w: bytes = anew(0);
+    let x: bytes = iset(w, 1);
+    let n: i64 = slen(w);
+    let m: i64 = slen(x);
+    let r: i64 = n + m + a;
+    return r;
+}

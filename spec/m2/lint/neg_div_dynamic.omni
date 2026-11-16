@@ -1,0 +1,5 @@
+// L7 DIV_DIVISOR: native IMOD by a runtime 0 returns the dividend (VM returns 0).
+fn main(a: i64, b: i64) -> i64 {
+    let r: i64 = a % b;
+    return r;
+}

@@ -1,0 +1,9 @@
+// L6 PACK5_OP: pack5 opcodes are excluded from M2.
+#[cap(AI)]
+fn main(x: i64) -> i64 {
+    let v: trit_vec = [+1t, -1t, 0t];
+    let p: bytes = pack5(v);
+    let n: i64 = slen(p);
+    let r: i64 = n + x;
+    return r;
+}

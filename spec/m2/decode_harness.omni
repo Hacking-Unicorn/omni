@@ -1,0 +1,8 @@
+// Test-only entry for selftest_m2_decode_diff (concatenated after util + decode; last fn = entry).
+// The single ANEW of the module lives here (lint L-2).
+#[strict]
+fn m2d_harness_main(arr: array) -> bytes {
+    let out: bytes = anew(0);
+    out = m2d_decode_module(arr, out);
+    return out;
+}

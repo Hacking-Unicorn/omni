@@ -939,6 +939,58 @@ pub fn run_workspace_selftest() -> Result<usize, String> {
         checks += 1;
     }
 
+
+    // M2. Milestone 2 foundation guards (workspace crates vs committed spec/m2 records).
+    checks += run_workspace_m2_guards()?;
+    Ok(checks)
+}
+
+/// Milestone 2 foundation guards, recomputed through the workspace crates and checked against the
+/// monolith's committed records (spec/m2/): frozen hashes and the single-mode byte lock.
+pub fn run_workspace_m2_guards() -> Result<usize, String> {
+    let mut checks = 0usize;
+    let (g1, g2, e1, e2) = omni_lang::run_phase_d_pure_omni_selfhost_bootstrap()?;
+    if g1 != g2 || e1 != e2 {
+        return Err("Workspace M2 frozen guard: Phase D gen1 != gen2".into());
+    }
+    let suite = omni_lang::build_pure_omni_core_suite_stream()?;
+    let stage1 = build_step7_stage1_compiler_stream();
+    let s1_elf = compile_pure_u16_to_x86_64_elf_with_args(&stage1, 45, 40, 90)?;
+    let got: [(usize, u64); 4] = [
+        (g1.len(), fnv1a_64_hash(&encode_u16_stream_to_bytes(&g1))),
+        (e1.len(), fnv1a_64_hash(&e1)),
+        (suite.len(), fnv1a_64_hash(&encode_u16_stream_to_bytes(&suite))),
+        (s1_elf.len(), fnv1a_64_hash(&s1_elf)),
+    ];
+    for (i, &(len, h)) in got.iter().enumerate() {
+        let (name, wl, wh) = monolith::M2_FROZEN_HASHES[i];
+        if len != wl || h != wh {
+            return Err(format!(
+                "Workspace M2 frozen-hash guard FAILED for {}: got len={} fnv=0x{:016X}, frozen len={} fnv=0x{:016X}",
+                name, len, h, wl, wh
+            ));
+        }
+        checks += 1;
+    }
+    let ws_lock = monolith::m2_render_single_mode_lock_with(
+        &|w: &[u16], a: i64, b: i64, c: i64| compile_pure_u16_to_x86_64_elf_with_args(w, a, b, c),
+        &|w: &[u16]| compile_pure_u16_to_wasm(w),
+    );
+    monolith::m2_compare_tsv("workspace single-mode byte lock", monolith::M2_SINGLE_MODE_LOCK_TSV, &ws_lock)?;
+    checks += 1;
+    // M2-02: the workspace verifier and emitter agree with the monolith's label reference.
+    for (name, s) in monolith::m2_label_cases()? {
+        let ws_ok = verify_u16_stream(&s).map(|r| r.iter().all(|x| x.passed)).unwrap_or(false);
+        let mono = decode_omni_token_stream(&s)
+            .ok()
+            .map(|_| monolith::verify_u16_stream(&s).map(|r| r.iter().all(|x| x.passed)).unwrap_or(false));
+        let ws_elf = compile_pure_u16_to_x86_64_elf_with_args(&s, 0, 0, 0).ok();
+        let mono_elf = monolith::compile_pure_u16_to_x86_64_elf_with_args(&s, 0, 0, 0).ok();
+        if Some(ws_ok) != mono || ws_elf != mono_elf {
+            return Err(format!("Workspace vs monolith label reference divergence on {}", name));
+        }
+    }
+    checks += 1;
     Ok(checks)
 }
 
@@ -986,6 +1038,9 @@ fn main() {
                         std::process::exit(2);
                     }
                 }
+            }
+            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" => {
+                std::process::exit(monolith::run_m2_cli(&args[1..]));
             }
             "selftest" => {
                 match run_workspace_selftest() {
