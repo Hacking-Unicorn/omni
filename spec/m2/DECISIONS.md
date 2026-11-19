@@ -37,18 +37,14 @@ O-2, O-3, O-4, O-5 and O-7 were decided after M2-00 was first committed (see D-7
 
 ## Standing invariants (every M2 commit)
 
-- 192 SSA registers / **16 labels** per function (ids 0..15). The emitter, both verifiers and all four
-  backends accept 16 labels in assembly-built functions (Vera, `lbl16_asm_ids_0_15`). The Rust
-  **source compiler** still numbers labels from 1 (`omni_rust_bootstrap.rs:3587`, `next_lbl: 1`) and
-  rejects the 16th (`:3646-3656`), so **frontend-compiled functions are capped at 15 until main-line
-  C4 lands**. The M2-03 budget report prints both caps. M2 code targets ≤ 120 SSA / ≤ 12 labels.
+- 192 SSA registers / **16 labels** per function (ids 0..15; both assembly-built and frontend-compiled after C4). M2 code targets ≤ 120 SSA / ≤ 12 labels.
 - Call depth ≤ 64 frames; no recursion in `.omni`; eager argument evaluation.
 - No heap structs, maps, or GC in `.omni`.
 - The 128-entry opcode table (`0x7F00..0x7F7F`) is never renumbered.
-- Frozen bootstrap hashes unchanged (enforced by `selftest_m2_frozen_hashes`, M2-01):
+- Frozen bootstrap hashes unchanged (enforced by `selftest_m2_frozen_hashes`, M2-01, and `13BF` C1):
   - Phase D `omni_self_compiler.omni_bc`: 159 words, FNV-1a64 `0x23B8D17257CCA9C4`
   - Phase D ELF: 824 B, `0xE221085777B8AC47`
   - 18-module pure core suite stream: 14,559 words, `0x78462AE4C81DF408`
   - Stage-1 self-compiler ELF: 106,242 B, `0xEAFC81F46B482FF8`
-  - Stage-1 bytecode `omni_self_compiler.omni_bc`: 19,731 words, `0x677F57AE71D28FED` (checked by `fixed-point`)
+  - Stage-1 bytecode `omni_self_compiler.omni_bc`: 19,731 words / 39,462 B, `0x677F57AE71D28FED`
 - Zero external crates.

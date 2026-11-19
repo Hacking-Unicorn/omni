@@ -1,0 +1,5 @@
+// neg IMMUT_PARAM: assignment to a parameter.
+fn main(x: i64, y: i64) -> i64 {
+    y = x * 2;
+    return y;
+}

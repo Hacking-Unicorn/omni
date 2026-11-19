@@ -1,0 +1,9 @@
+// Q5: a macro used before its definition is not substituted.
+fn first(x: i64) -> i64 {
+    return twice(x);
+}
+macro twice(v) = v * 2;
+fn main(x: i64) -> i64 {
+    let y = twice(x);
+    return first(y);
+}

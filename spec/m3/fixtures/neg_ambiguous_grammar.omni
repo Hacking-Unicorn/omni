@@ -1,0 +1,5 @@
+// neg AMBIGUOUS_GRAMMAR: non-canonical type alias under the strict attribute.
+#[strict]
+fn main(x: int) -> i64 {
+    return x;
+}

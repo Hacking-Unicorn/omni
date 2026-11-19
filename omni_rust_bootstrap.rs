@@ -4723,557 +4723,58 @@ impl SurfaceLowerCtx {
 pub fn lookup_omni_stdlib_module(path: &str) -> Option<&'static str> {
     match path {
         "std/prelude.omni" => Some(
-            "#[strict] fn std_clamp(x: i64, lo: i64, hi: i64) -> i64 { let lower: i64 = imax(x, lo); let clamped: i64 = imin(lower, hi); return clamped; }
-#[strict] fn std_abs_diff(a: i64, b: i64) -> i64 { let d: i64 = a - b; let r: i64 = iabs(d); return r; }
-#[strict] fn std_trit_mux(cond: trit, neg_v: i64, zero_v: i64, pos_v: i64) -> i64 { let r: i64 = sel_trit(cond, neg_v, zero_v, pos_v); return r; }
-#[strict] fn std_consensus3(s0: trit, s1: trit, s2: trit) -> trit { let m: trit = tmaj(s0, s1, s2); return m; }",
+            include_str!("std/prelude.omni")
         ),
         "std/math.omni" => Some(
-            "#[strict] fn std_clamp(x: i64, lo: i64, hi: i64) -> i64 { let lower: i64 = imax(x, lo); let clamped: i64 = imin(lower, hi); return clamped; }
-#[strict] fn std_abs_diff(a: i64, b: i64) -> i64 { let d: i64 = a - b; let r: i64 = iabs(d); return r; }
-#[strict] fn std_signum(x: i64) -> i64 { let c: trit = x <=> 0; let s: i64 = sel_trit(c, -1, 0, 1); return s; }
-#[strict] fn std_mad_clamped(x: i64, weight: i64, bias: i64, lo: i64, hi: i64) -> i64 { let raw: i64 = x * weight + bias; let lower: i64 = imax(raw, lo); let res: i64 = imin(lower, hi); return res; }
-#[strict] fn std_sum_range(n: i64) -> i64 { let acc: i64 = 0; let i: i64 = 1; while i <= n { acc += i; i += 1; } return acc; }",
+            include_str!("std/math.omni")
         ),
         "std/trit.omni" => Some(
-            "#[strict] fn std_trit_mux(cond: trit, neg_v: i64, zero_v: i64, pos_v: i64) -> i64 { let r: i64 = sel_trit(cond, neg_v, zero_v, pos_v); return r; }
-#[strict] fn std_consensus3(s0: trit, s1: trit, s2: trit) -> trit { let m: trit = tmaj(s0, s1, s2); return m; }
-#[strict] fn std_trit_quorum5(t0: trit, t1: trit, t2: trit, t3: trit, t4: trit) -> trit { let left: trit = tmaj(t0, t1, t2); let right: trit = tmaj(t2, t3, t4); let out: trit = tmaj(left, t2, right); return out; }
-#[strict] fn std_trit_score(t0: trit, t1: trit, t2: trit, weight: i64) -> i64 { let m: trit = tmaj(t0, t1, t2); let base: i64 = sel_trit(m, -100, 0, 100); return base * weight; }",
+            include_str!("std/trit.omni")
         ),
         "std/http.omni" => Some(
-            "#[strict] fn std_http_is_success(status: i64) -> trit { let ge_200: trit = status >= 200; let lt_300: trit = status < 300; let ok: trit = tand(ge_200, lt_300); return ok; }
-#[strict] fn std_http_pack_response(status: i64, payload: i64) -> i64 { let valid_cmp: trit = status >= 100; let code: i64 = if_pos valid_cmp { status } else { 500 }; return code * 1000000 + payload; }
-#[strict] fn std_http_route_score(method_code: i64, param_id: i64) -> i64 { let m_cmp: trit = method_code <=> 1; let method_bonus: i64 = match_trit m_cmp { neg => 400, zero => 200, pos => 201 }; return method_bonus * 1000000 + param_id; }",
+            include_str!("std/http.omni")
         ),
         "std/pack5.omni" => Some(
-            "#[strict] fn std_pack5_bytes_needed(trit_count: i64) -> i64 { let valid_cmp: trit = trit_count <=> 0; let padded: i64 = trit_count + 4; let bytes: i64 = padded / 5; let out: i64 = if_pos valid_cmp { bytes } else { 0 }; return out; }
-#[strict] fn std_pack5_is_valid_byte(byte_val: i64) -> trit { let ge_zero: trit = byte_val >= 0; let le_max: trit = byte_val <= 242; let ok: trit = tand(ge_zero, le_max); return ok; }
-#[strict] fn std_pack5_dot10_score(dot_raw: i64, scale: i64, threshold: i64) -> i64 { let scaled: i64 = dot_raw * scale; let cmp: trit = scaled <=> threshold; let bonus: i64 = match_trit cmp { neg => -50, zero => 0, pos => 50 }; return scaled + bonus; }
-#[strict] fn std_pack5_cosine_gate(dot_raw: i64, norm_bound: i64) -> trit { let hi_cmp: trit = dot_raw <=> norm_bound; let neg_bound: i64 = 0 - norm_bound; let lo_cmp: trit = dot_raw <=> neg_bound; let gate: trit = tmaj(hi_cmp, lo_cmp, 0t); return gate; }",
+            include_str!("std/pack5.omni")
         ),
         "std/decision.omni" => Some(
-            "#[strict] fn std_decision_band(signal: i64, lo_thresh: i64, hi_thresh: i64) -> trit { let above_hi: trit = signal <=> hi_thresh; let below_lo: trit = signal <=> lo_thresh; let is_high: trit = tand(above_hi, +1t); let is_low: trit = tor(below_lo, -1t); let out: trit = match_trit above_hi { neg => is_low, zero => 0t, pos => is_high }; return out; }
-#[strict] fn std_decision_hysteresis(prev_state: trit, signal: i64, margin: i64) -> trit { let neg_margin: i64 = 0 - margin; let hi_cmp: trit = signal <=> margin; let lo_cmp: trit = signal <=> neg_margin; let next_state: trit = match_trit hi_cmp { neg => match_trit lo_cmp { neg => -1t, zero => prev_state, pos => prev_state }, zero => prev_state, pos => +1t }; return next_state; }
-#[strict] #[cap(AI)] fn std_decision_weighted_hook(signal: i64, bias: i64, neg_out: i64, zero_out: i64, pos_out: i64) -> i64 { let net: i64 = signal + bias; let g: trit = egate(net); let l: trit = tlogic(net); let combined: trit = tmaj(g, l, g); let res: i64 = sel_trit(combined, neg_out, zero_out, pos_out); return res; }
-#[strict] #[cap(AI)] fn std_decision_quorum_hook(s0: i64, s1: i64, s2: i64, threshold: i64) -> trit { let g0: trit = egate(s0 - threshold); let g1: trit = egate(s1 - threshold); let g2: trit = egate(s2 - threshold); let q: trit = tmaj(g0, g1, g2); return q; }",
+            include_str!("std/decision.omni")
         ),
         "std/resource.omni" => Some(
-            "#[strict] fn std_arena_scoped_score(base: i64, weight: i64, offset: i64) -> i64 { let a_scope: arena = arena(1024); let r_view: i64 = borrow_r(a_scope); let prod: i64 = base * weight; let total: i64 = prod + offset + (r_view * 0); drop(r_view); drop(a_scope); return total; }
-#[strict] fn std_budget_headroom(used_units: i64, limit_units: i64) -> i64 { let raw_rem: i64 = limit_units - used_units; let clamped: i64 = imax(raw_rem, 0); return clamped; }
-#[strict] fn std_budget_is_within(used_units: i64, limit_units: i64, safety_margin: i64) -> trit { let effective_used: i64 = used_units + safety_margin; let cmp: trit = effective_used <= limit_units; return cmp; }
-#[strict] fn std_arena_chunk_capacity(total_bytes: i64, chunk_size: i64) -> i64 { let valid_chunk: i64 = imax(chunk_size, 64); let chunks: i64 = total_bytes / valid_chunk; let clamped: i64 = imax(chunks, 1); return clamped; }",
+            include_str!("std/resource.omni")
         ),
         "pure/compiler.omni" | "spec/pure_self_host/omni_selfhost_compiler.omni" => Some(
-            "#[strict]
-fn pure_lex_classify_token(src_len: i64, strict_violation_code: i64, syntax_err_code: i64) -> i64 {
-    let len_cmp: trit = src_len <=> 0;
-    let syn_cmp: trit = syntax_err_code <=> 0;
-    let strict_cmp: trit = strict_violation_code <=> 1;
-    let strict_any: trit = strict_violation_code <=> 0;
-    let strict_res: i64 = match_trit strict_cmp {
-        neg => 0,
-        zero => 2002,
-        pos => 2003
-    };
-    let after_strict: i64 = if_pos strict_any { strict_res } else { 0 };
-    let after_syn: i64 = if_pos syn_cmp { 2001 } else { after_strict };
-    let final_code: i64 = match_trit len_cmp {
-        neg => 2001,
-        zero => 2001,
-        pos => after_syn
-    };
-    return final_code;
-}
-#[strict]
-fn pure_check_include_graph(include_depth: i64, has_cycle: i64, max_depth: i64) -> i64 {
-    let cyc_cmp: trit = has_cycle <=> 0;
-    let dep_cmp: trit = include_depth <=> max_depth;
-    let dep_err: i64 = if_pos dep_cmp { 2008 } else { 0 };
-    let res: i64 = if_pos cyc_cmp { 2008 } else { dep_err };
-    return res;
-}
-#[strict]
-fn pure_check_macro_hygiene(decl_arity: i64, call_arity: i64, unbound_free_vars: i64) -> i64 {
-    let raw_diff: i64 = decl_arity - call_arity;
-    let ar_diff: i64 = iabs(raw_diff);
-    let ar_cmp: trit = ar_diff <=> 0;
-    let fv_cmp: trit = unbound_free_vars <=> 0;
-    let fv_err: i64 = if_pos fv_cmp { 2004 } else { 0 };
-    let res: i64 = if_pos ar_cmp { 2006 } else { fv_err };
-    return res;
-}
-#[strict]
-fn pure_check_call_and_label(unknown_fn_flag: i64, immut_param_flag: i64, unresolved_lbl_flag: i64) -> i64 {
-    let fn_cmp: trit = unknown_fn_flag <=> 0;
-    let im_cmp: trit = immut_param_flag <=> 0;
-    let lb_cmp: trit = unresolved_lbl_flag <=> 0;
-    let lb_err: i64 = if_pos lb_cmp { 2009 } else { 0 };
-    let im_or_lb: i64 = if_pos im_cmp { 2005 } else { lb_err };
-    let res: i64 = if_pos fn_cmp { 2007 } else { im_or_lb };
-    return res;
-}
-#[strict]
-fn pure_verify_function_invariants(missing_cap_bits: i64, taint_violation_kind: i64, arena_balance: i64) -> i64 {
-    let cap_cmp: trit = missing_cap_bits <=> 0;
-    let taint_cmp: trit = taint_violation_kind <=> 1;
-    let taint_any: trit = taint_violation_kind <=> 0;
-    let arena_cmp: trit = arena_balance <=> 0;
-    let taint_code: i64 = match_trit taint_cmp {
-        neg => 0,
-        zero => 1001,
-        pos => 1002
-    };
-    let arena_code: i64 = match_trit arena_cmp {
-        neg => 1005,
-        zero => 0,
-        pos => 1004
-    };
-    let after_taint: i64 = if_pos taint_any { taint_code } else { arena_code };
-    let final_code: i64 = if_pos cap_cmp { 1003 } else { after_taint };
-    return final_code;
-}
-#[strict]
-fn pure_lower_pack5_density(trit_count: i64, max_byte_val: i64) -> i64 {
-    let corrupt_cmp: trit = max_byte_val <=> 242;
-    let packed_bytes: i64 = (trit_count + 4) / 5;
-    let res: i64 = if_pos corrupt_cmp { 3002 } else { packed_bytes };
-    return res;
-}
-#[strict]
-fn pure_compiler_pipeline_main(src_len: i64, missing_cap_bits: i64, taint_or_arena_err: i64) -> i64 {
-    let fe_code: i64 = pure_lex_classify_token(src_len, 0, 0);
-    let inc_code: i64 = pure_check_include_graph(1, 0, 16);
-    let mac_code: i64 = pure_check_macro_hygiene(2, 2, 0);
-    let sem_code: i64 = pure_check_call_and_label(0, 0, 0);
-    let fe_total: i64 = fe_code + inc_code + mac_code + sem_code;
-    let fe_bad: trit = fe_total <=> 0;
-    let ver_code: i64 = pure_verify_function_invariants(missing_cap_bits, taint_or_arena_err, 0);
-    let final_code: i64 = if_pos fe_bad { fe_total } else { ver_code };
-    return final_code;
-}",
+            include_str!("pure/compiler.omni")
         ),
         "pure/verifier.omni" => Some(
-            "#[strict]
-fn omni_pure_verify_opcode_cap(fn_cap_mask: i64, req_cap_mask: i64) -> i64 {
-    let covered: i64 = fn_cap_mask & req_cap_mask;
-    let diff: i64 = req_cap_mask - covered;
-    let cmp: trit = diff <=> 0;
-    let res: i64 = if_pos cmp { 1003 } else { 0 };
-    return res;
-}
-#[strict]
-fn omni_pure_verify_taint_flow(is_ret: i64, is_sink: i64, operand_tainted: i64) -> i64 {
-    let t_cmp: trit = operand_tainted <=> 0;
-    let r_cmp: trit = is_ret <=> 0;
-    let s_cmp: trit = is_sink <=> 0;
-    let sink_err: i64 = if_pos s_cmp { 1002 } else { 0 };
-    let ret_or_sink: i64 = if_pos r_cmp { 1001 } else { sink_err };
-    let out: i64 = if_pos t_cmp { ret_or_sink } else { 0 };
-    return out;
-}
-#[strict]
-fn omni_pure_verify_header(missing_cap_bits: i64, taint_violation_kind: i64, arena_balance: i64) -> i64 {
-    let cap_cmp: trit = missing_cap_bits <=> 0;
-    let taint_cmp: trit = taint_violation_kind <=> 1;
-    let taint_any: trit = taint_violation_kind <=> 0;
-    let arena_cmp: trit = arena_balance <=> 0;
-    let taint_code: i64 = match_trit taint_cmp {
-        neg => 0,
-        zero => 1001,
-        pos => 1002
-    };
-    let arena_code: i64 = match_trit arena_cmp {
-        neg => 1005,
-        zero => 0,
-        pos => 1004
-    };
-    let after_taint: i64 = if_pos taint_any { taint_code } else { arena_code };
-    let final_code: i64 = if_pos cap_cmp { 1003 } else { after_taint };
-    return final_code;
-}",
+            include_str!("pure/verifier.omni")
         ),
         "pure/host_runtime.omni" | "spec/pure_self_host/host_runtime.omni" => Some(
-            "#[strict]
-fn omni_pure_host_check_route_caps(cap_mask: i64, needs_db_r: i64, needs_db_w: i64) -> i64 {
-    let has_net: i64 = cap_mask & 4;
-    let net_cmp: trit = has_net <=> 0;
-    let r_cmp: trit = needs_db_r <=> 0;
-    let w_cmp: trit = needs_db_w <=> 0;
-    let has_r: i64 = cap_mask & 1;
-    let has_w: i64 = cap_mask & 2;
-    let r_ok: i64 = if_pos r_cmp { has_r } else { 1 };
-    let w_ok: i64 = if_pos w_cmp { has_w } else { 1 };
-    let rw_prod: i64 = r_ok * w_ok;
-    let rw_cmp: trit = rw_prod <=> 0;
-    let rw_status: i64 = if_pos rw_cmp { 0 } else { 1003 };
-    let final_status: i64 = if_pos net_cmp { rw_status } else { 1003 };
-    return final_status;
-}
-#[strict]
-fn omni_pure_host_check_taint_sink(param_tainted: i64, auth_verified: i64, is_db_or_rsp_sink: i64) -> i64 {
-    let t_cmp: trit = param_tainted <=> 0;
-    let a_cmp: trit = auth_verified <=> 0;
-    let s_cmp: trit = is_db_or_rsp_sink <=> 0;
-    let unsan: i64 = if_pos a_cmp { 0 } else { 1002 };
-    let sink_err: i64 = if_pos s_cmp { unsan } else { 0 };
-    let out: i64 = if_pos t_cmp { sink_err } else { 0 };
-    return out;
-}
-#[strict]
-fn omni_pure_host_kv_apply(op_code: i64, key_id: i64, val_in: i64) -> i64 {
-    let op_cmp: trit = op_code <=> 2;
-    let q_val: i64 = key_id * 10;
-    let res: i64 = match_trit op_cmp {
-        neg => val_in,
-        zero => val_in,
-        pos => q_val
-    };
-    return res;
-}
-#[strict]
-fn omni_pure_host_dispatch(method_code: i64, status_code: i64, payload: i64) -> i64 {
-    let m_cmp: trit = method_code <=> 0;
-    let s_cmp: trit = status_code <=> 199;
-    let valid_status: i64 = if_pos s_cmp { status_code } else { 500 };
-    let packed: i64 = valid_status * 1000000 + payload;
-    let res: i64 = match_trit m_cmp {
-        neg => 400000000,
-        zero => 404000000,
-        pos => packed
-    };
-    return res;
-}",
+            include_str!("pure/host_runtime.omni")
         ),
         "pure/tooling.omni" => Some(
-            "#[strict]
-fn pure_acceptance_diff_check(rust_words: i64, pure_words: i64, hash_diff: i64) -> i64 {
-    let raw_diff: i64 = rust_words - pure_words;
-    let len_diff: i64 = iabs(raw_diff);
-    let h_diff: i64 = iabs(hash_diff);
-    let total_diff: i64 = len_diff + h_diff;
-    let cmp: trit = total_diff <=> 0;
-    let status: i64 = if_pos cmp { 4001 } else { 0 };
-    return status;
-}
-#[strict]
-fn pure_select_repair_strategy(err_code_id: i64, is_multi_fn: i64) -> i64 {
-    let is_cap: trit = err_code_id <=> 1003;
-    let multi_cmp: trit = is_multi_fn <=> 0;
-    let cap_strat: i64 = if_pos multi_cmp { 2 } else { 1 };
-    let res: i64 = match_trit is_cap {
-        neg => err_code_id - 998,
-        zero => cap_strat,
-        pos => err_code_id - 997
-    };
-    return res;
-}
-#[strict]
-fn pure_inspect_opcode_category(tok: i64) -> i64 {
-    let is_eng: trit = tok < 32256;
-    let is_op: trit = tok >= 32512;
-    let op_or_meta: i64 = if_pos is_op { 6 } else { 4 };
-    let category: i64 = if_pos is_eng { 1 } else { op_or_meta };
-    return category;
-}
-#[strict]
-fn pure_explain_error_stage(err_code_id: i64) -> i64 {
-    let is_ver: trit = err_code_id <= 1005;
-    let is_rt: trit = err_code_id >= 1013;
-    let rt_or_fe: i64 = if_pos is_rt { 3 } else { 2 };
-    let stage: i64 = if_pos is_ver { 1 } else { rt_or_fe };
-    return stage;
-}
-#[strict]
-fn pure_bootstrap_fixed_point_check(gen1_words: i64, gen2_words: i64, elf_hash_diff: i64) -> i64 {
-    let raw_w: i64 = gen1_words - gen2_words;
-    let w_diff: i64 = iabs(raw_w);
-    let e_diff: i64 = iabs(elf_hash_diff);
-    let w_cmp: trit = w_diff <=> 0;
-    let e_cmp: trit = e_diff <=> 0;
-    let elf_status: i64 = if_pos e_cmp { 5002 } else { 0 };
-    let final_status: i64 = if_pos w_cmp { 5001 } else { elf_status };
-    return final_status;
-}
-#[strict]
-fn pure_inspect_module_metrics(fn_count: i64, total_words: i64, union_cap_mask: i64) -> i64 {
-    let f_ok: trit = fn_count > 0;
-    let w_ok: trit = total_words > 0;
-    let valid: trit = tand(f_ok, w_ok);
-    let score: i64 = (fn_count * 100000) + (total_words * 10) + (union_cap_mask & 1023);
-    let out: i64 = if_pos valid { score } else { -1 };
-    return out;
-}
-#[strict]
-fn pure_multi_step_repair_budget(attempt: i64, max_attempts: i64, remaining_errors: i64) -> i64 {
-    let err_cmp: trit = remaining_errors <=> 0;
-    let budget_cmp: trit = attempt <=> max_attempts;
-    let exhausted_or_step: i64 = if_pos budget_cmp { 4002 } else { remaining_errors };
-    let status: i64 = if_pos err_cmp { exhausted_or_step } else { 0 };
-    return status;
-}",
+            include_str!("pure/tooling.omni")
         ),
         "pure/selfhost_suite.omni" => Some(
-            "include \"std/math.omni\";
-include \"std/trit.omni\";
-include \"std/http.omni\";
-include \"pure/compiler.omni\";
-include \"pure/verifier.omni\";
-include \"pure/tooling.omni\";
-include \"pure/host_runtime.omni\";
-macro pure_stage_gate(code) = sel_trit(code <=> 0, 1, 0, 1);
-#[strict]
-fn pure_selfhost_verify_fixed_point(gen1_words: i64, gen2_words: i64, suite_words: i64) -> i64 {
-    let fp_st: i64 = pure_bootstrap_fixed_point_check(gen1_words, gen2_words, 0);
-    let suite_st: i64 = pure_acceptance_diff_check(suite_words, suite_words, 0);
-    let ver_st: i64 = omni_pure_verify_header(0, 0, 0);
-    let math_c: i64 = std_mad_clamped(10, 2, 5, 0, 100);
-    let q: trit = std_trit_quorum5(+1t, +1t, -1t, +1t, +1t);
-    let q_bonus: i64 = std_trit_mux(q, -5, 0, 5);
-    let http_ok: trit = std_http_is_success(200);
-    let http_bonus: i64 = std_trit_mux(http_ok, 0, 0, 10);
-    let err_sum: i64 = fp_st + suite_st + ver_st;
-    let err_cmp: trit = err_sum <=> 0;
-    let ok_score: i64 = math_c + q_bonus + http_bonus;
-    let out: i64 = if_pos err_cmp { err_sum } else { ok_score };
-    return out;
-}
-#[strict]
-#[cap(AI)]
-fn pure_selfhost_suite_entry(src_len: i64, cap_mask: i64, payload: i64) -> i64 {
-    let clamped_len: i64 = std_clamp(src_len, 1, 65536);
-    let comp_status: i64 = pure_compiler_pipeline_main(clamped_len, 0, 0);
-    let host_cap_status: i64 = omni_pure_host_check_route_caps(cap_mask, 1, 1);
-    let diff_status: i64 = pure_acceptance_diff_check(clamped_len, clamped_len, 0);
-    let strat_id: i64 = pure_select_repair_strategy(1003, 1);
-    let op_cat: i64 = pure_inspect_opcode_category(32565);
-    let http_packed: i64 = omni_pure_host_dispatch(1, 200, payload);
-    let delta: i64 = http_packed - 200000000;
-    let gate: trit = egate(delta);
-    let bonus: i64 = std_trit_mux(gate, -10, 0, 10);
-    let errs: i64 = comp_status + host_cap_status + diff_status;
-    let err_cmp: trit = errs <=> 0;
-    let ok_val: i64 = http_packed + strat_id + op_cat + bonus;
-    let res: i64 = if_pos err_cmp { errs } else { ok_val };
-    return res;
-}",
+            include_str!("pure/selfhost_suite.omni")
         ),
         "pure/programs/ternary_neural_router.omni" => Some(
-            "include \"std/math.omni\";
-include \"std/trit.omni\";
-macro router_margin(a, b) = (a * 3) - (b * 2);
-#[strict]
-#[cap(AI)]
-fn route_layer_score(bias: i64, scale: i64) -> i64 {
-    let w_pos: bytes = pack5_bytes([+1t, +1t, 0t, +1t, -1t, +1t, +1t, 0t, +1t, +1t]);
-    let w_neg: bytes = pack5_bytes([-1t, 0t, +1t, -1t, +1t, 0t, -1t, +1t, 0t, -1t]);
-    let d_pos: i64 = pack5_tdot(w_pos, w_pos);
-    let d_cross: i64 = pack5_tdot(w_pos, w_neg);
-    let g_pos: trit = pack5_gate(w_pos);
-    let g_bonus: i64 = std_trit_mux(g_pos, -20, 0, 20);
-    let m: i64 = router_margin(d_pos, d_cross);
-    let raw: i64 = m * scale + bias + g_bonus;
-    let clamped: i64 = std_clamp(raw, -500, 500);
-    return clamped;
-}
-#[strict]
-#[cap(AI)]
-fn route_quorum_gate(score_a: i64, score_b: i64, threshold: i64) -> trit {
-    let da: i64 = score_a - threshold;
-    let db: i64 = score_b - threshold;
-    let sum_ab: i64 = score_a + score_b;
-    let d_sum: i64 = sum_ab - threshold;
-    let ga: trit = egate(da);
-    let gb: trit = egate(db);
-    let gc: trit = tlogic(d_sum);
-    let q: trit = std_trit_quorum5(ga, gb, gc, +1t, ga);
-    return q;
-}
-#[strict]
-#[cap(AI)]
-#[step_budget(10000)]
-#[mem_budget(16384)]
-fn main(input_signal: i64, threshold: i64) -> i64 {
-    let s1: i64 = route_layer_score(input_signal, 4);
-    let half_sig: i64 = input_signal / 2;
-    let s2: i64 = route_layer_score(half_sig, 2);
-    let gate: trit = route_quorum_gate(s1, s2, threshold);
-    let bonus: i64 = std_trit_score(gate, +1t, gate, 3);
-    let total: i64 = s1 + s2 + bonus;
-    return total;
-}",
+            include_str!("pure/programs/ternary_neural_router.omni")
         ),
         "pure/programs/arena_audit_pipeline.omni" => Some(
-            "include \"std/math.omni\";
-include \"std/trit.omni\";
-#[strict]
-#[cap(AI)]
-fn compute_arena_window(limit: i64, stride: i64) -> i64 {
-    let a_main: arena = arena(4096);
-    let r_view: arena = borrow_r(a_main);
-    let acc: i64 = 0;
-    let i: i64 = 1;
-    while i <= limit {
-        let step_val: i64 = std_mad_clamped(i, stride, 3, 0, 200);
-        acc += step_val;
-        i += 1;
-    }
-    let gate_in: i64 = acc - 50;
-    let g: trit = egate(gate_in);
-    let adj: i64 = std_trit_mux(g, -10, 0, 10);
-    drop(r_view);
-    drop(a_main);
-    return acc + adj;
-}
-#[strict]
-#[cap(DB_W, DOM, AI)]
-fn sanitize_and_score_payload(base_score: i64) -> i64 {
-    let raw_lit: str = \"125\";
-    let sql_ok: str = san_sql(raw_lit);
-    let dom_ok: str = san_dom(sql_ok);
-    let prm_ok: str = san_prm(dom_ok);
-    let parsed_n: i64 = s2i(prm_ok);
-    let combined: i64 = base_score + parsed_n;
-    return combined;
-}
-#[strict]
-#[cap(DB_W, DOM, AI)]
-#[step_budget(20000)]
-#[mem_budget(32768)]
-fn main(limit: i64, stride: i64) -> i64 {
-    let clamped_lim: i64 = std_clamp(limit, 1, 20);
-    let win_score: i64 = compute_arena_window(clamped_lim, stride);
-    let final_score: i64 = sanitize_and_score_payload(win_score);
-    return final_score;
-}",
+            include_str!("pure/programs/arena_audit_pipeline.omni")
         ),
         "pure/programs/policy_consensus_engine.omni" => Some(
-            "include \"std/math.omni\";
-include \"std/trit.omni\";
-include \"std/http.omni\";
-include \"pure/verifier.omni\";
-macro risk_delta(val, limit) = val - limit;
-#[strict]
-#[cap(AI)]
-fn evaluate_agent_vote(metric: i64, soft_limit: i64, hard_limit: i64) -> trit {
-    let d_soft: i64 = risk_delta(metric, soft_limit);
-    let d_hard: i64 = risk_delta(metric, hard_limit);
-    let g_soft: trit = egate(d_soft);
-    let g_hard: trit = tlogic(d_hard);
-    let inv_soft: trit = !g_soft;
-    let inv_hard: trit = !g_hard;
-    let vote: trit = std_consensus3(inv_soft, inv_hard, +1t);
-    return vote;
-}
-#[strict]
-#[cap(AI)]
-#[step_budget(15000)]
-#[mem_budget(16384)]
-fn main(load_pct: i64, latency_ms: i64, fn_caps: i64) -> i64 {
-    let cap_err: i64 = omni_pure_verify_opcode_cap(fn_caps, 16);
-    let cap_cmp: trit = cap_err <=> 0;
-    let v_load: trit = evaluate_agent_vote(load_pct, 70, 90);
-    let v_lat: trit = evaluate_agent_vote(latency_ms, 100, 250);
-    let quorum: trit = std_trit_quorum5(v_load, v_lat, +1t, v_load, v_lat);
-    let q_score: i64 = std_trit_score(quorum, v_load, v_lat, 2);
-    let abs_gap: i64 = std_abs_diff(load_pct, latency_ms);
-    let payload: i64 = std_clamp(q_score + abs_gap, 0, 999999);
-    let status: i64 = std_trit_mux(quorum, 503, 202, 200);
-    let http_out: i64 = std_http_pack_response(status, payload);
-    let res: i64 = if_pos cap_cmp { cap_err } else { http_out };
-    return res;
-}",
+            include_str!("pure/programs/policy_consensus_engine.omni")
         ),
         "pure/programs/kv_ledger_service.omni" => Some(
-            "include \"std/math.omni\";
-include \"std/trit.omni\";
-#[strict]
-#[cap(NET, DB_R, DB_W, AUTH, AI)]
-route POST /ledger/:id (req: i64) {
-    let raw_id: i64 = req.param(\"id\");
-    let clean_id: i64 = auth_verify(raw_id);
-    let bounded_id: i64 = std_clamp(clean_id, 1, 10000);
-    let base_deposit: i64 = bounded_id * 10 + 500;
-    let delta: i64 = base_deposit - 600;
-    let g: trit = egate(delta);
-    let tier_bonus: i64 = std_trit_mux(g, 0, 25, 100);
-    let final_balance: i64 = base_deposit + tier_bonus;
-    let saved: i64 = kv_put(bounded_id, final_balance);
-    respond(201, saved);
-}
-#[strict]
-#[cap(NET, DB_R, AUTH)]
-route GET /ledger/:id (req: i64) {
-    let raw_id: i64 = req.param(\"id\");
-    let clean_id: i64 = auth_verify(raw_id);
-    let cur_bal: i64 = db_get(clean_id);
-    let audit_row: i64 = db_query(\"SELECT balance FROM ledger WHERE id = ?\", clean_id);
-    respond(200, cur_bal + audit_row);
-}",
+            include_str!("pure/programs/kv_ledger_service.omni")
         ),
         "pure/programs/compiler_self_audit.omni" => Some(
-            "include \"std/math.omni\";
-include \"std/trit.omni\";
-include \"std/http.omni\";
-include \"pure/compiler.omni\";
-include \"pure/verifier.omni\";
-include \"pure/tooling.omni\";
-include \"pure/host_runtime.omni\";
-#[strict]
-#[cap(AI)]
-#[step_budget(25000)]
-#[mem_budget(32768)]
-fn main(src_words: i64, trit_len: i64, err_probe: i64) -> i64 {
-    let c_st: i64 = pure_compiler_pipeline_main(src_words, 0, 0);
-    let v_st: i64 = omni_pure_verify_header(0, 0, 0);
-    let p5_bytes: i64 = pure_lower_pack5_density(trit_len, 240);
-    let diff_st: i64 = pure_acceptance_diff_check(src_words, src_words, 0);
-    let fp_st: i64 = pure_bootstrap_fixed_point_check(src_words, src_words, 0);
-    let strat: i64 = pure_select_repair_strategy(err_probe, 1);
-    let stg: i64 = pure_explain_error_stage(err_probe);
-    let cat: i64 = pure_inspect_opcode_category(32565);
-    let h_cap: i64 = omni_pure_host_check_route_caps(7, 1, 1);
-    let kv_val: i64 = omni_pure_host_kv_apply(3, 50, 0);
-    let err_total: i64 = c_st + v_st + diff_st + fp_st + h_cap;
-    let err_cmp: trit = err_total <=> 0;
-    let delta: i64 = kv_val - 100;
-    let g: trit = egate(delta);
-    let g_bonus: i64 = std_trit_mux(g, -10, 0, 10);
-    let digest: i64 = (p5_bytes * 1000) + (strat * 100) + (cat * 10) + stg + kv_val + g_bonus;
-    let out: i64 = if_pos err_cmp { err_total } else { digest };
-    return out;
-}",
+            include_str!("pure/programs/compiler_self_audit.omni")
         ),
         "pure/programs/pack5_decision_controller.omni" => Some(
-            "include \"std/pack5.omni\";
-include \"std/decision.omni\";
-include \"std/resource.omni\";
-#[strict]
-#[cap(AI)]
-#[step_budget(24000)]
-#[mem_budget(8192)]
-fn main(signal_a: i64, signal_b: i64, used_steps: i64) -> i64 {
-    let w_vec: bytes = pack5_bytes([+1t, +1t, 0t, +1t, -1t, +1t, +1t, 0t, +1t, +1t]);
-    let w_dot: i64 = pack5_tdot(w_vec, w_vec);
-    let p_bytes: i64 = std_pack5_bytes_needed(50);
-    let b_ok: trit = std_pack5_is_valid_byte(215);
-    let dot_sc: i64 = std_pack5_dot10_score(w_dot, 2, 10);
-    let cos_g: trit = std_pack5_cosine_gate(w_dot, 5);
-    let band_t: trit = std_decision_band(signal_a, 10, 30);
-    let hyst_t: trit = std_decision_hysteresis(band_t, signal_b, 15);
-    let hook_val: i64 = std_decision_weighted_hook(signal_a + signal_b, -20, -100, 0, 100);
-    let quorum_t: trit = std_decision_quorum_hook(signal_a, signal_b, signal_a + 10, 20);
-    let arena_sc: i64 = std_arena_scoped_score(p_bytes, 10, hook_val);
-    let headroom: i64 = std_budget_headroom(used_steps, 1000);
-    let budget_ok: trit = std_budget_is_within(used_steps, 1000, 50);
-    let chunks: i64 = std_arena_chunk_capacity(4096, 512);
-    let gate_all: trit = tmaj(b_ok, cos_g, quorum_t);
-    let hyst_bonus: i64 = sel_trit(hyst_t, -25, 0, 25);
-    let gate_bonus: i64 = sel_trit(gate_all, -10, 0, 40);
-    let total: i64 = dot_sc + arena_sc + (headroom / 10) + chunks + hyst_bonus + gate_bonus;
-    let final_out: i64 = if_pos budget_ok { total } else { -1 };
-    return final_out;
-}",
+            include_str!("pure/programs/pack5_decision_controller.omni")
         ),
         _ => None,
     }
@@ -6132,6 +5633,863 @@ pub fn execute_omni_surface_wasm_i64(src: &str, args: &[i64]) -> Result<i64, Str
     }
     let wasm = compile_pure_u16_to_wasm(&u16_stream)?;
     execute_wasm_module_i64_with_budgets(&wasm, args, step_b, mem_b)
+}
+
+// ==============================================================================
+// M3-01. CANONICAL FRONTEND DUMPS (`fe-dump`) & THE M3 FRONTEND LOCK
+// ==============================================================================
+// Fixed binary formats the future Omni frontend (`pure/m3/`) is diffed against.
+// Token dump: [M3_TOK_MAGIC, count_lo, count_hi] then per token
+//   [kind, line_lo, line_hi, col_lo, col_hi, v0, v1, v2, v3, nbytes, bytes...]
+//   (v0..v3 = little-endian i64 value: Int value or Trit value, else 0).
+// Sourcemap dump: [M3_SM_MAGIC, n_lo, n_hi] then per entry
+//   [off_lo, off_hi, line_lo, line_hi, col_lo, col_hi], then budget, default and pack5 spans.
+// Errors are compared as `CLASS:line:col` (message text is not part of the lock).
+// AST dump (0x4D41) and packet dump (0x4D50) formats are specified in spec/m3/FE_DUMP.md.
+// The lock covers the closed suite modules (strict, as the suite compiles them), the
+// verifier engine, the acceptance goldens on disk (minus the cwd-dependent
+// `neg_circular_include`), `spec/m3/fixtures/q*.omni` (quirks Q1-Q8) and one
+// `spec/m3/fixtures/neg_*.omni` per frontend error class.
+
+pub const M3_FE_DUMP_VERSION: &str = "omni-m3-fe-dump-v1";
+pub const M3_TOK_MAGIC: u16 = 0x4D33;
+pub const M3_SM_MAGIC: u16 = 0x4D53;
+pub const M3_TK_IDENT: u16 = 1;
+pub const M3_TK_INT: u16 = 2;
+pub const M3_TK_TRIT: u16 = 3;
+pub const M3_TK_STR: u16 = 4;
+pub const M3_TK_AT: u16 = 5;
+pub const M3_TK_SYM: u16 = 6;
+pub const M3_TK_OP: u16 = 7;
+pub const M3_TK_HASH: u16 = 8;
+
+pub const M3_FE_LOCK_TSV: &str = include_str!("spec/m3/corpus.tsv");
+
+pub const M3_FE_LOOKUP_CORPUS: [&str; 18] = [
+    "std/prelude.omni",
+    "std/math.omni",
+    "std/trit.omni",
+    "std/http.omni",
+    "std/pack5.omni",
+    "std/decision.omni",
+    "std/resource.omni",
+    "pure/compiler.omni",
+    "pure/verifier.omni",
+    "pure/host_runtime.omni",
+    "pure/tooling.omni",
+    "pure/selfhost_suite.omni",
+    "pure/programs/ternary_neural_router.omni",
+    "pure/programs/arena_audit_pipeline.omni",
+    "pure/programs/policy_consensus_engine.omni",
+    "pure/programs/kv_ledger_service.omni",
+    "pure/programs/compiler_self_audit.omni",
+    "pure/programs/pack5_decision_controller.omni",
+];
+
+pub const M3_FE_FILE_CORPUS: &[(&str, &str)] = &[
+    ("golden/arena_lifecycle_golden.omni", include_str!("spec/acceptance/goldens/arena_lifecycle_golden.omni")),
+    ("golden/asm_roundtrip.omni", include_str!("spec/acceptance/goldens/asm_roundtrip.omni")),
+    ("golden/br_neg_arith_golden.omni", include_str!("spec/acceptance/goldens/br_neg_arith_golden.omni")),
+    ("golden/br_pos_golden.omni", include_str!("spec/acceptance/goldens/br_pos_golden.omni")),
+    ("golden/branch_loop_golden.omni", include_str!("spec/acceptance/goldens/branch_loop_golden.omni")),
+    ("golden/byte_buf_golden.omni", include_str!("spec/acceptance/goldens/byte_buf_golden.omni")),
+    ("golden/custom_non_seed_alu.omni", include_str!("spec/acceptance/goldens/custom_non_seed_alu.omni")),
+    ("golden/decision_hook_golden.omni", include_str!("spec/acceptance/goldens/decision_hook_golden.omni")),
+    ("golden/iabs_golden.omni", include_str!("spec/acceptance/goldens/iabs_golden.omni")),
+    ("golden/idiv_zero.omni", include_str!("spec/acceptance/goldens/idiv_zero.omni")),
+    ("golden/match_trit_golden.omni", include_str!("spec/acceptance/goldens/match_trit_golden.omni")),
+    ("golden/multi_fn_weighted_term.omni", include_str!("spec/acceptance/goldens/multi_fn_weighted_term.omni")),
+    ("golden/neg_ambiguous_grammar.omni", include_str!("spec/acceptance/goldens/neg_ambiguous_grammar.omni")),
+    ("golden/neg_arity_mismatch.omni", include_str!("spec/acceptance/goldens/neg_arity_mismatch.omni")),
+    ("golden/neg_bad_type.omni", include_str!("spec/acceptance/goldens/neg_bad_type.omni")),
+    ("golden/neg_borrow_conflict.omni", include_str!("spec/acceptance/goldens/neg_borrow_conflict.omni")),
+    ("golden/neg_budget_exceeded.omni", include_str!("spec/acceptance/goldens/neg_budget_exceeded.omni")),
+    ("golden/neg_corrupt_pack5.omni", include_str!("spec/acceptance/goldens/neg_corrupt_pack5.omni")),
+    ("golden/neg_immut_param.omni", include_str!("spec/acceptance/goldens/neg_immut_param.omni")),
+    ("golden/neg_linear_leak.omni", include_str!("spec/acceptance/goldens/neg_linear_leak.omni")),
+    ("golden/neg_missing_cap.omni", include_str!("spec/acceptance/goldens/neg_missing_cap.omni")),
+    ("golden/neg_syntax_error.omni", include_str!("spec/acceptance/goldens/neg_syntax_error.omni")),
+    ("golden/neg_taint_on_ret.omni", include_str!("spec/acceptance/goldens/neg_taint_on_ret.omni")),
+    ("golden/neg_taint_sink.omni", include_str!("spec/acceptance/goldens/neg_taint_sink.omni")),
+    ("golden/neg_undef_var.omni", include_str!("spec/acceptance/goldens/neg_undef_var.omni")),
+    ("golden/neg_unknown_fn.omni", include_str!("spec/acceptance/goldens/neg_unknown_fn.omni")),
+    ("golden/neg_unresolved_label.omni", include_str!("spec/acceptance/goldens/neg_unresolved_label.omni")),
+    ("golden/nested_branch_golden.omni", include_str!("spec/acceptance/goldens/nested_branch_golden.omni")),
+    ("golden/pack5_direct_aot.omni", include_str!("spec/acceptance/goldens/pack5_direct_aot.omni")),
+    ("golden/pack5_trit_vec_golden.omni", include_str!("spec/acceptance/goldens/pack5_trit_vec_golden.omni")),
+    ("golden/route_db_query_golden.omni", include_str!("spec/acceptance/goldens/route_db_query_golden.omni")),
+    ("golden/route_kv_golden.omni", include_str!("spec/acceptance/goldens/route_kv_golden.omni")),
+    ("golden/seed0_risk.omni", include_str!("spec/acceptance/goldens/seed0_risk.omni")),
+    ("golden/seed4_consensus.omni", include_str!("spec/acceptance/goldens/seed4_consensus.omni")),
+    ("golden/seed6_clamp.omni", include_str!("spec/acceptance/goldens/seed6_clamp.omni")),
+    ("golden/sel_mix.omni", include_str!("spec/acceptance/goldens/sel_mix.omni")),
+    ("golden/shl_65.omni", include_str!("spec/acceptance/goldens/shl_65.omni")),
+    ("golden/stdlib_macro_pipeline_golden.omni", include_str!("spec/acceptance/goldens/stdlib_macro_pipeline_golden.omni")),
+    ("golden/while_sum_even_golden.omni", include_str!("spec/acceptance/goldens/while_sum_even_golden.omni")),
+    ("m3fix/q1_nonstrict_control.omni", include_str!("spec/m3/fixtures/q1_nonstrict_control.omni")),
+    ("m3fix/q1_strict_substring.omni", include_str!("spec/m3/fixtures/q1_strict_substring.omni")),
+    ("m3fix/q2_trit_text.omni", include_str!("spec/m3/fixtures/q2_trit_text.omni")),
+    ("m3fix/q3_neg_fold.omni", include_str!("spec/m3/fixtures/q3_neg_fold.omni")),
+    ("m3fix/q4_le_ge.omni", include_str!("spec/m3/fixtures/q4_le_ge.omni")),
+    ("m3fix/q5_macro_after_def.omni", include_str!("spec/m3/fixtures/q5_macro_after_def.omni")),
+    ("m3fix/q5_macro_order.omni", include_str!("spec/m3/fixtures/q5_macro_order.omni")),
+    ("m3fix/q6_include_once.omni", include_str!("spec/m3/fixtures/q6_include_once.omni")),
+    ("m3fix/q6_include_twice.omni", include_str!("spec/m3/fixtures/q6_include_twice.omni")),
+    ("m3fix/q7_fn_ids.omni", include_str!("spec/m3/fixtures/q7_fn_ids.omni")),
+    ("m3fix/q8a_ssa_limit.omni", include_str!("spec/m3/fixtures/q8a_ssa_limit.omni")),
+    ("m3fix/q8b_label_limit.omni", include_str!("spec/m3/fixtures/q8b_label_limit.omni")),
+    ("m3fix/q8c_label_ok.omni", include_str!("spec/m3/fixtures/q8c_label_ok.omni")),
+    ("m3fix/q8d_label_15.omni", include_str!("spec/m3/fixtures/q8d_label_15.omni")),
+    ("m3fix/q8e_label_17.omni", include_str!("spec/m3/fixtures/q8e_label_17.omni")),
+    ("m3fix/neg_ambiguous_grammar.omni", include_str!("spec/m3/fixtures/neg_ambiguous_grammar.omni")),
+    ("m3fix/neg_arity_mismatch.omni", include_str!("spec/m3/fixtures/neg_arity_mismatch.omni")),
+    ("m3fix/neg_bad_type.omni", include_str!("spec/m3/fixtures/neg_bad_type.omni")),
+    ("m3fix/neg_budget_exceeded.omni", include_str!("spec/m3/fixtures/neg_budget_exceeded.omni")),
+    ("m3fix/neg_circular_include.omni", include_str!("spec/m3/fixtures/neg_circular_include.omni")),
+    ("m3fix/neg_immut_param.omni", include_str!("spec/m3/fixtures/neg_immut_param.omni")),
+    ("m3fix/neg_missing_cap.omni", include_str!("spec/m3/fixtures/neg_missing_cap.omni")),
+    ("m3fix/neg_syntax_error.omni", include_str!("spec/m3/fixtures/neg_syntax_error.omni")),
+    ("m3fix/neg_undef_var.omni", include_str!("spec/m3/fixtures/neg_undef_var.omni")),
+    ("m3fix/neg_unknown_fn.omni", include_str!("spec/m3/fixtures/neg_unknown_fn.omni")),
+    ("m3fix/neg_unresolved_label.omni", include_str!("spec/m3/fixtures/neg_unresolved_label.omni")),
+];
+
+fn m3_push_u32(out: &mut Vec<u16>, v: usize) -> Result<(), String> {
+    if v > u32::MAX as usize {
+        return Err(format!("fe-dump value {} exceeds u32", v));
+    }
+    out.push((v & 0xFFFF) as u16);
+    out.push(((v >> 16) & 0xFFFF) as u16);
+    Ok(())
+}
+
+/// Canonical token dump of `tokenize_omni_surface_inner` (same strictness rule as the compiler).
+pub fn m3_dump_tokens(src: &str, strict: bool) -> Result<Vec<u16>, String> {
+    let effective_strict = strict || src.contains("#[strict]");
+    let toks = tokenize_omni_surface_inner(src, effective_strict)?;
+    let mut out = vec![M3_TOK_MAGIC];
+    m3_push_u32(&mut out, toks.len())?;
+    for t in &toks {
+        let (kind, val, text): (u16, i64, &str) = match &t.tok {
+            SurfaceTok::Ident(s) => (M3_TK_IDENT, 0, s.as_str()),
+            SurfaceTok::Int(v) => (M3_TK_INT, *v, ""),
+            SurfaceTok::Trit(s, v) => (M3_TK_TRIT, *v as i64, s.as_str()),
+            SurfaceTok::StrLit(s) => (M3_TK_STR, 0, s.as_str()),
+            SurfaceTok::AtIdent(s) => (M3_TK_AT, 0, s.as_str()),
+            SurfaceTok::Sym(s) => (M3_TK_SYM, 0, s.as_str()),
+            SurfaceTok::Op(s) => (M3_TK_OP, 0, s.as_str()),
+            SurfaceTok::Hash => (M3_TK_HASH, 0, ""),
+        };
+        out.push(kind);
+        m3_push_u32(&mut out, t.line)?;
+        m3_push_u32(&mut out, t.col)?;
+        let uv = val as u64;
+        for k in 0..4 {
+            out.push(((uv >> (16 * k)) & 0xFFFF) as u16);
+        }
+        let bytes = text.as_bytes();
+        if bytes.len() > 0xFFFF {
+            return Err(String::from("fe-dump token text longer than 65535 bytes"));
+        }
+        out.push(bytes.len() as u16);
+        for b in bytes {
+            out.push(*b as u16);
+        }
+    }
+    Ok(out)
+}
+
+/// Canonical dump of `compile_omni_surface_to_u16_with_sourcemap`: (u16 stream, sourcemap words).
+pub fn m3_dump_stream(src: &str, strict: bool) -> Result<(Vec<u16>, Vec<u16>), String> {
+    let (stream, sm) = compile_omni_surface_to_u16_with_sourcemap(src, strict)?;
+    let mut smw = vec![M3_SM_MAGIC];
+    m3_push_u32(&mut smw, sm.offset_to_span.len())?;
+    for (off, (l, c)) in &sm.offset_to_span {
+        m3_push_u32(&mut smw, *off)?;
+        m3_push_u32(&mut smw, *l)?;
+        m3_push_u32(&mut smw, *c)?;
+    }
+    m3_push_u32(&mut smw, sm.budget_span.0)?;
+    m3_push_u32(&mut smw, sm.budget_span.1)?;
+    m3_push_u32(&mut smw, sm.default_span.0)?;
+    m3_push_u32(&mut smw, sm.default_span.1)?;
+    match sm.pack5_span {
+        Some((l, c)) => {
+            smw.push(1);
+            m3_push_u32(&mut smw, l)?;
+            m3_push_u32(&mut smw, c)?;
+        }
+        None => smw.push(0),
+    }
+    Ok((stream, smw))
+}
+
+/// `error[CLASS] line L, col C: ...` -> `CLASS:L:C` (anything else -> `OTHER`).
+pub fn m3_error_key(e: &str) -> String {
+    let class = match (e.find("error["), e.find(']')) {
+        (Some(a), Some(b)) if b > a + 6 => &e[a + 6..b],
+        _ => return String::from("OTHER"),
+    };
+    let num_after = |pat: &str| -> Option<usize> {
+        let i = e.find(pat)? + pat.len();
+        let digits: String = e[i..].chars().take_while(|ch| ch.is_ascii_digit()).collect();
+        digits.parse::<usize>().ok()
+    };
+    match (num_after("line "), num_after("col ")) {
+        (Some(l), Some(c)) => format!("{}:{}:{}", class, l, c),
+        _ => format!("{}:?:?", class),
+    }
+}
+
+fn m3_words_fnv(w: &[u16]) -> String {
+    format!("{}:0x{:016X}", w.len(), fnv1a_64_hash(&encode_u16_stream_to_bytes(w)))
+}
+
+/// The token dump with every line/col zeroed: equal iff kinds, values and texts are equal.
+pub fn m3_strip_token_spans(dump: &[u16]) -> Vec<u16> {
+    let mut out = dump.to_vec();
+    let mut i = 3usize;
+    while i + 10 <= out.len() {
+        for k in 1..5 {
+            out[i + k] = 0;
+        }
+        let n = out[i + 9] as usize;
+        i += 10 + n;
+    }
+    out
+}
+
+pub const M3_AST_MAGIC: u16 = 0x4D41;
+pub const M3_PK_MAGIC: u16 = 0x4D50;
+
+fn m3_push_str(out: &mut Vec<u16>, s: &str) -> Result<(), String> {
+    let b = s.as_bytes();
+    if b.len() > 0xFFFF {
+        return Err(String::from("fe-dump string longer than 65535 bytes"));
+    }
+    out.push(b.len() as u16);
+    for x in b {
+        out.push(*x as u16);
+    }
+    Ok(())
+}
+
+fn m3_push_i64(out: &mut Vec<u16>, v: i64) {
+    let uv = v as u64;
+    for k in 0..4 {
+        out.push(((uv >> (16 * k)) & 0xFFFF) as u16);
+    }
+}
+
+fn m3_push_span(out: &mut Vec<u16>, l: usize, c: usize) -> Result<(), String> {
+    m3_push_u32(out, l)?;
+    m3_push_u32(out, c)
+}
+
+fn m3_ast_stmts(out: &mut Vec<u16>, body: &[SurfaceStmt]) -> Result<(), String> {
+    m3_push_u32(out, body.len())?;
+    for s in body {
+        m3_ast_stmt(out, s)?;
+    }
+    Ok(())
+}
+
+// Rust-side serializer only (host code); recursion here is fine, the no-recursion rule is for core .omni.
+fn m3_ast_stmt(out: &mut Vec<u16>, s: &SurfaceStmt) -> Result<(), String> {
+    match s {
+        SurfaceStmt::Let(name, ty, e, l, c) => {
+            out.push(0x10);
+            m3_push_span(out, *l, *c)?;
+            m3_push_str(out, name)?;
+            match ty {
+                Some((t, tl, tc)) => {
+                    out.push(1);
+                    m3_push_str(out, t)?;
+                    m3_push_span(out, *tl, *tc)?;
+                }
+                None => out.push(0),
+            }
+            m3_ast_expr(out, e)
+        }
+        SurfaceStmt::Assign(name, e, l, c) => {
+            out.push(0x11);
+            m3_push_span(out, *l, *c)?;
+            m3_push_str(out, name)?;
+            m3_ast_expr(out, e)
+        }
+        SurfaceStmt::DoWhile(body, cond, l, c) => {
+            out.push(0x12);
+            m3_push_span(out, *l, *c)?;
+            m3_ast_stmts(out, body)?;
+            m3_ast_expr(out, cond)
+        }
+        SurfaceStmt::While(cond, body, l, c) => {
+            out.push(0x13);
+            m3_push_span(out, *l, *c)?;
+            m3_ast_expr(out, cond)?;
+            m3_ast_stmts(out, body)
+        }
+        SurfaceStmt::Label(id, l, c) => {
+            out.push(0x14);
+            m3_push_span(out, *l, *c)?;
+            out.push(*id);
+            Ok(())
+        }
+        SurfaceStmt::Goto(id, l, c) => {
+            out.push(0x15);
+            m3_push_span(out, *l, *c)?;
+            out.push(*id);
+            Ok(())
+        }
+        SurfaceStmt::Ret(e, l, c) => {
+            out.push(0x16);
+            m3_push_span(out, *l, *c)?;
+            m3_ast_expr(out, e)
+        }
+        SurfaceStmt::Expr(e, l, c) => {
+            out.push(0x17);
+            m3_push_span(out, *l, *c)?;
+            m3_ast_expr(out, e)
+        }
+    }
+}
+
+fn m3_ast_expr(out: &mut Vec<u16>, e: &SurfaceExpr) -> Result<(), String> {
+    match e {
+        SurfaceExpr::Int(v, l, c) => {
+            out.push(0x20);
+            m3_push_span(out, *l, *c)?;
+            m3_push_i64(out, *v);
+            Ok(())
+        }
+        SurfaceExpr::Trit(s, v, l, c) => {
+            out.push(0x21);
+            m3_push_span(out, *l, *c)?;
+            m3_push_str(out, s)?;
+            out.push(*v as i16 as u16);
+            Ok(())
+        }
+        SurfaceExpr::StrLit(s, l, c) => {
+            out.push(0x22);
+            m3_push_span(out, *l, *c)?;
+            m3_push_str(out, s)
+        }
+        SurfaceExpr::TritVecLit(v, l, c) => {
+            out.push(0x23);
+            m3_push_span(out, *l, *c)?;
+            m3_push_u32(out, v.len())?;
+            for t in v {
+                out.push(*t as i16 as u16);
+            }
+            Ok(())
+        }
+        SurfaceExpr::Var(s, l, c) => {
+            out.push(0x24);
+            m3_push_span(out, *l, *c)?;
+            m3_push_str(out, s)
+        }
+        SurfaceExpr::UnOp(op, a, l, c) => {
+            out.push(0x25);
+            m3_push_span(out, *l, *c)?;
+            m3_push_str(out, op)?;
+            m3_ast_expr(out, a)
+        }
+        SurfaceExpr::BinOp(op, a, b, l, c) => {
+            out.push(0x26);
+            m3_push_span(out, *l, *c)?;
+            m3_push_str(out, op)?;
+            m3_ast_expr(out, a)?;
+            m3_ast_expr(out, b)
+        }
+        SurfaceExpr::Call(name, args, l, c) => {
+            out.push(0x27);
+            m3_push_span(out, *l, *c)?;
+            m3_push_str(out, name)?;
+            m3_push_u32(out, args.len())?;
+            for a in args {
+                m3_ast_expr(out, a)?;
+            }
+            Ok(())
+        }
+        SurfaceExpr::IfBranch(kind, cond, then_b, else_b, l, c) => {
+            out.push(0x28);
+            m3_push_span(out, *l, *c)?;
+            m3_push_str(out, kind)?;
+            m3_ast_expr(out, cond)?;
+            m3_ast_stmts(out, then_b)?;
+            m3_ast_stmts(out, else_b)
+        }
+        SurfaceExpr::MatchTrit(scrut, neg, zero, pos, l, c) => {
+            out.push(0x29);
+            m3_push_span(out, *l, *c)?;
+            m3_ast_expr(out, scrut)?;
+            m3_ast_stmts(out, neg)?;
+            m3_ast_stmts(out, zero)?;
+            m3_ast_stmts(out, pos)
+        }
+    }
+}
+
+/// Lex + parse exactly as `compile_omni_surface_to_u16_with_sourcemap` does (including its
+/// textual include expansion and re-parse), returning the parsed fns.
+fn m3_parse_like_compile(src: &str, strict: bool) -> Result<(bool, Vec<SurfaceFnDef>), String> {
+    let effective_strict = strict || src.contains("#[strict]");
+    let tokens = tokenize_omni_surface_inner(src, effective_strict)?;
+    let mut parser = SurfaceParser::new_with_strict(tokens, effective_strict);
+    let (includes, fns) = parser.parse_module()?;
+    if !includes.is_empty() {
+        let expanded = resolve_omni_surface_includes(src, None, None)?;
+        return m3_parse_like_compile(&expanded, effective_strict);
+    }
+    Ok((effective_strict, fns))
+}
+
+/// Canonical preorder AST dump of `parse_module` (after macro substitution, as the parser does it).
+pub fn m3_dump_ast(src: &str, strict: bool) -> Result<Vec<u16>, String> {
+    let (_, fns) = m3_parse_like_compile(src, strict)?;
+    let mut out = vec![M3_AST_MAGIC];
+    m3_push_u32(&mut out, fns.len())?;
+    for f in &fns {
+        out.push(0xF0);
+        m3_push_span(&mut out, f.fn_line, f.fn_col)?;
+        m3_push_str(&mut out, &f.name)?;
+        match f.fn_id_attr {
+            Some(id) => {
+                out.push(1);
+                out.push(id);
+            }
+            None => out.push(0),
+        }
+        out.push(f.cap_mask);
+        match f.step_budget_attr {
+            Some(v) => {
+                out.push(1);
+                m3_push_i64(&mut out, v as i64);
+            }
+            None => out.push(0),
+        }
+        match f.mem_budget_attr {
+            Some(v) => {
+                out.push(1);
+                m3_push_i64(&mut out, v as i64);
+            }
+            None => out.push(0),
+        }
+        match f.budget_span {
+            Some((l, c)) => {
+                out.push(1);
+                m3_push_span(&mut out, l, c)?;
+            }
+            None => out.push(0),
+        }
+        out.push(f.strict_attr as u16);
+        out.push(f.is_route as u16);
+        for opt in [&f.route_method, &f.route_path] {
+            match opt {
+                Some(s) => {
+                    out.push(1);
+                    m3_push_str(&mut out, s)?;
+                }
+                None => out.push(0),
+            }
+        }
+        out.push(f.params.len() as u16);
+        for p in &f.params {
+            m3_push_str(&mut out, &p.name)?;
+            m3_push_str(&mut out, &p.ty)?;
+            out.push(p.untrusted as u16);
+            m3_push_span(&mut out, p.line, p.col)?;
+        }
+        m3_push_str(&mut out, &f.ret_ty)?;
+        m3_push_span(&mut out, f.ret_line, f.ret_col)?;
+        m3_ast_stmts(&mut out, &f.body)?;
+    }
+    Ok(out)
+}
+
+/// Canonical per-function packet dump: the u16 packets `SurfaceLowerCtx` emits, each with its span.
+/// Mirrors the front half of `compile_omni_surface_to_u16_with_sourcemap` (no lockstep) and then
+/// re-packs the packets and checks the result equals the real compiler's stream word for word.
+pub fn m3_dump_packets(src: &str, strict: bool) -> Result<Vec<u16>, String> {
+    let (effective_strict, fns) = m3_parse_like_compile(src, strict)?;
+    let multi_fn = fns.len() > 1;
+    let mut fn_sigs: BTreeMap<String, (u16, usize, String)> = BTreeMap::new();
+    let mut assigned_ids: Vec<u16> = Vec::with_capacity(fns.len());
+    for (idx, f) in fns.iter().enumerate() {
+        let fid = if let Some(id_attr) = f.fn_id_attr {
+            id_attr
+        } else if !multi_fn || idx + 1 == fns.len() {
+            0
+        } else {
+            (idx + 1) as u16
+        };
+        let fn_strict = effective_strict || f.strict_attr;
+        let ret_asm = String::from(map_omni_surface_type_inner(&f.ret_ty, f.ret_line, f.ret_col, fn_strict)?);
+        for p in &f.params {
+            let _ = map_omni_surface_type_inner(&p.ty, p.line, p.col, fn_strict)?;
+        }
+        if fn_sigs.contains_key(&f.name) {
+            return Err(format!(
+                "error[SYNTAX_ERROR] line {}, col {}: Duplicate function definition '{}'",
+                f.ret_line, f.ret_col, f.name
+            ));
+        }
+        fn_sigs.insert(f.name.clone(), (fid, f.params.len(), ret_asm));
+        assigned_ids.push(fid);
+    }
+    let mut out = vec![M3_PK_MAGIC];
+    m3_push_u32(&mut out, fns.len())?;
+    let mut repack: Vec<u16> = Vec::new();
+    if multi_fn {
+        repack.push(TOK_MOD_BEGIN);
+    }
+    for (idx, f) in fns.iter().enumerate() {
+        let fid = assigned_ids[idx];
+        let fn_strict = effective_strict || f.strict_attr;
+        let mut params = Vec::with_capacity(f.params.len());
+        for (p_idx, p) in f.params.iter().enumerate() {
+            let ty_str = map_omni_surface_type_inner(&p.ty, p.line, p.col, fn_strict)?;
+            params.push((PAR_BASE + (p_idx as u16), parse_asm_ty_tok(ty_str), pack_tc(p.untrusted, CAP_ID_PURE)));
+        }
+        let ret_ty_str = map_omni_surface_type_inner(&f.ret_ty, f.ret_line, f.ret_col, fn_strict)?;
+        let ret_ty_tok = parse_asm_ty_tok(ret_ty_str);
+        let mut ctx = SurfaceLowerCtx::new(&f.params, fn_sigs.clone(), ret_ty_tok, false);
+        ctx.cur_span = (f.fn_line.max(1), f.fn_col.max(1));
+        if f.is_route {
+            let method_code = match f.route_method.as_deref() {
+                Some("GET") => 1,
+                Some("POST") => 2,
+                Some("PUT") => 3,
+                Some("DELETE") => 4,
+                _ => 0,
+            };
+            let path_hash = fnv1a_32_positive(f.route_path.as_deref().unwrap_or("/"));
+            let r_rt = ctx.alloc_reg(f.fn_line, f.fn_col)?;
+            ctx.cur_span = (f.fn_line.max(1), f.fn_col.max(1));
+            ctx.emit(format!("{} = ROUTE {} {}", r_rt, method_code, path_hash))?;
+        }
+        for stmt in &f.body {
+            ctx.lower_stmt(stmt)?;
+        }
+        ctx.check_unresolved_labels()?;
+        out.push(fid);
+        out.push(params.len() as u16);
+        for (pt, pty, ptc) in &params {
+            out.push(*pt);
+            out.push(*pty);
+            out.push(*ptc);
+        }
+        out.push(ret_ty_tok);
+        out.push(f.cap_mask);
+        m3_push_u32(&mut out, ctx.packets.len())?;
+        for (pkt, sp) in ctx.packets.iter().zip(ctx.pkt_spans.iter()) {
+            m3_push_span(&mut out, sp.0, sp.1)?;
+            if pkt.len() > 0xFFFF {
+                return Err(String::from("fe-dump packet longer than 65535 words"));
+            }
+            out.push(pkt.len() as u16);
+            out.extend_from_slice(pkt);
+        }
+        if multi_fn {
+            repack.push(TOK_FN_DEF);
+            repack.push(fid);
+            repack.push(params.len() as u16);
+            for (pt, pty, ptc) in &params {
+                repack.push(*pt);
+                repack.push(*pty);
+                repack.push(*ptc);
+            }
+            repack.push(ret_ty_tok);
+            repack.push(f.cap_mask);
+            repack.push(ctx.packets.len() as u16);
+            for pkt in &ctx.packets {
+                repack.extend_from_slice(pkt);
+            }
+        } else {
+            repack = pack_fn_module(&[], fid, &params, ret_ty_tok, f.cap_mask, &ctx.packets);
+        }
+    }
+    if multi_fn {
+        repack.push(TOK_MOD_END);
+    }
+    if !fns.is_empty() {
+        if let Ok((stream, _)) = compile_omni_surface_to_u16_with_sourcemap(src, strict) {
+            if stream != repack {
+                return Err(String::from("error[FE_DUMP_DIVERGENCE] line 1, col 1: packet dump does not re-pack to the compiler's stream"));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// One lock row: `name<TAB>strict<TAB>tok=..<TAB>ast=..<TAB>pk=..<TAB>out=..`.
+pub fn m3_fe_lock_row(name: &str, src: &str, strict: bool) -> String {
+    let tok = match m3_dump_tokens(src, strict) {
+        Ok(t) => format!("tok={}:tokv={}", m3_words_fnv(&t), m3_words_fnv(&m3_strip_token_spans(&t))),
+        Err(e) => format!("tok=ERR:{}", m3_error_key(&e)),
+    };
+    let ast = match m3_dump_ast(src, strict) {
+        Ok(a) => format!("ast={}", m3_words_fnv(&a)),
+        Err(e) => format!("ast=ERR:{}", m3_error_key(&e)),
+    };
+    let pk = match m3_dump_packets(src, strict) {
+        Ok(p) => format!("pk={}", m3_words_fnv(&p)),
+        Err(e) => format!("pk=ERR:{}", m3_error_key(&e)),
+    };
+    let out = match m3_dump_stream(src, strict) {
+        Ok((s, sm)) => format!("out={}:sm={}", m3_words_fnv(&s), m3_words_fnv(&sm)),
+        Err(e) => format!("out=ERR:{}", m3_error_key(&e)),
+    };
+    format!("{}\t{}\t{}\t{}\t{}\t{}", name, if strict { 1 } else { 0 }, tok, ast, pk, out)
+}
+
+/// The circular-include fixture names a repo-root-relative path, so the lock resolves it through
+/// the resolver's in-memory VFS instead of the process cwd (same result as compiling it from the
+/// repo root, without depending on where the test runs).
+pub fn m3_fe_lock_row_circular(name: &str, vfs_path: &str, src: &str) -> String {
+    let mut vfs = BTreeMap::new();
+    vfs.insert(String::from(vfs_path), String::from(src));
+    let inc = match resolve_omni_surface_includes(src, None, Some(&vfs)) {
+        Ok(x) => format!("inc=OK:{}", x.len()),
+        Err(e) => format!("inc=ERR:{}", m3_error_key(&e)),
+    };
+    format!("{}\t0\t{}", name, inc)
+}
+
+/// One negative fixture per frontend error class: (class, fixture name). Each must fail the
+/// stream compile with exactly that class.
+pub const M3_NEG_CLASS_FIXTURES: [(&str, &str); 11] = [
+    ("SYNTAX_ERROR", "m3fix/neg_syntax_error.omni"),
+    ("ARITY_MISMATCH", "m3fix/neg_arity_mismatch.omni"),
+    ("UNRESOLVED_LABEL", "m3fix/neg_unresolved_label.omni"),
+    ("BAD_TYPE", "m3fix/neg_bad_type.omni"),
+    ("AMBIGUOUS_GRAMMAR", "m3fix/neg_ambiguous_grammar.omni"),
+    ("UNDEF_VAR", "m3fix/neg_undef_var.omni"),
+    ("BUDGET_EXCEEDED", "m3fix/neg_budget_exceeded.omni"),
+    ("UNKNOWN_FN", "m3fix/neg_unknown_fn.omni"),
+    ("MISSING_CAP", "m3fix/neg_missing_cap.omni"),
+    ("IMMUT_PARAM", "m3fix/neg_immut_param.omni"),
+    ("CIRCULAR_INCLUDE", "m3fix/neg_circular_include.omni"),
+];
+
+/// Every lock row, in manifest order.
+pub fn m3_fe_lock_rows() -> Result<Vec<String>, String> {
+    let mut rows = Vec::new();
+    for key in M3_FE_LOOKUP_CORPUS.iter() {
+        let src = lookup_omni_stdlib_module(key)
+            .ok_or_else(|| format!("M3 lock: missing built-in module '{}'", key))?;
+        rows.push(m3_fe_lock_row(&format!("lookup/{}", key), src, true));
+    }
+    rows.push(m3_fe_lock_row("engine/pure/verifier_engine.omni", OMNI_VERIFIER_ENGINE_SURFACE, false));
+    for (name, src) in M3_FE_FILE_CORPUS.iter() {
+        if *name == "m3fix/neg_circular_include.omni" {
+            rows.push(m3_fe_lock_row_circular(name, "spec/m3/fixtures/neg_circular_include.omni", src));
+        } else {
+            rows.push(m3_fe_lock_row(name, src, false));
+        }
+    }
+    Ok(rows)
+}
+
+/// M3-01 lock: the Rust frontend's canonical dumps must equal `spec/m3/corpus.tsv` row for row.
+pub fn run_m3_fe_lock_selftests() -> Result<usize, String> {
+    let rows = m3_fe_lock_rows()?;
+    let want: Vec<&str> = M3_FE_LOCK_TSV
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        .collect();
+    if want.len() != rows.len() {
+        return Err(format!("M3 frontend lock: {} rows computed, {} locked", rows.len(), want.len()));
+    }
+    for (got, exp) in rows.iter().zip(want.iter()) {
+        if got.as_str() != *exp {
+            return Err(format!("M3 frontend lock mismatch:\n  got  {}\n  want {}", got, exp));
+        }
+    }
+    let mut checks = rows.len();
+    for (class, fx) in M3_NEG_CLASS_FIXTURES.iter() {
+        let row = rows
+            .iter()
+            .find(|r| r.split('\t').next() == Some(*fx))
+            .ok_or_else(|| format!("M3 negative fixture '{}' missing from the lock", fx))?;
+        let want_out = format!("out=ERR:{}:", class);
+        let want_inc = format!("inc=ERR:{}:", class);
+        if !row.contains(&want_out) && !row.contains(&want_inc) {
+            return Err(format!("M3 negative fixture '{}' does not fail with {}: {}", fx, class, row));
+        }
+        checks += 1;
+    }
+    Ok(checks)
+}
+
+/// M3-01 canonical dumper.
+///   fe-dump lock                                         (prints the spec/m3/corpus.tsv rows)
+///   fe-dump --tokens|--ast|--packets|--stream <file.omni> [out.bin] [--strict]
+/// `tokens`/`ast`/`packets`/`stream` without dashes are accepted too. With `out.bin`, the dump is
+/// written as little-endian u16 words; `--stream` also writes `<out.bin>.sm` (sourcemap dump).
+/// Includes resolve as an in-memory compile does (built-in modules, then the cwd).
+pub fn run_m3_fe_dump_cli(argv: &[String]) -> i32 {
+    let strict = argv.iter().any(|a| a == "--strict");
+    let rest: Vec<&str> = argv.iter().map(|s| s.as_str()).filter(|a| *a != "--strict").collect();
+    let usage = || {
+        eprintln!("usage: fe-dump lock | fe-dump --tokens|--ast|--packets|--stream <file.omni> [out.bin] [--strict]");
+        2
+    };
+    let mode = match rest.first() {
+        Some(m) => m.trim_start_matches('-'),
+        None => return usage(),
+    };
+    if mode == "lock" {
+        return match m3_fe_lock_rows() {
+            Ok(rows) => {
+                println!("# {} lock rows: name, strict, tok=words:fnv1a64:tokv=span-free words:fnv1a64, ast=words:fnv1a64, pk=words:fnv1a64, out=words:fnv1a64:sm=words:fnv1a64 (any column may be ERR:CLASS:line:col; inc= rows go through the include resolver)", M3_FE_DUMP_VERSION);
+                for r in rows {
+                    println!("{}", r);
+                }
+                0
+            }
+            Err(e) => {
+                eprintln!("[FE-DUMP FAIL] {}", e);
+                1
+            }
+        };
+    }
+    if !matches!(mode, "tokens" | "ast" | "packets" | "stream") || rest.len() < 2 {
+        return usage();
+    }
+    let src = match fs::read_to_string(rest[1]) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[FE-DUMP FAIL] cannot read '{}': {}", rest[1], e);
+            return 1;
+        }
+    };
+    let res = match mode {
+        "tokens" => m3_dump_tokens(&src, strict).map(|t| (t, None)),
+        "ast" => m3_dump_ast(&src, strict).map(|t| (t, None)),
+        "packets" => m3_dump_packets(&src, strict).map(|t| (t, None)),
+        _ => m3_dump_stream(&src, strict).map(|(s, sm)| (s, Some(sm))),
+    };
+    match res {
+        Ok((words, sm)) => {
+            let mut msg = format!("[FE-DUMP] {} {} words={}", mode, rest[1], m3_words_fnv(&words));
+            if let Some(smw) = &sm {
+                msg.push_str(&format!(" sm={}", m3_words_fnv(smw)));
+            }
+            if let Some(outp) = rest.get(2) {
+                if let Err(e) = fs::write(outp, encode_u16_stream_to_bytes(&words)) {
+                    eprintln!("[FE-DUMP FAIL] write: {}", e);
+                    return 1;
+                }
+                if let Some(smw) = sm {
+                    if let Err(e) = fs::write(format!("{}.sm", outp), encode_u16_stream_to_bytes(&smw)) {
+                        eprintln!("[FE-DUMP FAIL] write: {}", e);
+                        return 1;
+                    }
+                }
+            }
+            println!("{}", msg);
+            0
+        }
+        Err(e) => {
+            println!("[FE-DUMP] {} {} ERR:{}", mode, rest[1], m3_error_key(&e));
+            1
+        }
+    }
+}
+
+// ==============================================================================
+// M3-02. GATE FOR `pure/m3/`: no recursion, label/SSA budgets, call depth <= 64
+// ==============================================================================
+// The plan points `m2-lint` (M2-03) and the M2-08 module/call-depth check at `pure/m3/*.omni`.
+// Neither tool is on this base (`d2d6c13`): `m2-lint` exists only as uncommitted WIP, and
+// `nyx/m2-foundation` routes the `m2-lint` word to `run_m2_cli` with no handler behind it. M2-08
+// is not written yet. Rather than write a second lint next to Nyx's, this gate FAILS CLOSED:
+// it passes only while `pure/m3/` holds no `.omni` module, and rejects any module until the real
+// tools are wired in here (flip `M3_GATE_TOOLS_WIRED` in the same commit that calls them).
+
+pub const M3_GATE_TOOLS_WIRED: bool = false;
+pub const M3_GATE_MISSING: &str = "m2-lint (M2-03: no recursion, <= 15 labels until C4 / 16 after, <= 192 SSA) and the M2-08 acyclic call-graph / <= 64-frame depth check are not on this base";
+
+/// Gate verdict for a set of `(path, source)` modules. Ok(n) = n modules passed.
+pub fn m3_gate_check(modules: &[(String, String)]) -> Result<usize, String> {
+    if modules.is_empty() {
+        return Ok(0);
+    }
+    let names: Vec<&str> = modules.iter().map(|(p, _)| p.as_str()).collect();
+    if !M3_GATE_TOOLS_WIRED {
+        return Err(format!(
+            "error[M3_GATE_UNAVAILABLE] refusing to pass {} pure/m3 module(s) [{}]: {}",
+            modules.len(),
+            names.join(", "),
+            M3_GATE_MISSING
+        ));
+    }
+    Err(String::from("error[M3_GATE_UNAVAILABLE] gate marked wired but no checker is connected"))
+}
+
+/// Every `*.omni` directly under `dir`, sorted by path. A missing directory is an empty set.
+pub fn m3_gate_collect(dir: &str) -> Result<Vec<(String, String)>, String> {
+    let rd = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let mut out = Vec::new();
+    for ent in rd {
+        let p = ent.map_err(|e| format!("m3-gate: {}", e))?.path();
+        if p.extension().and_then(|x| x.to_str()) == Some("omni") {
+            let s = fs::read_to_string(&p).map_err(|e| format!("m3-gate: cannot read {}: {}", p.display(), e))?;
+            out.push((p.display().to_string(), s));
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// M3-02 selftest: the gate is vacuous on an empty set, fails closed on any module (including a
+/// clean one and a self-recursive one), and, when run from the repo root, gates `pure/m3/` itself.
+pub fn run_m3_gate_selftests() -> Result<usize, String> {
+    let mut checks = 0usize;
+    if m3_gate_check(&[]) != Ok(0) {
+        return Err(String::from("M3 gate: empty module set must pass vacuously"));
+    }
+    checks += 1;
+    let clean = (String::from("pure/m3/clean.omni"), String::from("fn main(x: i64) -> i64 { return x; }"));
+    let rec = (
+        String::from("pure/m3/rec.omni"),
+        String::from("fn f(x: i64) -> i64 { let y = f(x); return y; }\nfn main(x: i64) -> i64 { let r = f(x); return r; }"),
+    );
+    for m in [clean, rec] {
+        match m3_gate_check(&[m.clone()]) {
+            Err(e) if e.contains("M3_GATE_UNAVAILABLE") => checks += 1,
+            other => return Err(format!("M3 gate must fail closed on {}: {:?}", m.0, other)),
+        }
+    }
+    if std::path::Path::new("omni_rust_bootstrap.rs").exists() && std::path::Path::new("spec/m3").is_dir() {
+        let mods = m3_gate_collect("pure/m3")?;
+        m3_gate_check(&mods)?;
+        checks += 1;
+    }
+    Ok(checks)
+}
+
+/// `m3-gate [dir]` (default `pure/m3`): exit 0 only if the gate passes.
+pub fn run_m3_gate_cli(argv: &[String]) -> i32 {
+    let dir = argv.first().map(|s| s.as_str()).unwrap_or("pure/m3");
+    match m3_gate_collect(dir).and_then(|m| m3_gate_check(&m)) {
+        Ok(0) => {
+            println!("[M3-GATE PASS] 0 modules under {} (vacuous; the gate fails closed on any module: {})", dir, M3_GATE_MISSING);
+            0
+        }
+        Ok(n) => {
+            println!("[M3-GATE PASS] {} modules under {}", n, dir);
+            0
+        }
+        Err(e) => {
+            eprintln!("[M3-GATE FAIL] {}", e);
+            1
+        }
+    }
 }
 
 // ==============================================================================
@@ -21270,6 +21628,14 @@ fn main(a: i64) -> i64 {
 
         // 13AZ. Port-plan step 9 KV slice: `pure/host_kv.omni` vs Rust VM KV lockstep (VM-only)
         checks_passed += run_host_kv_lockstep_selftests()?;
+
+        // 13M3a. M3-01 frontend lock: canonical token / AST / packet / stream / sourcemap dumps == spec/m3/corpus.tsv, plus one negative fixture per error class
+        // Run here, not inside run_ai_first_surface_selftests, so the monolith/workspace AI-first
+        // count check (omni-cli main.rs:870-873) still compares like with like.
+        checks_passed += run_m3_fe_lock_selftests()?;
+
+        // 13M3b. M3-02 gate for pure/m3/: fails closed until m2-lint (M2-03) and the M2-08 depth check land
+        checks_passed += run_m3_gate_selftests()?;
     }
 
     // M2. Milestone 2 foundation guards (spec/m2/): frozen hashes, byte lock, census, labels, lint, decoder.
@@ -22052,6 +22418,12 @@ fn main() {
                     p0, p1, rew, probs
                 );
                 return;
+            }
+            "fe-dump" | "--fe-dump" => {
+                std::process::exit(run_m3_fe_dump_cli(&cli_args[2..]));
+            }
+            "m3-gate" | "--m3-gate" => {
+                std::process::exit(run_m3_gate_cli(&cli_args[2..]));
             }
             "fixed-point" | "--fixed-point" => {
                 let s1_u16 = build_step7_stage1_compiler_stream();

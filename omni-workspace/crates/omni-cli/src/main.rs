@@ -872,6 +872,27 @@ pub fn run_workspace_selftest() -> Result<usize, String> {
     if ai_first_checks != m_ai_first_checks {
         return Err(format!("Monolith vs workspace AI-first selftest count mismatch: {} != {}", m_ai_first_checks, ai_first_checks));
     }
+    // 13M3a / 13M3b run here, not inside run_ai_first_surface_selftests, so the AI-first twin
+    // count check above still compares like with like (d2d6c13 chain length).
+    let m3a_ws = omni_lang::run_m3_fe_lock_selftests()?;
+    let m3a_mono = monolith::run_m3_fe_lock_selftests()?;
+    if m3a_ws != m3a_mono {
+        return Err(format!("Monolith vs workspace 13M3a count mismatch: {} != {}", m3a_mono, m3a_ws));
+    }
+    checks += m3a_ws;
+    let m3b_ws = omni_lang::run_m3_gate_selftests()?;
+    let m3b_mono = monolith::run_m3_gate_selftests()?;
+    if m3b_ws != m3b_mono {
+        return Err(format!("Monolith vs workspace 13M3b count mismatch: {} != {}", m3b_mono, m3b_ws));
+    }
+    checks += m3b_ws;
+    // M3-01: monolith vs workspace canonical frontend dumps, row for row.
+    let m3_ws = omni_lang::m3_fe_lock_rows()?;
+    let m3_mono = monolith::m3_fe_lock_rows()?;
+    if m3_ws != m3_mono {
+        return Err("Monolith vs workspace M3 frontend lock rows mismatch".into());
+    }
+    checks += m3_ws.len();
     if omni_harness_spec_json() != monolith::omni_harness_spec_json() {
         return Err("Monolith vs workspace omni_harness_spec_json mismatch".into());
     }
@@ -1005,6 +1026,12 @@ fn main() {
         match args[1].as_str() {
             "harness" | "--harness" => {
                 std::process::exit(run_omni_harness_cli(&args[2..]));
+            }
+            "fe-dump" | "--fe-dump" => {
+                std::process::exit(omni_lang::run_m3_fe_dump_cli(&args[2..]));
+            }
+            "m3-gate" | "--m3-gate" => {
+                std::process::exit(omni_lang::run_m3_gate_cli(&args[2..]));
             }
             "agent-driver" | "--agent-driver" => {
                 std::process::exit(run_omni_agent_driver_cli(&args[2..]));

@@ -1,0 +1,10 @@
+// Q4: <= and >= desugar to TNOT(CGT) / TNOT(CLT).
+fn main(a: i64, b: i64) -> trit {
+    let c = a <= b;
+    let d = a >= b;
+    let e = a < b;
+    let f = a > b;
+    let g = tand(c, d);
+    let h = tor(e, f);
+    return tand(g, h);
+}

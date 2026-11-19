@@ -1,0 +1,8 @@
+// Q3: unary minus folds Int literals, including through parens and double negation.
+fn main(x: i64) -> i64 {
+    let a = - -5;
+    let b = -(7);
+    let c = -x;
+    let d = ~x;
+    return a + b + c + d;
+}
