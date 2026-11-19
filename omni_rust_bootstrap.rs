@@ -870,15 +870,17 @@ pub fn verify_binary_function(func: &BinFunction) -> BinVerificationReport {
         }
 
         if ins.op_tok == 0x7F4A {
-            if let Some(op0) = ins.operands.first() {
+            for (oi, op) in ins.operands.iter().enumerate() {
                 let mut ref_toks = Vec::new();
-                collect_operand_slots(op0, &mut ref_toks);
+                collect_operand_slots(op, &mut ref_toks);
                 for r_tok in ref_toks {
                     if let Some(slot) = token_to_slot(r_tok) {
                         if regs[slot].taint == Taint::Untrusted {
                             errors.push(format!("Offset {}: error[TAINT_ON_RET]: Taint violation on RET 0x{:04X}", ins.offset, r_tok));
                         }
-                        regs[slot].state = RegState::Moved;
+                        if oi == 0 {
+                            regs[slot].state = RegState::Moved;
+                        }
                     }
                 }
             }
@@ -1314,14 +1316,43 @@ impl OmniBinaryVm {
                     continue;
                 }
                 0x7F4A => {
-                    let ret_val = match &ins.operands[0] {
-                        BinOperand::Reg(t) => {
-                            token_to_slot(*t).map(|s| std::mem::replace(&mut regs[s], OmniValue::Void)).unwrap_or(OmniValue::Void)
+                    let ret_val = if ins.operands.len() == 3 {
+                        // M2-06 (D-1): 3-op RET buf, off, len -> byte-slice return with strict bounds.
+                        let off_opt = Self::eval_as_i64(&ins.operands[1], &regs);
+                        let len_opt = Self::eval_as_i64(&ins.operands[2], &regs);
+                        match (Self::eval_op_ref(&ins.operands[0], &regs), off_opt, len_opt) {
+                            (Some(OmniValue::Bytes(buf)), Some(off), Some(len)) if off >= 0 && len >= 0 => {
+                                match (off as u64).checked_add(len as u64) {
+                                    Some(end) if end <= buf.len() as u64 => {
+                                        let o = off as usize;
+                                        let l = len as usize;
+                                        OmniValue::Bytes(buf[o..o + l].to_vec())
+                                    }
+                                    _ => {
+                                        for &mut (p_idx, ref mut out_v) in restore_borrowed.iter_mut() {
+                                            *out_v = std::mem::replace(&mut regs[192 + p_idx], OmniValue::Void);
+                                        }
+                                        return Err(String::from(OMNI_OOB_ERROR));
+                                    }
+                                }
+                            }
+                            _ => {
+                                for &mut (p_idx, ref mut out_v) in restore_borrowed.iter_mut() {
+                                    *out_v = std::mem::replace(&mut regs[192 + p_idx], OmniValue::Void);
+                                }
+                                return Err(String::from(OMNI_OOB_ERROR));
+                            }
                         }
-                        BinOperand::Param(t) if (owned_params & (1u32 << (*t - PAR_BASE))) != 0 => {
-                            token_to_slot(*t).map(|s| std::mem::replace(&mut regs[s], OmniValue::Void)).unwrap_or(OmniValue::Void)
+                    } else {
+                        match &ins.operands[0] {
+                            BinOperand::Reg(t) => {
+                                token_to_slot(*t).map(|s| std::mem::replace(&mut regs[s], OmniValue::Void)).unwrap_or(OmniValue::Void)
+                            }
+                            BinOperand::Param(t) if (owned_params & (1u32 << (*t - PAR_BASE))) != 0 => {
+                                token_to_slot(*t).map(|s| std::mem::replace(&mut regs[s], OmniValue::Void)).unwrap_or(OmniValue::Void)
+                            }
+                            other => Self::eval_op(other, &regs),
                         }
-                        other => Self::eval_op(other, &regs),
                     };
                     for &mut (p_idx, ref mut out_v) in restore_borrowed.iter_mut() {
                         *out_v = std::mem::replace(&mut regs[192 + p_idx], OmniValue::Void);
@@ -2129,7 +2160,13 @@ pub fn encode_asm_ins_packet_u16(line: &str, ret_ty: u16) -> Result<Vec<u16>, St
         Ok(pkt)
     } else if parts[0] == "RET" && parts.len() >= 2 {
         let mut pkt = vec![0x7F4A];
-        push_operand_tok(&mut pkt, parts[1])?;
+        if parts.len() == 4 {
+            push_operand_tok(&mut pkt, parts[1])?;
+            push_operand_tok(&mut pkt, parts[2])?;
+            push_operand_tok(&mut pkt, parts[3])?;
+        } else {
+            push_operand_tok(&mut pkt, parts[1])?;
+        }
         pkt.push(TOK_INS_END);
         Ok(pkt)
     } else if parts[0] == "LABEL" && parts.len() >= 2 {
@@ -4632,6 +4669,22 @@ impl SurfaceLowerCtx {
                 Ok(())
             }
             SurfaceStmt::Ret(expr, line, col) => {
+                if let SurfaceExpr::Call(cname, args, cl, cc) = expr {
+                    if cname.eq_ignore_ascii_case("ret_slice") {
+                        if args.len() != 3 {
+                            return Err(format!(
+                                "error[ARITY_MISMATCH] line {}, col {}: 'ret_slice' expects 3 arguments (buf, off, len)",
+                                cl, cc
+                            ));
+                        }
+                        let buf_op = self.eval_to_operand(&args[0])?;
+                        let off_op = self.eval_to_operand(&args[1])?;
+                        let len_op = self.eval_to_operand(&args[2])?;
+                        self.cur_span = (*cl, *cc);
+                        self.emit(format!("RET {} {} {}", buf_op, off_op, len_op))?;
+                        return Ok(());
+                    }
+                }
                 let op = self.eval_to_operand(expr)?;
                 self.cur_span = (*line, *col);
                 self.emit(format!("RET {}", op))?;
@@ -4640,7 +4693,20 @@ impl SurfaceLowerCtx {
             SurfaceStmt::Expr(expr, line, col) => {
                 if let SurfaceExpr::Call(cname, args, cl, cc) = expr {
                     let low = cname.to_ascii_lowercase();
-                    if low == "br_pos" || low == "br_neg" {
+                    if low == "ret_slice" {
+                        if args.len() != 3 {
+                            return Err(format!(
+                                "error[ARITY_MISMATCH] line {}, col {}: 'ret_slice' expects 3 arguments (buf, off, len)",
+                                cl, cc
+                            ));
+                        }
+                        let buf_op = self.eval_to_operand(&args[0])?;
+                        let off_op = self.eval_to_operand(&args[1])?;
+                        let len_op = self.eval_to_operand(&args[2])?;
+                        self.cur_span = (*cl, *cc);
+                        self.emit(format!("RET {} {} {}", buf_op, off_op, len_op))?;
+                        return Ok(());
+                    } else if low == "br_pos" || low == "br_neg" {
                         if args.len() != 2 {
                             return Err(format!(
                                 "error[ARITY_MISMATCH] line {}, col {}: '{}' expects 2 arguments",
@@ -5560,6 +5626,11 @@ pub fn compile_omni_surface_via_stage1_to_elf(
 /// (the image itself is frozen, so this changes no Stage-1 bytes).
 pub fn stage1_reject_unsupported_shapes(func: &BinFunction) -> Result<(), String> {
     for (ii, ins) in func.instructions.iter().enumerate() {
+        if ins.op_tok == 0x7F4A && ins.operands.len() == 3 {
+            return Err(format!(
+                "error[UNSUPPORTED]: Stage-1 does not implement 3-op RET (ret_slice) (ins {ii})"
+            ));
+        }
         if ins.op_tok == 0x7F0E && ins.operands.len() == 3 {
             return Err(format!(
                 "error[UNSUPPORTED]: Stage-1 does not implement 3-op IGET (ld_u16/ld_u32/ld_u64) (ins {ii})"
@@ -14901,6 +14972,28 @@ pub const OMNI_DIFF4_GOLDENS: &[DiffGolden] = &[
         runs: &[(&[7], DiffExpect::I64(8))],
         backends: &["vm"],
     },
+    // --- M2-06 (D-1): 3-op RET buf, off, len / ret_slice(buf, off, len) ---
+    DiffGolden {
+        id: "m2_ret_slice_basic",
+        proposal: "M2-06",
+        src: "fn rslice(x: i64) -> Bytes { let buf = anew(0); buf = iset(buf, 10, 20, 30); buf = iset(buf, 40); return ret_slice(buf, 1, 2); }",
+        runs: &[(&[0], DiffExpect::Bytes(&[20, 30]))],
+        backends: DIFF4_ALL,
+    },
+    DiffGolden {
+        id: "m2_ret_slice_zero_len",
+        proposal: "M2-06",
+        src: "fn rslice0(x: i64) -> Bytes { let buf = anew(0); buf = iset(buf, 10, 20); return ret_slice(buf, 2, 0); }",
+        runs: &[(&[0], DiffExpect::Bytes(&[]))],
+        backends: DIFF4_ALL,
+    },
+    DiffGolden {
+        id: "m2_ret_slice_oob",
+        proposal: "M2-06",
+        src: "fn rslice_oob(x: i64) -> Bytes { let buf = anew(0); buf = iset(buf, 10, 20); return ret_slice(buf, 1, 5); }",
+        runs: &[(&[0], DiffExpect::OobErr)],
+        backends: DIFF4_ALL,
+    },
 ];
 
 /// Known backend divergences: `(golden id, backend, reason with file:line)`.
@@ -14961,6 +15054,12 @@ pub const OMNI_DIFF4_KNOWN_DIVERGENCES: &[(&str, &str, &str)] = &[
     ("isab_oob_ld_u64_past_end", "stage1", "Stage-1 is frozen; rejects ISA-B 3-op IGET with error[UNSUPPORTED]"),
     ("isab_oob_st_u16_past_end", "stage1", "Stage-1 is frozen; rejects ISA-B 4-op ISET with error[UNSUPPORTED]"),
     ("isab_oob_st_u32_negative", "stage1", "Stage-1 is frozen; rejects ISA-B 4-op ISET with error[UNSUPPORTED]"),
+    // M2-06 (D-1): 3-op RET (ret_slice). Stage-1 is frozen and rejects up front; Wasm has no Bytes-return ABI.
+    ("m2_ret_slice_basic", "stage1", "Stage-1 is frozen; rejects M2-06 3-op RET with error[UNSUPPORTED]"),
+    ("m2_ret_slice_basic", "wasm", "Wasm has no bytes-return ABI (returns packed slice descriptor i64)"),
+    ("m2_ret_slice_zero_len", "stage1", "Stage-1 is frozen; rejects M2-06 3-op RET with error[UNSUPPORTED]"),
+    ("m2_ret_slice_zero_len", "wasm", "Wasm has no bytes-return ABI (returns packed slice descriptor i64)"),
+    ("m2_ret_slice_oob", "stage1", "Stage-1 is frozen; rejects M2-06 3-op RET with error[UNSUPPORTED]"),
 ];
 
 pub fn omni_diff4_known_divergence(id: &str, backend: &str) -> Option<&'static str> {
@@ -17724,16 +17823,47 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
             }
             0x7F4A => {
                 if func.ret_ty_tok == TY_BYTES {
-                    code.extend_from_slice(&[
-                        0xBF, 0x01, 0x00, 0x00, 0x00,
-                        0x48, 0x8D, 0xB5, 0x00, 0x00, 0xFE, 0xFF,
-                        0x4C, 0x89, 0xDA,
-                        0xB8, 0x01, 0x00, 0x00, 0x00,
-                        0x0F, 0x05,
-                        0x31, 0xFF,
-                        0xB8, 0x3C, 0x00, 0x00, 0x00,
-                        0x0F, 0x05,
-                    ]);
+                    if ins.operands.len() == 3 {
+                        // M2-06 (D-1): 3-op RET buf, off, len -> slice [off..off+len] of ISET heap
+                        // with strict bounds against both buf_len (r8) and heap len (r11).
+                        emit_load_op(&mut code, &ins.operands[0], false); // rax = buf_len
+                        code.extend_from_slice(&[0x49, 0x89, 0xC0]);      // mov r8, rax
+                        emit_load_op(&mut code, &ins.operands[1], true);  // rcx = off
+                        emit_load_op(&mut code, &ins.operands[2], false); // rax = len
+                        code.extend_from_slice(&[0x48, 0x89, 0xC2]);      // mov rdx, rax
+                        // Bounds checks: off >= 0, len >= 0, !overflow(off+len), off+len <= r8, off+len <= r11
+                        code.extend_from_slice(&[
+                            0x48, 0x85, 0xC9, 0x78, 0x34,       // test rcx, rcx; js +52 (oob)
+                            0x48, 0x85, 0xD2, 0x78, 0x2F,       // test rdx, rdx; js +47 (oob)
+                            0x48, 0x89, 0xC8,                   // mov rax, rcx
+                            0x48, 0x01, 0xD0,                   // add rax, rdx
+                            0x72, 0x27,                         // jc +39 (oob)
+                            0x4C, 0x39, 0xC0, 0x77, 0x22,       // cmp rax, r8; ja +34 (oob)
+                            0x4C, 0x39, 0xD8, 0x77, 0x1D,       // cmp rax, r11; ja +29 (oob)
+                            // In-bounds (29 bytes): write(1, rbp + rcx - 0x20000, rdx); exit(0)
+                            0x48, 0x8D, 0xB4, 0x0D, 0x00, 0x00, 0xFE, 0xFF, // lea rsi, [rbp+rcx-0x20000]
+                            0xBF, 0x01, 0x00, 0x00, 0x00,       // mov edi, 1
+                            0xB8, 0x01, 0x00, 0x00, 0x00,       // mov eax, 1 (sys_write)
+                            0x0F, 0x05,                         // syscall
+                            0x31, 0xFF,                         // xor edi, edi
+                            0xB8, 0x3C, 0x00, 0x00, 0x00,       // mov eax, 60 (sys_exit)
+                            0x0F, 0x05,                         // syscall
+                        ]);
+                        code.extend_from_slice(&x86_oob_trap());
+                    } else {
+                        code.extend_from_slice(&[
+                            0xBF, 0x01, 0x00, 0x00, 0x00,
+                            0x48, 0x8D, 0xB5, 0x00, 0x00, 0xFE, 0xFF,
+                            0x4C, 0x89, 0xDA,
+                            0xB8, 0x01, 0x00, 0x00, 0x00,
+                            0x0F, 0x05,
+                            0x31, 0xFF,
+                            0xB8, 0x3C, 0x00, 0x00, 0x00,
+                            0x0F, 0x05,
+                        ]);
+                    }
+                } else if ins.operands.len() == 3 {
+                    return Err(String::from("error[BAD_TYPE]: 3-op RET requires Bytes return type"));
                 } else {
                     emit_load_op(&mut code, &ins.operands[0], false);
                     // 64-bit result channel: write raw little-endian i64 to stdout, then exit(0)
@@ -18508,8 +18638,47 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
                 emit_wasm_set_dest(b, ins.dest_reg);
             }
             0x7F4A => {
-                emit_wasm_op(b, &ins.operands[0]);
-                b.push(0x0F);
+                if ins.operands.len() == 3 {
+                    // M2-06 (D-1): 3-op RET buf, off, len -> strict bounds check + slice descriptor.
+                    emit_wasm_op(b, &ins.operands[0]);
+                    wasm_buf_split(b, &bl);
+                    emit_wasm_op(b, &ins.operands[1]);
+                    wasm_lset(b, scratch0); // off
+                    emit_wasm_op(b, &ins.operands[2]);
+                    wasm_lset(b, scratch1); // len
+                    // off >= 0 && len >= 0 && len <= bl.blen && off <= bl.blen - len
+                    wasm_lget(b, scratch0);
+                    wasm_i64c(b, 0);
+                    b.extend_from_slice(&[0x53, 0x50]); // !(off < 0)
+                    wasm_lget(b, scratch1);
+                    wasm_i64c(b, 0);
+                    b.extend_from_slice(&[0x53, 0x50]); // !(len < 0)
+                    b.push(0x71); // i32.and
+                    wasm_lget(b, scratch1);
+                    wasm_lget(b, bl.blen);
+                    b.extend_from_slice(&[0x55, 0x50]); // !(len > blen)
+                    b.push(0x71); // i32.and
+                    wasm_lget(b, scratch0);
+                    wasm_lget(b, bl.blen);
+                    wasm_lget(b, scratch1);
+                    b.push(0x7D); // blen - len
+                    b.extend_from_slice(&[0x55, 0x50]); // !(off > blen - len)
+                    b.push(0x71); // i32.and
+                    // if !in_bounds -> unreachable (OMNI_OOB_ERROR)
+                    b.extend_from_slice(&[0x45, 0x04, 0x40, 0x00, 0x0B]);
+                    // return packed slice descriptor ((bbase + off) << 32) | len
+                    wasm_lget(b, bl.bbase);
+                    wasm_lget(b, scratch0);
+                    b.push(0x7C);
+                    wasm_i64c(b, 32);
+                    b.push(0x86);
+                    wasm_lget(b, scratch1);
+                    b.push(0x84);
+                    b.push(0x0F);
+                } else {
+                    emit_wasm_op(b, &ins.operands[0]);
+                    b.push(0x0F);
+                }
             }
             _ => {}
         }
@@ -18586,8 +18755,7 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
                     body.extend_from_slice(&[0x0C, 0x01]);
                 }
                 0x7F4A => {
-                    emit_wasm_op(&mut body, &ins.operands[0]);
-                    body.push(0x0F);
+                    emit_straight_ins(&mut body, ins);
                 }
                 _ => {
                     emit_straight_ins(&mut body, ins);

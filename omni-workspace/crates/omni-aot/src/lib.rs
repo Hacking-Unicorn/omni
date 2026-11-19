@@ -707,16 +707,45 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
             }
             0x7F4A => {
                 if func.ret_ty_tok == TY_BYTES {
-                    code.extend_from_slice(&[
-                        0xBF, 0x01, 0x00, 0x00, 0x00,
-                        0x48, 0x8D, 0xB5, 0x00, 0x00, 0xFE, 0xFF,
-                        0x4C, 0x89, 0xDA,
-                        0xB8, 0x01, 0x00, 0x00, 0x00,
-                        0x0F, 0x05,
-                        0x31, 0xFF,
-                        0xB8, 0x3C, 0x00, 0x00, 0x00,
-                        0x0F, 0x05,
-                    ]);
+                    if ins.operands.len() == 3 {
+                        // M2-06 (D-1): 3-op RET buf, off, len -> slice [off..off+len] of ISET heap
+                        // with strict bounds against both buf_len (r8) and heap len (r11).
+                        emit_load_op(&mut code, &ins.operands[0], false); // rax = buf_len
+                        code.extend_from_slice(&[0x49, 0x89, 0xC0]);      // mov r8, rax
+                        emit_load_op(&mut code, &ins.operands[1], true);  // rcx = off
+                        emit_load_op(&mut code, &ins.operands[2], false); // rax = len
+                        code.extend_from_slice(&[0x48, 0x89, 0xC2]);      // mov rdx, rax
+                        code.extend_from_slice(&[
+                            0x48, 0x85, 0xC9, 0x78, 0x34,       // test rcx, rcx; js +52 (oob)
+                            0x48, 0x85, 0xD2, 0x78, 0x2F,       // test rdx, rdx; js +47 (oob)
+                            0x48, 0x89, 0xC8,                   // mov rax, rcx
+                            0x48, 0x01, 0xD0,                   // add rax, rdx
+                            0x72, 0x27,                         // jc +39 (oob)
+                            0x4C, 0x39, 0xC0, 0x77, 0x22,       // cmp rax, r8; ja +34 (oob)
+                            0x4C, 0x39, 0xD8, 0x77, 0x1D,       // cmp rax, r11; ja +29 (oob)
+                            0x48, 0x8D, 0xB4, 0x0D, 0x00, 0x00, 0xFE, 0xFF, // lea rsi, [rbp+rcx-0x20000]
+                            0xBF, 0x01, 0x00, 0x00, 0x00,       // mov edi, 1
+                            0xB8, 0x01, 0x00, 0x00, 0x00,       // mov eax, 1 (sys_write)
+                            0x0F, 0x05,                         // syscall
+                            0x31, 0xFF,                         // xor edi, edi
+                            0xB8, 0x3C, 0x00, 0x00, 0x00,       // mov eax, 60 (sys_exit)
+                            0x0F, 0x05,                         // syscall
+                        ]);
+                        code.extend_from_slice(&x86_oob_trap());
+                    } else {
+                        code.extend_from_slice(&[
+                            0xBF, 0x01, 0x00, 0x00, 0x00,
+                            0x48, 0x8D, 0xB5, 0x00, 0x00, 0xFE, 0xFF,
+                            0x4C, 0x89, 0xDA,
+                            0xB8, 0x01, 0x00, 0x00, 0x00,
+                            0x0F, 0x05,
+                            0x31, 0xFF,
+                            0xB8, 0x3C, 0x00, 0x00, 0x00,
+                            0x0F, 0x05,
+                        ]);
+                    }
+                } else if ins.operands.len() == 3 {
+                    return Err(String::from("error[BAD_TYPE]: 3-op RET requires Bytes return type"));
                 } else {
                     emit_load_op(&mut code, &ins.operands[0], false);
                     // 64-bit result channel: write raw little-endian i64 to stdout, then exit(0)
@@ -1491,8 +1520,44 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
                 emit_wasm_set_dest(b, ins.dest_reg);
             }
             0x7F4A => {
-                emit_wasm_op(b, &ins.operands[0]);
-                b.push(0x0F);
+                if ins.operands.len() == 3 {
+                    // M2-06 (D-1): 3-op RET buf, off, len -> strict bounds check + slice descriptor.
+                    emit_wasm_op(b, &ins.operands[0]);
+                    wasm_buf_split(b, &bl);
+                    emit_wasm_op(b, &ins.operands[1]);
+                    wasm_lset(b, scratch0); // off
+                    emit_wasm_op(b, &ins.operands[2]);
+                    wasm_lset(b, scratch1); // len
+                    wasm_lget(b, scratch0);
+                    wasm_i64c(b, 0);
+                    b.extend_from_slice(&[0x53, 0x50]); // !(off < 0)
+                    wasm_lget(b, scratch1);
+                    wasm_i64c(b, 0);
+                    b.extend_from_slice(&[0x53, 0x50]); // !(len < 0)
+                    b.push(0x71); // i32.and
+                    wasm_lget(b, scratch1);
+                    wasm_lget(b, bl.blen);
+                    b.extend_from_slice(&[0x55, 0x50]); // !(len > blen)
+                    b.push(0x71); // i32.and
+                    wasm_lget(b, scratch0);
+                    wasm_lget(b, bl.blen);
+                    wasm_lget(b, scratch1);
+                    b.push(0x7D); // blen - len
+                    b.extend_from_slice(&[0x55, 0x50]); // !(off > blen - len)
+                    b.push(0x71); // i32.and
+                    b.extend_from_slice(&[0x45, 0x04, 0x40, 0x00, 0x0B]);
+                    wasm_lget(b, bl.bbase);
+                    wasm_lget(b, scratch0);
+                    b.push(0x7C);
+                    wasm_i64c(b, 32);
+                    b.push(0x86);
+                    wasm_lget(b, scratch1);
+                    b.push(0x84);
+                    b.push(0x0F);
+                } else {
+                    emit_wasm_op(b, &ins.operands[0]);
+                    b.push(0x0F);
+                }
             }
             _ => {}
         }
@@ -1569,8 +1634,7 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
                     body.extend_from_slice(&[0x0C, 0x01]);
                 }
                 0x7F4A => {
-                    emit_wasm_op(&mut body, &ins.operands[0]);
-                    body.push(0x0F);
+                    emit_straight_ins(&mut body, ins);
                 }
                 _ => {
                     emit_straight_ins(&mut body, ins);

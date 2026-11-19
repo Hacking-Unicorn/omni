@@ -133,15 +133,17 @@ pub fn verify_binary_function(func: &BinFunction) -> BinVerificationReport {
         }
 
         if ins.op_tok == 0x7F4A {
-            if let Some(op0) = ins.operands.first() {
+            for (oi, op) in ins.operands.iter().enumerate() {
                 let mut ref_toks = Vec::new();
-                collect_operand_slots(op0, &mut ref_toks);
+                collect_operand_slots(op, &mut ref_toks);
                 for r_tok in ref_toks {
                     if let Some(slot) = token_to_slot(r_tok) {
                         if regs[slot].taint == Taint::Untrusted {
                             errors.push(format!("Offset {}: error[TAINT_ON_RET]: Taint violation on RET 0x{:04X}", ins.offset, r_tok));
                         }
-                        regs[slot].state = RegState::Moved;
+                        if oi == 0 {
+                            regs[slot].state = RegState::Moved;
+                        }
                     }
                 }
             }

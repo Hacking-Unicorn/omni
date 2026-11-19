@@ -2388,6 +2388,22 @@ impl SurfaceLowerCtx {
                 Ok(())
             }
             SurfaceStmt::Ret(expr, line, col) => {
+                if let SurfaceExpr::Call(cname, args, cl, cc) = expr {
+                    if cname.eq_ignore_ascii_case("ret_slice") {
+                        if args.len() != 3 {
+                            return Err(format!(
+                                "error[ARITY_MISMATCH] line {}, col {}: 'ret_slice' expects 3 arguments (buf, off, len)",
+                                cl, cc
+                            ));
+                        }
+                        let buf_op = self.eval_to_operand(&args[0])?;
+                        let off_op = self.eval_to_operand(&args[1])?;
+                        let len_op = self.eval_to_operand(&args[2])?;
+                        self.cur_span = (*cl, *cc);
+                        self.emit(format!("RET {} {} {}", buf_op, off_op, len_op))?;
+                        return Ok(());
+                    }
+                }
                 let op = self.eval_to_operand(expr)?;
                 self.cur_span = (*line, *col);
                 self.emit(format!("RET {}", op))?;
@@ -2396,7 +2412,20 @@ impl SurfaceLowerCtx {
             SurfaceStmt::Expr(expr, line, col) => {
                 if let SurfaceExpr::Call(cname, args, cl, cc) = expr {
                     let low = cname.to_ascii_lowercase();
-                    if low == "br_pos" || low == "br_neg" {
+                    if low == "ret_slice" {
+                        if args.len() != 3 {
+                            return Err(format!(
+                                "error[ARITY_MISMATCH] line {}, col {}: 'ret_slice' expects 3 arguments (buf, off, len)",
+                                cl, cc
+                            ));
+                        }
+                        let buf_op = self.eval_to_operand(&args[0])?;
+                        let off_op = self.eval_to_operand(&args[1])?;
+                        let len_op = self.eval_to_operand(&args[2])?;
+                        self.cur_span = (*cl, *cc);
+                        self.emit(format!("RET {} {} {}", buf_op, off_op, len_op))?;
+                        return Ok(());
+                    } else if low == "br_pos" || low == "br_neg" {
                         if args.len() != 2 {
                             return Err(format!(
                                 "error[ARITY_MISMATCH] line {}, col {}: '{}' expects 2 arguments",

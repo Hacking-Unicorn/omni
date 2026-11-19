@@ -292,14 +292,43 @@ impl OmniBinaryVm {
                     continue;
                 }
                 0x7F4A => {
-                    let ret_val = match &ins.operands[0] {
-                        BinOperand::Reg(t) => {
-                            token_to_slot(*t).map(|s| std::mem::replace(&mut regs[s], OmniValue::Void)).unwrap_or(OmniValue::Void)
+                    let ret_val = if ins.operands.len() == 3 {
+                        // M2-06 (D-1): 3-op RET buf, off, len -> byte-slice return with strict bounds.
+                        let off_opt = Self::eval_as_i64(&ins.operands[1], &regs);
+                        let len_opt = Self::eval_as_i64(&ins.operands[2], &regs);
+                        match (Self::eval_op_ref(&ins.operands[0], &regs), off_opt, len_opt) {
+                            (Some(OmniValue::Bytes(buf)), Some(off), Some(len)) if off >= 0 && len >= 0 => {
+                                match (off as u64).checked_add(len as u64) {
+                                    Some(end) if end <= buf.len() as u64 => {
+                                        let o = off as usize;
+                                        let l = len as usize;
+                                        OmniValue::Bytes(buf[o..o + l].to_vec())
+                                    }
+                                    _ => {
+                                        for &mut (p_idx, ref mut out_v) in restore_borrowed.iter_mut() {
+                                            *out_v = std::mem::replace(&mut regs[192 + p_idx], OmniValue::Void);
+                                        }
+                                        return Err(String::from(OMNI_OOB_ERROR));
+                                    }
+                                }
+                            }
+                            _ => {
+                                for &mut (p_idx, ref mut out_v) in restore_borrowed.iter_mut() {
+                                    *out_v = std::mem::replace(&mut regs[192 + p_idx], OmniValue::Void);
+                                }
+                                return Err(String::from(OMNI_OOB_ERROR));
+                            }
                         }
-                        BinOperand::Param(t) if (owned_params & (1u32 << (*t - PAR_BASE))) != 0 => {
-                            token_to_slot(*t).map(|s| std::mem::replace(&mut regs[s], OmniValue::Void)).unwrap_or(OmniValue::Void)
+                    } else {
+                        match &ins.operands[0] {
+                            BinOperand::Reg(t) => {
+                                token_to_slot(*t).map(|s| std::mem::replace(&mut regs[s], OmniValue::Void)).unwrap_or(OmniValue::Void)
+                            }
+                            BinOperand::Param(t) if (owned_params & (1u32 << (*t - PAR_BASE))) != 0 => {
+                                token_to_slot(*t).map(|s| std::mem::replace(&mut regs[s], OmniValue::Void)).unwrap_or(OmniValue::Void)
+                            }
+                            other => Self::eval_op(other, &regs),
                         }
-                        other => Self::eval_op(other, &regs),
                     };
                     for &mut (p_idx, ref mut out_v) in restore_borrowed.iter_mut() {
                         *out_v = std::mem::replace(&mut regs[192 + p_idx], OmniValue::Void);

@@ -152,7 +152,13 @@ pub fn encode_asm_ins_packet_u16(line: &str, ret_ty: u16) -> Result<Vec<u16>, St
         Ok(pkt)
     } else if parts[0] == "RET" && parts.len() >= 2 {
         let mut pkt = vec![0x7F4A];
-        push_operand_tok(&mut pkt, parts[1])?;
+        if parts.len() == 4 {
+            push_operand_tok(&mut pkt, parts[1])?;
+            push_operand_tok(&mut pkt, parts[2])?;
+            push_operand_tok(&mut pkt, parts[3])?;
+        } else {
+            push_operand_tok(&mut pkt, parts[1])?;
+        }
         pkt.push(TOK_INS_END);
         Ok(pkt)
     } else if parts[0] == "LABEL" && parts.len() >= 2 {
