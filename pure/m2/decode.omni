@@ -122,11 +122,14 @@ fn m2d_op_meta(t: bytes, tb: i64, op: i64) -> i64 {
     let i: i64 = isa_op_index(op);
     let have: i64 = m2u_ge(slen(t), tb + isa_tbl_len(0));
     let ok: i64 = m2u_ge(i, 0) * have;
-    let b: i64 = m2u_sel(have, tb, 0);
-    let j: i64 = m2u_sel(ok, i, 0);
-    let f: i64 = isa_op_flags(t, b, j);
-    let c: i64 = isa_op_cap(t, b, j);
-    let r: i64 = m2u_sel(ok, f | (c << 8), 0 - 1);
+    let c: trit = ok <=> 0;
+    let r: i64 = if_pos c {
+        let f: i64 = isa_op_flags(t, tb, i);
+        let cap: i64 = isa_op_cap(t, tb, i);
+        f | (cap << 8)
+    } else {
+        0 - 1
+    };
     return r;
 }
 

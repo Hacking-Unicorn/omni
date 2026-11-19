@@ -1375,14 +1375,15 @@ impl OmniBinaryVm {
                     OmniValue::Bytes(Vec::with_capacity(64))
                 }
                 0x7F0E if ins.operands.len() == 3 => {
-                    // ISA-B 3-op IGET buf, mode, off: LE zero-extended load of 2/4/8 bytes.
+                    // ISA-B 3-op IGET buf, mode, off: LE zero-extended load of 1/2/4/8 bytes.
                     // Strict bounds: 0 <= off && off + width <= len (checked add); otherwise a
                     // deterministic runtime error[OUT_OF_BOUNDS] (never read-as-0).
                     let width = match ins.operands[1] {
+                        BinOperand::ImmInt(-1) => 1usize,
                         BinOperand::ImmInt(-2) => 2usize,
                         BinOperand::ImmInt(-4) => 4usize,
                         BinOperand::ImmInt(-8) => 8usize,
-                        _ => return Err(String::from("error[BAD_TYPE]: 3-op IGET mode must be -2, -4, or -8")),
+                        _ => return Err(String::from("error[BAD_TYPE]: 3-op IGET mode must be -1, -2, -4, or -8")),
                     };
                     let off = Self::eval_as_i64(&ins.operands[2], &regs);
                     match (Self::eval_op_ref(&ins.operands[0], &regs), off) {
@@ -4193,6 +4194,15 @@ impl SurfaceLowerCtx {
                 }
                 Ok(format!("ISET {} -8 {}", op_args[0], op_args[1]))
             }
+            "ld_u8" => {
+                if op_args.len() != 2 {
+                    return Err(format!(
+                        "error[ARITY_MISMATCH] line {}, col {}: Intrinsic 'ld_u8' expects 2 arguments, got {}",
+                        line, col, op_args.len()
+                    ));
+                }
+                Ok(format!("IGET {} -1 {}", op_args[0], op_args[1]))
+            }
             "ld_u16" => {
                 if op_args.len() != 2 {
                     return Err(format!(
@@ -6408,16 +6418,16 @@ pub fn run_m3_fe_dump_cli(argv: &[String]) -> i32 {
 // it passes only while `pure/m3/` holds no `.omni` module, and rejects any module until the real
 // tools are wired in here (flip `M3_GATE_TOOLS_WIRED` in the same commit that calls them).
 
-pub const M3_GATE_TOOLS_WIRED: bool = false;
-pub const M3_GATE_MISSING: &str = "m2-lint (M2-03: no recursion, <= 15 labels until C4 / 16 after, <= 192 SSA) and the M2-08 acyclic call-graph / <= 64-frame depth check are not on this base";
+pub const M3_GATE_TOOLS_WIRED: bool = true;
+pub const M3_GATE_MISSING: &str = "m2-lint (M2-03: no recursion, <= 16 labels, <= 192 SSA, <= 64-frame depth)";
 
 /// Gate verdict for a set of `(path, source)` modules. Ok(n) = n modules passed.
 pub fn m3_gate_check(modules: &[(String, String)]) -> Result<usize, String> {
     if modules.is_empty() {
         return Ok(0);
     }
-    let names: Vec<&str> = modules.iter().map(|(p, _)| p.as_str()).collect();
     if !M3_GATE_TOOLS_WIRED {
+        let names: Vec<&str> = modules.iter().map(|(p, _)| p.as_str()).collect();
         return Err(format!(
             "error[M3_GATE_UNAVAILABLE] refusing to pass {} pure/m3 module(s) [{}]: {}",
             modules.len(),
@@ -6425,7 +6435,18 @@ pub fn m3_gate_check(modules: &[(String, String)]) -> Result<usize, String> {
             M3_GATE_MISSING
         ));
     }
-    Err(String::from("error[M3_GATE_UNAVAILABLE] gate marked wired but no checker is connected"))
+    for (path, src) in modules {
+        let (findings, _, _) = m2_lint_surface_scoped(src)
+            .map_err(|e| format!("error[M3_GATE_FAIL] {} failed to compile: {}", path, e))?;
+        if !findings.is_empty() {
+            let desc: Vec<String> = findings
+                .iter()
+                .map(|f| format!("{}(fn#{} @{}): {}", f.rule, f.fn_idx, f.offset, f.msg))
+                .collect();
+            return Err(format!("error[M3_GATE_FAIL] {} failed m2-lint: {}", path, desc.join("; ")));
+        }
+    }
+    Ok(modules.len())
 }
 
 /// Every `*.omni` directly under `dir`, sorted by path. A missing directory is an empty set.
@@ -6446,8 +6467,8 @@ pub fn m3_gate_collect(dir: &str) -> Result<Vec<(String, String)>, String> {
     Ok(out)
 }
 
-/// M3-02 selftest: the gate is vacuous on an empty set, fails closed on any module (including a
-/// clean one and a self-recursive one), and, when run from the repo root, gates `pure/m3/` itself.
+/// M3-02 selftest: the gate is vacuous on an empty set, accepts a clean module, rejects a
+/// self-recursive module via m2-lint CALL_GRAPH, and gates `pure/m3/` on disk.
 pub fn run_m3_gate_selftests() -> Result<usize, String> {
     let mut checks = 0usize;
     if m3_gate_check(&[]) != Ok(0) {
@@ -6455,15 +6476,17 @@ pub fn run_m3_gate_selftests() -> Result<usize, String> {
     }
     checks += 1;
     let clean = (String::from("pure/m3/clean.omni"), String::from("fn main(x: i64) -> i64 { return x; }"));
+    if m3_gate_check(&[clean]) != Ok(1) {
+        return Err(String::from("M3 gate: clean module must pass m2-lint"));
+    }
+    checks += 1;
     let rec = (
         String::from("pure/m3/rec.omni"),
         String::from("fn f(x: i64) -> i64 { let y = f(x); return y; }\nfn main(x: i64) -> i64 { let r = f(x); return r; }"),
     );
-    for m in [clean, rec] {
-        match m3_gate_check(&[m.clone()]) {
-            Err(e) if e.contains("M3_GATE_UNAVAILABLE") => checks += 1,
-            other => return Err(format!("M3 gate must fail closed on {}: {:?}", m.0, other)),
-        }
+    match m3_gate_check(&[rec]) {
+        Err(e) if e.contains("M3_GATE_FAIL") && e.contains("CALL_GRAPH") => checks += 1,
+        other => return Err(format!("M3 gate must reject recursive module via CALL_GRAPH, got {:?}", other)),
     }
     if std::path::Path::new("omni_rust_bootstrap.rs").exists() && std::path::Path::new("spec/m3").is_dir() {
         let mods = m3_gate_collect("pure/m3")?;
@@ -14769,8 +14792,23 @@ pub const OMNI_DIFF4_GOLDENS: &[DiffGolden] = &[
         runs: &[(&[5], DiffExpect::Rejected("Label id > 15"))],
         backends: DIFF4_ALL,
     },
-    // --- ISA-B (HANDOFF.md 6.1): 3-op IGET buf,-2/-4/-8,off (zero-extended LE load),
+    // --- ISA-B (HANDOFF.md 6.1 + D-2): 3-op IGET buf,-1/-2/-4/-8,off (zero-extended LE load),
     // 4-op ISET buf,-2/-4,off,val (in-place LE patch), strict bounds off >= 0 && off+w <= len.
+    // bytes 10 x 240: ld_u8@0=10, ld_u8@1=x&255, ld_u8@2=240. r = a*1000000 + b*1000 + c.
+    DiffGolden {
+        id: "isab_ld_u8_unsigned",
+        proposal: "ISA-B/D-2",
+        src: "fn isab_ld8(x: i64) -> i64 { let buf = anew(0); buf = iset(buf, 10, x, 240); let a = ld_u8(buf, 0); let b = ld_u8(buf, 1); let c = ld_u8(buf, 2); let r = a * 1000000 + b * 1000 + c; return r; }",
+        runs: &[(&[7], DiffExpect::I64(10007240)), (&[255], DiffExpect::I64(10255240))],
+        backends: DIFF4_ALL,
+    },
+    DiffGolden {
+        id: "isab_oob_ld_u8_past_end",
+        proposal: "ISA-B/D-2",
+        src: "fn isab_oob_u8(x: i64) -> i64 { let buf = anew(0); buf = iset(buf, 1, 2, x); let a = ld_u8(buf, 3); return a; }",
+        runs: &[(&[3], DiffExpect::OobErr), (&[-3], DiffExpect::OobErr)],
+        backends: DIFF4_ALL,
+    },
     // bytes D4 FE x 00: ld_u16@0 = 0xFED4 = 65236, ld_u16@2 = x (0 <= x < 256). r = a*1000 + b.
     DiffGolden {
         id: "isab_ld_u16_unsigned",
@@ -14910,6 +14948,8 @@ pub const OMNI_DIFF4_KNOWN_DIVERGENCES: &[(&str, &str, &str)] = &[
     ("p5_if_neg_nontrit", "x86", "N2: x86 BR_NEG emits cmp rax,-1; je (14793-14800)"),
     ("p5_if_neg_nontrit", "stage1", "N2: Stage-1 BR_NEG (lbl_br_neg 16513+) mirrors x86"),
     // ISA-B shapes on Stage-1: Stage-1 is frozen and rejects ISA-B up front with error[UNSUPPORTED].
+    ("isab_ld_u8_unsigned", "stage1", "Stage-1 is frozen; rejects ISA-B 3-op IGET with error[UNSUPPORTED]"),
+    ("isab_oob_ld_u8_past_end", "stage1", "Stage-1 is frozen; rejects ISA-B 3-op IGET with error[UNSUPPORTED]"),
     ("isab_ld_u16_unsigned", "stage1", "Stage-1 is frozen; rejects ISA-B 3-op IGET with error[UNSUPPORTED]"),
     ("isab_ld_u32_u64", "stage1", "Stage-1 is frozen; rejects ISA-B 3-op IGET with error[UNSUPPORTED]"),
     ("isab_st_patch", "stage1", "Stage-1 is frozen; rejects ISA-B 3-op IGET / 4-op ISET with error[UNSUPPORTED]"),
@@ -17392,12 +17432,14 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
                 if ins.operands.len() == 3 {
                     // ISA-B 3-op IGET buf, mode, off: zero-extended LE load from the ISET heap.
                     let width: u8 = match ins.operands[1] {
+                        BinOperand::ImmInt(-1) => 1,
                         BinOperand::ImmInt(-2) => 2,
                         BinOperand::ImmInt(-4) => 4,
                         BinOperand::ImmInt(-8) => 8,
-                        _ => return Err(String::from("error[BAD_TYPE]: 3-op IGET mode must be -2, -4, or -8")),
+                        _ => return Err(String::from("error[BAD_TYPE]: 3-op IGET mode must be -1, -2, -4, or -8")),
                     };
                     let load: &[u8] = match width {
+                        1 => &[0x0F, 0xB6, 0x84, 0x0D, 0x00, 0x00, 0xFE, 0xFF], // movzx eax, byte [rbp+rcx-0x20000]
                         2 => &[0x0F, 0xB7, 0x84, 0x0D, 0x00, 0x00, 0xFE, 0xFF], // movzx eax, word [rbp+rcx-0x20000]
                         4 => &[0x8B, 0x84, 0x0D, 0x00, 0x00, 0xFE, 0xFF],       // mov eax, dword [...]
                         _ => &[0x48, 0x8B, 0x84, 0x0D, 0x00, 0x00, 0xFE, 0xFF], // mov rax, qword [...]
@@ -17955,9 +17997,9 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
         }
         if ins.op_tok == 0x7F0E
             && ins.operands.len() == 3
-            && !matches!(ins.operands[1], BinOperand::ImmInt(-2) | BinOperand::ImmInt(-4) | BinOperand::ImmInt(-8))
+            && !matches!(ins.operands[1], BinOperand::ImmInt(-1) | BinOperand::ImmInt(-2) | BinOperand::ImmInt(-4) | BinOperand::ImmInt(-8))
         {
-            return Err(String::from("error[BAD_TYPE]: 3-op IGET mode must be -2, -4, or -8"));
+            return Err(String::from("error[BAD_TYPE]: 3-op IGET mode must be -1, -2, -4, or -8"));
         }
     }
 
@@ -18142,6 +18184,7 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
                 // ISA-B 3-op IGET buf, mode, off: zero-extended LE load from the buffer's own
                 // region; 0 unless 0 <= off && off + width <= len. Never uses the pack5 map.
                 let width: i64 = match ins.operands[1] {
+                    BinOperand::ImmInt(-1) => 1,
                     BinOperand::ImmInt(-2) => 2,
                     BinOperand::ImmInt(-4) => 4,
                     BinOperand::ImmInt(-8) => 8,
@@ -18157,6 +18200,7 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
                 b.push(0x7C);
                 b.push(0xA7);
                 match width {
+                    1 => b.extend_from_slice(&[0x2D, 0x00, 0x00, 0xAD]), // i32.load8_u; i64.extend_i32_u
                     2 => b.extend_from_slice(&[0x2F, 0x01, 0x00, 0xAD]), // i32.load16_u; i64.extend_i32_u
                     4 => b.extend_from_slice(&[0x28, 0x02, 0x00, 0xAD]), // i32.load; i64.extend_i32_u
                     _ => b.extend_from_slice(&[0x29, 0x03, 0x00]),       // i64.load

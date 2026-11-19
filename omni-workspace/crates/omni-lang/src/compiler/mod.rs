@@ -1950,6 +1950,15 @@ impl SurfaceLowerCtx {
                 }
                 Ok(format!("ISET {} -8 {}", op_args[0], op_args[1]))
             }
+            "ld_u8" => {
+                if op_args.len() != 2 {
+                    return Err(format!(
+                        "error[ARITY_MISMATCH] line {}, col {}: Intrinsic 'ld_u8' expects 2 arguments, got {}",
+                        line, col, op_args.len()
+                    ));
+                }
+                Ok(format!("IGET {} -1 {}", op_args[0], op_args[1]))
+            }
             "ld_u16" => {
                 if op_args.len() != 2 {
                     return Err(format!(

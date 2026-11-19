@@ -353,14 +353,15 @@ impl OmniBinaryVm {
                     OmniValue::Bytes(Vec::with_capacity(64))
                 }
                 0x7F0E if ins.operands.len() == 3 => {
-                    // ISA-B 3-op IGET buf, mode, off: LE zero-extended load of 2/4/8 bytes.
+                    // ISA-B 3-op IGET buf, mode, off: LE zero-extended load of 1/2/4/8 bytes.
                     // Strict bounds: 0 <= off && off + width <= len (checked add); otherwise a
                     // deterministic runtime error[OUT_OF_BOUNDS] (never read-as-0).
                     let width = match ins.operands[1] {
+                        BinOperand::ImmInt(-1) => 1usize,
                         BinOperand::ImmInt(-2) => 2usize,
                         BinOperand::ImmInt(-4) => 4usize,
                         BinOperand::ImmInt(-8) => 8usize,
-                        _ => return Err(String::from("error[BAD_TYPE]: 3-op IGET mode must be -2, -4, or -8")),
+                        _ => return Err(String::from("error[BAD_TYPE]: 3-op IGET mode must be -1, -2, -4, or -8")),
                     };
                     let off = Self::eval_as_i64(&ins.operands[2], &regs);
                     match (Self::eval_op_ref(&ins.operands[0], &regs), off) {

@@ -415,12 +415,14 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
                 if ins.operands.len() == 3 {
                     // ISA-B 3-op IGET buf, mode, off: zero-extended LE load from the ISET heap.
                     let width: u8 = match ins.operands[1] {
+                        BinOperand::ImmInt(-1) => 1,
                         BinOperand::ImmInt(-2) => 2,
                         BinOperand::ImmInt(-4) => 4,
                         BinOperand::ImmInt(-8) => 8,
-                        _ => return Err(String::from("error[BAD_TYPE]: 3-op IGET mode must be -2, -4, or -8")),
+                        _ => return Err(String::from("error[BAD_TYPE]: 3-op IGET mode must be -1, -2, -4, or -8")),
                     };
                     let load: &[u8] = match width {
+                        1 => &[0x0F, 0xB6, 0x84, 0x0D, 0x00, 0x00, 0xFE, 0xFF], // movzx eax, byte [rbp+rcx-0x20000]
                         2 => &[0x0F, 0xB7, 0x84, 0x0D, 0x00, 0x00, 0xFE, 0xFF], // movzx eax, word [rbp+rcx-0x20000]
                         4 => &[0x8B, 0x84, 0x0D, 0x00, 0x00, 0xFE, 0xFF],       // mov eax, dword [...]
                         _ => &[0x48, 0x8B, 0x84, 0x0D, 0x00, 0x00, 0xFE, 0xFF], // mov rax, qword [...]
@@ -978,9 +980,9 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
         }
         if ins.op_tok == 0x7F0E
             && ins.operands.len() == 3
-            && !matches!(ins.operands[1], BinOperand::ImmInt(-2) | BinOperand::ImmInt(-4) | BinOperand::ImmInt(-8))
+            && !matches!(ins.operands[1], BinOperand::ImmInt(-1) | BinOperand::ImmInt(-2) | BinOperand::ImmInt(-4) | BinOperand::ImmInt(-8))
         {
-            return Err(String::from("error[BAD_TYPE]: 3-op IGET mode must be -2, -4, or -8"));
+            return Err(String::from("error[BAD_TYPE]: 3-op IGET mode must be -1, -2, -4, or -8"));
         }
     }
 
@@ -1165,6 +1167,7 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
                 // ISA-B 3-op IGET buf, mode, off: zero-extended LE load from the buffer's own
                 // region; 0 unless 0 <= off && off + width <= len. Never uses the pack5 map.
                 let width: i64 = match ins.operands[1] {
+                    BinOperand::ImmInt(-1) => 1,
                     BinOperand::ImmInt(-2) => 2,
                     BinOperand::ImmInt(-4) => 4,
                     BinOperand::ImmInt(-8) => 8,
@@ -1180,6 +1183,7 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
                 b.push(0x7C);
                 b.push(0xA7);
                 match width {
+                    1 => b.extend_from_slice(&[0x2D, 0x00, 0x00, 0xAD]), // i32.load8_u; i64.extend_i32_u
                     2 => b.extend_from_slice(&[0x2F, 0x01, 0x00, 0xAD]), // i32.load16_u; i64.extend_i32_u
                     4 => b.extend_from_slice(&[0x28, 0x02, 0x00, 0xAD]), // i32.load; i64.extend_i32_u
                     _ => b.extend_from_slice(&[0x29, 0x03, 0x00]),       // i64.load

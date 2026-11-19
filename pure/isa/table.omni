@@ -390,9 +390,7 @@ fn isa_is_lt(a: i64, b: i64) -> i64 {
 
 #[strict]
 fn isa_u16_at(t: bytes, off: i64) -> i64 {
-    let lo: i64 = iget(t, off);
-    let hi: i64 = iget(t, off + 1);
-    let v: i64 = lo | (hi << 8);
+    let v: i64 = ld_u16(t, off);
     return v;
 }
 
@@ -424,7 +422,7 @@ fn isa_op_cap(t: bytes, b: i64, i: i64) -> i64 {
 
 #[strict]
 fn isa_op_flags(t: bytes, b: i64, i: i64) -> i64 {
-    let v: i64 = iget(t, isa_op_rec(b, i) + 4);
+    let v: i64 = ld_u8(t, isa_op_rec(b, i) + 4);
     return v;
 }
 
@@ -443,13 +441,13 @@ fn isa_mn_rec(b: i64, m: i64) -> i64 {
 
 #[strict]
 fn isa_mn_op(t: bytes, b: i64, m: i64) -> i64 {
-    let v: i64 = 32512 + iget(t, isa_mn_rec(b, m));
+    let v: i64 = 32512 + ld_u8(t, isa_mn_rec(b, m));
     return v;
 }
 
 #[strict]
 fn isa_mn_tyb(t: bytes, b: i64, m: i64) -> i64 {
-    let v: i64 = iget(t, isa_mn_rec(b, m) + 1);
+    let v: i64 = ld_u8(t, isa_mn_rec(b, m) + 1);
     return v;
 }
 
@@ -472,13 +470,13 @@ fn isa_mn_ty(t: bytes, b: i64, m: i64, ret_ty: i64) -> i64 {
 
 #[strict]
 fn isa_mn_len(t: bytes, b: i64, m: i64) -> i64 {
-    let v: i64 = iget(t, isa_mn_rec(b, m) + 2);
+    let v: i64 = ld_u8(t, isa_mn_rec(b, m) + 2);
     return v;
 }
 
 #[strict]
 fn isa_mn_ch(t: bytes, b: i64, m: i64, k: i64) -> i64 {
-    let v: i64 = iget(t, isa_mn_rec(b, m) + 3 + k);
+    let v: i64 = ld_u8(t, isa_mn_rec(b, m) + 3 + k);
     return v;
 }
 
@@ -488,7 +486,7 @@ fn isa_mn_eq(t: bytes, b: i64, m: i64, s: bytes, off: i64, len: i64) -> i64 {
     let n: i64 = ok * len;
     let k: i64 = 0;
     while n - k <=> 0 {
-        ok = ok * isa_is_eq(isa_mn_ch(t, b, m, k), iget(s, off + k));
+        ok = ok * isa_is_eq(isa_mn_ch(t, b, m, k), ld_u8(s, off + k));
         k = k + 1;
     }
     return ok;
