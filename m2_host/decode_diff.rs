@@ -412,6 +412,120 @@ pub fn selftest_m2_decode_diff() -> Result<usize, String> {
     Ok(checks)
 }
 
+pub const M3_ENCODE_OMNI_SRC: &str = concat!(
+    include_str!("../pure/m2/util.omni"),
+    "\n",
+    include_str!("../pure/isa/table.omni"),
+    "\n",
+    include_str!("../pure/m2/decode.omni"),
+    "\n",
+    include_str!("../pure/isa/encode.omni"),
+    "\n",
+    include_str!("../spec/m2/encode_harness.omni")
+);
+
+pub const M2_LABELS_OMNI_SRC: &str = concat!(
+    include_str!("../pure/m2/util.omni"),
+    "\n",
+    include_str!("../pure/isa/table.omni"),
+    "\n",
+    include_str!("../pure/m2/decode.omni"),
+    "\n",
+    include_str!("../pure/m2/labels.omni"),
+    "\n",
+    include_str!("../spec/m2/labels_harness.omni")
+);
+
+/// M3-04 selftest: `pure/isa/encode.omni` re-encodes every positive acceptance golden,
+/// `pure/verifier_engine.omni` (11,893 words), and `build_step7_stage1_compiler_stream`
+/// (19,731 words) bit-for-bit identically to `encode_u16_stream_to_bytes`.
+pub fn selftest_m3_isa_encode_roundtrip() -> Result<usize, String> {
+    let enc_mod = m2_compile_decoder(M3_ENCODE_OMNI_SRC)?;
+    let entry = m2_entry_of(&enc_mod);
+    let mut checks = 0usize;
+    let mut cases: Vec<(String, Vec<u16>)> = Vec::new();
+    for &(gid, src) in M2_GOLDEN_SOURCES {
+        if let Ok(u) = compile_omni_surface_to_u16(src) {
+            cases.push((format!("golden:{}", gid), u));
+        }
+    }
+    let ve_u16 = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(OMNI_VERIFIER_ENGINE_SURFACE))?;
+    cases.push((String::from("pure/verifier_engine.omni"), ve_u16));
+    cases.push((String::from("stage1_compiler_stream"), build_step7_stage1_compiler_stream()));
+    for (name, stream) in &cases {
+        let want = encode_u16_stream_to_bytes(stream);
+        let mut vm = OmniBinaryVm::new();
+        let got = match vm.execute_function(&enc_mod, entry, vec![OmniValue::U16Array(stream.clone())])? {
+            OmniValue::Bytes(b) => b,
+            o => return Err(format!("M3-04 encode roundtrip '{}': returned {:?}", name, o)),
+        };
+        if got != want {
+            let min_l = got.len().min(want.len());
+            let diff = (0..min_l).find(|&i| got[i] != want[i]).unwrap_or(min_l);
+            return Err(format!(
+                "M3-04 encode roundtrip '{}' mismatch: got {} B vs want {} B (first diff at byte {})",
+                name, got.len(), want.len(), diff
+            ));
+        }
+        checks += 1;
+    }
+    Ok(checks)
+}
+
+/// M2 label-table selftest (`pure/m2/labels.omni`): verifies D-3 (u32 off+1 / 0=undef),
+/// D-8 (0x20000..0x23FFF), D-11 (IMM >= 4080 rejected), and D-12 (first-definition-wins;
+/// LBL 0x7EF0..0x7EFF occupy slots 4080..4095 without aliasing IMM ids).
+pub fn selftest_m2_labels_table() -> Result<usize, String> {
+    let lbl_mod = m2_compile_decoder(M2_LABELS_OMNI_SRC)?;
+    let entry = m2_entry_of(&lbl_mod);
+    let arena_size = 0x24000usize;
+    let run_q = |stream: &[u16], slot: i64| -> Result<i64, String> {
+        let mut vm = OmniBinaryVm::new();
+        match vm.execute_function(
+            &lbl_mod,
+            entry,
+            vec![
+                OmniValue::U16Array(stream.to_vec()),
+                OmniValue::Int(slot),
+                OmniValue::Bytes(vec![0u8; arena_size]),
+            ],
+        )? {
+            OmniValue::Int(v) => Ok(v),
+            o => Err(format!("m2lbl_test_main returned {:?}", o)),
+        }
+    };
+    let mut checks = 0usize;
+    // 1. LBL 1 at ins 0 (slot 4081); LBL 2 undefined (slot 4082); IMM 1 undefined (slot 1, no alias).
+    let s1 = assemble_omni_text_to_u16("PARAM $0 I64 SAFE\nRET_TY I64\nLABEL 1\nJMP 1\nRET 7\n")?;
+    if run_q(&s1, 4081)? != 0 || run_q(&s1, 4082)? != -1 || run_q(&s1, 1)? != -1 {
+        return Err(String::from("M2 labels: LBL 1 / undefined / no-IMM-alias check failed"));
+    }
+    checks += 3;
+    // 2. Duplicate LABEL 1 at ins 1 and ins 3: first definition (1) wins (D-12).
+    let s_dup = assemble_omni_text_to_u16("PARAM $0 I64 SAFE\nRET_TY I64\nJMP 1\nLABEL 1\n%0 = CINT 5\nLABEL 1\nRET 7\n")?;
+    if run_q(&s_dup, 4081)? != 1 {
+        return Err(String::from("M2 labels: duplicate LABEL did not keep first definition"));
+    }
+    checks += 1;
+    // 3. IMM label id 82 -> slot 82; IMM label id 4079 -> slot 4079; IMM 4080 rejected (-1, D-11).
+    let s_imm82 = m2_lbl_patch("PARAM $0 I64 SAFE\nRET_TY I64\nLABEL 1\nJMP 1\nRET 7\n", &[(0, &m2_imm16(82)), (1, &m2_imm16(82))])?;
+    if run_q(&s_imm82, 82)? != 0 || run_q(&s_imm82, 4081)? != -1 {
+        return Err(String::from("M2 labels: IMM 82 slot check failed"));
+    }
+    checks += 2;
+    let s_imm4079 = m2_lbl_patch("PARAM $0 I64 SAFE\nRET_TY I64\nLABEL 1\nJMP 1\nRET 7\n", &[(0, &m2_imm16(4079)), (1, &m2_imm16(4079))])?;
+    if run_q(&s_imm4079, 4079)? != 0 {
+        return Err(String::from("M2 labels: IMM 4079 boundary slot check failed"));
+    }
+    checks += 1;
+    let s_imm4080 = m2_lbl_patch("PARAM $0 I64 SAFE\nRET_TY I64\nLABEL 1\nJMP 1\nRET 7\n", &[(0, &m2_imm16(4080)), (1, &m2_imm16(4080))])?;
+    if run_q(&s_imm4080, 4080)? != -1 {
+        return Err(String::from("M2 labels: IMM 4080 must be rejected per D-11"));
+    }
+    checks += 1;
+    Ok(checks)
+}
+
 /// `omni m2-decode` runs the decoder differential; `omni m2-decode <file.omni_bc>` decodes one
 /// stream with the Omni decoder on the VM and checks it against Rust.
 pub fn m2_decode_cli(args: &[String]) -> i32 {

@@ -1,0 +1,116 @@
+// ==============================================================================
+// pure/m2/labels.omni  (Milestone 2) — arena-backed u32 label table & resolver
+// ==============================================================================
+// Link order: pure/m2/util.omni, pure/isa/table.omni, pure/m2/decode.omni, this file.
+// Implements D-3 (u32 entries: code_off + 1, 0 = undefined), D-8 (arena band
+// 0x20000..0x23FFF = 4096 x u32), D-11 (IMM label ids >= 4080 rejected), and
+// D-12 (first definition wins; LBL 0x7EF0..0x7EFF occupy slots 4080..4095 so
+// mixed LBL/IMM forms never alias).
+// Iterative, zero recursion, zero ANEW, gated by `omni m2-lint` with 0 findings.
+// ==============================================================================
+
+#[strict]
+fn m2lbl_max_slots() -> i64 { return 4096; }
+
+#[strict]
+fn m2lbl_imm_limit() -> i64 { return 4080; }
+
+// Maps a decoded packed operand word (from m2d_operand) to a label slot 0..4095,
+// or -1 if it is not a valid M2 label operand (rejects IMM < 0 or >= 4080 per D-11).
+#[strict]
+fn m2lbl_slot_of(packed: i64) -> i64 {
+    let kind: i64 = m2d_kind(packed);
+    let is_lbl: i64 = m2u_eq(kind, 3);
+    let is_imm: i64 = m2u_eq(kind, 5);
+    let uval: i64 = m2d_uval(packed);
+    let ival: i64 = m2d_ival(packed);
+    let lbl_ok: i64 = is_lbl * m2u_in(uval, 32496, 32511);
+    let imm_ok: i64 = is_imm * m2u_in(ival, 0, 4079);
+    let lbl_slot: i64 = 4080 + (uval - 32496);
+    let r: i64 = m2u_sel(lbl_ok, lbl_slot, m2u_sel(imm_ok, ival, 0 - 1));
+    return r;
+}
+
+// Byte offset of label slot `slot` in the M2 arena (base m2l_labels() = 0x20000).
+#[strict]
+fn m2lbl_byte_off(slot: i64) -> i64 {
+    let r: i64 = m2l_labels() + (slot << 2);
+    return r;
+}
+
+// Clears all 4096 u32 slots (16 KiB = 2048 i64 words) at 0x20000..0x23FFF.
+#[strict]
+fn m2lbl_clear_all(arena: bytes) -> bytes {
+    let w: bytes = arena;
+    let base: i64 = m2l_labels();
+    let i: i64 = 0;
+    while 2048 - i <=> 0 {
+        w = iset_patch_i64(w, base + (i << 3), 0);
+        i = i + 1;
+    }
+    return w;
+}
+
+// Records a label definition at `code_off >= 0` using first-definition-wins (D-12).
+// Out-of-range slots (< 0 or >= 4096) are ignored cleanly.
+#[strict]
+fn m2lbl_define(arena: bytes, slot: i64, code_off: i64) -> bytes {
+    let ok: trit = m2u_in(slot, 0, 4095) <=> 0;
+    let r: bytes = if_pos ok {
+        let boff: i64 = m2lbl_byte_off(slot);
+        let cur: i64 = ld_u32(arena, boff);
+        let unset: trit = m2u_eq(cur, 0) <=> 0;
+        let w: bytes = if_pos unset {
+            st_u32(arena, boff, code_off + 1)
+        } else {
+            arena
+        };
+        w
+    } else {
+        arena
+    };
+    return r;
+}
+
+// Looks up a label slot; returns code_off >= 0 if defined, or -1 if undefined / invalid.
+#[strict]
+fn m2lbl_lookup(arena: bytes, slot: i64) -> i64 {
+    let ok: trit = m2u_in(slot, 0, 4095) <=> 0;
+    let r: i64 = if_pos ok {
+        let cur: i64 = ld_u32(arena, m2lbl_byte_off(slot));
+        cur - 1
+    } else {
+        0 - 1
+    };
+    return r;
+}
+
+// Scans one function body starting at first instruction word `ins_start` (`ins_cnt`
+// instructions), recording each LABEL (0x7F40) with its instruction index as `code_off`.
+#[strict]
+fn m2lbl_collect_fn(arena: bytes, arr: array, n: i64, ins_start: i64, ins_cnt: i64) -> bytes {
+    let w: bytes = arena;
+    let cur: i64 = ins_start;
+    let ii: i64 = 0;
+    while ins_cnt - ii <=> 0 {
+        let op: i64 = m2d_ins_op(arr, n, cur);
+        let is_lbl_ins: trit = m2u_eq(op, 32576) <=> 0;
+        w = if_pos is_lbl_ins {
+            let pw: i64 = m2d_operand(arr, n, cur + 1);
+            let valid: trit = (1 - m2d_is_err(pw)) <=> 0;
+            let w2: bytes = if_pos valid {
+                let slot: i64 = m2lbl_slot_of(pw);
+                m2lbl_define(w, slot, ii)
+            } else {
+                w
+            };
+            w2
+        } else {
+            w
+        };
+        let nxt: i64 = m2d_decode_at(arr, n, cur);
+        cur = m2u_sel(m2d_is_err(nxt), n, nxt);
+        ii = ii + 1;
+    }
+    return w;
+}

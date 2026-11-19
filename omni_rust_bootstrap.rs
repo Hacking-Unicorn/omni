@@ -22081,6 +22081,8 @@ pub fn run_m2_foundation_selftests() -> Result<usize, String> {
     n += selftest_m2_label_reference()?;
     n += selftest_m2_lint()?;
     n += selftest_m2_decode_diff()?;
+    n += selftest_m3_isa_encode_roundtrip()?;
+    n += selftest_m2_labels_table()?;
     Ok(n)
 }
 
