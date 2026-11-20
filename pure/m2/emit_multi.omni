@@ -333,10 +333,10 @@ fn m2m_emit_iset_patch(arena: bytes, mv: i64, p2: i64, p3: i64, pass: i64) -> by
         let t: bytes = m2m_load_op(arena, p2, 1);
         t = m2m_load_op(t, p3, 0);
         t = m2x_b3(t, 72, 133, 201);                        // 48 85 C9
-        t = m2a_emit_u16(t, 3960);                          // 78 0F (0x0F78)
+        t = m2a_emit_u16(t, 3448);                          // 78 0D (0x0D78)
         t = m2x_b4(t, 72, 141, 113, 8);                     // 48 8D 71 08
         t = m2x_b3(t, 76, 57, 222);                         // 4C 39 DE
-        t = m2a_emit_u16(t, 1655);                          // 77 06 (0x0677)
+        t = m2a_emit_u16(t, 1143);                          // 77 04 (0x0477)
         m2x_b4(t, 72, 137, 4, 11)                           // 48 89 04 0B
     } else {
         let width: i64 = 0 - mv;
@@ -877,9 +877,9 @@ fn m2m_run_all_fns(arena: bytes, arr: array, n: i64, first_fn: i64, pass: i64) -
     return w;
 }
 
-// Top-level Pure-Omni two-pass multi-function u16 -> x86-64 ELF64 compiler (M2-15).
+// Top-level Pure-Omni two-pass multi-function u16 -> x86-64 ELF64 compiler (in-place into arena).
 #[strict]
-fn m2_compile_multi_x86(arena: bytes, arr: array, arg0: i64, arg1: i64, arg2: i64) -> bytes {
+fn m2_compile_multi_x86_into(arena: bytes, arr: array, arg0: i64, arg1: i64, arg2: i64) -> bytes {
     let n: i64 = slen(arr);
     let first_fn: i64 = m2m_first_fn_pos(arr, n);
     let einfo: i64 = m2m_find_entry(arr, n, first_fn);
@@ -896,5 +896,11 @@ fn m2_compile_multi_x86(arena: bytes, arr: array, arg0: i64, arg1: i64, arg2: i6
     w = m2e_emit_elf64_hdr(w, total_size);
     w = m2m_emit_entry_stub(w, entry_b, entry_fn, arg0, arg1, arg2, 2);
     w = m2m_run_all_fns(w, arr, n, first_fn, 2);
-    return m2a_finish_slice(w);
+    return w;
+}
+
+// Top-level Pure-Omni two-pass multi-function u16 -> x86-64 ELF64 compiler (M2-15, returns slice).
+#[strict]
+fn m2_compile_multi_x86(arena: bytes, arr: array, arg0: i64, arg1: i64, arg2: i64) -> bytes {
+    return m2a_finish_slice(m2_compile_multi_x86_into(arena, arr, arg0, arg1, arg2));
 }

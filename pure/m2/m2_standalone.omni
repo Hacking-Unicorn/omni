@@ -11,5 +11,12 @@
 #[strict]
 fn m2_standalone_entry(arr: array, arg0: i64, arg1: i64, arg2: i64) -> bytes {
     let w: bytes = anew(0);
-    return m2_compile_multi_x86(w, arr, arg0, arg1, arg2);
+    let i: i64 = 0;
+    while 65536 - i <=> 0 {
+        w = iset_i64(w, 0);
+        i = i + 1;
+    }
+    w = m2_compile_multi_x86_into(w, arr, arg0, arg1, arg2);
+    let n: i64 = ld_u64(w, m2l_regs());
+    return ret_slice(w, m2l_out(), n);
 }

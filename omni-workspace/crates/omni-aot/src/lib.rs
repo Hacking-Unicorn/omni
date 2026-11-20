@@ -1085,9 +1085,9 @@ pub fn compile_pure_u16_to_x86_64_elf_multi(
                         emit_load_op(&mut code, &ins.operands[2], true);
                         emit_load_op(&mut code, &ins.operands[3], false);
                         code.extend_from_slice(&[
-                            0x48, 0x85, 0xC9, 0x78, 0x0F,
+                            0x48, 0x85, 0xC9, 0x78, 0x0D,
                             0x48, 0x8D, 0x71, 0x08,
-                            0x4C, 0x39, 0xDE, 0x77, 0x06,
+                            0x4C, 0x39, 0xDE, 0x77, 0x04,
                             0x48, 0x89, 0x04, 0x0B,
                         ]);
                     } else if ins.operands.len() == 4

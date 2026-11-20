@@ -920,10 +920,8 @@ pub fn selftest_m2_16_fixed_point(write_seed: bool) -> Result<(usize, usize, u64
         ));
     }
 
-    #[allow(unused_mut)]
-    let mut native_verified = false;
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    {
+    let native_verified = {
         use std::os::unix::fs::PermissionsExt;
         let p_bc = std::env::temp_dir().join("omni_m2_seed_fp.omni_bc");
         let p_s1 = std::env::temp_dir().join("omni_m2_s1.elf");
@@ -972,8 +970,10 @@ pub fn selftest_m2_16_fixed_point(write_seed: bool) -> Result<(usize, usize, u64
                 s3.len(), fnv1a_64_hash(&s3), s2.len(), fnv1a_64_hash(&s2)
             ));
         }
-        native_verified = true;
-    }
+        true
+    };
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    let native_verified = false;
 
     Ok((3, seed_u16.len(), fnv1a_64_hash(&seed_bytes), s1.len(), fnv1a_64_hash(&s1), native_verified))
 }
