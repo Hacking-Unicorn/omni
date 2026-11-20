@@ -561,6 +561,7 @@ pub const M2_PURE_MODULES: &[(&str, &str)] = &[
     ("pure/m2/util.omni+pure/m3/arena.omni+pure/m3/lex.omni+spec/m3/lex_harness.omni", M3_LEX_OMNI_SRC),
     ("pure/m3/skim.omni+spec/m3/skim_harness.omni", M3_SKIM_OMNI_SRC),
     ("pure/m3/expr.omni+spec/m3/expr_harness.omni", M3_EXPR_OMNI_SRC),
+    ("pure/m3/stmt.omni+spec/m3/stmt_harness.omni", M3_STMT_OMNI_SRC),
 ];
 
 /// Lint fixtures: (name, source, the exact comma-separated rule set it must trip; "" = clean).

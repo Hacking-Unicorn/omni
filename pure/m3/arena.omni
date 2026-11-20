@@ -69,6 +69,8 @@ fn m3err_budget() -> i64 { return 3; }
 fn m3err_bad_type() -> i64 { return 4; }
 #[strict]
 fn m3err_missing_cap() -> i64 { return 5; }
+#[strict]
+fn m3err_unresolved_label() -> i64 { return 6; }
 
 #[strict]
 fn m3a_g_get(arena: bytes, slot: i64) -> i64 {

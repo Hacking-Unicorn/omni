@@ -530,6 +530,12 @@ pub const M3_EXPR_OMNI_SRC: &str = concat!(
     include_str!("../spec/m3/expr_harness.omni")
 );
 
+pub const M3_STMT_OMNI_SRC: &str = concat!(
+    include_str!("../pure/m3/stmt.omni"),
+    "\n",
+    include_str!("../spec/m3/stmt_harness.omni")
+);
+
 /// M3-04 selftest: `pure/isa/encode.omni` re-encodes every positive acceptance golden,
 /// `pure/verifier_engine.omni` (11,893 words), and `build_step7_stage1_compiler_stream`
 /// (19,731 words) bit-for-bit identically to `encode_u16_stream_to_bytes`.
@@ -1357,7 +1363,113 @@ fn m3_08_cmp_expr(
                 cur = ((aw0 >> 48) & 0xFFFF) as usize;
             }
         }
-        other => return Err(format!("M3-08 '{}': unexpected Rust expr {:?}", name, other)),
+        SurfaceExpr::IfBranch(mnem, cond, tb, eb, _, _) => {
+            let want_op = if mnem == "BR_POS" { 1u8 } else { 2u8 };
+            if kind != 9 || op != want_op {
+                return Err(format!("M3-09 '{}': IfBranch mismatch Omni(k={},op={}) vs Rust {}", name, kind, op, mnem));
+            }
+            m3_08_cmp_expr(name, src, rtoks, ast, (w1 & 0xFFFF) as usize, cond)?;
+            m3_09_cmp_block(name, src, rtoks, ast, ((w1 >> 16) & 0xFFFF) as usize, tb)?;
+            m3_09_cmp_block(name, src, rtoks, ast, ((w1 >> 32) & 0xFFFF) as usize, eb)?;
+        }
+        SurfaceExpr::MatchTrit(scrut, neg, zero, pos, _, _) => {
+            if kind != 10 {
+                return Err(format!("M3-09 '{}': MatchTrit mismatch Omni(k={})", name, kind));
+            }
+            m3_08_cmp_expr(name, src, rtoks, ast, (w1 & 0xFFFF) as usize, scrut)?;
+            m3_09_cmp_block(name, src, rtoks, ast, ((w1 >> 16) & 0xFFFF) as usize, neg)?;
+            m3_09_cmp_block(name, src, rtoks, ast, ((w1 >> 32) & 0xFFFF) as usize, zero)?;
+            m3_09_cmp_block(name, src, rtoks, ast, ((w1 >> 48) & 0xFFFF) as usize, pos)?;
+        }
+    }
+    Ok(())
+}
+
+/// Recursively compares a Pure-Omni AST statement list (`head` linked via `w0 >> 48`) against Rust `&[SurfaceStmt]`.
+fn m3_09_cmp_block(
+    name: &str,
+    src: &str,
+    rtoks: &[SpannedSurfaceTok],
+    ast: &[u8],
+    head: usize,
+    stmts: &[SurfaceStmt],
+) -> Result<(), String> {
+    let mut cur = head;
+    for (si, st) in stmts.iter().enumerate() {
+        if cur == 0 || (cur + 1) * 16 > ast.len() {
+            return Err(format!("M3-09 '{}': block ended early at stmt#{} (cur={})", name, si, cur));
+        }
+        let off = cur * 16;
+        let w0 = u64::from_le_bytes(ast[off..off + 8].try_into().unwrap());
+        let w1 = u64::from_le_bytes(ast[off + 8..off + 16].try_into().unwrap());
+        let kind = (w0 & 0xFF) as u8;
+        let line = ((w0 >> 16) & 0xFFFF) as usize;
+        let col = ((w0 >> 32) & 0xFFFF) as usize;
+        let next = ((w0 >> 48) & 0xFFFF) as usize;
+        let (rl, rc) = st.span();
+        if line != rl || col != rc {
+            return Err(format!("M3-09 '{}' stmt#{}: span mismatch Omni ({},{}) vs Rust ({},{})", name, si, line, col, rl, rc));
+        }
+        let tok_ident = |ti: usize| -> &str {
+            match rtoks.get(ti).map(|t| &t.tok) {
+                Some(SurfaceTok::Ident(s)) => s.as_str(),
+                _ => "",
+            }
+        };
+        match st {
+            SurfaceStmt::Let(vname, _, expr, _, _) => {
+                if kind != 16 || tok_ident((w1 & 0xFFFF) as usize) != vname.as_str() {
+                    return Err(format!("M3-09 '{}' stmt#{}: Let mismatch for '{}'", name, si, vname));
+                }
+                m3_08_cmp_expr(name, src, rtoks, ast, ((w1 >> 16) & 0xFFFF) as usize, expr)?;
+            }
+            SurfaceStmt::Assign(vname, expr, _, _) => {
+                if kind != 17 || tok_ident((w1 & 0xFFFF) as usize) != vname.as_str() {
+                    return Err(format!("M3-09 '{}' stmt#{}: Assign mismatch for '{}'", name, si, vname));
+                }
+                m3_08_cmp_expr(name, src, rtoks, ast, ((w1 >> 16) & 0xFFFF) as usize, expr)?;
+            }
+            SurfaceStmt::DoWhile(body, cond, _, _) => {
+                if kind != 18 {
+                    return Err(format!("M3-09 '{}' stmt#{}: DoWhile mismatch (k={})", name, si, kind));
+                }
+                m3_09_cmp_block(name, src, rtoks, ast, (w1 & 0xFFFF) as usize, body)?;
+                m3_08_cmp_expr(name, src, rtoks, ast, ((w1 >> 16) & 0xFFFF) as usize, cond)?;
+            }
+            SurfaceStmt::While(cond, body, _, _) => {
+                if kind != 19 {
+                    return Err(format!("M3-09 '{}' stmt#{}: While mismatch (k={})", name, si, kind));
+                }
+                m3_08_cmp_expr(name, src, rtoks, ast, (w1 & 0xFFFF) as usize, cond)?;
+                m3_09_cmp_block(name, src, rtoks, ast, ((w1 >> 16) & 0xFFFF) as usize, body)?;
+            }
+            SurfaceStmt::Label(lid, _, _) => {
+                if kind != 20 || (w1 as u16) != *lid {
+                    return Err(format!("M3-09 '{}' stmt#{}: Label mismatch", name, si));
+                }
+            }
+            SurfaceStmt::Goto(lid, _, _) => {
+                if kind != 21 || (w1 as u16) != *lid {
+                    return Err(format!("M3-09 '{}' stmt#{}: Goto mismatch", name, si));
+                }
+            }
+            SurfaceStmt::Ret(expr, _, _) => {
+                if kind != 22 {
+                    return Err(format!("M3-09 '{}' stmt#{}: Ret mismatch (k={})", name, si, kind));
+                }
+                m3_08_cmp_expr(name, src, rtoks, ast, (w1 & 0xFFFF) as usize, expr)?;
+            }
+            SurfaceStmt::Expr(expr, _, _) => {
+                if kind != 23 {
+                    return Err(format!("M3-09 '{}' stmt#{}: Expr mismatch (k={})", name, si, kind));
+                }
+                m3_08_cmp_expr(name, src, rtoks, ast, (w1 & 0xFFFF) as usize, expr)?;
+            }
+        }
+        cur = next;
+    }
+    if cur != 0 {
+        return Err(format!("M3-09 '{}': extra trailing stmt node {}", name, cur));
     }
     Ok(())
 }
@@ -1437,6 +1549,86 @@ pub fn selftest_m3_08_expr_diff() -> Result<usize, String> {
                 }
                 let root_id = u16::from_le_bytes([out_bytes[0], out_bytes[1]]) as usize;
                 m3_08_cmp_expr(name, src, &rtoks, &out_bytes, root_id, &re)?;
+            }
+        }
+        checks += 1;
+    }
+    Ok(checks)
+}
+
+/// M3-09 selftest: Pure-Omni iterative statement/block/if_pos/match_trit parser (`pure/m3/stmt.omni`)
+/// differentially checked full-AST-for-full-AST against Rust `SurfaceParser::parse_module` across
+/// rich multi-construct programs, `pure/m2/util.omni`, `pure/m2/arena.omni`, `pure/verifier_engine.omni`,
+/// Q3/Q4/Q7 fixtures, and negative statement error fixtures.
+pub fn selftest_m3_09_stmt_diff() -> Result<usize, String> {
+    let stmt_mod = m2_compile_decoder(M3_STMT_OMNI_SRC)?;
+    let entry = m2_entry_of(&stmt_mod);
+    let cases: Vec<(&str, &str, bool)> = vec![
+        ("let_assign_compound", "#[strict]\nfn main(x: i64) -> i64 { let a: i64 = x + 1; a += 2; a -= 1; a *= 3; return a; }\n", false),
+        ("while_dowhile", "#[strict]\nfn main(x: i64) -> i64 { let s: i64 = 0; let i: i64 = x; while i <=> 0 { s += i; i -= 1; } do_while { s = s + 1; } (0 <=> 1); return s; }\n", false),
+        ("label_goto", "#[strict]\nfn main(x: i64) -> i64 { goto 1; label 1; return x; }\n", false),
+        ("if_pos_nested", "#[strict]\nfn main(x: i64) -> i64 { let c: trit = x <=> 0; let r: i64 = if_pos c { let d: trit = (x - 5) <=> 0; if_neg d { x + 10 } else { x - 10 } } else { -x }; return r; }\n", false),
+        ("match_trit_mixed", "#[strict]\nfn main(x: i64) -> i64 { let t: trit = x <=> 0; let r: i64 = match_trit t { neg => { let a: i64 = -1; a }, zero => 0, pos => { x + 1 } }; return r; }\n", false),
+        ("q3_neg_fold", include_str!("../spec/m3/fixtures/q3_neg_fold.omni"), false),
+        ("q4_le_ge", include_str!("../spec/m3/fixtures/q4_le_ge.omni"), false),
+        ("q7_fn_ids", include_str!("../spec/m3/fixtures/q7_fn_ids.omni"), false),
+        ("pure/m2/util.omni", include_str!("../pure/m2/util.omni"), true),
+        ("pure/m2/arena.omni", include_str!("../pure/m2/arena.omni"), true),
+        ("pure/verifier_engine.omni", OMNI_VERIFIER_ENGINE_SURFACE, true),
+        ("err_strict_let_no_ty", "#[strict]\nfn main(x: i64) -> i64 { let y = x; return y; }\n", false),
+        ("err_label_oob", "#[strict]\nfn main(x: i64) -> i64 { label 16; return x; }\n", false),
+        ("err_match_missing_arm", "#[strict]\nfn main(x: i64) -> i64 { let t: trit = x <=> 0; let r: i64 = match_trit t { neg => 1, pos => 2 }; return r; }\n", false),
+    ];
+
+    let mut checks = 0usize;
+    for &(name, src, strict_arg) in &cases {
+        let eff_strict = strict_arg || src.contains("#[strict]");
+        let rtoks = tokenize_omni_surface_inner(src, eff_strict)?;
+        let mut parser = SurfaceParser::new_with_strict(rtoks.clone(), eff_strict);
+        let rust_res = parser.parse_module();
+
+        let src_u16: Vec<u16> = src.as_bytes().iter().map(|&b| b as u16).collect();
+        let arena_len = (131_072 + src.len() * 16 + 4096).max(262_144);
+        let mut vm = OmniBinaryVm::with_budgets(300_000_000, 64 * 1024 * 1024);
+        let out_bytes = match vm.execute_function(
+            &stmt_mod,
+            entry,
+            vec![
+                OmniValue::Bytes(vec![0u8; arena_len]),
+                OmniValue::U16Array(src_u16),
+                OmniValue::Int(if strict_arg { 1 } else { 0 }),
+                OmniValue::Int(-1),
+            ],
+        )? {
+            OmniValue::Bytes(b) => b,
+            other => return Err(format!("M3-09 '{}': returned {:?}, expected Bytes", name, other)),
+        };
+        let is_omni_err = out_bytes.len() == 16 && u16::from_le_bytes([out_bytes[0], out_bytes[1]]) == 0xFFFF;
+        match rust_res {
+            Err(re) => {
+                if !is_omni_err {
+                    return Err(format!("M3-09 '{}': Rust errored ({}) but Omni succeeded", name, re));
+                }
+                let ecode = u16::from_le_bytes([out_bytes[2], out_bytes[3]]);
+                let want_code = if re.contains("AMBIGUOUS_GRAMMAR") { 2u16 }
+                    else if re.contains("BAD_TYPE") { 4u16 }
+                    else if re.contains("UNRESOLVED_LABEL") { 6u16 }
+                    else { 1u16 };
+                if ecode != want_code {
+                    return Err(format!("M3-09 '{}': error mismatch Omni={} vs Rust '{}'", name, ecode, re));
+                }
+            }
+            Ok((_incs, rfns)) => {
+                if is_omni_err {
+                    let ecode = u16::from_le_bytes([out_bytes[2], out_bytes[3]]);
+                    let eline = u16::from_le_bytes([out_bytes[4], out_bytes[5]]);
+                    let ecol = u16::from_le_bytes([out_bytes[6], out_bytes[7]]);
+                    return Err(format!("M3-09 '{}': Rust ok ({} fns) but Omni errored (code={}, {}:{})", name, rfns.len(), ecode, eline, ecol));
+                }
+                // `target_fn = -1` parses EVERY fn in the module and leaves the last fn's AST in `out_bytes`.
+                let root_head = u16::from_le_bytes([out_bytes[0], out_bytes[1]]) as usize;
+                let last_fn = rfns.last().unwrap();
+                m3_09_cmp_block(name, src, &rtoks, &out_bytes, root_head, &last_fn.body)?;
             }
         }
         checks += 1;

@@ -23014,6 +23014,7 @@ pub fn run_m2_foundation_selftests() -> Result<usize, String> {
     n += selftest_m3_06_lex_diff()?;
     n += selftest_m3_07_skim_diff()?;
     n += selftest_m3_08_expr_diff()?;
+    n += selftest_m3_09_stmt_diff()?;
     Ok(n)
 }
 
@@ -23361,6 +23362,16 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
                 1
             }
         },
+        "m3-stmt" => match selftest_m3_09_stmt_diff() {
+            Ok(n) => {
+                println!("[M3-STMT PASS] {} full-module Pass P ASTs parsed in Pure Omni with 100% stmt/block/if_pos/match_trit parity vs Rust (incl. verifier_engine.omni!)", n);
+                0
+            }
+            Err(e) => {
+                eprintln!("[M3-STMT FAIL] {}", e);
+                1
+            }
+        },
         _ => {
             eprintln!("usage: omni m2-frozen | m2-lock | m2-census | m2-labels | m2-lint [file.omni|file.omni_asm]... | m2-decode | m2-elf");
             2
@@ -23652,7 +23663,7 @@ fn main() {
             "harness" | "--harness" => {
                 std::process::exit(run_omni_harness_cli(&cli_args[2..]));
             }
-            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m3-lex" | "m3-skim" | "m3-expr" => {
+            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" => {
                 std::process::exit(run_m2_cli(&cli_args[1..]));
             }
             "agent-driver" | "--agent-driver" => {

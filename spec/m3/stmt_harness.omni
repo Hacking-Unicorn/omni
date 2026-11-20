@@ -1,0 +1,11 @@
+// ==============================================================================
+// spec/m3/stmt_harness.omni  (Milestone 3, M3-09) — Pass P AST diff harness
+// ==============================================================================
+// Entry point for `omnic m3-stmt`: invokes `m3_parse_all(arena, src, strict_arg, target_fn)`
+// and returns the 16-byte/node AST pool slice (or 16-byte error sentinel).
+// ==============================================================================
+
+#[strict]
+fn m3_stmt_main(arena: bytes, src: array, strict_arg: i64, target_fn: i64) -> bytes {
+    return m3_parse_all(arena, src, strict_arg, target_fn);
+}
