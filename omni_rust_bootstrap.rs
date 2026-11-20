@@ -18307,7 +18307,7 @@ pub fn compile_pure_u16_to_x86_64_elf_multi(
                         Some(BinOperand::Param(p_tok)) => func
                             .params
                             .get((*p_tok - PAR_BASE) as usize)
-                            .map(|&(ty, _, _)| ty == TY_ARRAY)
+                            .map(|&(_, ty, _)| ty == TY_ARRAY)
                             .unwrap_or(false),
                         _ => false,
                     };
@@ -23009,6 +23009,7 @@ pub fn run_m2_foundation_selftests() -> Result<usize, String> {
     n += selftest_m2_09_multi_aot()?;
     n += selftest_m2_11_arena_elf()?;
     n += selftest_m2_13_stage1_anchor()?;
+    n += selftest_m2_15_pure_multi_compiler()?;
     Ok(n)
 }
 
@@ -23292,6 +23293,16 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
             }
             Err(e) => {
                 eprintln!("[M2-MULTI FAIL] {}", e);
+                1
+            }
+        },
+        "m2-multi-pure" => match selftest_m2_15_pure_multi_compiler() {
+            Ok(n) => {
+                println!("[M2-MULTI-PURE PASS] {} Pure-Omni multi-function x86-64 ELF64 checks passed (0-byte diff vs Rust, including pure/compiler.omni & pure/verifier_engine.omni!)", n);
+                0
+            }
+            Err(e) => {
+                eprintln!("[M2-MULTI-PURE FAIL] {}", e);
                 1
             }
         },
@@ -23586,7 +23597,7 @@ fn main() {
             "harness" | "--harness" => {
                 std::process::exit(run_omni_harness_cli(&cli_args[2..]));
             }
-            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" => {
+            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" => {
                 std::process::exit(run_m2_cli(&cli_args[1..]));
             }
             "agent-driver" | "--agent-driver" => {

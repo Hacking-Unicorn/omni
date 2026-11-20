@@ -1015,7 +1015,7 @@ pub fn compile_pure_u16_to_x86_64_elf_multi(
                         Some(BinOperand::Param(p_tok)) => func
                             .params
                             .get((*p_tok - PAR_BASE) as usize)
-                            .map(|&(ty, _, _)| ty == TY_ARRAY)
+                            .map(|&(_, ty, _)| ty == TY_ARRAY)
                             .unwrap_or(false),
                         _ => false,
                     };

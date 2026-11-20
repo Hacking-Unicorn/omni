@@ -472,6 +472,26 @@ pub const M2_COMPILER_OMNI_SRC: &str = concat!(
     include_str!("../spec/m2/compiler_harness.omni")
 );
 
+pub const M2_MULTI_OMNI_SRC: &str = concat!(
+    include_str!("../pure/m2/util.omni"),
+    "\n",
+    include_str!("../pure/isa/table.omni"),
+    "\n",
+    include_str!("../pure/m2/decode.omni"),
+    "\n",
+    include_str!("../pure/m2/labels.omni"),
+    "\n",
+    include_str!("../pure/m2/arena.omni"),
+    "\n",
+    include_str!("../pure/m2/elf.omni"),
+    "\n",
+    include_str!("../pure/m2/emit_x86.omni"),
+    "\n",
+    include_str!("../pure/m2/emit_multi.omni"),
+    "\n",
+    include_str!("../spec/m2/multi_harness.omni")
+);
+
 /// M3-04 selftest: `pure/isa/encode.omni` re-encodes every positive acceptance golden,
 /// `pure/verifier_engine.omni` (11,893 words), and `build_step7_stage1_compiler_stream`
 /// (19,731 words) bit-for-bit identically to `encode_u16_stream_to_bytes`.
@@ -714,6 +734,97 @@ pub fn selftest_m2_13_stage1_anchor() -> Result<usize, String> {
             "M2-13 Stage-1 anchor hash/len mismatch: {} B / 0x{:016X}",
             got_elf.len(),
             fnv1a_64_hash(&got_elf)
+        ));
+    }
+    checks += 1;
+
+    Ok(checks)
+}
+
+/// M2-15 selftest: Pure-Omni multi-function x86-64 ELF64 compiler (`pure/m2/emit_multi.omni`)
+/// produces bit-for-bit identical ELF64 binaries (`0`-byte diff!) to Rust's
+/// `compile_pure_u16_to_x86_64_elf_multi` across multi-function call chains, 5-param stack args,
+/// Bytes threading + 3-op RET, `pure/compiler.omni` (7 fns), and `pure/verifier_engine.omni` (58 fns)!
+pub fn selftest_m2_15_pure_multi_compiler() -> Result<usize, String> {
+    let comp_mod = m2_compile_decoder(M2_MULTI_OMNI_SRC)?;
+    let entry = m2_entry_of(&comp_mod);
+    let compile_in_omni = |stream: &[u16], a0: i64, a1: i64, a2: i64| -> Result<Vec<u8>, String> {
+        let mut vm = OmniBinaryVm::with_budgets(500_000_000, 32 * 1024 * 1024);
+        let arena = OmniValue::Bytes(vec![0u8; 524_288]);
+        let res = vm.execute_function(
+            &comp_mod,
+            entry,
+            vec![
+                arena,
+                OmniValue::U16Array(stream.to_vec()),
+                OmniValue::Int(a0),
+                OmniValue::Int(a1),
+                OmniValue::Int(a2),
+            ],
+        )?;
+        match res {
+            OmniValue::Bytes(b) => Ok(b),
+            other => Err(format!("M2-15 compiler returned {:?}, expected Bytes", other)),
+        }
+    };
+    let cases: [(&str, &str); 5] = [
+        (
+            "mf_call_chain_2",
+            "#[strict]\nfn leaf(x: i64) -> i64 { return x * 3 + 1; }\n#[strict]\nfn main(x: i64) -> i64 { let r: i64 = leaf(x); return r + 5; }\n",
+        ),
+        (
+            "mf_params_5",
+            "#[strict]\nfn sum5(a: i64, b: i64, c: i64, d: i64, e: i64) -> i64 { return a + b * 2 + c * 3 + d * 4 + e * 5; }\n#[strict]\nfn main(x: i64) -> i64 { let r: i64 = sum5(x, x + 1, x + 2, x + 3, x + 4); return r; }\n",
+        ),
+        (
+            "mf_bytes_ret_slice",
+            "#[strict]\nfn fill(b: bytes, v: i64) -> bytes { let w: bytes = iset(b, v, v + 1, v + 2); return w; }\n#[strict]\nfn main(x: i64) -> bytes { let b: bytes = anew(0); b = fill(b, 10); return ret_slice(b, 1, 2); }\n",
+        ),
+        ("pure/compiler.omni", include_str!("../pure/compiler.omni")),
+        ("pure/verifier_engine.omni", OMNI_VERIFIER_ENGINE_SURFACE),
+    ];
+    let mut checks = 0usize;
+    for &(name, src) in &cases {
+        let u16s = compile_omni_surface_strict_to_u16(src)?;
+        let want = compile_pure_u16_to_x86_64_elf_multi(&u16s, 45, 40, 90)?;
+        let got = compile_in_omni(&u16s, 45, 40, 90)?;
+        if got != want {
+            let min_l = got.len().min(want.len());
+            let diff = (120..min_l).find(|&i| got[i] != want[i]).unwrap_or(min_l);
+            return Err(format!(
+                "M2-15 '{}' mismatch: got {} B (FNV=0x{:016X}) vs want {} B (FNV=0x{:016X}), first code diff at byte {} (got {:02X?} vs want {:02X?})",
+                name,
+                got.len(),
+                fnv1a_64_hash(&got),
+                want.len(),
+                fnv1a_64_hash(&want),
+                diff,
+                got.get(diff..diff.saturating_add(16).min(got.len())),
+                want.get(diff..diff.saturating_add(16).min(want.len()))
+            ));
+        }
+        checks += 1;
+    }
+
+    // 6. Self-compilation check: Pure Omni (`pure/m2/emit_multi.omni`) compiles `pure/m2/*.omni`
+    //    (standalone 4-param entry) byte-for-byte identically to Rust (`0`-byte diff!).
+    let m2_self_src = format!(
+        "{}\n#[strict]\nfn m2_standalone_main(arr: array, arg0: i64, arg1: i64, arg2: i64) -> bytes {{\n    let w: bytes = anew(0);\n    return m2_compile_single_x86(w, arr, arg0, arg1, arg2);\n}}\n",
+        M2_COMPILER_OMNI_SRC
+    );
+    let self_u16 = compile_omni_surface_strict_to_u16(&m2_self_src)?;
+    let want_self = compile_pure_u16_to_x86_64_elf_multi(&self_u16, 45, 40, 90)?;
+    let got_self = compile_in_omni(&self_u16, 45, 40, 90)?;
+    if got_self != want_self {
+        let min_l = got_self.len().min(want_self.len());
+        let diff = (120..min_l).find(|&i| got_self[i] != want_self[i]).unwrap_or(min_l);
+        return Err(format!(
+            "M2-15 self-compile mismatch: got {} B (FNV=0x{:016X}) vs want {} B (FNV=0x{:016X}), first code diff at byte {}",
+            got_self.len(),
+            fnv1a_64_hash(&got_self),
+            want_self.len(),
+            fnv1a_64_hash(&want_self),
+            diff
         ));
     }
     checks += 1;
