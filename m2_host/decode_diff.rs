@@ -492,6 +492,26 @@ pub const M2_MULTI_OMNI_SRC: &str = concat!(
     include_str!("../spec/m2/multi_harness.omni")
 );
 
+pub const M2_SELFHOST_OMNI_SRC: &str = concat!(
+    include_str!("../pure/m2/util.omni"),
+    "\n",
+    include_str!("../pure/isa/table.omni"),
+    "\n",
+    include_str!("../pure/m2/decode.omni"),
+    "\n",
+    include_str!("../pure/m2/labels.omni"),
+    "\n",
+    include_str!("../pure/m2/arena.omni"),
+    "\n",
+    include_str!("../pure/m2/elf.omni"),
+    "\n",
+    include_str!("../pure/m2/emit_x86.omni"),
+    "\n",
+    include_str!("../pure/m2/emit_multi.omni"),
+    "\n",
+    include_str!("../pure/m2/m2_standalone.omni")
+);
+
 /// M3-04 selftest: `pure/isa/encode.omni` re-encodes every positive acceptance golden,
 /// `pure/verifier_engine.omni` (11,893 words), and `build_step7_stage1_compiler_stream`
 /// (19,731 words) bit-for-bit identically to `encode_u16_stream_to_bytes`.
@@ -830,6 +850,120 @@ pub fn selftest_m2_15_pure_multi_compiler() -> Result<usize, String> {
     checks += 1;
 
     Ok(checks)
+}
+
+/// M2-16: Self-hosted M2 compiler fixed-point verification (`pure/m2/m2.omni_bc`).
+/// 1. Drift check: `RustFrontend(pure/m2/*.omni) == pure/m2/m2.omni_bc` (0-byte diff).
+/// 2. Self-compile parity: `M2_vm(m2.omni_bc) == RustEmitMulti(m2.omni_bc)` (0-byte diff, S1 == V).
+/// 3. Native Linux x86-64 triple fixed point: `S1(m2.omni_bc) -> S2`, `S2(m2.omni_bc) -> S3`,
+///    asserting `S1 == S2 == S3` (prints explicit SKIPPED on non-Linux hosts per PLAN.md §4).
+pub fn selftest_m2_16_fixed_point(write_seed: bool) -> Result<(usize, usize, u64, usize, u64, bool), String> {
+    let seed_u16 = compile_omni_surface_strict_to_u16(M2_SELFHOST_OMNI_SRC)?;
+    let seed_bytes = encode_u16_stream_to_bytes(&seed_u16);
+    if write_seed {
+        std::fs::write("pure/m2/m2.omni_bc", &seed_bytes)
+            .map_err(|e| format!("Failed to write pure/m2/m2.omni_bc: {}", e))?;
+    }
+    let committed_seed: &[u8] = include_bytes!("../pure/m2/m2.omni_bc");
+    if !write_seed && committed_seed != seed_bytes.as_slice() {
+        return Err(format!(
+            "M2-16 seed drift: committed pure/m2/m2.omni_bc ({} B, FNV=0x{:016X}) != RustFrontend(pure/m2/*.omni) ({} B, FNV=0x{:016X}); run `omnic m2-fixed-point --write-seed`",
+            committed_seed.len(),
+            fnv1a_64_hash(committed_seed),
+            seed_bytes.len(),
+            fnv1a_64_hash(&seed_bytes)
+        ));
+    }
+
+    // S1 = RustEmitMulti(T), V = M2_vm(T)
+    let s1 = compile_pure_u16_to_x86_64_elf_multi(&seed_u16, 45, 40, 90)?;
+    let comp_mod = m2_compile_decoder(M2_MULTI_OMNI_SRC)?;
+    let entry = m2_entry_of(&comp_mod);
+    let mut vm = OmniBinaryVm::with_budgets(1_000_000_000, 64 * 1024 * 1024);
+    let arena = OmniValue::Bytes(vec![0u8; 524_288]);
+    let v_elf = match vm.execute_function(
+        &comp_mod,
+        entry,
+        vec![
+            arena,
+            OmniValue::U16Array(seed_u16.clone()),
+            OmniValue::Int(45),
+            OmniValue::Int(40),
+            OmniValue::Int(90),
+        ],
+    )? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("M2-16 VM self-compile returned {:?}, expected Bytes", other)),
+    };
+    if v_elf != s1 {
+        let min_l = v_elf.len().min(s1.len());
+        let diff = (120..min_l).find(|&i| v_elf[i] != s1[i]).unwrap_or(min_l);
+        return Err(format!(
+            "M2-16 S1 != V mismatch: V={} B (0x{:016X}) vs S1={} B (0x{:016X}), first code diff at byte {}",
+            v_elf.len(),
+            fnv1a_64_hash(&v_elf),
+            s1.len(),
+            fnv1a_64_hash(&s1),
+            diff
+        ));
+    }
+
+    #[allow(unused_mut)]
+    let mut native_verified = false;
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let p_bc = std::env::temp_dir().join("omni_m2_seed_fp.omni_bc");
+        let p_s1 = std::env::temp_dir().join("omni_m2_s1.elf");
+        let p_s2 = std::env::temp_dir().join("omni_m2_s2.elf");
+        std::fs::write(&p_bc, &seed_bytes).map_err(|e| format!("write tmp bc: {}", e))?;
+        std::fs::write(&p_s1, &s1).map_err(|e| format!("write tmp s1: {}", e))?;
+        std::fs::set_permissions(&p_s1, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod s1: {}", e))?;
+        let out2 = std::process::Command::new(&p_s1)
+            .arg(&p_bc)
+            .arg("45")
+            .arg("40")
+            .arg("90")
+            .output()
+            .map_err(|e| format!("exec s1: {}", e))?;
+        if !out2.status.success() {
+            return Err(format!("M2-16 S1 exited with {:?}", out2.status));
+        }
+        let s2 = out2.stdout;
+        if s2 != s1 {
+            return Err(format!(
+                "M2-16 S2 != S1: S2={} B (0x{:016X}) vs S1={} B (0x{:016X})",
+                s2.len(), fnv1a_64_hash(&s2), s1.len(), fnv1a_64_hash(&s1)
+            ));
+        }
+        std::fs::write(&p_s2, &s2).map_err(|e| format!("write tmp s2: {}", e))?;
+        std::fs::set_permissions(&p_s2, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod s2: {}", e))?;
+        let out3 = std::process::Command::new(&p_s2)
+            .arg(&p_bc)
+            .arg("45")
+            .arg("40")
+            .arg("90")
+            .output()
+            .map_err(|e| format!("exec s2: {}", e))?;
+        if !out3.status.success() {
+            return Err(format!("M2-16 S2 exited with {:?}", out3.status));
+        }
+        let s3 = out3.stdout;
+        let _ = std::fs::remove_file(&p_bc);
+        let _ = std::fs::remove_file(&p_s1);
+        let _ = std::fs::remove_file(&p_s2);
+        if s3 != s2 {
+            return Err(format!(
+                "M2-16 S3 != S2: S3={} B (0x{:016X}) vs S2={} B (0x{:016X})",
+                s3.len(), fnv1a_64_hash(&s3), s2.len(), fnv1a_64_hash(&s2)
+            ));
+        }
+        native_verified = true;
+    }
+
+    Ok((3, seed_u16.len(), fnv1a_64_hash(&seed_bytes), s1.len(), fnv1a_64_hash(&s1), native_verified))
 }
 
 /// `omni m2-decode` runs the decoder differential; `omni m2-decode <file.omni_bc>` decodes one

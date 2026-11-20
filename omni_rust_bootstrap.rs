@@ -23010,6 +23010,7 @@ pub fn run_m2_foundation_selftests() -> Result<usize, String> {
     n += selftest_m2_11_arena_elf()?;
     n += selftest_m2_13_stage1_anchor()?;
     n += selftest_m2_15_pure_multi_compiler()?;
+    n += selftest_m2_16_fixed_point(false)?.0;
     Ok(n)
 }
 
@@ -23306,6 +23307,27 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
                 1
             }
         },
+        "m2-fixed-point" => {
+            let write_seed = args.get(1).map(|s| s.as_str()) == Some("--write-seed");
+            match selftest_m2_16_fixed_point(write_seed) {
+                Ok((_, words, bc_fnv, elf_len, elf_fnv, native)) => {
+                    let nat_str = if native {
+                        "S1 == S2 == S3 == V (native Linux x86-64 verified)"
+                    } else {
+                        "S1 == V (0-byte diff; native S2/S3 SKIPPED on non-Linux-x86-64)"
+                    };
+                    println!(
+                        "[M2-FIXED-POINT PASS] pure/m2/m2.omni_bc={} words (FNV-1a64=0x{:016X}) | ELF64={} B (FNV-1a64=0x{:016X}) | {}",
+                        words, bc_fnv, elf_len, elf_fnv, nat_str
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("[M2-FIXED-POINT FAIL] {}", e);
+                    1
+                }
+            }
+        }
         _ => {
             eprintln!("usage: omni m2-frozen | m2-lock | m2-census | m2-labels | m2-lint [file.omni|file.omni_asm]... | m2-decode | m2-elf");
             2
@@ -23597,7 +23619,7 @@ fn main() {
             "harness" | "--harness" => {
                 std::process::exit(run_omni_harness_cli(&cli_args[2..]));
             }
-            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" => {
+            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" => {
                 std::process::exit(run_m2_cli(&cli_args[1..]));
             }
             "agent-driver" | "--agent-driver" => {

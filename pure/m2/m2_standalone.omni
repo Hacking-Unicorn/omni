@@ -1,0 +1,15 @@
+// ==============================================================================
+// pure/m2/m2_standalone.omni  (Milestone 2, M2-16) — Standalone M2 compiler entry
+// ==============================================================================
+// Link order: pure/m2/util.omni, pure/isa/table.omni, pure/m2/decode.omni,
+//             pure/m2/labels.omni, pure/m2/arena.omni, pure/m2/elf.omni,
+//             pure/m2/emit_x86.omni, pure/m2/emit_multi.omni, this file.
+// 4-parameter standalone entry point for compiling `pure/m2/m2.omni_bc` into a
+// self-hosted native Linux x86-64 ELF64 binary (M2-16 fixed point).
+// ==============================================================================
+
+#[strict]
+fn m2_standalone_entry(arr: array, arg0: i64, arg1: i64, arg2: i64) -> bytes {
+    let w: bytes = anew(0);
+    return m2_compile_multi_x86(w, arr, arg0, arg1, arg2);
+}
