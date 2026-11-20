@@ -536,6 +536,12 @@ pub const M3_STMT_OMNI_SRC: &str = concat!(
     include_str!("../spec/m3/stmt_harness.omni")
 );
 
+pub const M3_LOWER_OMNI_SRC: &str = concat!(
+    include_str!("../pure/m3/lower.omni"),
+    "\n",
+    include_str!("../spec/m3/lower_harness.omni")
+);
+
 /// M3-04 selftest: `pure/isa/encode.omni` re-encodes every positive acceptance golden,
 /// `pure/verifier_engine.omni` (11,893 words), and `build_step7_stage1_compiler_stream`
 /// (19,731 words) bit-for-bit identically to `encode_u16_stream_to_bytes`.
@@ -1629,6 +1635,93 @@ pub fn selftest_m3_09_stmt_diff() -> Result<usize, String> {
                 let root_head = u16::from_le_bytes([out_bytes[0], out_bytes[1]]) as usize;
                 let last_fn = rfns.last().unwrap();
                 m3_09_cmp_block(name, src, &rtoks, &out_bytes, root_head, &last_fn.body)?;
+            }
+        }
+        checks += 1;
+    }
+    Ok(checks)
+}
+
+/// M3-10 selftest: Pure-Omni iterative lowering & module packer (`pure/m3/lower.omni`)
+/// differentially checked WORD-FOR-WORD (0-word diff!) against Rust `compile_omni_surface_to_u16`
+/// across arithmetic/bitwise/Q3/Q4, loops, labels/gotos, multi-fn calls (Q7), nested calls,
+/// memory/slice intrinsics, real `pure/m2/util.omni`, and negative lowering error fixtures.
+pub fn selftest_m3_10_lower_diff() -> Result<usize, String> {
+    let lower_mod = m2_compile_decoder(M3_LOWER_OMNI_SRC)?;
+    let entry = m2_entry_of(&lower_mod);
+    let cases: Vec<(&str, &str, bool)> = vec![
+        ("arith_bitwise", "#[strict]\nfn main(a: i64, b: i64) -> i64 { let x: i64 = (a + b) * 3 - (a / 2) % 5; let y: i64 = (x ^ b) | (a & 255); return (y << 2) >> 1; }\n", false),
+        ("q3_neg_fold", include_str!("../spec/m3/fixtures/q3_neg_fold.omni"), false),
+        ("q4_le_ge", include_str!("../spec/m3/fixtures/q4_le_ge.omni"), false),
+        ("q7_fn_ids", include_str!("../spec/m3/fixtures/q7_fn_ids.omni"), false),
+        ("compound_while_dowhile", "#[strict]\nfn main(x: i64) -> i64 { let s: i64 = 0; let i: i64 = x; while i <=> 0 { s += i; i -= 1; } do_while { s *= 2; } (0 <=> 1); return s; }\n", false),
+        ("label_goto", "#[strict]\nfn main(x: i64) -> i64 { goto 2; label 1; return 99; label 2; return x + 1; }\n", false),
+        ("nested_calls", "#[strict]\nfn add(a: i64, b: i64) -> i64 { return a + b; }\n#[strict]\nfn mul(a: i64, b: i64) -> i64 { return a * b; }\n#[strict]\nfn main(x: i64) -> i64 { return add(x, mul(add(x, 1), 3)); }\n", false),
+        ("mem_and_ret_slice", "#[strict]\nfn main(x: i64) -> bytes { let b: bytes = anew(0); b = iset_i64(b, x); b = st_u32(b, 0, x + 1); let v: i64 = ld_u32(b, 0); b = iset_patch_i64(b, 0, v); return ret_slice(b, 0, 8); }\n", false),
+        ("pure/m2/util.omni", include_str!("../pure/m2/util.omni"), true),
+        ("neg_undef_var", include_str!("../spec/m3/fixtures/neg_undef_var.omni"), false),
+        ("neg_immut_param", include_str!("../spec/m3/fixtures/neg_immut_param.omni"), false),
+        ("neg_unresolved_label", include_str!("../spec/m3/fixtures/neg_unresolved_label.omni"), false),
+        ("neg_unknown_fn", include_str!("../spec/m3/fixtures/neg_unknown_fn.omni"), false),
+        ("neg_arity_mismatch", include_str!("../spec/m3/fixtures/neg_arity_mismatch.omni"), false),
+    ];
+
+    let mut checks = 0usize;
+    for &(name, src, strict_arg) in &cases {
+        let rust_res = with_lockstep_suspended(|| {
+            if strict_arg { compile_omni_surface_strict_to_u16(src) } else { compile_omni_surface_to_u16(src) }
+        });
+        let src_u16: Vec<u16> = src.as_bytes().iter().map(|&b| b as u16).collect();
+        let arena_len = (131_072 + src.len() * 16 + 65_536).max(327_680);
+        let mut vm = OmniBinaryVm::with_budgets(300_000_000, 64 * 1024 * 1024);
+        let out_bytes = match vm.execute_function(
+            &lower_mod,
+            entry,
+            vec![
+                OmniValue::Bytes(vec![0u8; arena_len]),
+                OmniValue::U16Array(src_u16),
+                OmniValue::Int(if strict_arg { 1 } else { 0 }),
+            ],
+        )? {
+            OmniValue::Bytes(b) => b,
+            other => return Err(format!("M3-10 '{}': returned {:?}, expected Bytes", name, other)),
+        };
+        let is_omni_err = out_bytes.len() == 16 && u16::from_le_bytes([out_bytes[0], out_bytes[1]]) == 0xFFFF;
+        match rust_res {
+            Err(re) => {
+                if !is_omni_err {
+                    return Err(format!("M3-10 '{}': Rust errored ({}) but Omni succeeded ({} w)", name, re, out_bytes.len() / 2));
+                }
+                let ecode = u16::from_le_bytes([out_bytes[2], out_bytes[3]]);
+                let want_code = if re.contains("UNRESOLVED_LABEL") { 6u16 }
+                    else if re.contains("UNDEF_VAR") { 7u16 }
+                    else if re.contains("IMMUT_PARAM") { 8u16 }
+                    else if re.contains("UNKNOWN_FN") { 9u16 }
+                    else if re.contains("ARITY_MISMATCH") { 10u16 }
+                    else if re.contains("BUDGET_EXCEEDED") { 3u16 }
+                    else if re.contains("BAD_TYPE") { 4u16 }
+                    else { 1u16 };
+                if ecode != want_code {
+                    return Err(format!("M3-10 '{}': error mismatch Omni={} vs Rust '{}'", name, ecode, re));
+                }
+            }
+            Ok(want_u16) => {
+                if is_omni_err {
+                    let ecode = u16::from_le_bytes([out_bytes[2], out_bytes[3]]);
+                    let eline = u16::from_le_bytes([out_bytes[4], out_bytes[5]]);
+                    let ecol = u16::from_le_bytes([out_bytes[6], out_bytes[7]]);
+                    return Err(format!("M3-10 '{}': Rust ok ({} w) but Omni errored (code={}, {}:{})", name, want_u16.len(), ecode, eline, ecol));
+                }
+                let got_u16: Vec<u16> = out_bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+                if got_u16 != want_u16 {
+                    let min_l = got_u16.len().min(want_u16.len());
+                    let diff = (0..min_l).find(|&i| got_u16[i] != want_u16[i]).unwrap_or(min_l);
+                    return Err(format!(
+                        "M3-10 '{}': stream mismatch Omni {} w vs Rust {} w, first diff at word {} (Omni=0x{:04X} vs Rust=0x{:04X})",
+                        name, got_u16.len(), want_u16.len(), diff,
+                        got_u16.get(diff).copied().unwrap_or(0), want_u16.get(diff).copied().unwrap_or(0)
+                    ));
+                }
             }
         }
         checks += 1;

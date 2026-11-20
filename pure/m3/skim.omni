@@ -510,7 +510,8 @@ fn m3s_emit_fn_rec(arena: bytes, name_off: i64, name_len: i64, is_route: i64, bo
     let m32: i64 = m2u_mask32();
     let w0: i64 = (fid_val & 65535) | ((nparams & 65535) << 16) | ((ret_ty & 65535) << 32) | ((cap_mask & 65535) << 48);
     let w1: i64 = (name_off & m32) | ((name_len & 65535) << 32) | ((flags & 65535) << 48);
-    let w2: i64 = (body_start & m32) | ((body_end & m32) << 32);
+    let fn_tok: i64 = ld_u64(arena, 224);
+    let w2: i64 = (body_start & m32) | ((body_end & 65535) << 32) | ((fn_tok & 65535) << 48);
     let w3: i64 = (fn_line & 65535) | ((fn_col & 65535) << 16) | ((ret_line & 65535) << 32) | ((ret_col & 65535) << 48);
     let u: bytes = iset_patch_i64(arena, base, w0);
     u = iset_patch_i64(u, base + 8, w1);
@@ -592,7 +593,8 @@ fn m3s_parse_fn(arena: bytes, src: array, ntok: i64) -> bytes {
     let v1: i64 = ld_u64(arena, m3l_out() + (((ti + 1) * ok2) << 4) + 8);
     let is_id: trit = (ok2 * m2u_eq(h1 & 65535, 8)) <=> 0;
     let r: bytes = if_pos is_id {
-        let u: bytes = m3s_parse_params(iset_patch_i64(arena, 96, ti + 2), src, ntok);
+        let u: bytes = iset_patch_i64(arena, 224, ti);
+        u = m3s_parse_params(iset_patch_i64(u, 96, ti + 2), src, ntok);
         m3s_fn_tail(u, src, ntok, 1, v1, (h1 >> 16) & 65535, 0, (h0 >> 32) & 65535, (h0 >> 48) & 65535)
     } else {
         m3a_set_err(arena, m3err_syntax(), (h0 >> 32) & 65535, (h0 >> 48) & 65535)
