@@ -16,9 +16,13 @@ jobs:
       - name: Install Rust stable toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Run standalone monolith selftest (378 checks + Stage-1/Stage-2 & Gen-1/Gen-2 ELF64 fixed points + pure-omni-diff + harness & agent-driver contract)
+      - name: Run standalone monolith selftest (fixed-point + M2 lint/elf + 4-backend diff + pure-omni-diff + acceptance-diff + harness)
         run: |
           rustc -O omni_rust_bootstrap.rs -o omni
+          ./omni fixed-point
+          ./omni m2-lint
+          ./omni m2-elf
+          ./omni backend-diff --suite
           ./omni selftest
           ./omni pure-bootstrap
           ./omni pure-omni-diff
@@ -28,17 +32,17 @@ jobs:
           ./omni agent-driver --list-strategies
           ./omni agent-driver --strict "fn main(a: int) -> trit { let d = a - 10; let g = egate(d); return g; }" 25
 
-      - name: Build and run 8-crate Cargo workspace differential selftest (339/340 checks + pure-omni-diff + omni-harness & omni-agent-driver binaries)
+      - name: Build and run 8-crate Cargo workspace differential selftest (--release + cargo test)
         working-directory: omni-workspace
         env:
           CARGO_INCREMENTAL: "0"
         run: |
-          cargo build --workspace
-          cargo run -p omni-cli -- selftest
-          cargo run -p omni-cli -- pure-bootstrap
-          cargo run -p omni-cli -- pure-omni-diff
-          cargo run -p omni-cli -- acceptance-diff
-          cargo run -p omni-cli --bin omni-harness -- --spec
-          cargo run -p omni-cli --bin omni-agent-driver -- --list-strategies
-          cargo run -p omni-cli --bin omni-agent-driver -- --strict "fn main(a: int) -> trit { let d = a - 10; let g = egate(d); return g; }" 25
-          cargo test --workspace
+          cargo build --release --workspace
+          cargo run --release -p omni-cli -- selftest
+          cargo run --release -p omni-cli -- pure-bootstrap
+          cargo run --release -p omni-cli -- pure-omni-diff
+          cargo run --release -p omni-cli -- acceptance-diff
+          cargo run --release -p omni-cli --bin omni-harness -- --spec
+          cargo run --release -p omni-cli --bin omni-agent-driver -- --list-strategies
+          cargo run --release -p omni-cli --bin omni-agent-driver -- --strict "fn main(a: int) -> trit { let d = a - 10; let g = egate(d); return g; }" 25
+          cargo test --release --workspace
