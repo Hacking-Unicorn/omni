@@ -22413,6 +22413,7 @@ pub fn run_m2_foundation_selftests() -> Result<usize, String> {
     n += selftest_m3_isa_encode_roundtrip()?;
     n += selftest_m2_labels_table()?;
     n += selftest_m2_08_multi_aot_precheck()?;
+    n += selftest_m2_11_arena_elf()?;
     Ok(n)
 }
 
@@ -22580,8 +22581,18 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
         },
         "m2-lint" => m2_lint_cli(&args[1..]),
         "m2-decode" => m2_decode_cli(&args[1..]),
+        "m2-elf" => match selftest_m2_11_arena_elf() {
+            Ok(n) => {
+                println!("[M2-ELF PASS] {} M2-11 arena/ELF64 checks passed", n);
+                0
+            }
+            Err(e) => {
+                eprintln!("[M2-ELF FAIL] {}", e);
+                1
+            }
+        },
         _ => {
-            eprintln!("usage: omni m2-frozen | m2-lock | m2-census | m2-labels | m2-lint [file.omni|file.omni_asm]... | m2-decode");
+            eprintln!("usage: omni m2-frozen | m2-lock | m2-census | m2-labels | m2-lint [file.omni|file.omni_asm]... | m2-decode | m2-elf");
             2
         }
     }
@@ -22871,7 +22882,7 @@ fn main() {
             "harness" | "--harness" => {
                 std::process::exit(run_omni_harness_cli(&cli_args[2..]));
             }
-            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" => {
+            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" => {
                 std::process::exit(run_m2_cli(&cli_args[1..]));
             }
             "agent-driver" | "--agent-driver" => {

@@ -436,6 +436,22 @@ pub const M2_LABELS_OMNI_SRC: &str = concat!(
     include_str!("../spec/m2/labels_harness.omni")
 );
 
+pub const M2_ELF_OMNI_SRC: &str = concat!(
+    include_str!("../pure/m2/util.omni"),
+    "\n",
+    include_str!("../pure/isa/table.omni"),
+    "\n",
+    include_str!("../pure/m2/decode.omni"),
+    "\n",
+    include_str!("../pure/m2/labels.omni"),
+    "\n",
+    include_str!("../pure/m2/arena.omni"),
+    "\n",
+    include_str!("../pure/m2/elf.omni"),
+    "\n",
+    include_str!("../spec/m2/elf_harness.omni")
+);
+
 /// M3-04 selftest: `pure/isa/encode.omni` re-encodes every positive acceptance golden,
 /// `pure/verifier_engine.omni` (11,893 words), and `build_step7_stage1_compiler_stream`
 /// (19,731 words) bit-for-bit identically to `encode_u16_stream_to_bytes`.
@@ -523,6 +539,80 @@ pub fn selftest_m2_labels_table() -> Result<usize, String> {
         return Err(String::from("M2 labels: IMM 4080 must be rejected per D-11"));
     }
     checks += 1;
+    Ok(checks)
+}
+
+/// M2-11 selftest: `pure/m2/arena.omni` + `pure/m2/elf.omni`.
+/// Asserts D-7 rejection (>128 KiB), byte-exact 120-B ELF64 header vs Rust reference,
+/// and exact trap/multi-stub/prologue bytes via M2-06 `ret_slice`.
+pub fn selftest_m2_11_arena_elf() -> Result<usize, String> {
+    let elf_mod = m2_compile_decoder(M2_ELF_OMNI_SRC)?;
+    let entry = m2_entry_of(&elf_mod);
+    let run_h = |mode: i64, a1: i64, a2: i64| -> Result<Vec<u8>, String> {
+        let mut vm = OmniBinaryVm::with_budgets(50_000_000, 16 * 1024 * 1024);
+        let arena = OmniValue::Bytes(vec![0u8; 524_288]);
+        let res = vm
+            .execute_function(&elf_mod, entry, vec![arena, OmniValue::Int(mode), OmniValue::Int(a1), OmniValue::Int(a2)])
+            .map_err(|e| format!("M2-11 mode={} a1={} a2={}: {}", mode, a1, a2, e))?;
+        match res {
+            OmniValue::Bytes(b) => Ok(b),
+            other => Err(format!("M2-11 harness mode={} returned {:?}, expected Bytes", mode, other)),
+        }
+    };
+    let mut checks = 0usize;
+
+    // 1. D-7: nwords = 65537 (> 128 KiB) -> err = 1, out_len = 0
+    let b_over = run_h(0, 65537, 0)?;
+    if b_over.len() != 16 {
+        return Err(format!("M2-11 D-7 over-128K returned {} bytes, expected 16", b_over.len()));
+    }
+    let err_over = i64::from_le_bytes(b_over[0..8].try_into().unwrap());
+    let len_over = i64::from_le_bytes(b_over[8..16].try_into().unwrap());
+    if err_over != 1 || len_over != 0 {
+        return Err(format!("M2-11 D-7 over-128K expected (err=1, len=0), got ({}, {})", err_over, len_over));
+    }
+    checks += 1;
+
+    // 2. D-7: nwords = 65536 (exact 128 KiB boundary) -> err = 0, out_len = 0
+    let b_ok = run_h(0, 65536, 0)?;
+    let err_ok = i64::from_le_bytes(b_ok[0..8].try_into().unwrap());
+    let len_ok = i64::from_le_bytes(b_ok[8..16].try_into().unwrap());
+    if err_ok != 0 || len_ok != 0 {
+        return Err(format!("M2-11 D-7 boundary expected (err=0, len=0), got ({}, {})", err_ok, len_ok));
+    }
+    checks += 1;
+
+    // 3. 120-byte ELF64 header byte-exact vs Rust reference (compile_pure_u16_to_x86_64_elf_with_args)
+    let ref_u16 = compile_omni_surface_strict_to_u16("#[strict]\nfn f(x: i64) -> i64 { return x + 1; }\n")?;
+    let ref_elf = compile_pure_u16_to_x86_64_elf_with_args(&ref_u16, 0, 0, 0)?;
+    let omni_hdr = run_h(1, ref_elf.len() as i64, 0)?;
+    if omni_hdr.len() != 120 || omni_hdr.as_slice() != &ref_elf[..120] {
+        return Err(format!(
+            "M2-11 ELF64 header mismatch: len={} (want 120), first diff at {:?}",
+            omni_hdr.len(),
+            omni_hdr.iter().zip(ref_elf[..120].iter()).position(|(a, b)| a != b)
+        ));
+    }
+    checks += 1;
+
+    // 4. Trap stub (12 B) + multi stub head (25 B) + fn prologue (11 B) = 48 B exact bytes
+    let stubs = run_h(2, 42, 64)?;
+    let mut want_stubs: Vec<u8> = Vec::with_capacity(48);
+    // trap stub: BF 2A 00 00 00 B8 3C 00 00 00 0F 05
+    want_stubs.extend_from_slice(&[0xBF, 42, 0, 0, 0, 0xB8, 60, 0, 0, 0, 0x0F, 0x05]);
+    // multi stub head: 55 48 89 E5 48 81 EC 10 00 11 00 | 48 89 E3 | 48 C7 83 00 00 11 00 00 00 00 00
+    want_stubs.extend_from_slice(&[
+        0x55, 0x48, 0x89, 0xE5, 0x48, 0x81, 0xEC, 0x10, 0x00, 0x11, 0x00,
+        0x48, 0x89, 0xE3,
+        0x48, 0xC7, 0x83, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ]);
+    // fn prologue (frame_bytes = 64 = 0x40): 55 48 89 E5 48 81 EC 40 00 00 00
+    want_stubs.extend_from_slice(&[0x55, 0x48, 0x89, 0xE5, 0x48, 0x81, 0xEC, 64, 0, 0, 0]);
+    if stubs != want_stubs {
+        return Err(format!("M2-11 stubs mismatch: got {:02X?}, want {:02X?}", stubs, want_stubs));
+    }
+    checks += 1;
+
     Ok(checks)
 }
 
