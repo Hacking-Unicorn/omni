@@ -1,6 +1,6 @@
 # M3 decision record
 
-Recorded in M3-00 (`6234c0c`). **Updated 2026-11-14** to match `HANDOFF.md` §6/§8 on `docs/handoff` (`aa624b7`), which is the authority where the two disagree. Nothing here is new policy.
+Recorded in M3-00 (`6234c0c`). **Updated 2026-11-14** to match `HANDOFF.md` §6/§8 on `docs/handoff` (`aa624b7`), which is the authority where the two disagree. Nothing here is new policy. **Updated 2026-11-20:** O-3..O-9 and O-11 closed (decided by Caleb; O-3/O-4/O-5/O-7/O-8/O-9/O-11 confirmed by Lilith against the verified code at `eb60e2f`, O-6 accepted directly by Caleb).
 
 ## Settled (from Boss Lady / Caleb; treated as fixed)
 
@@ -30,16 +30,15 @@ Frozen values the guard checks on every commit:
 | O-1 | 15 or 16 labels? | **16** (S-2/S-3); 15 for frontend-compiled code until C4. |
 | O-2 | Hoist shared ISA/decoder code, or include `pure/m2/` read-only? | The shared decoder is Nyx's M2-04 in `pure/m2/`; Raven's ISA table/encoder build on it. M3 includes them read-only. Raven picks the module path. |
 | O-10 | M2's input window | **128 KiB** (M2 D-7), which fits the measured 34.5k-57.5k-word M3 image. |
+| O-3 | Linear-scan symtab with fnv32 compare keys vs "no hash maps"? | **Yes — linear-scan.** Verified in code (`pure/m3/skim.omni` uses FNV-1a hash keys with linear dispatch, no hash-map structure). Decided 2026-11-20. |
+| O-4 | Source input encoding | **The §3 split: `Bytes` on the VM, NUL-padded u16 natively.** Already implemented; proven by the M3-17/18 E2E chain. Decided 2026-11-20. |
+| O-5 | When to port include resolution to Omni? | **Deferred — host expands includes (status quo).** The M3 fixed point passes with this arrangement. Decided 2026-11-20. |
+| O-6 | New M3 capacity limits Rust doesn't have (512 nesting frames, 1024 fns, 128 macros, 32 KiB pool, 1024 AST nodes/fn) | **Accepted as documented errors.** Already baked into the arena layout and passing. Decided by Caleb 2026-11-20. |
+| O-7 | Error parity: `(class, line, col)` only, or exact message text too? | **`(class, line, col)` only** (M3-01 locks this). m3-lex holds 47/47 files at 100% token/error parity. Decided 2026-11-20. |
+| O-8 | Port `emit_asm` text mode to Omni? | **No — keep as Rust tooling** (PLAN §2). M3 is complete without porting it. Decided 2026-11-20. |
+| O-9 | Retire the monolith mirror before M3-14? | **No — mirror kept through M3-14.** Already satisfied: M3-14 (`2345447`) landed with the mirror kept. Decided 2026-11-20. |
+| O-11 | M3-02 gate: `m2-lint` + M2-08 check not shipped; gate fails closed | **Closed.** Both tools are wired in (`M3_GATE_TOOLS_WIRED = true`, m3-gate 6/6); `spec/m3/GATE.md` wording fixed 2026-11-20 (`7c410c2c`). Decided 2026-11-20. |
 
 ## Open (options only; not decided)
 
-| # | Question |
-|---|---|
-| O-3 | Do linear-scan symbol tables with fnv32 compare keys satisfy "no hash maps"? Not ruled on directly. The nearest ruling is KV/DB (HANDOFF §6.7): an arena sorted array with binary search is allowed. A linear scan with no buckets is the more conservative option, and that is what the plan uses. |
-| O-4 | Source input encoding: `Bytes` on the VM vs NUL-padded u16 words natively |
-| O-5 | When to port include resolution to Omni (via a host-provided source bundle) |
-| O-6 | New M3 capacity limits (nesting 512, 1024 fns, 128 macros, pools) that the Rust frontend doesn't have |
-| O-7 | Error parity on `(class, line, col)` only, or exact message text too? (M3-01 locks `(class, line, col)` only.) |
-| O-8 | Port the `emit_asm` text mode, or keep it as Rust tooling? |
-| O-9 | Retire the monolith mirror before the M3 lockstep (M3-14)? |
-| O-11 | M3-02 gate: `m2-lint` and the M2-08 call-depth check are not on any shipped branch yet (see `spec/m3/GATE.md`). The gate fails closed until they land. Reuse Nyx's tools when they ship, rather than writing a second lint. |
+None — all PLAN §9 questions are closed as of 2026-11-20.
