@@ -26,6 +26,9 @@ jobs:
           ./omni m2-multi
           ./omni m2-multi-pure
           ./omni m2-fixed-point
+          ./omni m3-gate
+          ./omni m3-lower
+          ./omni m3-fixed-point
           ./omni backend-diff --suite
           ./omni selftest
           ./omni pure-bootstrap

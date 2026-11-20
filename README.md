@@ -2,7 +2,7 @@
 
 Omni is a 16-bit token-stream ISA (128 opcodes, `0x7F00..=0x7F7F`) with a capability / linear-ownership / taint static verifier, a deterministic VM, `@PACK5` balanced-ternary packing, a `.omni` surface language, and native `x86-64` ELF64 and 64-bit WebAssembly backends for a documented opcode subset.
 
-**Status, in one line:** Omni is **token-level self-hosted for x86-64 ELF64** (Milestone 2 complete: **~4,300 lines of real, differentially-tested iterative `.omni` core modules** in `pure/m2/` + `pure/isa/` compile both the 19,731-word Stage-1 compiler bit-for-bit to `106,242` B and their own 32,674-word multi-function seed `pure/m2/m2.omni_bc` bit-for-bit to `136,841` B with `0`-byte diff vs Rust). The Stage-0 Rust host still performs surface `.omni` lexing/parsing/lowering (Milestone 3, `spec/m3/`), VM execution, and Wasm AOT (`M2-10` multi-function Wasm `CALL` pending); `@PACK5` ops are excluded from M2.
+**Status, in one line:** Omni is **self-hosted end-to-end in Pure-Omni for both the x86-64 ELF64 backend (M2) and the surface `.omni` → `.omni_bc` frontend (M3)**: ~7,500 lines of real, differentially-tested iterative `.omni` compiler modules in `pure/m3/`, `pure/m2/`, and `pure/isa/` compile (a) the 164,632-byte expanded M3 frontend source bit-for-bit to `pure/m3/m3.omni_bc` (`59,474` words / `118,948` B, `0`-word diff vs Rust), (b) the 32,796-word M2 backend seed `pure/m2/m2.omni_bc` bit-for-bit to `137,246`-B ELF64 (`0`-byte diff vs Rust), and (c) the 1,034-line `pure/verifier_engine.omni` end-to-end through Pure-Omni M3 → Pure-Omni M2 → `41,285`-B ELF64 (`0`-byte diff vs Rust). The Stage-0 Rust host still handles `include` file expansion, macro-using legacy fixtures, VM execution, Wasm AOT (`M2-10` multi-function Wasm `CALL` pending), and the live HTTP/KV host; `@PACK5` ops are excluded from M2.
 
 ## Design constraints
 
@@ -29,7 +29,8 @@ These limits are intentional invariants (`HANDOFF.md` §2):
 | `pure/m2/labels.omni` | 116 | Arena-backed `u32` label table & resolver (`0x20000..0x23FFF`, `code_off + 1` / `0 = undef`, first-definition-wins, LBL `0x7EF0..0x7EFF` disjoint from IMM `0..4079`, IMM ≥ 4080 rejected). |
 | `pure/m2/arena.omni` + `pure/m2/elf.omni` | 290 | M2 D-8 arena state/output band (`0x24000..0x7FEFF`), D-7 >128 KiB hard rejection, `m2a_finish_slice` (`ret_slice`), byte-exact 120-B ELF64 header, trap stubs, and x86-64 frame/multi prologues (`m2-elf`). |
 | `pure/m2/emit_x86.omni` + `pure/m2/driver.omni` | 485 | Two-pass single-function u16 → x86-64 ELF64 compiler (`M2-12`/`M2-13`). Compiles the full **19,731-word Stage-1 compiler stream** to the exact `106,242`-byte ELF64 (`0xEAFC81F46B482FF8`, `0`-byte diff vs Rust; `m2-compile`). |
-| `pure/m2/emit_multi.omni` + `pure/m2/m2_standalone.omni` | 620 | Two-pass multi-function u16 → x86-64 ELF64 compiler (`M2-15`/`M2-16`: D-4 stack args `[rbp+16+8k]`, 1 MiB `rbx` arena, `CALL`, 3-op `RET`, ISA-B `IGET`/`ISET`, trap stubs). Compiles `pure/compiler.omni`, `pure/verifier_engine.omni`, and its own 32,674-word seed `pure/m2/m2.omni_bc` → `136,841`-B ELF64 (`0x272A39311643CD65`) with `0`-byte diff vs Rust (`m2-multi-pure`, `m2-fixed-point`). |
+| `pure/m2/emit_multi.omni` + `pure/m2/m2_standalone.omni` | 640 | Two-pass multi-function u16 → x86-64 ELF64 compiler (`M2-15`/`M2-16`: D-4 stack args `[rbp+16+8k]`, 1 MiB `rbx` arena, `CALL`, 3-op `RET`, ISA-B `IGET`/`ISET`, trap stubs). Compiles `pure/compiler.omni`, `pure/verifier_engine.omni`, and its own 32,796-word seed `pure/m2/m2.omni_bc` → `137,246`-B ELF64 (`0xF05F0BFAD0E2DCCC`) with `0`-byte diff vs Rust (`m2-multi-pure`, `m2-fixed-point`). |
+| `pure/m3/*.omni` (`arena`, `lex`, `skim`, `expr`, `stmt`, `lower`) | ~3,200 | Iterative surface `.omni` → `.omni_bc` frontend (`M3-05..M3-17`: lexer, Pass S fn/macro/const skimmer, Pratt expression parser, iterative statement parser, full SSA/CFG/opcode lowerer with `if_pos`/`if_neg`, `match_trit`, `StrLit`, loops, labels/gotos, and O(1) scopes). Self-compiles its own 164,632-B expanded source to `pure/m3/m3.omni_bc` (`59,474` words, `0x0668919FB4378D88`, `0`-word diff vs Rust) and chains with Pure-Omni M2 on `pure/verifier_engine.omni` → `41,285`-B ELF64 (`0xCFF611B4DDBD80DD`, `0`-byte diff vs Rust; `m3-fixed-point`, `m3-lower`, `m3-gate`). |
 | `std/*.omni` (7) + `pure/programs/*.omni` (6) | ~1,000 | Standard library helpers and small production-style programs, served directly from disk via `include_str!` (`M3-16`). |
 | `pure/compiler.omni`, `pure/verifier.omni`, `pure/host_runtime.omni`, `pure/tooling.omni`, `pure/selfhost_suite.omni` | ~400 | Legacy Phase 7/A–D integer decision kernels (frozen for regression hashes; not the M2/M3 compilers). |
 
@@ -60,7 +61,7 @@ All 5 frozen artifacts are asserted by FNV-1a64 hash and exact size in `selftest
 
 - `omni_rust_bootstrap.rs` — Standalone Stage-0 monolith (`rustc -O omni_rust_bootstrap.rs -o omnic`, zero warnings).
 - `omni-workspace/` — 8-crate Cargo workspace (`omni-isa`, `omni-ir`, `omni-verifier`, `omni-vm`, `omni-assembler`, `omni-lang`, `omni-aot`, `omni-cli`).
-- `pure/` — Pure-Omni core modules (`pure/verifier_engine.omni`, `pure/isa/`, `pure/m2/`, `pure/host_kv.omni`, `pure/programs/`, and frozen legacy kernels).
+- `pure/` — Pure-Omni core modules (`pure/verifier_engine.omni`, `pure/isa/`, `pure/m2/`, `pure/m3/`, `pure/host_kv.omni`, `pure/programs/`, and frozen legacy kernels).
 - `std/` — Pure-Omni standard library (`std/prelude.omni`, `std/math.omni`, `std/trit.omni`, `std/http.omni`, `std/pack5.omni`, `std/decision.omni`, `std/resource.omni`).
 - `m2_host/` — Host-side Milestone 2 tooling (`lint.rs` for `m2-lint`, `decode_diff.rs` for decoder/encoder/label differential tests).
 - `spec/` — Executable specs & locks: `spec/acceptance/` (41 goldens), `spec/m2/` (M2 plan, decisions, single-mode byte lock, shape census, label reference, lint fixtures), `spec/m3/` (M3 plan, decisions, `corpus.tsv` frontend lock, Q1–Q8 & negative fixtures), `spec/host_runtime/`.
@@ -74,13 +75,16 @@ All 5 frozen artifacts are asserted by FNV-1a64 hash and exact size in `selftest
 
 ```bash
 rustc -O omni_rust_bootstrap.rs -o omnic
-./omnic selftest              # 1176+ checks (13AY diff4, 13AZ KV, 13BA ISA table, 13BF hash pin, M2/M3 locks)
+./omnic selftest              # 1224+ checks (13AY diff4, 13AZ KV, 13BA ISA table, 13BF hash pin, M2/M3 locks)
+./omnic m3-fixed-point        # Pure-Omni M3 frontend fixed point (59,474 words, 0-word diff) + E2E M3+M2 ELF64 chain
+./omnic m3-lower              # Pure-Omni M3 lowering parity vs Rust (21/21 modules incl. verifier_engine, 0-word diff)
+./omnic m3-gate               # lints + compiles + verifies all 6 pure/m3/*.omni modules
 ./omnic m2-fixed-point        # M2 self-hosted compiler drift check + S1 == V (and S1 == S2 == S3 on Linux x86-64)
 ./omnic m2-compile            # Pure-Omni 2-pass compiler on 19,731-word Stage-1 anchor (106,242 B, 0-byte diff)
 ./omnic m2-multi-pure         # Pure-Omni multi-function compiler (0-byte diff vs Rust on verifier_engine & self)
 ./omnic m2-multi              # Rust M2-09 multi-function x86-64 ELF64 reference checks
 ./omnic m2-elf                # Pure-Omni arena & ELF64 header/stub checks
-./omnic m2-lint               # lints all 7 registered pure/m2 & pure/isa modules (0 gated findings)
+./omnic m2-lint               # lints all 12 registered pure/m2, pure/m3 & pure/isa modules (0 gated findings)
 ./omnic backend-diff --suite  # 4-backend differential suite (0 FAIL, 0 XPASS required)
 ./omnic acceptance-diff       # 41 executable acceptance goldens
 ./omnic pure-omni-diff        # 49 Pure-Omni differential checks

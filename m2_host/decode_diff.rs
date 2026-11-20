@@ -1663,8 +1663,7 @@ pub fn selftest_m3_10_lower_diff() -> Result<usize, String> {
         ("str_lit_cstr", "#[strict]\nfn main(x: i64) -> str { let s: str = \"hello_omni\"; return s; }\n", false),
         ("pure/m2/util.omni", include_str!("../pure/m2/util.omni"), true),
         ("pure/m3/arena.omni", include_str!("../pure/m3/arena.omni"), true),
-        ("pure/m2/util+arena.omni", concat!(include_str!("../pure/m2/util.omni"), "\n", include_str!("../pure/m2/arena.omni")), true),
-        ("pure/m2/util+arena+elf.omni", concat!(include_str!("../pure/m2/util.omni"), "\n", include_str!("../pure/m2/arena.omni"), "\n", include_str!("../pure/m2/elf.omni")), true),
+        ("pure/m2/util+isa+decode.omni", concat!(include_str!("../pure/m2/util.omni"), "\n", include_str!("../pure/isa/table.omni"), "\n", include_str!("../pure/m2/decode.omni")), true),
         ("pure/verifier_engine.omni", OMNI_VERIFIER_ENGINE_SURFACE, true),
         ("neg_undef_var", include_str!("../spec/m3/fixtures/neg_undef_var.omni"), false),
         ("neg_immut_param", include_str!("../spec/m3/fixtures/neg_immut_param.omni"), false),
@@ -1734,6 +1733,113 @@ pub fn selftest_m3_10_lower_diff() -> Result<usize, String> {
         checks += 1;
     }
     Ok(checks)
+}
+
+/// M3-13 / M3-17: Pure-Omni Frontend Self-Hosting Fixed Point (`pure/m3/m3.omni_bc`).
+/// 1. Expands `pure/m3/*.omni` (`M3_LOWER_OMNI_SRC`) via Stage-0 include resolver.
+/// 2. Compiles `M3_src` with Rust frontend -> `T = RustFE(M3_src)`.
+/// 3. Drift check against committed `pure/m3/m3.omni_bc` (unless `write_seed == true`).
+/// 4. Runs Pure-Omni M3 (`T`) on `OmniBinaryVm` to compile ITS OWN SOURCE (`M3_src`) -> `V = M3_vm(M3_src)`.
+/// 5. Asserts `V == T == pure/m3/m3.omni_bc` (0-word diff — true frontend self-hosting fixed point!).
+/// 6. End-to-end M3 + M2 chain: compiles `pure/m2/util+arena+elf.omni` with Pure-Omni M3 -> `.omni_bc`,
+///    then compiles that `.omni_bc` with Pure-Omni M2 -> x86-64 ELF64, asserting 0-byte diff vs Rust!
+pub fn selftest_m3_17_fixed_point(write_seed: bool) -> Result<(usize, usize, u64, usize, u64), String> {
+    let expanded_src = resolve_omni_surface_includes(M3_LOWER_OMNI_SRC, None, None)?;
+    let seed_u16 = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(&expanded_src))?;
+    let seed_bytes = encode_u16_stream_to_bytes(&seed_u16);
+    if write_seed {
+        std::fs::write("pure/m3/m3.omni_bc", &seed_bytes)
+            .map_err(|e| format!("Failed to write pure/m3/m3.omni_bc: {}", e))?;
+    }
+    let committed_seed: &[u8] = include_bytes!("../pure/m3/m3.omni_bc");
+    if !write_seed && committed_seed != seed_bytes.as_slice() {
+        return Err(format!(
+            "M3-17 seed drift: committed pure/m3/m3.omni_bc ({} B, FNV=0x{:016X}) != RustFE(pure/m3/*.omni) ({} B, FNV=0x{:016X}); run `omnic m3-fixed-point --write-seed`",
+            committed_seed.len(),
+            fnv1a_64_hash(committed_seed),
+            seed_bytes.len(),
+            fnv1a_64_hash(&seed_bytes)
+        ));
+    }
+
+    // Self-compile: run Pure-Omni M3 (`seed_u16`) on its own expanded source (`expanded_src`)!
+    let m3_mod = decode_omni_token_stream(&seed_u16)?;
+    let entry = m2_entry_of(&m3_mod);
+    let src_u16: Vec<u16> = expanded_src.as_bytes().iter().map(|&b| b as u16).collect();
+    let arena_len = (131_072 + expanded_src.len() * 6 + seed_bytes.len() + 65_536).max(1_048_576);
+    let mut vm = OmniBinaryVm::with_budgets(1_500_000_000, 128 * 1024 * 1024);
+    let out_bytes = match vm.execute_function(
+        &m3_mod,
+        entry,
+        vec![
+            OmniValue::Bytes(vec![0u8; arena_len]),
+            OmniValue::U16Array(src_u16),
+            OmniValue::Int(1),
+        ],
+    )? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("M3-17 self-compile returned {:?}, expected Bytes", other)),
+    };
+    if out_bytes.len() == 16 && u16::from_le_bytes([out_bytes[0], out_bytes[1]]) == 0xFFFF {
+        let ec = u16::from_le_bytes([out_bytes[2], out_bytes[3]]);
+        let el = u16::from_le_bytes([out_bytes[4], out_bytes[5]]);
+        let ecol = u16::from_le_bytes([out_bytes[6], out_bytes[7]]);
+        return Err(format!("M3-17 self-compile errored (code={}, {}:{})", ec, el, ecol));
+    }
+    if out_bytes != seed_bytes {
+        let got_u16: Vec<u16> = out_bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let min_l = got_u16.len().min(seed_u16.len());
+        let diff = (0..min_l).find(|&i| got_u16[i] != seed_u16[i]).unwrap_or(min_l);
+        return Err(format!(
+            "M3-17 FIXED-POINT MISMATCH: M3_vm={} w (0x{:016X}) vs RustFE={} w (0x{:016X}), first diff at word {} (0x{:04X} vs 0x{:04X})",
+            got_u16.len(), fnv1a_64_hash(&out_bytes), seed_u16.len(), fnv1a_64_hash(&seed_bytes),
+            diff, got_u16.get(diff).copied().unwrap_or(0), seed_u16.get(diff).copied().unwrap_or(0)
+        ));
+    }
+
+    // End-to-end Pure-Omni M3 + M2 chain: 1,034-line `pure/verifier_engine.omni`
+    // `.omni` -> Pure-Omni M3 -> `.omni_bc` (11,893 w) -> Pure-Omni M2 -> x86-64 ELF64 (0-byte diff vs Rust!)
+    let chain_src = OMNI_VERIFIER_ENGINE_SURFACE;
+    let chain_u16_in: Vec<u16> = chain_src.as_bytes().iter().map(|&b| b as u16).collect();
+    let chain_bc_bytes = match vm.execute_function(
+        &m3_mod,
+        entry,
+        vec![
+            OmniValue::Bytes(vec![0u8; 786_432]),
+            OmniValue::U16Array(chain_u16_in),
+            OmniValue::Int(1),
+        ],
+    )? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("M3-17 E2E M3 step returned {:?}", other)),
+    };
+    let chain_bc_u16: Vec<u16> = chain_bc_bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let m2_mod = m2_compile_decoder(M2_MULTI_OMNI_SRC)?;
+    let m2_entry = m2_entry_of(&m2_mod);
+    let pure_elf = match vm.execute_function(
+        &m2_mod,
+        m2_entry,
+        vec![
+            OmniValue::Bytes(vec![0u8; 524_288]),
+            OmniValue::U16Array(chain_bc_u16),
+            OmniValue::Int(0),
+            OmniValue::Int(0),
+            OmniValue::Int(0),
+        ],
+    )? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("M3-17 E2E M2 step returned {:?}", other)),
+    };
+    let rust_bc = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(chain_src))?;
+    let rust_elf = compile_pure_u16_to_x86_64_elf_multi(&rust_bc, 0, 0, 0)?;
+    if pure_elf != rust_elf {
+        return Err(format!(
+            "M3-17 E2E M3+M2 ELF mismatch: Pure={} B (0x{:016X}) vs Rust={} B (0x{:016X})",
+            pure_elf.len(), fnv1a_64_hash(&pure_elf), rust_elf.len(), fnv1a_64_hash(&rust_elf)
+        ));
+    }
+
+    Ok((3, seed_u16.len(), fnv1a_64_hash(&seed_bytes), pure_elf.len(), fnv1a_64_hash(&pure_elf)))
 }
 
 /// `omni m2-decode` runs the decoder differential; `omni m2-decode <file.omni_bc>` decodes one

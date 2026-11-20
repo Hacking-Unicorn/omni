@@ -1285,6 +1285,47 @@ impl OmniBinaryVm {
     }
 
     #[inline]
+    /// Sound last-use check for zero-copy Bytes moves (zero semantic change):
+    /// `tok` is dead after `pc` iff it is never read after `pc`, AND either no branch after `pc`
+    /// jumps back to a label at `<= pc`, OR `tok` is a local register written after the last label
+    /// at `<= pc` and never read before `pc`.
+    fn tok_dead_after(insns: &[BinInstruction], pc: usize, tok: u16) -> bool {
+        let read_after = insns[pc + 1..].iter().any(|later| {
+            later.operands.iter().any(|op| matches!(op, BinOperand::Reg(ot) | BinOperand::Param(ot) if *ot == tok))
+        });
+        if read_after {
+            return false;
+        }
+        let mut prior_lbl_mask: u16 = 0;
+        let mut last_lbl_pc: usize = 0;
+        for (i, c) in insns[..=pc].iter().enumerate() {
+            if c.op_tok == 0x7F40 {
+                last_lbl_pc = i + 1;
+                if let Some(lid) = c.operands.first().and_then(extract_label_id) {
+                    prior_lbl_mask |= 1u16 << (lid & 0xF);
+                } else {
+                    prior_lbl_mask = 0xFFFF;
+                }
+            }
+        }
+        if prior_lbl_mask == 0 {
+            return true;
+        }
+        let has_back_branch = insns[pc + 1..].iter().any(|later| {
+            matches!(later.op_tok, 0x7F41..=0x7F44) && later.operands.iter().any(|op| {
+                extract_label_id(op).map_or(false, |lid| (prior_lbl_mask & (1u16 << (lid & 0xF))) != 0)
+            })
+        });
+        if !has_back_branch {
+            return true;
+        }
+        (REG_BASE..=REG_MAX).contains(&tok)
+            && insns[last_lbl_pc..pc].iter().any(|c| c.dest_reg == Some(tok))
+            && !insns[..pc].iter().any(|c| {
+                c.operands.iter().any(|op| matches!(op, BinOperand::Reg(ot) if *ot == tok))
+            })
+    }
+
     fn eval_op_ref<'a>(op: &BinOperand, regs: &'a [OmniValue; 224]) -> Option<&'a OmniValue> {
         match op {
             BinOperand::Reg(t) | BinOperand::Param(t) => token_to_slot(*t).map(|s| &regs[s]),
@@ -1536,20 +1577,12 @@ impl OmniBinaryVm {
                     other => other,
                 },
                 0x7F04 | 0x7F06 | 0x7F09 => match &ins.operands[0] {
-                    BinOperand::Reg(t)
-                        if !func.instructions[..=pc].iter().any(|c| c.op_tok == 0x7F40)
-                            && !func.instructions[pc + 1..].iter().any(|later| {
-                                later.operands.iter().any(|op| matches!(op, BinOperand::Reg(ot) if ot == t))
-                            }) =>
-                    {
+                    BinOperand::Reg(t) if Self::tok_dead_after(&func.instructions, pc, *t) => {
                         token_to_slot(*t).map(|s| std::mem::replace(&mut regs[s], OmniValue::Void)).unwrap_or(OmniValue::Void)
                     }
                     BinOperand::Param(t)
                         if (owned_params & (1u32 << (*t - PAR_BASE))) != 0
-                            && !func.instructions[..=pc].iter().any(|c| c.op_tok == 0x7F40)
-                            && !func.instructions[pc + 1..].iter().any(|later| {
-                                later.operands.iter().any(|op| matches!(op, BinOperand::Param(ot) if ot == t))
-                            }) =>
+                            && Self::tok_dead_after(&func.instructions, pc, *t) =>
                     {
                         token_to_slot(*t).map(|s| std::mem::replace(&mut regs[s], OmniValue::Void)).unwrap_or(OmniValue::Void)
                     }
@@ -1629,11 +1662,7 @@ impl OmniBinaryVm {
                     };
                     let can_take_last_use = match src_tok {
                         Some(t) if (REG_BASE..=REG_MAX).contains(&t) || ((PAR_BASE..=PAR_MAX).contains(&t) && (owned_params & (1u32 << (t - PAR_BASE))) != 0) => {
-                            not_in_rest_ops
-                                && !func.instructions[..=pc].iter().any(|c| c.op_tok == 0x7F40)
-                                && !func.instructions[pc + 1..].iter().any(|later| {
-                                    later.operands.iter().any(|op| matches!(op, BinOperand::Reg(ot) | BinOperand::Param(ot) if *ot == t))
-                                })
+                            not_in_rest_ops && Self::tok_dead_after(&func.instructions, pc, t)
                         }
                         _ => false,
                     };
@@ -1857,10 +1886,7 @@ impl OmniBinaryVm {
                                             let is_owned_src = (REG_BASE..=REG_MAX).contains(t)
                                                 || ((PAR_BASE..=PAR_MAX).contains(t) && (owned_params & (1u32 << (*t - PAR_BASE))) != 0);
                                             let dead_after = is_owned_src
-                                                && !func.instructions[..=pc].iter().any(|c| c.op_tok == 0x7F40)
-                                                && !func.instructions[pc + 1..].iter().any(|later| {
-                                                    later.operands.iter().any(|op_l| matches!(op_l, BinOperand::Reg(ot) | BinOperand::Param(ot) if ot == t))
-                                                });
+                                                && Self::tok_dead_after(&func.instructions, pc, *t);
                                             if dead_after {
                                                 callee_owned |= 1u32 << idx_op;
                                                 std::mem::replace(&mut regs[s], OmniValue::Void)
@@ -23383,6 +23409,22 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
                 1
             }
         },
+        "m3-fixed-point" => {
+            let write_seed = args.get(1).map(|s| s.as_str()) == Some("--write-seed");
+            match selftest_m3_17_fixed_point(write_seed) {
+                Ok((_, words, h_bc, elf_len, h_elf)) => {
+                    println!(
+                        "[M3-FIXED-POINT PASS] pure/m3/m3.omni_bc={} words (FNV-1a64=0x{:016X}) | M3_vm(pure/m3/*) == RustFE(pure/m3/*) (0-word diff!) | E2E M3+M2 ELF64={} B (0x{:016X}, 0-byte diff vs Rust!)",
+                        words, h_bc, elf_len, h_elf
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("[M3-FIXED-POINT FAIL] {}", e);
+                    1
+                }
+            }
+        }
         _ => {
             eprintln!("usage: omni m2-frozen | m2-lock | m2-census | m2-labels | m2-lint [file.omni|file.omni_asm]... | m2-decode | m2-elf");
             2
@@ -23674,7 +23716,7 @@ fn main() {
             "harness" | "--harness" => {
                 std::process::exit(run_omni_harness_cli(&cli_args[2..]));
             }
-            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" => {
+            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-fixed-point" => {
                 std::process::exit(run_m2_cli(&cli_args[1..]));
             }
             "agent-driver" | "--agent-driver" => {
