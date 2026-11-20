@@ -16,6 +16,8 @@ fn m3l_band() -> i64 { return 524288; }          // 0x80000
 #[strict]
 fn m3l_globals() -> i64 { return 0; }            // 0x00000
 #[strict]
+fn m3l_pstack() -> i64 { return 12288; }         // 0x03000 (512 frames x 16 B)
+#[strict]
 fn m3l_fntab() -> i64 { return 32768; }          // 0x08000 (512 fns x 32 B)
 #[strict]
 fn m3l_mactab() -> i64 { return 49152; }         // 0x0C000 (128 macros x 64 B)
