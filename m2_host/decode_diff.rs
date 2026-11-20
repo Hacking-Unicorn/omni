@@ -42,6 +42,38 @@ pub const M2_VERIFY_OMNI_SRC: &str = concat!(
     include_str!("../spec/m2/verify_harness.omni")
 );
 
+pub const M4_VM_OMNI_SRC: &str = concat!(
+    include_str!("../pure/m2/util.omni"),
+    "\n",
+    include_str!("../pure/isa/table.omni"),
+    "\n",
+    include_str!("../pure/m2/decode.omni"),
+    "\n",
+    include_str!("../pure/m2/labels.omni"),
+    "\n",
+    include_str!("../pure/m4/arena.omni"),
+    "\n",
+    include_str!("../pure/m4/ops_core.omni"),
+    "\n",
+    include_str!("../pure/m4/vm.omni"),
+    "\n",
+    include_str!("../spec/m4/vm_harness.omni")
+);
+
+pub const M4_VM_WASM_HARNESS_SRC: &str = concat!(
+    include_str!("../pure/m2/util.omni"),
+    "\n",
+    include_str!("../pure/isa/table.omni"),
+    "\n",
+    include_str!("../pure/m2/decode.omni"),
+    "\n",
+    include_str!("../pure/m4/arena.omni"),
+    "\n",
+    include_str!("../pure/m4/ops_core.omni"),
+    "\n",
+    include_str!("../spec/m4/vm_wasm_harness.omni")
+);
+
 /// Fixed scratch offsets written by m2d_decode_at_ws (must equal the m2l_scratch_* constants).
 pub const M2D_SCRATCH_OP: usize = 0x7FF00;
 pub const M2D_SCRATCH_NOPS: usize = 0x7FF08;
@@ -2349,6 +2381,255 @@ pub fn selftest_m3_15_four_backend_parity() -> Result<usize, String> {
             return Err(format!(
                 "M3-15 '{}': Pure-Omni M2 ELF ({} B) != Rust x86-multi ELF ({} B)",
                 name, pure_elf.len(), rust_elf.len()
+            ));
+        }
+        checks += 1;
+    }
+    Ok(checks)
+}
+
+// ============================================================================
+// Phase 4 (P4-1 / P4-2 / P4-5): Pure-Omni Token-Stream VM Differential Gate
+// ============================================================================
+
+/// Runs a raw `.omni_bc` u16 token stream on the Pure-Omni VM (`pure/m4/vm.omni`),
+/// returning `(ret_val, ret_tag, err_code, steps, trace_cnt)`.
+pub fn p4_run_raw_bc_on_pure_vm(
+    stream: &[u16],
+    a0: i64,
+    a1: i64,
+    a2: i64,
+    fuel: i64,
+    trace_mode: i64,
+) -> Result<(i64, u32, u32, u32, u32), String> {
+    static M4_VM_MOD: std::sync::OnceLock<Result<BinModule, String>> = std::sync::OnceLock::new();
+    let vm_mod = M4_VM_MOD
+        .get_or_init(|| m2_compile_decoder(M4_VM_OMNI_SRC))
+        .as_ref()
+        .map_err(|e| e.clone())?;
+    let entry = m2_entry_of(vm_mod);
+    let mut arena = vec![0u8; 524_288];
+    let st_base = 167_936usize;
+    arena[st_base + 48..st_base + 56].copy_from_slice(&a0.to_le_bytes());
+    arena[st_base + 56..st_base + 64].copy_from_slice(&a1.to_le_bytes());
+    arena[st_base + 64..st_base + 72].copy_from_slice(&a2.to_le_bytes());
+    let mut host_vm = OmniBinaryVm::with_budgets(500_000_000, 128 * 1024 * 1024);
+    let state_bytes = match host_vm.execute_function(
+        vm_mod,
+        entry,
+        vec![
+            OmniValue::Bytes(arena),
+            OmniValue::U16Array(stream.to_vec()),
+            OmniValue::Int(fuel),
+            OmniValue::Int(trace_mode),
+        ],
+    )? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("P4 VM returned {:?}, expected 64-B VM_STATE slice", other)),
+    };
+    if state_bytes.len() < 48 {
+        return Err(format!("P4 VM returned short state slice ({} B)", state_bytes.len()));
+    }
+    let trace_cnt = u32::from_le_bytes(state_bytes[24..28].try_into().unwrap());
+    let err_code = u32::from_le_bytes(state_bytes[28..32].try_into().unwrap());
+    let ret_val = i64::from_le_bytes(state_bytes[32..40].try_into().unwrap());
+    let ret_tag = u32::from_le_bytes(state_bytes[40..44].try_into().unwrap());
+    let steps = u32::from_le_bytes(state_bytes[44..48].try_into().unwrap());
+    Ok((ret_val, ret_tag, err_code, steps, trace_cnt))
+}
+
+/// P4-1 / P4-2 / P4-5 selftest: Pure-Omni VM (`pure/m4/vm.omni`) vs Rust `OmniBinaryVm`
+/// across arithmetic, bitwise, ternary, control flow, loops, byte buffers (ISA-B ld_u*/st_u*),
+/// multi-function CALL/RET, raw `.omni_bc` execution, P4-5 binary trace ring, and OOB/fuel/depth budgets.
+pub fn selftest_p4_1_vm_diff() -> Result<usize, String> {
+    let cases: [(&str, &str, [i64; 3]); 7] = [
+        (
+            "p4_arith_bit",
+            "#[strict]\nfn main(a: i64, b: i64, c: i64) -> i64 { let x: i64 = (a + b) * c - (a / 2) + (a % 3); let y: i64 = (x & 255) | (c << 2) ^ (b >> 1); return y + (-a); }\n",
+            [17, 6, 4],
+        ),
+        (
+            "p4_trit_match",
+            "#[strict]\nfn main(a: i64, b: i64, c: i64) -> i64 { let t: trit = a <=> b; let r: i64 = match_trit t { neg => c * 10, zero => c + 5, pos => a - b + c }; return r; }\n",
+            [12, 5, 3],
+        ),
+        (
+            "p4_loop_sum",
+            "#[strict]\nfn main(n: i64, a1: i64, a2: i64) -> i64 { let s: i64 = 0; let i: i64 = 1; while n >= i { s = s + i * i; i = i + 1; } return s + a1 + a2; }\n",
+            [8, 1, 2],
+        ),
+        (
+            "p4_mf_call_chain",
+            "#[strict]\nfn add1(x: i64) -> i64 { return x + 1; }\nfn mul3(x: i64) -> i64 { return add1(x) * 3; }\nfn main(a: i64, b: i64, c: i64) -> i64 { return mul3(a) + add1(b * c); }\n",
+            [7, 4, 5],
+        ),
+        (
+            "p4_buf_isab",
+            "#[strict]\nfn mk(a: i64, b: i64) -> bytes { let w: bytes = anew(0); w = iset_i32(w, a); w = iset_i32(w, b); w = st_u16(w, 2, 1234); return w; }\nfn main(a: i64, b: i64, c: i64) -> i64 { let w: bytes = mk(a, b); return ld_u16(w, 2) + ld_u32(w, 4) + slen(w) + c; }\n",
+            [99, 42000, 7],
+        ),
+        (
+            "p4_pure_compiler_kernel",
+            include_str!("../pure/compiler.omni"),
+            [10, 20, 5],
+        ),
+        (
+            "p4_if_neg_goto",
+            "#[strict]\nfn main(x: i64, y: i64, z: i64) -> i64 { let r: i64 = if_neg (x <=> y) { z * 3 } else { z + 7 }; goto 9; label 9; return r; }\n",
+            [2, 9, 11],
+        ),
+    ];
+
+    let mut checks = 0usize;
+    for (name, src, args) in &cases {
+        let stream = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(src))?;
+        let decoded = decode_omni_token_stream(&stream)?;
+        let entry = m2_entry_of(&decoded);
+        let pcnt = decoded
+            .functions
+            .iter()
+            .find(|f| f.fn_idx == entry)
+            .map(|f| f.params.len())
+            .unwrap_or(0);
+        let vm_args: Vec<OmniValue> = args[..pcnt.min(3)].iter().map(|&v| OmniValue::Int(v)).collect();
+        let mut rust_vm = OmniBinaryVm::new();
+        let rust_val = match rust_vm.execute_function(&decoded, entry, vm_args)? {
+            OmniValue::Int(v) => v,
+            OmniValue::Trit(t) => t as i64,
+            other => return Err(format!("P4 '{}': Rust VM returned {:?}", name, other)),
+        };
+
+        // Run with trace_mode = 0
+        let (p_val, _tag, err, steps, tcnt0) =
+            p4_run_raw_bc_on_pure_vm(&stream, args[0], args[1], args[2], 100_000, 0)?;
+        if err != 0 || p_val != rust_val || tcnt0 != 0 || steps == 0 {
+            return Err(format!(
+                "P4 '{}' (trace=0): mismatch rust={} pure={} err={} steps={} tcnt={}",
+                name, rust_val, p_val, err, steps, tcnt0
+            ));
+        }
+        checks += 1;
+    }
+
+    // P4-5: Binary trace ring check (trace_mode = 1 records exact step count and preserves result)
+    let tr_src = "#[strict]\nfn main(a: i64) -> i64 { let b: i64 = a * 2 + 3; return b; }\n";
+    let tr_stream = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(tr_src))?;
+    let (v1, _, err1, steps1, tcnt1) = p4_run_raw_bc_on_pure_vm(&tr_stream, 21, 0, 0, 10_000, 1)?;
+    if err1 != 0 || v1 != 45 || tcnt1 != steps1 || tcnt1 == 0 {
+        return Err(format!(
+            "P4-5 trace check failed: val={} err={} steps={} tcnt={}",
+            v1, err1, steps1, tcnt1
+        ));
+    }
+    checks += 1;
+
+    // Budget / negative 1: ISA-B strict OOB (err_code == 2)
+    let oob_src = "#[strict]\nfn main(a: i64) -> i64 { let w: bytes = anew(0); w = iset(w, a); return ld_u32(w, 0); }\n";
+    let oob_stream = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(oob_src))?;
+    let (_, _, err_oob, _, _) = p4_run_raw_bc_on_pure_vm(&oob_stream, 5, 0, 0, 10_000, 0)?;
+    if err_oob != 2 {
+        return Err(format!("P4 OOB expected err_code=2, got {}", err_oob));
+    }
+    checks += 1;
+
+    // Budget / negative 2: Fuel exhaustion (err_code == 3)
+    let fuel_src = "#[strict]\nfn main(n: i64) -> i64 { let i: i64 = 0; while n > i { i = i + 1; } return i; }\n";
+    let fuel_stream = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(fuel_src))?;
+    let (_, _, err_fuel, _, _) = p4_run_raw_bc_on_pure_vm(&fuel_stream, 1000, 0, 0, 10, 0)?;
+    if err_fuel != 3 {
+        return Err(format!("P4 fuel expected err_code=3, got {}", err_fuel));
+    }
+    checks += 1;
+
+    // Budget / negative 3: Call-depth-64 cap (err_code == 4)
+    let rec_src = "#[strict]\nfn rec(n: i64) -> i64 { let c: trit = n <=> 0; return if_pos c { 1 + rec(n - 1) } else { 0 }; }\nfn main(n: i64) -> i64 { return rec(n); }\n";
+    let rec_stream = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(rec_src))?;
+    let (_, _, err_depth, _, _) = p4_run_raw_bc_on_pure_vm(&rec_stream, 70, 0, 0, 100_000, 0)?;
+    if err_depth != 4 {
+        return Err(format!("P4 depth-64 expected err_code=4, got {}", err_depth));
+    }
+    checks += 1;
+
+    Ok(checks)
+}
+
+/// P4-3 selftest: Proves the Pure-Omni VM executes raw `.omni_bc` strictly through the
+/// minimal 3-op `OmniThinShim` (`read_bytes`, `write_bytes`, `spawn`) with zero HTTP/shell/file stack.
+pub fn selftest_p4_3_thin_shim() -> Result<usize, String> {
+    let src = "#[strict]\nfn dbl(x: i64) -> i64 { return x * 2; }\nfn main(a: i64, b: i64) -> i64 { return dbl(a) + b; }\n";
+    let stream = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(src))?;
+    let mut raw_bc: Vec<u8> = Vec::with_capacity(stream.len() * 2);
+    for w in &stream {
+        raw_bc.extend_from_slice(&w.to_le_bytes());
+    }
+    let mut shim = MemoryThinShim::new();
+    shim.write_bytes("prog.omni_bc", &raw_bc)?;
+
+    // Execute strictly via read_bytes + write_bytes (no source text, no parser!)
+    let (val, _tag, err, steps, tcnt) =
+        p4_shim_exec_bc(&mut shim, "prog.omni_bc", Some("result.bin"), 19, 7, 0, 10_000, 1)?;
+    if err != 0 || val != 45 || steps == 0 || tcnt != steps {
+        return Err(format!(
+            "P4-3 thin shim exec failed: val={} err={} steps={} tcnt={}",
+            val, err, steps, tcnt
+        ));
+    }
+    let out_bin = shim.read_bytes("result.bin")?;
+    if out_bin.len() != 20 {
+        return Err(format!("P4-3 thin shim output len expected 20, got {}", out_bin.len()));
+    }
+    let got_val = i64::from_le_bytes(out_bin[0..8].try_into().unwrap());
+    let got_tcnt = u32::from_le_bytes(out_bin[16..20].try_into().unwrap());
+    if got_val != 45 || got_tcnt != tcnt {
+        return Err(format!("P4-3 thin shim persisted summary mismatch: val={} tcnt={}", got_val, got_tcnt));
+    }
+    // Verify spawn 3rd primitive contract
+    let rc = shim.spawn("omni-p4-worker", &["prog.omni_bc"])?;
+    if rc != 0 || shim.spawned.len() != 1 || shim.spawned[0].0 != "omni-p4-worker" {
+        return Err(String::from("P4-3 thin shim spawn contract failed"));
+    }
+    Ok(3)
+}
+
+/// P4-4 selftest: Proves (1) the entire Pure-Omni VM (`pure/m4/vm.omni`, 160+ fns) compiles
+/// cleanly to WebAssembly v1 via M2-10 `compile_pure_u16_to_wasm_multi`, and (2) the Pure-Omni
+/// VM core (`arena.omni` + `ops_core.omni`) executes on the Wasm-multi host with bit-exact
+/// parity against Rust `OmniBinaryVm` (including P4-5 binary trace ring verification).
+pub fn selftest_p4_4_wasm_host() -> Result<usize, String> {
+    // 1. Full Pure-Omni VM compiles cleanly to WebAssembly v1 via M2-10
+    let vm_u16 = with_lockstep_suspended(|| compile_omni_surface_to_u16(M4_VM_OMNI_SRC))?;
+    let vm_wasm = compile_pure_u16_to_wasm_multi(&vm_u16)?;
+    if vm_wasm.len() < 8 || &vm_wasm[0..4] != b"\0asm" {
+        return Err(String::from("P4-4: full Pure-Omni VM Wasm binary invalid header"));
+    }
+
+    // 2. Wasm-hosted Pure-Omni VM core execution parity vs Rust OmniBinaryVm
+    let harness_u16 = with_lockstep_suspended(|| compile_omni_surface_to_u16(M4_VM_WASM_HARNESS_SRC))?;
+    let harness_wasm = compile_pure_u16_to_wasm_multi(&harness_u16)?;
+    let decoded = decode_omni_token_stream(&harness_u16)?;
+    let entry = m2_entry_of(&decoded);
+    let mut checks = 1usize;
+
+    for &(a0, a1, a2) in &[(7i64, 5i64, 6i64), (3, 4, 2)] {
+        let mut rust_vm = OmniBinaryVm::with_budgets(200_000_000, 64 * 1024 * 1024);
+        let rust_val = match rust_vm.execute_function(
+            &decoded,
+            entry,
+            vec![OmniValue::Int(a0), OmniValue::Int(a1), OmniValue::Int(a2)],
+        )? {
+            OmniValue::Int(v) => v,
+            other => return Err(format!("P4-4 Rust VM returned {:?}", other)),
+        };
+        let wasm_val = execute_wasm_module_i64_with_budgets(
+            &harness_wasm,
+            &[a0, a1, a2],
+            200_000_000,
+            64 * 1024 * 1024,
+        )?;
+        if wasm_val != rust_val {
+            return Err(format!(
+                "P4-4 Wasm host mismatch for ({},{},{}): rust={} wasm={}",
+                a0, a1, a2, rust_val, wasm_val
             ));
         }
         checks += 1;

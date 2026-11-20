@@ -1,0 +1,277 @@
+// Phase 4 (P4-1): Core operand evaluator & pure/memory opcode handlers for the Pure-Omni VM.
+// Covers: MOVE/DROP/CINT/CTRIT, IADD..IMAX, BAND..SHR, CEQ..CGT, TNOT..TMUL, EGATE,
+// SEL_TRIT, ANEW, IGET (2-op & 3-op ISA-B), ISET (append & 4-op ISA-B -2/-4/-9), SLEN.
+// All functions obey M2 lint budgets (<= 120 SSA, <= 12 labels, strict linear bytes).
+
+// Evaluate a decoded operand `pw` (from m2d_operand) to its i64 payload in frame `sp`.
+#[strict]
+fn m4o_eval(w: bytes, sp: i64, pw: i64) -> i64 {
+    let k: i64 = m2d_kind(pw);
+    let slot: i64 = m4_tok_to_slot(k, m2d_uval(pw));
+    let is_slot: i64 = m2u_ge(slot, 0);
+    let is_trit: i64 = m2u_eq(k, m2k_trit());
+    let is_imm: i64 = m2u_eq(k, m2k_imm());
+    let sval: i64 = if_pos is_slot <=> 0 {
+        m4f_get_slot_val(w, sp, slot)
+    } else {
+        0
+    };
+    let tval: i64 = (m2d_uval(pw) - 1) * is_trit;
+    let ival: i64 = m2d_ival(pw) * is_imm;
+    return sval + tval + ival;
+}
+
+#[strict]
+fn m4o_eval_tag(w: bytes, sp: i64, pw: i64) -> i64 {
+    let k: i64 = m2d_kind(pw);
+    let slot: i64 = m4_tok_to_slot(k, m2d_uval(pw));
+    let res: i64 = if_pos m2u_ge(slot, 0) <=> 0 {
+        m4f_get_slot_tag(w, sp, slot)
+    } else {
+        let is_trit: i64 = m2u_eq(k, m2k_trit());
+        let is_imm: i64 = m2u_eq(k, m2k_imm());
+        is_imm * 1 + is_trit * 2
+    };
+    return res;
+}
+
+// Clamp integer to balanced trit {-1, 0, +1}.
+#[strict]
+fn m4o_sign(v: i64) -> i64 {
+    let pos: i64 = m2u_lt(0, v);
+    let neg: i64 = m2u_lt(v, 0);
+    return pos - neg;
+}
+
+// Iterative binary long division (zero IDIV/IMOD opcodes -> 100% M2-lint DIV_DIVISOR clean).
+// Computes signed truncating quotient (want_rem=0) or remainder (want_rem=1), 0 if b == 0.
+#[strict]
+fn m4o_divmod(a: i64, b: i64, want_rem: i64) -> i64 {
+    let nz: i64 = 1 - m2u_eq(b, 0);
+    let na: i64 = m2u_lt(a, 0);
+    let nb: i64 = m2u_lt(b, 0);
+    let ua: i64 = m2u_sel(na, 0 - a, a);
+    let ub: i64 = m2u_sel(nb, 0 - b, b);
+    let q: i64 = 0;
+    let r: i64 = 0;
+    let bit: i64 = 62;
+    let go: i64 = nz;
+    while go <=> 0 {
+        r = (r << 1) | ((ua >> bit) & 1);
+        let ge: i64 = m2u_ge(r, ub);
+        r = r - ge * ub;
+        q = q | (ge << bit);
+        bit = bit - 1;
+        go = m2u_ge(bit, 0);
+    }
+    let q_neg: i64 = (na ^ nb);
+    let sq: i64 = m2u_sel(q_neg, 0 - q, q) * nz;
+    let sr: i64 = m2u_sel(na, 0 - r, r) * nz;
+    return m2u_sel(want_rem, sr, sq);
+}
+
+// 0x7F10..0x7F18: IADD, ISUB, IMUL, IDIV, IMOD, INEG, IABS, IMIN, IMAX
+#[strict]
+fn m4o_arith(op: i64, a: i64, b: i64) -> i64 {
+    let is_d: i64 = m2u_eq(op, 32531);
+    let is_r: i64 = m2u_eq(op, 32532);
+    let q: i64 = if_pos is_d <=> 0 { m4o_divmod(a, b, 0) } else { 0 };
+    let r: i64 = if_pos is_r <=> 0 { m4o_divmod(a, b, 1) } else { 0 };
+    let ab: i64 = m2u_sel(m2u_lt(a, 0), 0 - a, a);
+    let mn: i64 = m2u_sel(m2u_lt(a, b), a, b);
+    let mx: i64 = m2u_sel(m2u_lt(b, a), a, b);
+    let res: i64 = m2u_eq(op, 32528) * (a + b)
+        + m2u_eq(op, 32529) * (a - b)
+        + m2u_eq(op, 32530) * (a * b)
+        + q
+        + r
+        + m2u_eq(op, 32533) * (0 - a)
+        + m2u_eq(op, 32534) * ab
+        + m2u_eq(op, 32535) * mn
+        + m2u_eq(op, 32536) * mx;
+    return res;
+}
+
+// 0x7F1E..0x7F27: BAND, BOR, BXOR, BNOT, SHL, SHR, CEQ, CNE, CLT, CGT
+#[strict]
+fn m4o_bit_cmp(op: i64, a: i64, b: i64) -> i64 {
+    let sh: i64 = b & 63;
+    let eq: i64 = m2u_eq(a, b) * 2 - 1;
+    let ne: i64 = (1 - m2u_eq(a, b)) * 2 - 1;
+    let lt: i64 = m2u_lt(a, b) * 2 - 1;
+    let gt: i64 = m2u_lt(b, a) * 2 - 1;
+    let res: i64 = m2u_eq(op, 32542) * (a & b)
+        + m2u_eq(op, 32543) * (a | b)
+        + m2u_eq(op, 32544) * (a ^ b)
+        + m2u_eq(op, 32545) * (~a)
+        + m2u_eq(op, 32546) * (a << sh)
+        + m2u_eq(op, 32547) * (a >> sh)
+        + m2u_eq(op, 32548) * eq
+        + m2u_eq(op, 32549) * ne
+        + m2u_eq(op, 32550) * lt
+        + m2u_eq(op, 32551) * gt;
+    return res;
+}
+
+// 0x7F28..0x7F2F + 0x7F35: TNOT, TAND, TOR, TXOR, TMAJ, TCMP, TADD, TMUL, EGATE
+#[strict]
+fn m4o_trit(op: i64, a: i64, b: i64, c: i64) -> i64 {
+    let sa: i64 = m4o_sign(a);
+    let sb: i64 = m4o_sign(b);
+    let sc: i64 = m4o_sign(c);
+    let t_and: i64 = m2u_sel(m2u_lt(sa, sb), sa, sb);
+    let t_or: i64 = m2u_sel(m2u_lt(sb, sa), sa, sb);
+    let t_xor: i64 = 0 - (sa * sb);
+    let t_maj: i64 = m4o_sign(sa + sb + sc);
+    let t_cmp: i64 = m4o_sign(a - b);
+    let t_add: i64 = m4o_sign(sa + sb);
+    let t_mul: i64 = sa * sb;
+    let res: i64 = m2u_eq(op, 32552) * (0 - sa)
+        + m2u_eq(op, 32553) * t_and
+        + m2u_eq(op, 32554) * t_or
+        + m2u_eq(op, 32555) * t_xor
+        + m2u_eq(op, 32556) * t_maj
+        + m2u_eq(op, 32557) * t_cmp
+        + m2u_eq(op, 32558) * t_add
+        + m2u_eq(op, 32559) * t_mul
+        + m2u_eq(op, 32565) * sa;
+    return res;
+}
+
+// Copy `len` bytes from heap offset `src_off` to `dst_off` inside VM_HEAP.
+#[strict]
+fn m4o_heap_copy(w_in: bytes, src_off: i64, dst_off: i64, len: i64) -> bytes {
+    let w: bytes = w_in;
+    let i: i64 = 0;
+    while m2u_lt(i, len) <=> 0 {
+        let bv: i64 = ld_u8(w, m4a_heap() + src_off + i);
+        let hi: i64 = ld_u8(w, m4a_heap() + dst_off + i + 1);
+        w = st_u16(w, m4a_heap() + dst_off + i, (bv & 255) | ((hi & 255) << 8));
+        i = i + 1;
+    }
+    return w;
+}
+
+// Store 1 byte at heap offset `hoff` inside VM_HEAP.
+#[strict]
+fn m4o_heap_st_u8(w: bytes, hoff: i64, bv: i64) -> bytes {
+    let hi: i64 = ld_u8(w, m4a_heap() + hoff + 1);
+    return st_u16(w, m4a_heap() + hoff, (bv & 255) | ((hi & 255) << 8));
+}
+
+// 0x7F0D ANEW: allocate empty buffer at current heap_top -> (heap_top << 32) | 0
+#[strict]
+fn m4o_exec_anew(w: bytes, sp: i64, dslot: i64) -> bytes {
+    let top: i64 = ld_u32(w, m4s_heap_top());
+    let desc: i64 = top << 32;
+    let w1: bytes = m4f_set_slot_val(w, sp, dslot, desc);
+    return m4f_set_slot_tag(w1, sp, dslot, 3);
+}
+
+// 0x7F0E IGET (2-op lenient byte load, or 3-op ISA-B -1/-2/-4/-8 strict-bounds load)
+#[strict]
+fn m4o_exec_iget(w: bytes, sp: i64, dslot: i64, nops: i64, v0: i64, v1: i64, v2: i64) -> bytes {
+    let bbase: i64 = (v0 >> 32) & m4a_mask32();
+    let blen: i64 = v0 & m4a_mask32();
+    let is3: i64 = m2u_eq(nops, 3);
+    let off: i64 = m2u_sel(is3, v2, v1);
+    let width: i64 = m2u_sel(is3,
+        m2u_eq(v1, 0 - 1) * 1 + m2u_eq(v1, 0 - 2) * 2 + m2u_eq(v1, 0 - 4) * 4 + m2u_eq(v1, 0 - 8) * 8,
+        1
+    );
+    let ok: i64 = m2u_ge(off, 0) * m2u_ge(blen, off + width) * m2u_lt(0, width);
+    let out: bytes = if_pos ok <=> 0 {
+        let addr: i64 = m4a_heap() + bbase + off;
+        let v_u8: i64 = ld_u8(w, addr);
+        let v_u16: i64 = if_pos m2u_eq(width, 2) <=> 0 { ld_u16(w, addr) } else { 0 };
+        let v_u32: i64 = if_pos m2u_eq(width, 4) <=> 0 { ld_u32(w, addr) } else { 0 };
+        let v_u64: i64 = if_pos m2u_eq(width, 8) <=> 0 { ld_u64(w, addr) } else { 0 };
+        let loaded: i64 = m2u_eq(width, 1) * v_u8 + v_u16 + v_u32 + v_u64;
+        let w1: bytes = m4f_set_slot_val(w, sp, dslot, loaded);
+        m4f_set_slot_tag(w1, sp, dslot, 1)
+    } else {
+        let w_err: bytes = if_pos is3 <=> 0 {
+            m4_set_err(w, 2)
+        } else {
+            let w1: bytes = m4f_set_slot_val(w, sp, dslot, 0);
+            m4f_set_slot_tag(w1, sp, dslot, 1)
+        };
+        w_err
+    };
+    return out;
+}
+
+// 0x7F0F ISET 4-op patch (-2 st_u16, -4 st_u32, -9 iset_patch_i64)
+#[strict]
+fn m4o_exec_iset_patch(w: bytes, sp: i64, dslot: i64, v0: i64, mode: i64, off: i64, val: i64) -> bytes {
+    let bbase: i64 = (v0 >> 32) & m4a_mask32();
+    let blen: i64 = v0 & m4a_mask32();
+    let is_i64: i64 = m2u_eq(mode, 0 - 9);
+    let width: i64 = m2u_eq(mode, 0 - 2) * 2 + m2u_eq(mode, 0 - 4) * 4 + is_i64 * 8;
+    let ok: i64 = m2u_ge(off, 0) * m2u_ge(blen, off + width) * m2u_lt(0, width);
+    let out: bytes = if_pos ok <=> 0 {
+        let addr: i64 = m4a_heap() + bbase + off;
+        let w1: bytes = if_pos m2u_eq(width, 2) <=> 0 {
+            st_u16(w, addr, val & 65535)
+        } else {
+            let w1b: bytes = if_pos m2u_eq(width, 4) <=> 0 {
+                st_u32(w, addr, val & m4a_mask32())
+            } else {
+                iset_patch_i64(w, addr, val)
+            };
+            w1b
+        };
+        let w2: bytes = m4f_set_slot_val(w1, sp, dslot, v0);
+        m4f_set_slot_tag(w2, sp, dslot, 3)
+    } else {
+        let w_err: bytes = if_pos is_i64 <=> 0 {
+            let w2: bytes = m4f_set_slot_val(w, sp, dslot, v0);
+            m4f_set_slot_tag(w2, sp, dslot, 3)
+        } else {
+            m4_set_err(w, 2)
+        };
+        w_err
+    };
+    return out;
+}
+
+// 0x7F0F ISET append (2-op byte append or 3-op -4/-8 LE append).
+// Copies buffer to top if not already at top, then appends.
+#[strict]
+fn m4o_exec_iset_append(w_in: bytes, sp: i64, dslot: i64, nops: i64, v0: i64, v1: i64, v2: i64) -> bytes {
+    let bbase: i64 = (v0 >> 32) & m4a_mask32();
+    let blen: i64 = v0 & m4a_mask32();
+    let top: i64 = ld_u32(w_in, m4s_heap_top());
+    let is3_m4: i64 = m2u_eq(nops, 3) * m2u_eq(v1, 0 - 4);
+    let is3_m8: i64 = m2u_eq(nops, 3) * m2u_eq(v1, 0 - 8);
+    let add_len: i64 = is3_m4 * 4 + is3_m8 * 8 + (1 - is3_m4 - is3_m8) * 1;
+    let at_top: i64 = m2u_eq(bbase + blen, top);
+    let new_base: i64 = m2u_sel(at_top, bbase, top);
+    let new_end: i64 = new_base + blen + add_len;
+    let fits: i64 = m2u_ge(m4a_heap_cap() - 8, new_end);
+    let out: bytes = if_pos fits <=> 0 {
+        let w1: bytes = if_pos at_top <=> 0 {
+            w_in
+        } else {
+            m4o_heap_copy(w_in, bbase, new_base, blen)
+        };
+        let dst: i64 = new_base + blen;
+        let w2: bytes = if_pos is3_m4 <=> 0 {
+            st_u32(w1, m4a_heap() + dst, v2 & m4a_mask32())
+        } else {
+            let w2b: bytes = if_pos is3_m8 <=> 0 {
+                iset_patch_i64(w1, m4a_heap() + dst, v2)
+            } else {
+                m4o_heap_st_u8(w1, dst, v1)
+            };
+            w2b
+        };
+        let w3: bytes = st_u32(w2, m4s_heap_top(), new_end);
+        let desc: i64 = (new_base << 32) | (blen + add_len);
+        let w4: bytes = m4f_set_slot_val(w3, sp, dslot, desc);
+        m4f_set_slot_tag(w4, sp, dslot, 3)
+    } else {
+        m4_set_err(w_in, 2)
+    };
+    return out;
+}

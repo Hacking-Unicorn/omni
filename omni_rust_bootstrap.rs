@@ -18796,7 +18796,7 @@ fn wasm_buf_join(b: &mut Vec<u8>, l: &WasmBufLocals) {
 
 /// After `wasm_buf_split`: if the buffer does not end at `top`, copy it to `top` (when it fits)
 /// so appends never overwrite bytes another value still refers to.
-fn wasm_buf_make_appendable(b: &mut Vec<u8>, l: &WasmBufLocals) {
+fn wasm_buf_make_appendable(b: &mut Vec<u8>, l: &WasmBufLocals, mem_bytes: i64) {
     wasm_lget(b, l.bbase);
     wasm_lget(b, l.blen);
     b.push(0x7C);
@@ -18806,7 +18806,7 @@ fn wasm_buf_make_appendable(b: &mut Vec<u8>, l: &WasmBufLocals) {
     wasm_lget(b, l.top);
     wasm_lget(b, l.blen);
     b.push(0x7C);
-    wasm_i64c(b, WASM_ISET_MEMORY_BYTES);
+    wasm_i64c(b, mem_bytes);
     b.extend_from_slice(&[0x55, 0x50]); // !(top + blen > MEM)
     b.extend_from_slice(&[0x04, 0x40]); // if
     wasm_i64c(b, 0);
@@ -18844,7 +18844,7 @@ fn wasm_buf_make_appendable(b: &mut Vec<u8>, l: &WasmBufLocals) {
 }
 
 /// Pushes i32 cond: buffer ends at `top` and `top + width <= MEM`.
-fn wasm_buf_can_append(b: &mut Vec<u8>, l: &WasmBufLocals, width: i64) {
+fn wasm_buf_can_append(b: &mut Vec<u8>, l: &WasmBufLocals, width: i64, mem_bytes: i64) {
     wasm_lget(b, l.bbase);
     wasm_lget(b, l.blen);
     b.push(0x7C);
@@ -18853,7 +18853,7 @@ fn wasm_buf_can_append(b: &mut Vec<u8>, l: &WasmBufLocals, width: i64) {
     wasm_lget(b, l.top);
     wasm_i64c(b, width);
     b.push(0x7C);
-    wasm_i64c(b, WASM_ISET_MEMORY_BYTES);
+    wasm_i64c(b, mem_bytes);
     b.extend_from_slice(&[0x55, 0x50]);
     b.push(0x71); // i32.and
 }
@@ -19346,9 +19346,10 @@ fn compile_wasm_single_func_body(
                     }
                     b.push(0x0B);
                 } else {
+                    let mem_bytes: i64 = if is_multi { 32 * 65536 } else { WASM_ISET_MEMORY_BYTES };
                     emit_src(b);
                     wasm_buf_split(b, &bl);
-                    wasm_buf_make_appendable(b, &bl);
+                    wasm_buf_make_appendable(b, &bl, mem_bytes);
                     let chunks: Vec<(i64, &BinOperand)> = if ops.len() == 3 && ops[1] == BinOperand::ImmInt(-4) {
                         vec![(4, &ops[2])]
                     } else if ops.len() == 3 && ops[1] == BinOperand::ImmInt(-8) {
@@ -19357,7 +19358,7 @@ fn compile_wasm_single_func_body(
                         ops.iter().skip(1).map(|o| (1i64, o)).collect()
                     };
                     for (width, op_v) in chunks {
-                        wasm_buf_can_append(b, &bl, width);
+                        wasm_buf_can_append(b, &bl, width, mem_bytes);
                         b.extend_from_slice(&[0x04, 0x40]); // if
                         wasm_lget(b, bl.top);
                         b.push(0xA7);
@@ -23297,6 +23298,9 @@ pub fn run_m2_foundation_selftests() -> Result<usize, String> {
     n += selftest_m2_10_wasm_multi()?;
     n += selftest_m2_14_verify_diff()?;
     n += selftest_m3_15_four_backend_parity()?;
+    n += selftest_p4_1_vm_diff()?;
+    n += selftest_p4_3_thin_shim()?;
+    n += selftest_p4_4_wasm_host()?;
     Ok(n)
 }
 
@@ -23664,6 +23668,76 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
                 1
             }
         },
+        "p4-vm" => match selftest_p4_1_vm_diff() {
+            Ok(n) => {
+                println!(
+                    "[P4-VM PASS] {} checks (pure/m4/vm.omni == Rust OmniBinaryVm: arith, trit, loops, CALL/RET, ISA-B bufs, P4-5 trace ring, OOB/fuel/depth-64)",
+                    n
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("[P4-VM FAIL] {}", e);
+                1
+            }
+        },
+        "p4-shim" => match selftest_p4_3_thin_shim() {
+            Ok(n) => {
+                println!(
+                    "[P4-SHIM PASS] {} checks (3-op OmniThinShim: read_bytes, write_bytes, spawn — zero HTTP/shell/parser)",
+                    n
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("[P4-SHIM FAIL] {}", e);
+                1
+            }
+        },
+        "p4-wasm" => match selftest_p4_4_wasm_host() {
+            Ok(n) => {
+                println!(
+                    "[P4-WASM PASS] {} checks (full pure/m4/vm.omni compiles to Wasm v1 + Pure-Omni VM core executes on M2-10 Wasm-multi host == Rust VM)",
+                    n
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("[P4-WASM FAIL] {}", e);
+                1
+            }
+        },
+        "p4-exec" => {
+            if args.len() < 2 {
+                eprintln!("usage: omni p4-exec <file.omni_bc> [a0] [a1] [a2] [--trace]");
+                return 2;
+            }
+            let path = &args[1];
+            let trace_mode = if args.iter().any(|a| a == "--trace") { 1i64 } else { 0i64 };
+            let nums: Vec<i64> = args[2..]
+                .iter()
+                .filter(|a| *a != "--trace")
+                .filter_map(|a| a.parse::<i64>().ok())
+                .collect();
+            let a0 = nums.first().copied().unwrap_or(0);
+            let a1 = nums.get(1).copied().unwrap_or(0);
+            let a2 = nums.get(2).copied().unwrap_or(0);
+            let mut shim = StdThinShim;
+            match p4_shim_exec_bc(&mut shim, path, None, a0, a1, a2, 1_000_000, trace_mode) {
+                Ok((val, tag, 0, steps, tcnt)) => {
+                    println!("[P4-EXEC OK] {} -> val={} tag={} steps={} trace={}", path, val, tag, steps, tcnt);
+                    0
+                }
+                Ok((_, _, err, steps, _)) => {
+                    eprintln!("[P4-EXEC ERR] {} -> err_code={} after {} steps", path, err, steps);
+                    1
+                }
+                Err(e) => {
+                    eprintln!("[P4-EXEC FAIL] {}", e);
+                    1
+                }
+            }
+        }
         "m2-verify" => match selftest_m2_14_verify_diff() {
             Ok(n) => {
                 println!(
@@ -24008,6 +24082,7 @@ pub fn selftest_m2_label_reference() -> Result<usize, String> {
 // M2-03+: host-side M2 tooling lives in m2_host/ (kept out of the monolith to avoid main-line collisions).
 include!("m2_host/lint.rs");
 include!("m2_host/decode_diff.rs");
+include!("p4_shim/mod.rs");
 
 // ==== END M2 FOUNDATION ====
 
@@ -24023,7 +24098,7 @@ fn main() {
             "harness" | "--harness" => {
                 std::process::exit(run_omni_harness_cli(&cli_args[2..]));
             }
-            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" => {
+            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" => {
                 std::process::exit(run_m2_cli(&cli_args[1..]));
             }
             "agent-driver" | "--agent-driver" => {

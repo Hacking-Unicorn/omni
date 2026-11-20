@@ -1,0 +1,42 @@
+// Phase 4 (P4-4): Wasm-hosted Pure-Omni VM execution witness (`spec/m4/vm_wasm_harness.omni`).
+// Compiles via M2-10 `compile_pure_u16_to_wasm_multi` and executes inside `execute_wasm_module_i64`
+// on Wasm linear memory using the real `pure/m4/arena.omni` + `pure/m4/ops_core.omni` VM core:
+//   - Pre-allocates the 512 KiB VM arena on Wasm linear memory
+//   - Initializes VM state + P4-5 binary trace ring (`trace_mode = 1`)
+//   - Dispatches arithmetic (`IADD`, `IMUL`), balanced ternary (`TCMP`, `TNOT`),
+//     frame register slot load/store (`m4f_set_slot_val`/`m4f_get_slot_val`),
+//     and ISA-B byte-buffer (`m4o_exec_anew`, `m4o_exec_iset_append`, `m4o_exec_iget`)
+//   - Returns `result * 10 + trace_cnt` so Wasm host parity proves both computation & P4-5 tracing!
+
+#[strict]
+fn m4w_alloc_arena() -> bytes {
+    let w: bytes = anew(0);
+    let i: i64 = 0;
+    while m2u_lt(i, 65536) <=> 0 {
+        w = iset_i64(w, 0);
+        i = i + 1;
+    }
+    return w;
+}
+
+#[strict]
+fn main(a0: i64, a1: i64, a2: i64) -> i64 {
+    let w0: bytes = m4w_alloc_arena();
+    let w1: bytes = m4a_init(w0, 1000, 1);
+    let r0: i64 = m4o_arith(32528, a0, a1);
+    let w2: bytes = m4f_set_slot_val(w1, 0, 0, r0);
+    let w3: bytes = m4_trace_push(w2, 0, 0, 32528, 10, r0);
+    let r1: i64 = m4o_arith(32530, m4f_get_slot_val(w3, 0, 0), a2);
+    let w4: bytes = m4f_set_slot_val(w3, 0, 1, r1);
+    let w5: bytes = m4_trace_push(w4, 1, 0, 32530, 16, r1);
+    let t0: i64 = m4o_trit(32557, r1, 50, 0);
+    let w6: bytes = m4o_exec_anew(w5, 0, 2);
+    let b0: i64 = m4f_get_slot_val(w6, 0, 2);
+    let w7: bytes = m4o_exec_iset_append(w6, 0, 2, 3, b0, 0 - 4, r1 + t0);
+    let b1: i64 = m4f_get_slot_val(w7, 0, 2);
+    let w8: bytes = m4o_exec_iget(w7, 0, 3, 3, b1, 0 - 4, 0);
+    let w9: bytes = m4_trace_push(w8, 2, 0, 32526, 30, m4f_get_slot_val(w8, 0, 3));
+    let val: i64 = m4f_get_slot_val(w9, 0, 3);
+    let tcnt: i64 = ld_u32(w9, m4s_trace_cnt());
+    return val * 10 + tcnt;
+}

@@ -32,6 +32,7 @@ These limits are intentional invariants (`HANDOFF.md` §2):
 | `pure/m2/verify/mod_check.omni` | 245 | Iterative multi-AOT module verifier (`M2-14`): unique `fn_idx`, `CALL` target/arity checks, iterative Kahn topological-sort cycle detection (no recursion), and L1–L12 label-key parity via `pure/m2/labels.omni` (`m2-verify`, 10/10 differential checks vs Rust). |
 | `pure/m2/emit_multi.omni` + `pure/m2/m2_standalone.omni` | 640 | Two-pass multi-function u16 → x86-64 ELF64 compiler (`M2-15`/`M2-16`: D-4 stack args `[rbp+16+8k]`, 1 MiB `rbx` arena, `CALL`, 3-op `RET`, ISA-B `IGET`/`ISET`, trap stubs). Compiles `pure/compiler.omni`, `pure/verifier_engine.omni`, and its own 32,796-word seed `pure/m2/m2.omni_bc` → `137,246`-B ELF64 (`0xF05F0BFAD0E2DCCC`) with `0`-byte diff vs Rust (`m2-multi-pure`, `m2-fixed-point`). |
 | `pure/m3/*.omni` (`arena`, `lex`, `skim`, `expr`, `stmt`, `lower`) | ~3,200 | Iterative surface `.omni` → `.omni_bc` frontend (`M3-05..M3-17`: lexer, Pass S fn/macro/const skimmer, Pratt expression parser, iterative statement parser, full SSA/CFG/opcode lowerer with `if_pos`/`if_neg`, `match_trit`, `StrLit`, loops, labels/gotos, and O(1) scopes). Self-compiles its own 164,632-B expanded source to `pure/m3/m3.omni_bc` (`59,474` words, `0x0668919FB4378D88`, `0`-word diff vs Rust) and chains with Pure-Omni M2 on `pure/verifier_engine.omni` → `41,285`-B ELF64 (`0xCFF611B4DDBD80DD`, `0`-byte diff vs Rust; `m3-fixed-point`, `m3-lower`, `m3-gate`). |
+| `pure/m4/*.omni` (`arena`, `ops_core`, `vm`) | ~490 | Phase 4 AI-native Pure-Omni deterministic token-stream VM (`P4-1..P4-5`): executes raw `.omni_bc` directly in a 512 KiB flat arena (64-deep call stack, 224 slots/frame, fuel cap, ISA-B byte buffers, built-in 64 KiB binary trace ring `0x70000..0x7FFFF`), backed by a minimal 3-op thin shim (`p4_shim/mod.rs`: `read_bytes`/`write_bytes`/`spawn`) and running on M2-10 Wasm-multi (`p4-vm`, `p4-exec`, `p4-shim`, `p4-wasm`). |
 | `std/*.omni` (7) + `pure/programs/*.omni` (6) | ~1,000 | Standard library helpers and small production-style programs, served directly from disk via `include_str!` (`M3-16`). |
 | `pure/compiler.omni`, `pure/verifier.omni`, `pure/host_runtime.omni`, `pure/tooling.omni`, `pure/selfhost_suite.omni` | ~400 | Legacy Phase 7/A–D integer decision kernels (frozen for regression hashes; not the M2/M3 compilers). |
 
@@ -76,7 +77,11 @@ All 5 frozen artifacts are asserted by FNV-1a64 hash and exact size in `selftest
 
 ```bash
 rustc -O omni_rust_bootstrap.rs -o omnic
-./omnic selftest              # 1363+ checks (1479+ on Linux x86-64; 13AY diff4, 13AZ KV, 13BA ISA table, 13BF hash pin, M2/M3 locks)
+./omnic selftest              # 1380+ checks (1496+ on Linux x86-64; 13AY diff4, 13AZ KV, 13BA ISA table, 13BF hash pin, M2/M3/P4 locks)
+./omnic p4-vm                 # Phase 4 Pure-Omni token-stream VM == Rust OmniBinaryVm (11/11 checks incl. P4-5 trace ring)
+./omnic p4-exec <f.omni_bc>   # Phase 4 raw .omni_bc execution via 3-op OmniThinShim (zero source/parser at runtime)
+./omnic p4-shim               # Phase 4 minimal 3-op thin host shim (read_bytes, write_bytes, spawn — zero HTTP/shell)
+./omnic p4-wasm               # Phase 4 full Pure-Omni VM compiles to Wasm v1 + VM core executes on M2-10 Wasm-multi host
 ./omnic m3-fixed-point        # Pure-Omni M3 frontend fixed point (59,474 words, 0-word diff) + E2E M3+M2 ELF64 chain
 ./omnic m3-4backend           # 4-backend parity (VM == Wasm-multi == Rust-x86-multi == Pure-Omni-M2-ELF64; Stage-1 N/A)
 ./omnic m3-lockstep           # Opt-in lockstep_shadow_frontend (OMNI_M3_LOCKSTEP=1) parity + mismatch hard-fail checks
@@ -89,7 +94,7 @@ rustc -O omni_rust_bootstrap.rs -o omnic
 ./omnic m2-multi-pure         # Pure-Omni multi-function compiler (0-byte diff vs Rust on verifier_engine & self)
 ./omnic m2-multi              # Rust M2-09 multi-function x86-64 ELF64 reference checks
 ./omnic m2-elf                # Pure-Omni arena & ELF64 header/stub checks
-./omnic m2-lint               # lints all 13 registered pure/m2, pure/m3 & pure/isa modules (0 gated findings)
+./omnic m2-lint               # lints all 14 registered pure/m2, pure/m3, pure/m4 & pure/isa modules (0 gated findings)
 ./omnic backend-diff --suite  # 4-backend differential suite (0 FAIL, 0 XPASS required)
 ./omnic acceptance-diff       # 41 executable acceptance goldens
 ./omnic pure-omni-diff        # 49 Pure-Omni differential checks

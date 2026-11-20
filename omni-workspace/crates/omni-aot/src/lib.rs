@@ -1471,7 +1471,7 @@ fn wasm_buf_join(b: &mut Vec<u8>, l: &WasmBufLocals) {
 
 /// After `wasm_buf_split`: if the buffer does not end at `top`, copy it to `top` (when it fits)
 /// so appends never overwrite bytes another value still refers to.
-fn wasm_buf_make_appendable(b: &mut Vec<u8>, l: &WasmBufLocals) {
+fn wasm_buf_make_appendable(b: &mut Vec<u8>, l: &WasmBufLocals, mem_bytes: i64) {
     wasm_lget(b, l.bbase);
     wasm_lget(b, l.blen);
     b.push(0x7C);
@@ -1481,7 +1481,7 @@ fn wasm_buf_make_appendable(b: &mut Vec<u8>, l: &WasmBufLocals) {
     wasm_lget(b, l.top);
     wasm_lget(b, l.blen);
     b.push(0x7C);
-    wasm_i64c(b, WASM_ISET_MEMORY_BYTES);
+    wasm_i64c(b, mem_bytes);
     b.extend_from_slice(&[0x55, 0x50]); // !(top + blen > MEM)
     b.extend_from_slice(&[0x04, 0x40]); // if
     wasm_i64c(b, 0);
@@ -1519,7 +1519,7 @@ fn wasm_buf_make_appendable(b: &mut Vec<u8>, l: &WasmBufLocals) {
 }
 
 /// Pushes i32 cond: buffer ends at `top` and `top + width <= MEM`.
-fn wasm_buf_can_append(b: &mut Vec<u8>, l: &WasmBufLocals, width: i64) {
+fn wasm_buf_can_append(b: &mut Vec<u8>, l: &WasmBufLocals, width: i64, mem_bytes: i64) {
     wasm_lget(b, l.bbase);
     wasm_lget(b, l.blen);
     b.push(0x7C);
@@ -1528,7 +1528,7 @@ fn wasm_buf_can_append(b: &mut Vec<u8>, l: &WasmBufLocals, width: i64) {
     wasm_lget(b, l.top);
     wasm_i64c(b, width);
     b.push(0x7C);
-    wasm_i64c(b, WASM_ISET_MEMORY_BYTES);
+    wasm_i64c(b, mem_bytes);
     b.extend_from_slice(&[0x55, 0x50]);
     b.push(0x71); // i32.and
 }
@@ -2017,9 +2017,10 @@ fn compile_wasm_single_func_body(
                     }
                     b.push(0x0B);
                 } else {
+                    let mem_bytes: i64 = if is_multi { 32 * 65536 } else { WASM_ISET_MEMORY_BYTES };
                     emit_src(b);
                     wasm_buf_split(b, &bl);
-                    wasm_buf_make_appendable(b, &bl);
+                    wasm_buf_make_appendable(b, &bl, mem_bytes);
                     let chunks: Vec<(i64, &BinOperand)> = if ops.len() == 3 && ops[1] == BinOperand::ImmInt(-4) {
                         vec![(4, &ops[2])]
                     } else if ops.len() == 3 && ops[1] == BinOperand::ImmInt(-8) {
@@ -2028,7 +2029,7 @@ fn compile_wasm_single_func_body(
                         ops.iter().skip(1).map(|o| (1i64, o)).collect()
                     };
                     for (width, op_v) in chunks {
-                        wasm_buf_can_append(b, &bl, width);
+                        wasm_buf_can_append(b, &bl, width, mem_bytes);
                         b.extend_from_slice(&[0x04, 0x40]); // if
                         wasm_lget(b, bl.top);
                         b.push(0xA7);

@@ -33,6 +33,9 @@ jobs:
           ./omni m3-lockstep
           ./omni m3-4backend
           ./omni m3-fixed-point
+          ./omni p4-vm
+          ./omni p4-shim
+          ./omni p4-wasm
           ./omni backend-diff --suite
           ./omni selftest
           ./omni pure-bootstrap
