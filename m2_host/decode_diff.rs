@@ -1842,6 +1842,197 @@ pub fn selftest_m3_17_fixed_point(write_seed: bool) -> Result<(usize, usize, u64
     Ok((3, seed_u16.len(), fnv1a_64_hash(&seed_bytes), pure_elf.len(), fnv1a_64_hash(&pure_elf)))
 }
 
+// ============================================================================
+// M3-14: Lockstep Shadow Frontend (`lockstep_shadow_frontend`)
+// ============================================================================
+
+static M3_LOCKSTEP_SEED_MOD: std::sync::OnceLock<Result<BinModule, String>> = std::sync::OnceLock::new();
+static M3_LOCKSTEP_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+thread_local! {
+    static M3_LOCKSTEP_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static M3_LOCKSTEP_SUSPENDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static M3_LOCKSTEP_INJECT_PATH: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+pub fn with_m3_lockstep_enabled<R>(f: impl FnOnce() -> R) -> R {
+    let prev = M3_LOCKSTEP_ENABLED.with(|c| c.replace(true));
+    let r = f();
+    M3_LOCKSTEP_ENABLED.with(|c| c.set(prev));
+    r
+}
+
+pub fn with_m3_lockstep_suspended<R>(f: impl FnOnce() -> R) -> R {
+    let prev = M3_LOCKSTEP_SUSPENDED.with(|c| c.replace(true));
+    let r = f();
+    M3_LOCKSTEP_SUSPENDED.with(|c| c.set(prev));
+    r
+}
+
+pub fn with_m3_lockstep_inject_mismatch<R>(path: &'static str, f: impl FnOnce() -> R) -> R {
+    let prev = M3_LOCKSTEP_INJECT_PATH.with(|c| c.replace(Some(path)));
+    let r = f();
+    M3_LOCKSTEP_INJECT_PATH.with(|c| c.set(prev));
+    r
+}
+
+fn m3_lockstep_is_active() -> bool {
+    if M3_LOCKSTEP_SUSPENDED.with(|c| c.get()) || LOCKSTEP_SUSPENDED.with(|c| c.get()) {
+        return false;
+    }
+    M3_LOCKSTEP_ENABLED.with(|c| c.get())
+        || std::env::var("OMNI_M3_LOCKSTEP").ok().as_deref() == Some("1")
+}
+
+fn m3_lockstep_seed_module() -> Result<&'static BinModule, String> {
+    let r = M3_LOCKSTEP_SEED_MOD.get_or_init(|| {
+        const SEED: &[u8] = include_bytes!("../pure/m3/m3.omni_bc");
+        if SEED.len() % 2 != 0 {
+            return Err("M3-14: pure/m3/m3.omni_bc has odd byte length".to_string());
+        }
+        let u16s: Vec<u16> = SEED
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        decode_omni_token_stream(&u16s)
+    });
+    r.as_ref().map_err(|e| e.clone())
+}
+
+fn m3_lockstep_compile_via_omni(src: &str, strict: bool) -> Result<Result<Vec<u16>, (u16, u16, u16)>, String> {
+    let m3_mod = m3_lockstep_seed_module()?;
+    let entry = m2_entry_of(m3_mod);
+    let src_u16: Vec<u16> = src.as_bytes().iter().map(|&b| b as u16).collect();
+    let arena_bytes = 786_432usize;
+    let mut vm = OmniBinaryVm::with_budgets(500_000_000, 128 * 1024 * 1024);
+    let out_bytes = match vm.execute_function(
+        m3_mod,
+        entry,
+        vec![
+            OmniValue::Bytes(vec![0u8; arena_bytes]),
+            OmniValue::U16Array(src_u16),
+            OmniValue::Int(if strict { 1 } else { 0 }),
+        ],
+    )? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("M3-14: Omni M3 returned {:?}, expected Bytes", other)),
+    };
+    if out_bytes.len() == 16 && u16::from_le_bytes([out_bytes[0], out_bytes[1]]) == 0xFFFF {
+        let code = u16::from_le_bytes([out_bytes[2], out_bytes[3]]);
+        let line = u16::from_le_bytes([out_bytes[4], out_bytes[5]]);
+        let col = u16::from_le_bytes([out_bytes[6], out_bytes[7]]);
+        return Ok(Err((code, line, col)));
+    }
+    if out_bytes.len() % 2 != 0 {
+        return Err(format!("M3-14: Omni M3 returned odd byte length {}", out_bytes.len()));
+    }
+    let words: Vec<u16> = out_bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    Ok(Ok(words))
+}
+
+/// M3-14: Opt-in lockstep shadow frontend (`OMNI_M3_LOCKSTEP=1` or `with_m3_lockstep_enabled`).
+/// Modeled on `lockstep_shadow_verify`: compiles `src` with the committed Pure-Omni M3 seed on the VM
+/// and hard-errors with `error[LOCKSTEP_MISMATCH]` on any word-level or error-presence disagreement.
+pub fn lockstep_shadow_frontend(
+    path: &str,
+    src: &str,
+    strict: bool,
+    rust_res: &Result<Vec<u16>, String>,
+) -> Result<(), String> {
+    if !m3_lockstep_is_active() {
+        return Ok(());
+    }
+    let mut omni_res = with_m3_lockstep_suspended(|| m3_lockstep_compile_via_omni(src, strict))?;
+    if M3_LOCKSTEP_INJECT_PATH.with(|c| c.get()) == Some(path) {
+        omni_res = match omni_res {
+            Ok(mut v) => {
+                if let Some(first) = v.first_mut() {
+                    *first ^= 0x0001;
+                } else {
+                    v.push(0xFFFF);
+                }
+                Ok(v)
+            }
+            Err(_) => Ok(vec![0x7F00]),
+        };
+    }
+    M3_LOCKSTEP_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    match (rust_res, &omni_res) {
+        (Ok(r), Ok(o)) if r == o => Ok(()),
+        (Ok(r), Ok(o)) => {
+            let min_l = r.len().min(o.len());
+            let diff = (0..min_l).find(|&i| r[i] != o[i]).unwrap_or(min_l);
+            Err(format!(
+                "error[LOCKSTEP_MISMATCH] line 1, col 1: path={}: Rust and Omni M3 frontends disagree: rust={} words vs omni={} words (first diff at word {}: 0x{:04X} vs 0x{:04X})",
+                path, r.len(), o.len(), diff, r.get(diff).copied().unwrap_or(0), o.get(diff).copied().unwrap_or(0)
+            ))
+        }
+        (Err(_), Err(_)) => Ok(()),
+        (Ok(r), Err((c, l, col))) => Err(format!(
+            "error[LOCKSTEP_MISMATCH] line 1, col 1: path={}: Rust frontend ok ({} words) but Omni M3 errored (code={}, {}:{})",
+            path, r.len(), c, l, col
+        )),
+        (Err(re), Ok(o)) => Err(format!(
+            "error[LOCKSTEP_MISMATCH] line 1, col 1: path={}: Rust frontend errored ({}) but Omni M3 ok ({} words)",
+            path, re, o.len()
+        )),
+    }
+}
+
+/// M3-14 selftest: verifies `lockstep_shadow_frontend` positive parity (arithmetic, `if_pos`/`match_trit`,
+/// `pure/m2/util.omni`, and negative error agreement), injected-mismatch hard rejection, and suspend hook.
+pub fn selftest_m3_14_lockstep_frontend() -> Result<usize, String> {
+    let mut checks = 0usize;
+    let before = M3_LOCKSTEP_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+
+    let ok_arith = "#[strict]\nfn main(a: i64) -> i64 { let b: i64 = a + 1; return b; }\n";
+    let ok_cf = "#[strict]\nfn main(x: i64) -> i64 { let t: trit = x <=> 0; let r: i64 = match_trit t { neg => -x, zero => 0, pos => if_pos (x <=> 10) { x - 10 } else { x + 1 } }; return r; }\n";
+    let ok_util = include_str!("../pure/m2/util.omni");
+    let err_src = "#[strict]\nfn main(x: i64) -> i64 { return undeclared_var; }\n";
+
+    with_m3_lockstep_enabled(|| -> Result<(), String> {
+        // 1-3: Positive 0-word-diff parity through production `compile_omni_surface_to_u16`
+        let _ = compile_omni_surface_to_u16(ok_arith)?;
+        checks += 1;
+        let _ = compile_omni_surface_to_u16(ok_cf)?;
+        checks += 1;
+        let _ = compile_omni_surface_strict_to_u16(ok_util)?;
+        checks += 1;
+
+        // 4: Negative parity (both Rust and Omni M3 reject; lockstep agrees and returns Rust's Err)
+        match compile_omni_surface_to_u16(err_src) {
+            Err(e) if !e.starts_with("error[LOCKSTEP_MISMATCH]") => checks += 1,
+            other => return Err(format!("M3-14 negative parity expected normal error, got {:?}", other)),
+        }
+
+        // 5: Injected disagreement MUST hard-error with error[LOCKSTEP_MISMATCH]
+        let inj = with_m3_lockstep_inject_mismatch("compile", || compile_omni_surface_to_u16(ok_arith));
+        match inj {
+            Err(e) if e.starts_with("error[LOCKSTEP_MISMATCH]") => checks += 1,
+            other => return Err(format!("M3-14 inject-mismatch expected LOCKSTEP_MISMATCH, got {:?}", other)),
+        }
+
+        // 6: Suspend hook skips lockstep cleanly (even with mismatch injection armed)
+        let susp = with_m3_lockstep_suspended(|| {
+            with_m3_lockstep_inject_mismatch("compile", || compile_omni_surface_to_u16(ok_arith))
+        });
+        match susp {
+            Ok(_) => checks += 1,
+            Err(e) => return Err(format!("M3-14 suspended hook unexpectedly failed: {}", e)),
+        }
+        Ok(())
+    })?;
+
+    let after = M3_LOCKSTEP_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+    if after < before + 5 {
+        return Err(format!("M3-14 lockstep counter did not advance as expected ({} -> {})", before, after));
+    }
+    Ok(checks)
+}
+
 /// `omni m2-decode` runs the decoder differential; `omni m2-decode <file.omni_bc>` decodes one
 /// stream with the Omni decoder on the VM and checks it against Rust.
 pub fn m2_decode_cli(args: &[String]) -> i32 {

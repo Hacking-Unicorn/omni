@@ -5410,7 +5410,9 @@ pub fn compile_omni_surface_to_u16_with_sourcemap(
 }
 
 fn compile_omni_surface_to_u16_inner(src: &str, strict: bool) -> Result<Vec<u16>, String> {
-    compile_omni_surface_to_u16_with_sourcemap(src, strict).map(|(s, _)| s)
+    let res = compile_omni_surface_to_u16_with_sourcemap(src, strict).map(|(s, _)| s);
+    lockstep_shadow_frontend("compile", src, strict, &res)?;
+    res
 }
 
 /// Compiles an Omni surface language program directly into a `Vec<u16>` token stream without
@@ -23042,6 +23044,7 @@ pub fn run_m2_foundation_selftests() -> Result<usize, String> {
     n += selftest_m3_08_expr_diff()?;
     n += selftest_m3_09_stmt_diff()?;
     n += selftest_m3_10_lower_diff()?;
+    n += selftest_m3_14_lockstep_frontend()?;
     Ok(n)
 }
 
@@ -23409,6 +23412,19 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
                 1
             }
         },
+        "m3-lockstep" => match selftest_m3_14_lockstep_frontend() {
+            Ok(n) => {
+                println!(
+                    "[M3-LOCKSTEP PASS] {} checks (lockstep_shadow_frontend: positive parity, negative agreement, injected mismatch hard-fail, suspend hook)",
+                    n
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("[M3-LOCKSTEP FAIL] {}", e);
+                1
+            }
+        },
         "m3-fixed-point" => {
             let write_seed = args.get(1).map(|s| s.as_str()) == Some("--write-seed");
             match selftest_m3_17_fixed_point(write_seed) {
@@ -23716,7 +23732,7 @@ fn main() {
             "harness" | "--harness" => {
                 std::process::exit(run_omni_harness_cli(&cli_args[2..]));
             }
-            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-fixed-point" => {
+            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-fixed-point" => {
                 std::process::exit(run_m2_cli(&cli_args[1..]));
             }
             "agent-driver" | "--agent-driver" => {
