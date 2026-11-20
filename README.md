@@ -75,9 +75,9 @@ All 5 frozen artifacts are asserted by FNV-1a64 hash and exact size in `selftest
 
 ```bash
 rustc -O omni_rust_bootstrap.rs -o omnic
-./omnic selftest              # 1224+ checks (13AY diff4, 13AZ KV, 13BA ISA table, 13BF hash pin, M2/M3 locks)
+./omnic selftest              # 1465 checks (13AY diff4, 13AZ KV, 13BA ISA table, 13BF hash pin, M2/M3 locks)
 ./omnic m3-fixed-point        # Pure-Omni M3 frontend fixed point (59,474 words, 0-word diff) + E2E M3+M2 ELF64 chain
-./omnic m3-lower              # Pure-Omni M3 lowering parity vs Rust (21/21 modules incl. verifier_engine, 0-word diff)
+./omnic m3-lower              # Pure-Omni M3 lowering parity vs Rust (20/20 modules incl. verifier_engine, 0-word diff)
 ./omnic m3-gate               # lints + compiles + verifies all 6 pure/m3/*.omni modules
 ./omnic m2-fixed-point        # M2 self-hosted compiler drift check + S1 == V (and S1 == S2 == S3 on Linux x86-64)
 ./omnic m2-compile            # Pure-Omni 2-pass compiler on 19,731-word Stage-1 anchor (106,242 B, 0-byte diff)
