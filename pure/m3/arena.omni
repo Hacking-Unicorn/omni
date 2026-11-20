@@ -16,6 +16,10 @@ fn m3l_band() -> i64 { return 524288; }          // 0x80000
 #[strict]
 fn m3l_globals() -> i64 { return 0; }            // 0x00000
 #[strict]
+fn m3l_fntab() -> i64 { return 32768; }          // 0x08000 (512 fns x 32 B)
+#[strict]
+fn m3l_mactab() -> i64 { return 49152; }         // 0x0C000 (128 macros x 64 B)
+#[strict]
 fn m3l_ring() -> i64 { return 57344; }           // 0x0E000
 #[strict]
 fn m3l_pool() -> i64 { return 65536; }           // 0x10000
@@ -59,6 +63,10 @@ fn m3err_syntax() -> i64 { return 1; }
 fn m3err_ambiguous() -> i64 { return 2; }
 #[strict]
 fn m3err_budget() -> i64 { return 3; }
+#[strict]
+fn m3err_bad_type() -> i64 { return 4; }
+#[strict]
+fn m3err_missing_cap() -> i64 { return 5; }
 
 #[strict]
 fn m3a_g_get(arena: bytes, slot: i64) -> i64 {
@@ -78,12 +86,12 @@ fn m3a_set_err(arena: bytes, code: i64, line: i64, col: i64) -> bytes {
     return w;
 }
 
-// Initializes M3 globals (slots 0..15) for a source buffer of length `src_len`.
+// Initializes M3 globals (slots 0..23) for a source buffer of length `src_len`.
 #[strict]
 fn m3a_init(arena: bytes, src_len: i64, strict: i64) -> bytes {
     let w: bytes = arena;
     let i: i64 = 0;
-    while 16 - i <=> 0 {
+    while 24 - i <=> 0 {
         w = iset_patch_i64(w, i << 3, 0);
         i = i + 1;
     }

@@ -518,6 +518,12 @@ pub const M3_LEX_OMNI_SRC: &str = concat!(
     include_str!("../spec/m3/lex_harness.omni")
 );
 
+pub const M3_SKIM_OMNI_SRC: &str = concat!(
+    include_str!("../pure/m3/skim.omni"),
+    "\n",
+    include_str!("../spec/m3/skim_harness.omni")
+);
+
 /// M3-04 selftest: `pure/isa/encode.omni` re-encodes every positive acceptance golden,
 /// `pure/verifier_engine.omni` (11,893 words), and `build_step7_stage1_compiler_stream`
 /// (19,731 words) bit-for-bit identically to `encode_u16_stream_to_bytes`.
@@ -1083,6 +1089,157 @@ pub fn selftest_m3_06_lex_diff() -> Result<usize, String> {
                         return Err(format!(
                             "M3-06 '{}' tok#{}: token mismatch Omni (kind={}, sub={}, val={}) vs Rust {:?}",
                             name, ti, kind, sub, val, rt.tok
+                        ));
+                    }
+                }
+            }
+        }
+        checks += 1;
+    }
+    Ok(checks)
+}
+
+/// M3-07 selftest: Pure-Omni Pass S (`pure/m3/skim.omni`) differentially checked against Rust
+/// `parse_module` + signature checks across acceptance goldens, `pure/verifier_engine.omni`,
+/// Q5/Q7 fixtures, and negative header/signature fixtures (`BAD_TYPE`, `MISSING_CAP`,
+/// `BUDGET_EXCEEDED`, `AMBIGUOUS_GRAMMAR`, duplicate fn, empty module).
+pub fn selftest_m3_07_skim_diff() -> Result<usize, String> {
+    let skim_mod = m2_compile_decoder(M3_SKIM_OMNI_SRC)?;
+    let entry = m2_entry_of(&skim_mod);
+    let mut cases: Vec<(String, String, bool)> = Vec::new();
+    for &(gid, src) in M2_GOLDEN_SOURCES {
+        cases.push((format!("golden:{}", gid), String::from(src), false));
+    }
+    cases.push((String::from("pure/verifier_engine.omni"), String::from(OMNI_VERIFIER_ENGINE_SURFACE), true));
+    cases.push((String::from("q7_fn_ids"), String::from(include_str!("../spec/m3/fixtures/q7_fn_ids.omni")), false));
+    cases.push((String::from("q5_macro_after_def"), String::from(include_str!("../spec/m3/fixtures/q5_macro_after_def.omni")), false));
+    cases.push((String::from("neg_bad_type"), String::from(include_str!("../spec/m3/fixtures/neg_bad_type.omni")), false));
+    cases.push((String::from("neg_missing_cap"), String::from(include_str!("../spec/m3/fixtures/neg_missing_cap.omni")), false));
+    cases.push((String::from("neg_budget_exceeded"), String::from(include_str!("../spec/m3/fixtures/neg_budget_exceeded.omni")), false));
+    cases.push((String::from("neg_ambiguous_grammar"), String::from(include_str!("../spec/m3/fixtures/neg_ambiguous_grammar.omni")), false));
+    cases.push((String::from("err_dup_fn"), String::from("fn f(x: i64) -> i64 { return x; }\nfn f(y: i64) -> i64 { return y; }\n"), false));
+    cases.push((String::from("err_strict_mod"), String::from("#[strict]\nmod \"std/math.omni\";\nfn main(x: i64) -> i64 { return x; }\n"), false));
+    cases.push((String::from("err_empty_mod"), String::from("// no functions here\n"), false));
+
+    let mut checks = 0usize;
+    for (name, src, strict_arg) in &cases {
+        let eff_strict = *strict_arg || src.contains("#[strict]");
+        let rust_res: Result<Vec<(u16, usize, u16, u16, String, bool, bool, usize, usize, usize, usize)>, String> = (|| {
+            let toks = tokenize_omni_surface_inner(src, eff_strict)?;
+            let mut parser = SurfaceParser::new_with_strict(toks, eff_strict);
+            let (_incs, fns) = parser.parse_module()?;
+            let multi_fn = fns.len() > 1;
+            let mut seen = BTreeSet::new();
+            let mut out = Vec::with_capacity(fns.len());
+            for (idx, f) in fns.iter().enumerate() {
+                let fid = if let Some(id_attr) = f.fn_id_attr {
+                    id_attr
+                } else if !multi_fn || idx + 1 == fns.len() {
+                    0
+                } else {
+                    (idx + 1) as u16
+                };
+                let fn_strict = eff_strict || f.strict_attr;
+                let ret_asm = map_omni_surface_type_inner(&f.ret_ty, f.ret_line, f.ret_col, fn_strict)?;
+                let ret_tok = parse_asm_ty_tok(ret_asm);
+                for p in &f.params {
+                    let _ = map_omni_surface_type_inner(&p.ty, p.line, p.col, fn_strict)?;
+                }
+                if !seen.insert(f.name.clone()) {
+                    return Err(format!(
+                        "error[SYNTAX_ERROR] line {}, col {}: Duplicate function definition '{}'",
+                        f.ret_line, f.ret_col, f.name
+                    ));
+                }
+                out.push((fid, f.params.len(), ret_tok, f.cap_mask, f.name.clone(), f.is_route, fn_strict, f.fn_line, f.fn_col, f.ret_line, f.ret_col));
+            }
+            Ok(out)
+        })();
+
+        let src_u16: Vec<u16> = src.as_bytes().iter().map(|&b| b as u16).collect();
+        let arena_len = (131_072 + src.len() * 16 + 4096).max(262_144);
+        let mut vm = OmniBinaryVm::with_budgets(250_000_000, 64 * 1024 * 1024);
+        let out_bytes = match vm.execute_function(
+            &skim_mod,
+            entry,
+            vec![
+                OmniValue::Bytes(vec![0u8; arena_len]),
+                OmniValue::U16Array(src_u16),
+                OmniValue::Int(if *strict_arg { 1 } else { 0 }),
+            ],
+        )? {
+            OmniValue::Bytes(b) => b,
+            other => return Err(format!("M3-07 '{}': returned {:?}, expected Bytes", name, other)),
+        };
+        let is_omni_err = out_bytes.len() == 16 && u16::from_le_bytes([out_bytes[0], out_bytes[1]]) == 0xFFFF;
+        match rust_res {
+            Err(re) => {
+                if is_omni_err {
+                    let ecode = u16::from_le_bytes([out_bytes[2], out_bytes[3]]);
+                    let eline = u16::from_le_bytes([out_bytes[4], out_bytes[5]]);
+                    let ecol = u16::from_le_bytes([out_bytes[6], out_bytes[7]]);
+                    let want_code = if re.contains("AMBIGUOUS_GRAMMAR") {
+                        2u16
+                    } else if re.contains("BUDGET_EXCEEDED") {
+                        3u16
+                    } else if re.contains("BAD_TYPE") {
+                        4u16
+                    } else if re.contains("MISSING_CAP") {
+                        5u16
+                    } else {
+                        1u16
+                    };
+                    let want_span = format!("line {}, col {}:", eline, ecol);
+                    if ecode != want_code || (!re.contains(&want_span) && name != "err_empty_mod") {
+                        return Err(format!(
+                            "M3-07 '{}': error mismatch: Omni (code={}, line={}, col={}) vs Rust '{}'",
+                            name, ecode, eline, ecol, re
+                        ));
+                    }
+                } else if name.starts_with("neg_") || name.starts_with("err_") {
+                    return Err(format!("M3-07 '{}': Rust errored ({}) but Omni succeeded ({} fns)", name, re, out_bytes.len() / 32));
+                }
+            }
+            Ok(rfns) => {
+                if is_omni_err {
+                    let ecode = u16::from_le_bytes([out_bytes[2], out_bytes[3]]);
+                    let eline = u16::from_le_bytes([out_bytes[4], out_bytes[5]]);
+                    let ecol = u16::from_le_bytes([out_bytes[6], out_bytes[7]]);
+                    return Err(format!(
+                        "M3-07 '{}': Rust ok ({} fns) but Omni errored (code={}, line={}, col={})",
+                        name, rfns.len(), ecode, eline, ecol
+                    ));
+                }
+                if out_bytes.len() != rfns.len() * 32 {
+                    return Err(format!(
+                        "M3-07 '{}': fn count mismatch: Omni {} vs Rust {}",
+                        name, out_bytes.len() / 32, rfns.len()
+                    ));
+                }
+                let sbytes = src.as_bytes();
+                for (fi, (rfid, rnpar, rret, rcap, rname, rrt, rstr, rfl, rfc, rrl, rrc)) in rfns.iter().enumerate() {
+                    let off = fi * 32;
+                    let w0 = u64::from_le_bytes(out_bytes[off..off + 8].try_into().unwrap());
+                    let w1 = u64::from_le_bytes(out_bytes[off + 8..off + 16].try_into().unwrap());
+                    let w3 = u64::from_le_bytes(out_bytes[off + 24..off + 32].try_into().unwrap());
+                    let ofid = (w0 & 0xFFFF) as u16;
+                    let onpar = ((w0 >> 16) & 0xFFFF) as usize;
+                    let oret = ((w0 >> 32) & 0xFFFF) as u16;
+                    let ocap = ((w0 >> 48) & 0xFFFF) as u16;
+                    let onoff = (w1 & 0xFFFF_FFFF) as usize;
+                    let onlen = ((w1 >> 32) & 0xFFFF) as usize;
+                    let ostr = ((w1 >> 48) & 1) != 0;
+                    let ort = ((w1 >> 49) & 1) != 0;
+                    let ofl = (w3 & 0xFFFF) as usize;
+                    let ofc = ((w3 >> 16) & 0xFFFF) as usize;
+                    let orl = ((w3 >> 32) & 0xFFFF) as usize;
+                    let orc = ((w3 >> 48) & 0xFFFF) as usize;
+                    let name_ok = ort || &sbytes[onoff..onoff + onlen] == rname.as_bytes();
+                    if ofid != *rfid || onpar != *rnpar || oret != *rret || ocap != *rcap || !name_ok || ort != *rrt || ostr != *rstr || ofl != *rfl || ofc != *rfc || orl != *rrl || orc != *rrc {
+                        return Err(format!(
+                            "M3-07 '{}' fn#{} ('{}'): mismatch Omni(fid={},np={},ret=0x{:X},cap=0x{:X},rt={},str={},fl={}:{},rl={}:{}) vs Rust(fid={},np={},ret=0x{:X},cap=0x{:X},rt={},str={},fl={}:{},rl={}:{})",
+                            name, fi, rname, ofid, onpar, oret, ocap, ort, ostr, ofl, ofc, orl, orc,
+                            rfid, rnpar, rret, rcap, rrt, rstr, rfl, rfc, rrl, rrc
                         ));
                     }
                 }

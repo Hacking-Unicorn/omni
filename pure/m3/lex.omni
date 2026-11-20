@@ -323,9 +323,9 @@ fn m3l_lex_one(arena: bytes, src: array, n: i64) -> bytes {
     return r6;
 }
 
-// Top-level Pass L: lexes the entire source buffer into 16-byte token records.
+// Top-level Pass L (in-place): lexes the entire source buffer into m3l_out() without slicing.
 #[strict]
-fn m3_lex_all(arena: bytes, src: array, strict_arg: i64) -> bytes {
+fn m3_lex_into(arena: bytes, src: array, strict_arg: i64) -> bytes {
     let n: i64 = slen(src);
     let eff_strict: i64 = strict_arg | m3l_has_strict_attr(src, n);
     let w: bytes = m3a_init(arena, n, eff_strict);
@@ -341,5 +341,11 @@ fn m3_lex_all(arena: bytes, src: array, strict_arg: i64) -> bytes {
         let err2: i64 = ld_u64(w, 40);
         going = more * m2u_eq(err2, 0);
     }
-    return m3a_finish_lex(w);
+    return w;
+}
+
+// Top-level Pass L: lexes the entire source buffer into 16-byte token records and slices output.
+#[strict]
+fn m3_lex_all(arena: bytes, src: array, strict_arg: i64) -> bytes {
+    return m3a_finish_lex(m3_lex_into(arena, src, strict_arg));
 }

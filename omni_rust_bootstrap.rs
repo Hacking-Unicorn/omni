@@ -23012,6 +23012,7 @@ pub fn run_m2_foundation_selftests() -> Result<usize, String> {
     n += selftest_m2_15_pure_multi_compiler()?;
     n += selftest_m2_16_fixed_point(false)?.0;
     n += selftest_m3_06_lex_diff()?;
+    n += selftest_m3_07_skim_diff()?;
     Ok(n)
 }
 
@@ -23339,6 +23340,16 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
                 1
             }
         },
+        "m3-skim" => match selftest_m3_07_skim_diff() {
+            Ok(n) => {
+                println!("[M3-SKIM PASS] {} files skimmed in Pure Omni with 100% fn-table, Q5/Q7 & signature parity vs Rust!", n);
+                0
+            }
+            Err(e) => {
+                eprintln!("[M3-SKIM FAIL] {}", e);
+                1
+            }
+        },
         _ => {
             eprintln!("usage: omni m2-frozen | m2-lock | m2-census | m2-labels | m2-lint [file.omni|file.omni_asm]... | m2-decode | m2-elf");
             2
@@ -23630,7 +23641,7 @@ fn main() {
             "harness" | "--harness" => {
                 std::process::exit(run_omni_harness_cli(&cli_args[2..]));
             }
-            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m3-lex" => {
+            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m3-lex" | "m3-skim" => {
                 std::process::exit(run_m2_cli(&cli_args[1..]));
             }
             "agent-driver" | "--agent-driver" => {
