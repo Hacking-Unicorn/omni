@@ -1,0 +1,10 @@
+// Test-only entry: exercises m2d_decode_at_ws. The caller passes the arena `ws` with
+// slen(ws) == m2l_isa_tbl() (0x81000); the harness appends the ISA table rodata there
+// (isa_tbl_append, pure/isa/table.omni) and returns ws with the four scratch words patched.
+#[strict]
+fn m2d_ws_harness_main(arr: array, off: i64, ws: bytes) -> bytes {
+    let n: i64 = slen(arr);
+    let t: bytes = isa_tbl_append(ws);
+    let w: bytes = m2d_decode_at_ws(arr, n, off, t);
+    return w;
+}

@@ -1,0 +1,15 @@
+// Harness for M2 label-table collector/resolver selftest (pure/m2/labels.omni).
+// Takes (arr: array, query_slot: i64, arena: bytes) -> i64 (resolved instruction index, or -1).
+// Linked after pure/m2/util.omni + pure/isa/table.omni + pure/m2/decode.omni + pure/m2/labels.omni.
+#[strict]
+fn m2lbl_test_main(arr: array, query_slot: i64, arena: bytes) -> i64 {
+    let n: i64 = slen(arr);
+    let w: bytes = m2lbl_clear_all(arena);
+    let p_cnt: i64 = m2u_tok(arr, n, 3);
+    let sig_pos: i64 = 4 + p_cnt * 3;
+    let ins_cnt: i64 = m2u_tok(arr, n, sig_pos + 2);
+    let ins_start: i64 = sig_pos + 3;
+    w = m2lbl_collect_fn(w, arr, n, ins_start, ins_cnt);
+    let r: i64 = m2lbl_lookup(w, query_slot);
+    return r;
+}

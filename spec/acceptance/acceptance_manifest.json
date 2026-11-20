@@ -26,6 +26,8 @@
     {"id": "pack5_direct_aot", "file": "goldens/pack5_direct_aot.omni", "locked_u16_tokens": null, "args": [], "expected_result": "2422", "expected_backend": "aot"},
     {"id": "route_kv_golden", "file": "goldens/route_kv_golden.omni", "locked_u16_tokens": null, "args": ["42"], "expected_result": "200000777", "expected_backend": "vm"},
     {"id": "route_db_query_golden", "file": "goldens/route_db_query_golden.omni", "locked_u16_tokens": null, "args": ["42"], "expected_result": "200000420", "expected_backend": "vm"},
+    {"id": "route_db_get_miss_golden", "file": "goldens/route_db_get_miss_golden.omni", "locked_u16_tokens": null, "args": ["42"], "expected_result": "199999999", "expected_backend": "vm"},
+    {"id": "route_db_query_miss_golden", "file": "goldens/route_db_query_miss_golden.omni", "locked_u16_tokens": null, "args": ["42"], "expected_result": "199999999", "expected_backend": "vm"},
     {"id": "stdlib_macro_pipeline_golden", "file": "goldens/stdlib_macro_pipeline_golden.omni", "locked_u16_tokens": null, "args": ["45", "10", "40"], "expected_result": "100", "expected_backend": "vm"}
   ],
   "negative_goldens": [

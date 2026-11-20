@@ -1,0 +1,41 @@
+// ==============================================================================
+// spec/m2/elf_harness.omni  (M2-11 test driver)
+// ==============================================================================
+// Link order: pure/m2/util.omni, pure/isa/table.omni, pure/m2/decode.omni,
+//             pure/m2/labels.omni, pure/m2/arena.omni, pure/m2/elf.omni, this file.
+// Mode:
+//   0: verify D-7 rejection (nwords = arg1 -> returns err code, out_len)
+//   1: emit 120-B ELF64 header (total_size = arg1) and return via m2a_finish_slice
+//   2: emit trap stub (exit_code = arg1) + multi stub head (25 B) + fn prologue (arg2)
+// ==============================================================================
+
+#[strict]
+fn m2e_run_d7(arena: bytes, nwords: i64) -> bytes {
+    let w: bytes = m2a_init(arena, nwords, 1, 1);
+    let err: i64 = ld_u64(w, m2l_regs() + 16);
+    let olen: i64 = ld_u64(w, m2l_regs());
+    w = m2a_emit_u64(w, err);
+    w = m2a_emit_u64(w, olen);
+    return w;
+}
+
+#[strict]
+fn m2e_run_stubs(arena: bytes, exit_code: i64, frame_bytes: i64) -> bytes {
+    let w: bytes = m2a_init(arena, 100, 1, 1);
+    w = m2e_emit_trap_stub(w, exit_code);
+    w = m2e_emit_multi_stub_head(w);
+    w = m2e_emit_fn_prologue(w, frame_bytes);
+    return w;
+}
+
+#[strict]
+fn m2e_harness(arena: bytes, mode: i64, arg1: i64, arg2: i64) -> bytes {
+    let w: bytes = arena;
+    let is_d7: trit = m2u_eq(mode, 0) <=> 0;
+    let is_hdr: trit = m2u_eq(mode, 1) <=> 0;
+    let is_stubs: trit = m2u_eq(mode, 2) <=> 0;
+    w = if_pos is_d7 { m2e_run_d7(w, arg1) } else { w };
+    w = if_pos is_hdr { m2e_emit_elf64_hdr(m2a_init(w, 100, 1, 1), arg1) } else { w };
+    w = if_pos is_stubs { m2e_run_stubs(w, arg1, arg2) } else { w };
+    return m2a_finish_slice(w);
+}

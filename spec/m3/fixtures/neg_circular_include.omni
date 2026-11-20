@@ -1,0 +1,5 @@
+// neg CIRCULAR_INCLUDE: this file includes itself (resolved from the repo root).
+include "spec/m3/fixtures/neg_circular_include.omni";
+fn main(x: i64) -> i64 {
+    return x;
+}
