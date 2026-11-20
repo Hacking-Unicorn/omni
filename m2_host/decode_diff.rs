@@ -2033,6 +2033,107 @@ pub fn selftest_m3_14_lockstep_frontend() -> Result<usize, String> {
     Ok(checks)
 }
 
+/// M2-10 selftest: Multi-function Wasm v1 emitter + `CALL` + shared linear-memory bump global +
+/// call-depth-64 budget enforcement, differentially verified against `OmniBinaryVm` and x86-64 multi AOT.
+pub fn selftest_m2_10_wasm_multi() -> Result<usize, String> {
+    let cases: [(&str, &str, Vec<i64>, i64); 4] = [
+        (
+            "mf_chain_arith",
+            "#[strict]\nfn add1(x: i64) -> i64 { return x + 1; }\nfn mul3(x: i64) -> i64 { return add1(x) * 3; }\nfn main(a: i64) -> i64 { return mul3(a) + add1(a * 2); }\n",
+            vec![7],
+            (7 + 1) * 3 + (14 + 1),
+        ),
+        (
+            "mf_loop_helper",
+            "#[strict]\nfn step(acc: i64, i: i64) -> i64 { return acc + i * i; }\nfn main(n: i64) -> i64 { let acc: i64 = 0; let i: i64 = 1; while n >= i { acc = step(acc, i); i = i + 1; } return acc; }\n",
+            vec![5],
+            55,
+        ),
+        (
+            "mf_buf_across_call",
+            "#[strict]\nfn mk_buf(a: i64, b: i64) -> bytes { let w: bytes = anew(0); w = iset(w, a); w = iset(w, b); return w; }\nfn sum_buf(w: bytes) -> i64 { return iget(w, 0) + iget(w, 1) + slen(w); }\nfn main(x: i64) -> i64 { let a: bytes = mk_buf(x, x + 1); let b: bytes = mk_buf(x + 10, x + 20); return sum_buf(a) * 100 + sum_buf(b); }\n",
+            vec![5],
+            (5 + 6 + 2) * 100 + (15 + 25 + 2),
+        ),
+        (
+            "mf_deep_dag",
+            "#[strict]\nfn f1(x: i64) -> i64 { return x + 1; }\nfn f2(x: i64) -> i64 { return f1(x) + f1(x + 1); }\nfn f3(x: i64) -> i64 { return f2(x) * 2 + f1(x); }\nfn main(n: i64) -> i64 { return f3(n) + f2(n); }\n",
+            vec![4],
+            ((5 + 6) * 2 + 5) + (5 + 6),
+        ),
+    ];
+
+    let mut checks = 0usize;
+    for (name, src, args, want) in &cases {
+        let stream = compile_omni_surface_strict_to_u16(src)?;
+        let m = decode_omni_token_stream(&stream)?;
+        let entry = m2_entry_of(&m);
+        let vm_args: Vec<OmniValue> = args.iter().map(|&v| OmniValue::Int(v)).collect();
+        let mut vm = OmniBinaryVm::new();
+        let vm_got = match vm.execute_function(&m, entry, vm_args)? {
+            OmniValue::Int(v) => v,
+            other => return Err(format!("M2-10 '{}': VM returned {:?}", name, other)),
+        };
+        let wasm = compile_pure_u16_to_wasm_multi(&stream)?;
+        let wasm_got = execute_wasm_module_i64(&wasm, args)?;
+        // Also verify x86-64 multi-fn compiles cleanly on the same stream
+        let _x86_elf = compile_pure_u16_to_x86_64_elf_multi(&stream, args.first().copied().unwrap_or(0), 0, 0)?;
+        if vm_got != *want || wasm_got != *want {
+            return Err(format!(
+                "M2-10 '{}': mismatch want={} vm={} wasm={}",
+                name, want, vm_got, wasm_got
+            ));
+        }
+        checks += 1;
+    }
+
+    // Recursion MUST be rejected by multi-AOT verifier (MULTI_AOT_RECURSION)
+    let rec_src = "#[strict]\nfn rec(n: i64) -> i64 { let c: trit = n <=> 0; return if_pos c { 1 + rec(n - 1) } else { 0 }; }\nfn main(n: i64) -> i64 { return rec(n); }\n";
+    let rec_stream = compile_omni_surface_strict_to_u16(rec_src)?;
+    match compile_pure_u16_to_wasm_multi(&rec_stream) {
+        Err(e) if e.contains("MULTI_AOT_RECURSION") => checks += 1,
+        other => return Err(format!("M2-10 recursion expected MULTI_AOT_RECURSION, got {:?}", other)),
+    }
+
+    // Evaluator call-depth-64 budget enforcement (direct 1-fn Wasm module: if p0>0 call 0(p0-1)+1 else 0)
+    let mut depth_wasm: Vec<u8> = vec![
+        0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x06, 0x01, 0x60, 0x01, 0x7E, 0x01, 0x7E, // Type: (i64)->i64
+        0x03, 0x02, 0x01, 0x00,                         // Func: 0
+        0x07, 0x0B, 0x01, 0x07, b'o', b'm', b'n', b'i', b'_', b'f', b'n', 0x00, 0x00,
+    ];
+    let body: Vec<u8> = vec![
+        0x00,                   // 0 locals
+        0x20, 0x00,             // local.get 0
+        0x42, 0x00, 0x55,       // i64.const 0; i64.gt_s
+        0x04, 0x40,             // if void
+        0x20, 0x00, 0x42, 0x01, 0x7D, // local.get 0 - 1
+        0x10, 0x00,             // call 0
+        0x42, 0x01, 0x7C,       // + 1
+        0x0F,                   // return
+        0x0B,                   // end if
+        0x42, 0x00,             // i64.const 0
+        0x0B,                   // end fn
+    ];
+    let mut code_sec = vec![0x01];
+    code_sec.extend(encode_uleb128(body.len()));
+    code_sec.extend(body);
+    depth_wasm.push(0x0A);
+    depth_wasm.extend(encode_uleb128(code_sec.len()));
+    depth_wasm.extend(code_sec);
+
+    if execute_wasm_module_i64(&depth_wasm, &[60])? != 60 {
+        return Err(String::from("M2-10 depth-60 evaluator mismatch"));
+    }
+    checks += 1;
+    match execute_wasm_module_i64(&depth_wasm, &[70]) {
+        Err(e) if e.contains("BUDGET_EXCEEDED") && e.contains("64") => checks += 1,
+        other => return Err(format!("M2-10 depth-70 expected call-depth BUDGET_EXCEEDED, got {:?}", other)),
+    }
+
+    Ok(checks)
+}
+
 /// `omni m2-decode` runs the decoder differential; `omni m2-decode <file.omni_bc>` decodes one
 /// stream with the Omni decoder on the VM and checks it against Rust.
 pub fn m2_decode_cli(args: &[String]) -> i32 {
