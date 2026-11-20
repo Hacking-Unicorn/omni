@@ -23011,6 +23011,7 @@ pub fn run_m2_foundation_selftests() -> Result<usize, String> {
     n += selftest_m2_13_stage1_anchor()?;
     n += selftest_m2_15_pure_multi_compiler()?;
     n += selftest_m2_16_fixed_point(false)?.0;
+    n += selftest_m3_06_lex_diff()?;
     Ok(n)
 }
 
@@ -23328,6 +23329,16 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
                 }
             }
         }
+        "m3-lex" => match selftest_m3_06_lex_diff() {
+            Ok(n) => {
+                println!("[M3-LEX PASS] {} files lexed in Pure Omni with 100% token & error parity vs Rust (incl. verifier_engine.omni & Q1/Q2!)", n);
+                0
+            }
+            Err(e) => {
+                eprintln!("[M3-LEX FAIL] {}", e);
+                1
+            }
+        },
         _ => {
             eprintln!("usage: omni m2-frozen | m2-lock | m2-census | m2-labels | m2-lint [file.omni|file.omni_asm]... | m2-decode | m2-elf");
             2
@@ -23619,7 +23630,7 @@ fn main() {
             "harness" | "--harness" => {
                 std::process::exit(run_omni_harness_cli(&cli_args[2..]));
             }
-            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" => {
+            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m3-lex" => {
                 std::process::exit(run_m2_cli(&cli_args[1..]));
             }
             "agent-driver" | "--agent-driver" => {

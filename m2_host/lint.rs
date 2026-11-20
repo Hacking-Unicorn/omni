@@ -453,16 +453,17 @@ fn m2_count_fn_decls(src: &str) -> usize {
 /// (matched by position in declaration order) are split out. ANEW_COUNT only counts
 /// M2-owned functions. Returns (gated findings, foreign notes, budget rows).
 pub fn m2_lint_surface_scoped(src: &str) -> Result<(Vec<M2LintFinding>, Vec<M2LintFinding>, Vec<M2BudgetRow>), String> {
-    let u16s = compile_omni_surface_to_u16(src)?;
+    let expanded = resolve_omni_surface_includes(src, None, None)?;
+    let u16s = compile_omni_surface_to_u16(&expanded)?;
     let m = decode_omni_token_stream(&u16s)?;
-    let total = m2_count_fn_decls(src);
+    let total = m2_count_fn_decls(&expanded);
     if total != m.functions.len() {
         return Err(format!("M2 lint scope: {} fn declarations but {} compiled functions", total, m.functions.len()));
     }
     let mut foreign_idx: Vec<u16> = Vec::new();
     for &(_, fsrc) in M2_FOREIGN_MODULES {
-        if let Some(pos) = src.find(fsrc) {
-            let before = m2_count_fn_decls(&src[..pos]);
+        if let Some(pos) = expanded.find(fsrc) {
+            let before = m2_count_fn_decls(&expanded[..pos]);
             let n = m2_count_fn_decls(fsrc);
             foreign_idx.extend(m.functions[before..before + n].iter().map(|f| f.fn_idx));
         }
@@ -557,6 +558,7 @@ pub const M2_PURE_MODULES: &[(&str, &str)] = &[
     ("pure/m2/util.omni+pure/isa/table.omni+pure/m2/decode.omni+pure/m2/labels.omni+pure/m2/arena.omni+pure/m2/elf.omni+spec/m2/elf_harness.omni", M2_ELF_OMNI_SRC),
     ("pure/m2/util.omni+pure/isa/table.omni+pure/m2/decode.omni+pure/m2/labels.omni+pure/m2/arena.omni+pure/m2/elf.omni+pure/m2/emit_x86.omni+pure/m2/driver.omni+spec/m2/compiler_harness.omni", M2_COMPILER_OMNI_SRC),
     ("pure/m2/util.omni+pure/isa/table.omni+pure/m2/decode.omni+pure/m2/labels.omni+pure/m2/arena.omni+pure/m2/elf.omni+pure/m2/emit_x86.omni+pure/m2/emit_multi.omni+spec/m2/multi_harness.omni", M2_MULTI_OMNI_SRC),
+    ("pure/m2/util.omni+pure/m3/arena.omni+pure/m3/lex.omni+spec/m3/lex_harness.omni", M3_LEX_OMNI_SRC),
 ];
 
 /// Lint fixtures: (name, source, the exact comma-separated rule set it must trip; "" = clean).

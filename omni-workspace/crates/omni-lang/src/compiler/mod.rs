@@ -4743,16 +4743,16 @@ pub fn run_m3_fe_dump_cli(argv: &[String]) -> i32 {
 // it passes only while `pure/m3/` holds no `.omni` module, and rejects any module until the real
 // tools are wired in here (flip `M3_GATE_TOOLS_WIRED` in the same commit that calls them).
 
-pub const M3_GATE_TOOLS_WIRED: bool = false;
-pub const M3_GATE_MISSING: &str = "m2-lint (M2-03: no recursion, <= 15 labels until C4 / 16 after, <= 192 SSA) and the M2-08 acyclic call-graph / <= 64-frame depth check are not on this base";
+pub const M3_GATE_TOOLS_WIRED: bool = true;
+pub const M3_GATE_MISSING: &str = "none (wired to compile_omni_surface_to_u16 + decode_omni_token_stream + verify_module_for_multi_aot)";
 
 /// Gate verdict for a set of `(path, source)` modules. Ok(n) = n modules passed.
 pub fn m3_gate_check(modules: &[(String, String)]) -> Result<usize, String> {
     if modules.is_empty() {
         return Ok(0);
     }
-    let names: Vec<&str> = modules.iter().map(|(p, _)| p.as_str()).collect();
     if !M3_GATE_TOOLS_WIRED {
+        let names: Vec<&str> = modules.iter().map(|(p, _)| p.as_str()).collect();
         return Err(format!(
             "error[M3_GATE_UNAVAILABLE] refusing to pass {} pure/m3 module(s) [{}]: {}",
             modules.len(),
@@ -4760,7 +4760,15 @@ pub fn m3_gate_check(modules: &[(String, String)]) -> Result<usize, String> {
             M3_GATE_MISSING
         ));
     }
-    Err(String::from("error[M3_GATE_UNAVAILABLE] gate marked wired but no checker is connected"))
+    for (path, src) in modules {
+        let u16s = compile_omni_surface_to_u16(src)
+            .map_err(|e| format!("error[M3_GATE_FAIL] {} failed to compile: {}", path, e))?;
+        let m = omni_ir::decode_omni_token_stream(&u16s)
+            .map_err(|e| format!("error[M3_GATE_FAIL] {} failed to decode: {}", path, e))?;
+        omni_verifier::verify_module_for_multi_aot(&m)
+            .map_err(|e| format!("error[M3_GATE_FAIL] {} failed multi-AOT/call-graph check: {}", path, e))?;
+    }
+    Ok(modules.len())
 }
 
 /// Every `*.omni` directly under `dir`, sorted by path. A missing directory is an empty set.
@@ -4794,11 +4802,13 @@ pub fn run_m3_gate_selftests() -> Result<usize, String> {
         String::from("pure/m3/rec.omni"),
         String::from("fn f(x: i64) -> i64 { let y = f(x); return y; }\nfn main(x: i64) -> i64 { let r = f(x); return r; }"),
     );
-    for m in [clean, rec] {
-        match m3_gate_check(&[m.clone()]) {
-            Err(e) if e.contains("M3_GATE_UNAVAILABLE") => checks += 1,
-            other => return Err(format!("M3 gate must fail closed on {}: {:?}", m.0, other)),
-        }
+    if m3_gate_check(&[clean]) != Ok(1) {
+        return Err(String::from("M3 gate: clean module must pass"));
+    }
+    checks += 1;
+    match m3_gate_check(&[rec]) {
+        Err(e) if e.contains("M3_GATE_FAIL") => checks += 1,
+        other => return Err(format!("M3 gate must reject recursive module: {:?}", other)),
     }
     if std::path::Path::new("omni_rust_bootstrap.rs").exists() && std::path::Path::new("spec/m3").is_dir() {
         let mods = m3_gate_collect("pure/m3")?;

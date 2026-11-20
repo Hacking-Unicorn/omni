@@ -1,0 +1,10 @@
+// ==============================================================================
+// spec/m3/lex_harness.omni  (M3-05/M3-06 test driver)
+// ==============================================================================
+// Link order: pure/m2/util.omni, pure/m3/arena.omni, pure/m3/lex.omni, this file.
+// ==============================================================================
+
+#[strict]
+fn m3_lex_main(arena: bytes, src: array, strict_arg: i64) -> bytes {
+    return m3_lex_all(arena, src, strict_arg);
+}

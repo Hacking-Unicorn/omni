@@ -512,6 +512,12 @@ pub const M2_SELFHOST_OMNI_SRC: &str = concat!(
     include_str!("../pure/m2/m2_standalone.omni")
 );
 
+pub const M3_LEX_OMNI_SRC: &str = concat!(
+    include_str!("../pure/m3/lex.omni"),
+    "\n",
+    include_str!("../spec/m3/lex_harness.omni")
+);
+
 /// M3-04 selftest: `pure/isa/encode.omni` re-encodes every positive acceptance golden,
 /// `pure/verifier_engine.omni` (11,893 words), and `build_step7_stage1_compiler_stream`
 /// (19,731 words) bit-for-bit identically to `encode_u16_stream_to_bytes`.
@@ -964,6 +970,127 @@ pub fn selftest_m2_16_fixed_point(write_seed: bool) -> Result<(usize, usize, u64
     }
 
     Ok((3, seed_u16.len(), fnv1a_64_hash(&seed_bytes), s1.len(), fnv1a_64_hash(&s1), native_verified))
+}
+
+/// M3-05/M3-06 selftest: Pure-Omni streaming lexer (`pure/m3/arena.omni` + `pure/m3/lex.omni`)
+/// differentially checked token-for-token (kind, line, col, value/text) and error-for-error
+/// against Rust `tokenize_omni_surface_inner` across all acceptance goldens,
+/// `pure/verifier_engine.omni` (32,942 B), and Q1/Q2/negative-lex fixtures.
+pub fn selftest_m3_06_lex_diff() -> Result<usize, String> {
+    let lex_mod = m2_compile_decoder(M3_LEX_OMNI_SRC)?;
+    let entry = m2_entry_of(&lex_mod);
+    let mut cases: Vec<(String, String, bool)> = Vec::new();
+    for &(gid, src) in M2_GOLDEN_SOURCES {
+        cases.push((format!("golden:{}", gid), String::from(src), false));
+    }
+    cases.push((String::from("pure/verifier_engine.omni"), String::from(OMNI_VERIFIER_ENGINE_SURFACE), true));
+    // Q1/Q2/lex-error edge cases
+    cases.push((String::from("q1_strict_in_comment"), String::from("// #[strict]\nfn f(x: i64) -> trit { return TRIT_POS; }\n"), false));
+    cases.push((String::from("q2_trit_ident"), String::from("fn f(x: i64) -> i64 { let a = +1t; let b = -1t; let c = 0t; let d = 0t_x; return 0; }\n"), false));
+    cases.push((String::from("err_unterm_str"), String::from("fn f() -> i64 { let s = \"abc\n; return 0; }\n"), false));
+    cases.push((String::from("err_bare_at"), String::from("fn f() -> i64 { let x = @ + 1; return x; }\n"), false));
+    cases.push((String::from("err_bad_char"), String::from("fn f() -> i64 { return $; }\n"), false));
+    cases.push((String::from("err_int_ovf"), String::from("fn f() -> i64 { return 9223372036854775808; }\n"), false));
+
+    let mut checks = 0usize;
+    for (name, src, strict_arg) in &cases {
+        let eff_strict = *strict_arg || src.contains("#[strict]");
+        let rust_res = tokenize_omni_surface_inner(src, eff_strict);
+        let src_u16: Vec<u16> = src.as_bytes().iter().map(|&b| b as u16).collect();
+        let arena_len = (131_072 + src.len() * 16 + 4096).max(262_144);
+        let mut vm = OmniBinaryVm::with_budgets(200_000_000, 64 * 1024 * 1024);
+        let out_bytes = match vm.execute_function(
+            &lex_mod,
+            entry,
+            vec![
+                OmniValue::Bytes(vec![0u8; arena_len]),
+                OmniValue::U16Array(src_u16),
+                OmniValue::Int(if *strict_arg { 1 } else { 0 }),
+            ],
+        )? {
+            OmniValue::Bytes(b) => b,
+            other => return Err(format!("M3-06 '{}': returned {:?}, expected Bytes", name, other)),
+        };
+        let is_omni_err = out_bytes.len() == 16 && u16::from_le_bytes([out_bytes[0], out_bytes[1]]) == 0xFFFF;
+        match rust_res {
+            Err(re) => {
+                if !is_omni_err {
+                    return Err(format!("M3-06 '{}': Rust errored ({}) but Omni succeeded ({} toks)", name, re, out_bytes.len() / 16));
+                }
+                let ecode = u16::from_le_bytes([out_bytes[2], out_bytes[3]]);
+                let eline = u16::from_le_bytes([out_bytes[4], out_bytes[5]]);
+                let ecol = u16::from_le_bytes([out_bytes[6], out_bytes[7]]);
+                let want_code = if re.contains("AMBIGUOUS_GRAMMAR") { 2u16 } else { 1u16 };
+                let want_span = format!("line {}, col {}:", eline, ecol);
+                if ecode != want_code || !re.contains(&want_span) {
+                    return Err(format!(
+                        "M3-06 '{}': error mismatch: Omni (code={}, line={}, col={}) vs Rust '{}'",
+                        name, ecode, eline, ecol, re
+                    ));
+                }
+            }
+            Ok(rtoks) => {
+                if is_omni_err {
+                    let ecode = u16::from_le_bytes([out_bytes[2], out_bytes[3]]);
+                    let eline = u16::from_le_bytes([out_bytes[4], out_bytes[5]]);
+                    let ecol = u16::from_le_bytes([out_bytes[6], out_bytes[7]]);
+                    return Err(format!(
+                        "M3-06 '{}': Rust ok ({} toks) but Omni errored (code={}, line={}, col={})",
+                        name, rtoks.len(), ecode, eline, ecol
+                    ));
+                }
+                if out_bytes.len() != rtoks.len() * 16 {
+                    return Err(format!(
+                        "M3-06 '{}': token count mismatch: Omni {} vs Rust {}",
+                        name, out_bytes.len() / 16, rtoks.len()
+                    ));
+                }
+                let sbytes = src.as_bytes();
+                for (ti, rt) in rtoks.iter().enumerate() {
+                    let off = ti * 16;
+                    let kind = u16::from_le_bytes([out_bytes[off], out_bytes[off + 1]]);
+                    let sub = u16::from_le_bytes([out_bytes[off + 2], out_bytes[off + 3]]) as usize;
+                    let line = u16::from_le_bytes([out_bytes[off + 4], out_bytes[off + 5]]) as usize;
+                    let col = u16::from_le_bytes([out_bytes[off + 6], out_bytes[off + 7]]) as usize;
+                    let val = i64::from_le_bytes(out_bytes[off + 8..off + 16].try_into().unwrap());
+                    if line != rt.line || col != rt.col {
+                        return Err(format!(
+                            "M3-06 '{}' tok#{}: span mismatch Omni ({},{}) vs Rust ({},{}) [{:?}]",
+                            name, ti, line, col, rt.line, rt.col, rt.tok
+                        ));
+                    }
+                    let ok = match &rt.tok {
+                        SurfaceTok::Hash => kind == 1,
+                        SurfaceTok::StrLit(s) => kind == 2 && &sbytes[val as usize..val as usize + sub] == s.as_bytes(),
+                        SurfaceTok::AtIdent(s) => kind == 3 && &sbytes[val as usize..val as usize + sub] == s.as_bytes(),
+                        SurfaceTok::Trit(_, v) => kind == 4 && val == (*v as i64),
+                        SurfaceTok::Sym(s) => {
+                            let sb = s.as_bytes();
+                            let wv = (sb[0] as i64) | (if sb.len() > 1 { (sb[1] as i64) << 8 } else { 0 });
+                            kind == 5 && sub == sb.len() && val == wv
+                        }
+                        SurfaceTok::Op(s) => {
+                            let sb = s.as_bytes();
+                            let wv = (sb[0] as i64)
+                                | (if sb.len() > 1 { (sb[1] as i64) << 8 } else { 0 })
+                                | (if sb.len() > 2 { (sb[2] as i64) << 16 } else { 0 });
+                            kind == 6 && sub == sb.len() && val == wv
+                        }
+                        SurfaceTok::Int(v) => kind == 7 && val == *v,
+                        SurfaceTok::Ident(s) => kind == 8 && &sbytes[val as usize..val as usize + sub] == s.as_bytes(),
+                    };
+                    if !ok {
+                        return Err(format!(
+                            "M3-06 '{}' tok#{}: token mismatch Omni (kind={}, sub={}, val={}) vs Rust {:?}",
+                            name, ti, kind, sub, val, rt.tok
+                        ));
+                    }
+                }
+            }
+        }
+        checks += 1;
+    }
+    Ok(checks)
 }
 
 /// `omni m2-decode` runs the decoder differential; `omni m2-decode <file.omni_bc>` decodes one
