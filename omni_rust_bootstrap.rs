@@ -1014,6 +1014,167 @@ pub fn verify_u16_stream(stream: &[u16]) -> Result<Vec<BinVerificationReport>, S
     Ok(module.functions.iter().map(verify_binary_function).collect())
 }
 
+/// M2-08: Module-level pre-check required before multi-function AOT emission.
+/// Enforces:
+/// (1) every CALL (0x7F48) operand 0 is a `FnRef` to an existing function;
+/// (2) CALL argument count == callee `params.len()`;
+/// (3) call graph is acyclic (no direct or mutual recursion);
+/// (4) longest call chain from entry <= 64 frames (entry = frame 1);
+/// (5) entry = fn_idx 0 else last; entry `p_cnt <= 4`; every callee `p_cnt <= 32`;
+/// (6) function count in 1..=1024;
+/// (7) total M2 label-table slot budget <= 4096 (each key in `0x7EF0..=0x7EFF` or `< 4080`).
+pub fn verify_module_for_multi_aot(module: &BinModule) -> Result<(), String> {
+    let n = module.functions.len();
+    if n == 0 {
+        return Err(String::from("error[MULTI_AOT_EMPTY]: module contains no functions"));
+    }
+    if n > 1024 {
+        return Err(format!("error[MULTI_AOT_FN_CAP]: module has {} functions (max 1024)", n));
+    }
+
+    let mut fn_map: std::collections::HashMap<u16, usize> = std::collections::HashMap::with_capacity(n);
+    for (pos, func) in module.functions.iter().enumerate() {
+        if fn_map.insert(func.fn_idx, pos).is_some() {
+            return Err(format!("error[MULTI_AOT_DUP_FN]: duplicate function id fn#{}", func.fn_idx));
+        }
+    }
+
+    let entry_pos = module.functions.iter().position(|f| f.fn_idx == 0).unwrap_or(n - 1);
+    let entry_fn = &module.functions[entry_pos];
+    if entry_fn.params.len() > 4 {
+        return Err(format!(
+            "error[MULTI_AOT_ENTRY_PARAMS]: entry fn#{} has {} params (max 4)",
+            entry_fn.fn_idx,
+            entry_fn.params.len()
+        ));
+    }
+    for func in &module.functions {
+        if func.params.len() > 32 {
+            return Err(format!(
+                "error[MULTI_AOT_CALLEE_PARAMS]: fn#{} has {} params (max 32)",
+                func.fn_idx,
+                func.params.len()
+            ));
+        }
+    }
+
+    let mut edges: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut in_deg: Vec<usize> = vec![0usize; n];
+    let mut total_label_slots: usize = 0;
+
+    for (caller_pos, func) in module.functions.iter().enumerate() {
+        let mut max_imm_key: Option<u16> = None;
+        for ins in &func.instructions {
+            if ins.op_tok == 0x7F48 {
+                let callee_idx = match ins.operands.first() {
+                    Some(BinOperand::FnRef(idx)) => *idx,
+                    _ => {
+                        return Err(format!(
+                            "error[MULTI_AOT_BAD_CALL]: fn#{} @{} CALL operand 0 is not a FnRef",
+                            func.fn_idx, ins.offset
+                        ));
+                    }
+                };
+                let callee_pos = match fn_map.get(&callee_idx) {
+                    Some(&p) => p,
+                    None => {
+                        return Err(format!(
+                            "error[MULTI_AOT_MISSING_FN]: fn#{} @{} CALL targets missing fn#{}",
+                            func.fn_idx, ins.offset, callee_idx
+                        ));
+                    }
+                };
+                let arg_cnt = ins.operands.len() - 1;
+                let expected = module.functions[callee_pos].params.len();
+                if arg_cnt != expected {
+                    return Err(format!(
+                        "error[MULTI_AOT_ARITY]: fn#{} @{} CALL fn#{} passed {} args, expected {}",
+                        func.fn_idx, ins.offset, callee_idx, arg_cnt, expected
+                    ));
+                }
+                edges[caller_pos].push(callee_pos);
+                in_deg[callee_pos] += 1;
+            } else if matches!(ins.op_tok, 0x7F40 | 0x7F41 | 0x7F42 | 0x7F43 | 0x7F44) {
+                let ops: &[BinOperand] = if ins.op_tok == 0x7F40 || ins.op_tok == 0x7F41 {
+                    &ins.operands[..]
+                } else if ins.operands.len() > 1 {
+                    &ins.operands[1..]
+                } else {
+                    &[]
+                };
+                for op in ops {
+                    if let Some(key) = extract_label_id(op) {
+                        if !(0x7EF0..=0x7EFF).contains(&key) {
+                            if key < 4080 {
+                                max_imm_key = Some(max_imm_key.map_or(key, |m| m.max(key)));
+                            } else {
+                                return Err(format!(
+                                    "error[LABEL_ID_RANGE]: fn#{} @{} label key 0x{:04X} outside M2 slot domain",
+                                    func.fn_idx, ins.offset, key
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let span = match max_imm_key {
+            Some(m) => 16 + (m as usize) + 1,
+            None => 16,
+        };
+        total_label_slots += span;
+        if total_label_slots > 4096 {
+            return Err(format!(
+                "error[MULTI_AOT_LABEL_BUDGET]: module requires {} label slots (max 4096)",
+                total_label_slots
+            ));
+        }
+    }
+
+    // Kahn's topological sort (iterative, zero recursion) to reject any cycle (direct or mutual).
+    let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    for i in 0..n {
+        if in_deg[i] == 0 {
+            queue.push_back(i);
+        }
+    }
+    let mut topo: Vec<usize> = Vec::with_capacity(n);
+    while let Some(u) = queue.pop_front() {
+        topo.push(u);
+        for &v in &edges[u] {
+            in_deg[v] -= 1;
+            if in_deg[v] == 0 {
+                queue.push_back(v);
+            }
+        }
+    }
+    if topo.len() != n {
+        return Err(String::from(
+            "error[MULTI_AOT_RECURSION]: call graph contains a cycle (recursion is forbidden)"
+        ));
+    }
+
+    // Longest call chain from each node (entry = frame 1), computed in reverse topological order.
+    let mut max_chain: Vec<usize> = vec![1usize; n];
+    for &u in topo.iter().rev() {
+        let mut best = 1usize;
+        for &v in &edges[u] {
+            let cand = 1 + max_chain[v];
+            if cand > best {
+                best = cand;
+            }
+        }
+        max_chain[u] = best;
+    }
+    if max_chain[entry_pos] > 64 {
+        return Err(format!(
+            "error[MULTI_AOT_DEPTH]: max call chain from entry fn#{} is {} frames (max 64)",
+            entry_fn.fn_idx, max_chain[entry_pos]
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum OmniValue {
     Void,
@@ -22251,7 +22412,133 @@ pub fn run_m2_foundation_selftests() -> Result<usize, String> {
     n += selftest_m2_decode_diff()?;
     n += selftest_m3_isa_encode_roundtrip()?;
     n += selftest_m2_labels_table()?;
+    n += selftest_m2_08_multi_aot_precheck()?;
     Ok(n)
+}
+
+/// M2-08: multi-function AOT module pre-check selftests.
+pub fn selftest_m2_08_multi_aot_precheck() -> Result<usize, String> {
+    let mk_fn = |fn_idx: u16, n_params: usize, ins: Vec<BinInstruction>| BinFunction {
+        fn_idx,
+        params: (0..n_params).map(|_| (TY_I64, TC_BASE, 0u16)).collect(),
+        ret_ty_tok: TY_I64,
+        cap_mask: 0,
+        instructions: ins,
+    };
+    let mk_call = |callee: u16, n_args: usize| {
+        let mut ops = Vec::with_capacity(1 + n_args);
+        ops.push(BinOperand::FnRef(callee));
+        for _ in 0..n_args {
+            ops.push(BinOperand::ImmInt(1));
+        }
+        BinInstruction {
+            offset: 0,
+            dest_reg: Some(REG_BASE),
+            op_tok: 0x7F48,
+            ty_tok: TY_I64,
+            tc_tok: TC_BASE,
+            operands: ops,
+        }
+    };
+    let ret0 = BinInstruction {
+        offset: 1,
+        dest_reg: None,
+        op_tok: 0x7F4A,
+        ty_tok: TY_I64,
+        tc_tok: TC_BASE,
+        operands: vec![BinOperand::ImmInt(0)],
+    };
+    let expect_err = |name: &str, m: &BinModule, needle: &str| -> Result<(), String> {
+        match verify_module_for_multi_aot(m) {
+            Ok(()) => Err(format!("M2-08 {}: expected error containing '{}', got Ok(())", name, needle)),
+            Err(e) if e.contains(needle) => Ok(()),
+            Err(e) => Err(format!("M2-08 {}: expected '{}', got '{}'", name, needle, e)),
+        }
+    };
+
+    // 1. multi_reject_recursion_direct
+    let m_direct = BinModule {
+        functions: vec![mk_fn(0, 1, vec![mk_call(0, 1), ret0.clone()])],
+        ..Default::default()
+    };
+    expect_err("multi_reject_recursion_direct", &m_direct, "MULTI_AOT_RECURSION")?;
+
+    // 2. multi_reject_recursion_mutual
+    let m_mutual = BinModule {
+        functions: vec![
+            mk_fn(1, 1, vec![mk_call(0, 1), ret0.clone()]),
+            mk_fn(0, 1, vec![mk_call(1, 1), ret0.clone()]),
+        ],
+        ..Default::default()
+    };
+    expect_err("multi_reject_recursion_mutual", &m_mutual, "MULTI_AOT_RECURSION")?;
+
+    // 3. multi_reject_depth65
+    let mut fns65 = Vec::with_capacity(65);
+    for i in (1..65u16).rev() {
+        let ins = if i == 64 {
+            vec![ret0.clone()]
+        } else {
+            vec![mk_call(i + 1, 1), ret0.clone()]
+        };
+        fns65.push(mk_fn(i, 1, ins));
+    }
+    fns65.push(mk_fn(0, 1, vec![mk_call(1, 1), ret0.clone()]));
+    let m_depth65 = BinModule { functions: fns65, ..Default::default() };
+    expect_err("multi_reject_depth65", &m_depth65, "MULTI_AOT_DEPTH")?;
+
+    // 4. multi_reject_arity_short
+    let m_short = BinModule {
+        functions: vec![
+            mk_fn(1, 2, vec![ret0.clone()]),
+            mk_fn(0, 1, vec![mk_call(1, 1), ret0.clone()]),
+        ],
+        ..Default::default()
+    };
+    expect_err("multi_reject_arity_short", &m_short, "MULTI_AOT_ARITY")?;
+
+    // 5. multi_reject_arity_long
+    let m_long = BinModule {
+        functions: vec![
+            mk_fn(1, 1, vec![ret0.clone()]),
+            mk_fn(0, 1, vec![mk_call(1, 2), ret0.clone()]),
+        ],
+        ..Default::default()
+    };
+    expect_err("multi_reject_arity_long", &m_long, "MULTI_AOT_ARITY")?;
+
+    // 6. multi_reject_missing_fn
+    let m_missing = BinModule {
+        functions: vec![mk_fn(0, 1, vec![mk_call(99, 0), ret0.clone()])],
+        ..Default::default()
+    };
+    expect_err("multi_reject_missing_fn", &m_missing, "MULTI_AOT_MISSING_FN")?;
+
+    // 7. multi_reject_entry_p5
+    let m_entry5 = BinModule {
+        functions: vec![mk_fn(0, 5, vec![ret0.clone()])],
+        ..Default::default()
+    };
+    expect_err("multi_reject_entry_p5", &m_entry5, "MULTI_AOT_ENTRY_PARAMS")?;
+
+    // 8. multi_ok_depth64: chain of 64 frames accepted by pre-check AND succeeds on VM
+    let mut src64 = String::new();
+    src64.push_str("#[strict]\nfn f63(x: i64) -> i64 { return x + 1; }\n");
+    for i in (0..63usize).rev() {
+        src64.push_str(&format!(
+            "#[strict]\nfn f{}(x: i64) -> i64 {{ let r: i64 = f{}(x); return r + 1; }}\n",
+            i, i + 1
+        ));
+    }
+    let u16_64 = compile_omni_surface_strict_to_u16(&src64)?;
+    let mod64 = decode_omni_token_stream(&u16_64)?;
+    verify_module_for_multi_aot(&mod64)
+        .map_err(|e| format!("M2-08 multi_ok_depth64 rejected unexpectedly: {}", e))?;
+    let vm_val = execute_omni_surface_program(&src64, vec![OmniValue::Int(0)])?;
+    if vm_val != OmniValue::Int(64) {
+        return Err(format!("M2-08 multi_ok_depth64 VM returned {:?}, expected Int(64)", vm_val));
+    }
+    Ok(8)
 }
 
 /// `omni m2-frozen | m2-lock | m2-census` (Milestone 2 tooling).

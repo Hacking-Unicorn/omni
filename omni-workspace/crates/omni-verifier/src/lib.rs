@@ -277,6 +277,157 @@ pub fn verify_u16_stream(stream: &[u16]) -> Result<Vec<BinVerificationReport>, S
     Ok(module.functions.iter().map(verify_binary_function).collect())
 }
 
+/// M2-08: Module-level pre-check required before multi-function AOT emission.
+pub fn verify_module_for_multi_aot(module: &BinModule) -> Result<(), String> {
+    let n = module.functions.len();
+    if n == 0 {
+        return Err(String::from("error[MULTI_AOT_EMPTY]: module contains no functions"));
+    }
+    if n > 1024 {
+        return Err(format!("error[MULTI_AOT_FN_CAP]: module has {} functions (max 1024)", n));
+    }
+
+    let mut fn_map: std::collections::HashMap<u16, usize> = std::collections::HashMap::with_capacity(n);
+    for (pos, func) in module.functions.iter().enumerate() {
+        if fn_map.insert(func.fn_idx, pos).is_some() {
+            return Err(format!("error[MULTI_AOT_DUP_FN]: duplicate function id fn#{}", func.fn_idx));
+        }
+    }
+
+    let entry_pos = module.functions.iter().position(|f| f.fn_idx == 0).unwrap_or(n - 1);
+    let entry_fn = &module.functions[entry_pos];
+    if entry_fn.params.len() > 4 {
+        return Err(format!(
+            "error[MULTI_AOT_ENTRY_PARAMS]: entry fn#{} has {} params (max 4)",
+            entry_fn.fn_idx,
+            entry_fn.params.len()
+        ));
+    }
+    for func in &module.functions {
+        if func.params.len() > 32 {
+            return Err(format!(
+                "error[MULTI_AOT_CALLEE_PARAMS]: fn#{} has {} params (max 32)",
+                func.fn_idx,
+                func.params.len()
+            ));
+        }
+    }
+
+    let mut edges: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut in_deg: Vec<usize> = vec![0usize; n];
+    let mut total_label_slots: usize = 0;
+
+    for (caller_pos, func) in module.functions.iter().enumerate() {
+        let mut max_imm_key: Option<u16> = None;
+        for ins in &func.instructions {
+            if ins.op_tok == 0x7F48 {
+                let callee_idx = match ins.operands.first() {
+                    Some(BinOperand::FnRef(idx)) => *idx,
+                    _ => {
+                        return Err(format!(
+                            "error[MULTI_AOT_BAD_CALL]: fn#{} @{} CALL operand 0 is not a FnRef",
+                            func.fn_idx, ins.offset
+                        ));
+                    }
+                };
+                let callee_pos = match fn_map.get(&callee_idx) {
+                    Some(&p) => p,
+                    None => {
+                        return Err(format!(
+                            "error[MULTI_AOT_MISSING_FN]: fn#{} @{} CALL targets missing fn#{}",
+                            func.fn_idx, ins.offset, callee_idx
+                        ));
+                    }
+                };
+                let arg_cnt = ins.operands.len() - 1;
+                let expected = module.functions[callee_pos].params.len();
+                if arg_cnt != expected {
+                    return Err(format!(
+                        "error[MULTI_AOT_ARITY]: fn#{} @{} CALL fn#{} passed {} args, expected {}",
+                        func.fn_idx, ins.offset, callee_idx, arg_cnt, expected
+                    ));
+                }
+                edges[caller_pos].push(callee_pos);
+                in_deg[callee_pos] += 1;
+            } else if matches!(ins.op_tok, 0x7F40 | 0x7F41 | 0x7F42 | 0x7F43 | 0x7F44) {
+                let ops: &[BinOperand] = if ins.op_tok == 0x7F40 || ins.op_tok == 0x7F41 {
+                    &ins.operands[..]
+                } else if ins.operands.len() > 1 {
+                    &ins.operands[1..]
+                } else {
+                    &[]
+                };
+                for op in ops {
+                    if let Some(key) = extract_label_id(op) {
+                        if !(0x7EF0..=0x7EFF).contains(&key) {
+                            if key < 4080 {
+                                max_imm_key = Some(max_imm_key.map_or(key, |m| m.max(key)));
+                            } else {
+                                return Err(format!(
+                                    "error[LABEL_ID_RANGE]: fn#{} @{} label key 0x{:04X} outside M2 slot domain",
+                                    func.fn_idx, ins.offset, key
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let span = match max_imm_key {
+            Some(m) => 16 + (m as usize) + 1,
+            None => 16,
+        };
+        total_label_slots += span;
+        if total_label_slots > 4096 {
+            return Err(format!(
+                "error[MULTI_AOT_LABEL_BUDGET]: module requires {} label slots (max 4096)",
+                total_label_slots
+            ));
+        }
+    }
+
+    let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    for i in 0..n {
+        if in_deg[i] == 0 {
+            queue.push_back(i);
+        }
+    }
+    let mut topo: Vec<usize> = Vec::with_capacity(n);
+    while let Some(u) = queue.pop_front() {
+        topo.push(u);
+        for &v in &edges[u] {
+            in_deg[v] -= 1;
+            if in_deg[v] == 0 {
+                queue.push_back(v);
+            }
+        }
+    }
+    if topo.len() != n {
+        return Err(String::from(
+            "error[MULTI_AOT_RECURSION]: call graph contains a cycle (recursion is forbidden)"
+        ));
+    }
+
+    let mut max_chain: Vec<usize> = vec![1usize; n];
+    for &u in topo.iter().rev() {
+        let mut best = 1usize;
+        for &v in &edges[u] {
+            let cand = 1 + max_chain[v];
+            if cand > best {
+                best = cand;
+            }
+        }
+        max_chain[u] = best;
+    }
+    if max_chain[entry_pos] > 64 {
+        return Err(format!(
+            "error[MULTI_AOT_DEPTH]: max call chain from entry fn#{} is {} frames (max 64)",
+            entry_fn.fn_idx, max_chain[entry_pos]
+        ));
+    }
+    Ok(())
+}
+
 
 /// Pretty-prints a pure `u16` stream using the `OMNI_ISA_TABLE` opcode labels for human debugging (`--debug-lens`, Roadmap 3.3).
 pub fn format_debug_lens(stream: &[u16]) -> Result<String, String> {
