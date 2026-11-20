@@ -452,6 +452,26 @@ pub const M2_ELF_OMNI_SRC: &str = concat!(
     include_str!("../spec/m2/elf_harness.omni")
 );
 
+pub const M2_COMPILER_OMNI_SRC: &str = concat!(
+    include_str!("../pure/m2/util.omni"),
+    "\n",
+    include_str!("../pure/isa/table.omni"),
+    "\n",
+    include_str!("../pure/m2/decode.omni"),
+    "\n",
+    include_str!("../pure/m2/labels.omni"),
+    "\n",
+    include_str!("../pure/m2/arena.omni"),
+    "\n",
+    include_str!("../pure/m2/elf.omni"),
+    "\n",
+    include_str!("../pure/m2/emit_x86.omni"),
+    "\n",
+    include_str!("../pure/m2/driver.omni"),
+    "\n",
+    include_str!("../spec/m2/compiler_harness.omni")
+);
+
 /// M3-04 selftest: `pure/isa/encode.omni` re-encodes every positive acceptance golden,
 /// `pure/verifier_engine.omni` (11,893 words), and `build_step7_stage1_compiler_stream`
 /// (19,731 words) bit-for-bit identically to `encode_u16_stream_to_bytes`.
@@ -610,6 +630,91 @@ pub fn selftest_m2_11_arena_elf() -> Result<usize, String> {
     want_stubs.extend_from_slice(&[0x55, 0x48, 0x89, 0xE5, 0x48, 0x81, 0xEC, 64, 0, 0, 0]);
     if stubs != want_stubs {
         return Err(format!("M2-11 stubs mismatch: got {:02X?}, want {:02X?}", stubs, want_stubs));
+    }
+    checks += 1;
+
+    Ok(checks)
+}
+
+/// M2-12/M2-13 selftest: Pure-Omni two-pass x86-64 ELF64 compiler (`pure/m2/emit_x86.omni` +
+/// `pure/m2/driver.omni`). Compiles:
+/// 1. Core positive single-function AOT goldens -> 0-byte diff vs Rust reference.
+/// 2. The full 19,731-word `build_step7_stage1_compiler_stream()` -> 106,242 B,
+///    FNV-1a64 = 0xEAFC81F46B482FF8, 0-byte diff vs Rust!
+pub fn selftest_m2_13_stage1_anchor() -> Result<usize, String> {
+    let comp_mod = m2_compile_decoder(M2_COMPILER_OMNI_SRC)?;
+    let entry = m2_entry_of(&comp_mod);
+    let compile_in_omni = |stream: &[u16], a0: i64, a1: i64, a2: i64| -> Result<Vec<u8>, String> {
+        let mut vm = OmniBinaryVm::with_budgets(500_000_000, 32 * 1024 * 1024);
+        let arena = OmniValue::Bytes(vec![0u8; 524_288]);
+        let res = vm.execute_function(
+            &comp_mod,
+            entry,
+            vec![
+                arena,
+                OmniValue::U16Array(stream.to_vec()),
+                OmniValue::Int(a0),
+                OmniValue::Int(a1),
+                OmniValue::Int(a2),
+            ],
+        )?;
+        match res {
+            OmniValue::Bytes(b) => Ok(b),
+            other => Err(format!("M2-12/13 compiler returned {:?}, expected Bytes", other)),
+        }
+    };
+    let mut checks = 0usize;
+
+    // 1. Sample single-fn positive goldens (ALU, branches, loops, sel_trit) -> 0-byte diff vs Rust
+    let sample_srcs: [&str; 3] = [
+        "#[strict]\nfn f(x: i64) -> i64 { return x + 7; }\n",
+        "#[strict]\nfn f(a: i64, b: i64) -> i64 { let c: trit = a <=> b; let r: i64 = sel_trit(c, a, 0, b); return r; }\n",
+        "#[strict]\nfn f(n: i64) -> i64 { let s: i64 = 0; let i: i64 = 0; while n - i <=> 0 { s = s + i; i = i + 1; } return s; }\n",
+    ];
+    for (idx, src) in sample_srcs.iter().enumerate() {
+        let u16s = compile_omni_surface_strict_to_u16(src)?;
+        let want = compile_pure_u16_to_x86_64_elf_with_args(&u16s, 45, 40, 90)?;
+        let got = compile_in_omni(&u16s, 45, 40, 90)?;
+        if got != want {
+            let min_l = got.len().min(want.len());
+            let diff = (0..min_l).find(|&i| got[i] != want[i]).unwrap_or(min_l);
+            return Err(format!(
+                "M2-12 sample#{} mismatch: got {} B vs want {} B (first diff at byte {}: got {:02X?} vs want {:02X?})",
+                idx,
+                got.len(),
+                want.len(),
+                diff,
+                got.get(diff..diff.saturating_add(8).min(got.len())),
+                want.get(diff..diff.saturating_add(8).min(want.len()))
+            ));
+        }
+        checks += 1;
+    }
+
+    // 2. M2-13 Legacy Anchor: full 19,731-word Stage-1 self-compiler stream -> 106,242 B, 0xEAFC81F46B482FF8
+    let stage1_u16 = build_step7_stage1_compiler_stream();
+    let want_elf = compile_pure_u16_to_x86_64_elf_with_args(&stage1_u16, 45, 40, 90)?;
+    let got_elf = compile_in_omni(&stage1_u16, 45, 40, 90)?;
+    if got_elf != want_elf {
+        let min_l = got_elf.len().min(want_elf.len());
+        let diff = (120..min_l).find(|&i| got_elf[i] != want_elf[i]).unwrap_or(min_l);
+        return Err(format!(
+            "M2-13 Stage-1 anchor mismatch: got {} B (FNV=0x{:016X}) vs want {} B (FNV=0x{:016X}), first code diff at byte {} (got {:02X?} vs want {:02X?})",
+            got_elf.len(),
+            fnv1a_64_hash(&got_elf),
+            want_elf.len(),
+            fnv1a_64_hash(&want_elf),
+            diff,
+            got_elf.get(diff..diff.saturating_add(16).min(got_elf.len())),
+            want_elf.get(diff..diff.saturating_add(16).min(want_elf.len()))
+        ));
+    }
+    if got_elf.len() != 106_242 || fnv1a_64_hash(&got_elf) != 0xEAFC81F46B482FF8 {
+        return Err(format!(
+            "M2-13 Stage-1 anchor hash/len mismatch: {} B / 0x{:016X}",
+            got_elf.len(),
+            fnv1a_64_hash(&got_elf)
+        ));
     }
     checks += 1;
 

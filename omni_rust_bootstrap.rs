@@ -22414,6 +22414,7 @@ pub fn run_m2_foundation_selftests() -> Result<usize, String> {
     n += selftest_m2_labels_table()?;
     n += selftest_m2_08_multi_aot_precheck()?;
     n += selftest_m2_11_arena_elf()?;
+    n += selftest_m2_13_stage1_anchor()?;
     Ok(n)
 }
 
@@ -22588,6 +22589,16 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
             }
             Err(e) => {
                 eprintln!("[M2-ELF FAIL] {}", e);
+                1
+            }
+        },
+        "m2-compile" => match selftest_m2_13_stage1_anchor() {
+            Ok(n) => {
+                println!("[M2-COMPILE PASS] {} checks passed (including 19,731-word Stage-1 anchor -> 106,242 B, FNV-1a64=0xEAFC81F46B482FF8, 0-byte diff!)", n);
+                0
+            }
+            Err(e) => {
+                eprintln!("[M2-COMPILE FAIL] {}", e);
                 1
             }
         },
@@ -22882,7 +22893,7 @@ fn main() {
             "harness" | "--harness" => {
                 std::process::exit(run_omni_harness_cli(&cli_args[2..]));
             }
-            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" => {
+            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" => {
                 std::process::exit(run_m2_cli(&cli_args[1..]));
             }
             "agent-driver" | "--agent-driver" => {
