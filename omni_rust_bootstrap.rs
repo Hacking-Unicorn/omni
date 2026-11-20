@@ -18087,6 +18087,599 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
     Ok(elf)
 }
 
+/// M2-09 (D-4): Reference multi-function x86-64 ELF64 compiler.
+/// Uses the approved multi-mode ABI: stack args at `[rbp+16+8k]`, 1 MiB arena at `rbx`,
+/// 128 KiB input window at `rbx+0x100000`, `nwords` at `rbx+0x120000`, and fixed-width
+/// encodings so Pure Omni (M2-15) can reproduce every byte identically.
+/// Leaves single-mode `compile_pure_u16_to_x86_64_elf_with_args` completely untouched.
+pub fn compile_pure_u16_to_x86_64_elf_multi(
+    stream: &[u16],
+    arg0: i64,
+    arg1: i64,
+    arg2: i64,
+) -> Result<Vec<u8>, String> {
+    let module = decode_omni_token_stream(stream)?;
+    verify_module_for_multi_aot(&module)?;
+    for func in &module.functions {
+        let rep = verify_binary_function(func);
+        if !rep.passed {
+            return Err(format!(
+                "Cannot multi-AOT-compile unverified fn#{}: {:?}",
+                func.fn_idx, rep.errors
+            ));
+        }
+        for ins in &func.instructions {
+            if !is_x86_64_aot_supported_opcode(ins.op_tok) && ins.op_tok != 0x7F48 {
+                let lbl = decode_opcode_token(ins.op_tok).map(|s| s.debug_label).unwrap_or("OP_UNKNOWN");
+                return Err(format!(
+                    "Opcode 0x{:04X} ({}) in fn#{} is not lowered by multi-function x86-64 AOT",
+                    ins.op_tok, lbl, func.fn_idx
+                ));
+            }
+        }
+    }
+
+    let n_fns = module.functions.len();
+    let entry_pos = module.functions.iter().position(|f| f.fn_idx == 0).unwrap_or(n_fns - 1);
+    let entry_fn = &module.functions[entry_pos];
+    let entry_is_bytes = entry_fn.ret_ty_tok == TY_BYTES;
+
+    let mut code: Vec<u8> = Vec::with_capacity(8192);
+    let mut call_relocs: Vec<(usize, u16)> = Vec::new();
+    let mut trap_relocs: Vec<(usize, u8)> = Vec::new(); // 0 = T_TRUNC, 1 = T_OOB, 2 = T_CAP
+
+    // --- Entry stub ---
+    // push rbp; mov rbp, rsp; sub rsp, 0x120010 (1 MiB arena + 128 KiB window + nwords + probe)
+    code.extend_from_slice(&[0x55, 0x48, 0x89, 0xE5, 0x48, 0x81, 0xEC, 0x10, 0x00, 0x12, 0x00]);
+    // mov rbx, rsp
+    code.extend_from_slice(&[0x48, 0x89, 0xE3]);
+    // mov qword [rbx+0x120000], 0 (nwords = 0)
+    code.extend_from_slice(&[0x48, 0xC7, 0x83, 0x00, 0x00, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00]);
+
+    if entry_is_bytes {
+        code.extend_from_slice(&[0x49, 0xC7, 0xC4, 0x00, 0x00, 0x00, 0x00]);
+        code.extend_from_slice(&[0x49, 0xBD]);
+        code.extend_from_slice(&(arg0 as u64).to_le_bytes());
+        code.extend_from_slice(&[0x49, 0xBE]);
+        code.extend_from_slice(&(arg1 as u64).to_le_bytes());
+        code.extend_from_slice(&[0x49, 0xBF]);
+        code.extend_from_slice(&(arg2 as u64).to_le_bytes());
+        emit_cli_arg_parser(&mut code, 3, 0x20, 5);
+        emit_cli_arg_parser(&mut code, 4, 0x28, 6);
+        emit_cli_arg_parser(&mut code, 5, 0x30, 7);
+
+        // Read argv[1] into [rbx+0x100000..+0x20000]; reject odd length or >128 KiB via T_TRUNC.
+        code.extend_from_slice(&[0x48, 0x83, 0x7D, 0x08, 0x02, 0x7C]);
+        let j_no_arg = code.len();
+        code.push(0);
+        code.extend_from_slice(&[
+            0x48, 0x8B, 0x7D, 0x18,             // mov rdi, [rbp+0x18]
+            0x31, 0xF6, 0x31, 0xD2,             // xor esi, esi; xor edx, edx
+            0xB8, 0x02, 0x00, 0x00, 0x00,       // mov eax, 2 (sys_open)
+            0x0F, 0x05,                         // syscall
+            0x48, 0x85, 0xC0, 0x78,             // test rax, rax; js skip
+        ]);
+        let j_open_err = code.len();
+        code.push(0);
+        code.extend_from_slice(&[
+            0x48, 0x89, 0xC7,                         // mov rdi, rax (fd)
+            0x48, 0x8D, 0xB3, 0x00, 0x00, 0x10, 0x00, // lea rsi, [rbx+0x100000]
+            0xBA, 0x00, 0x00, 0x02, 0x00,             // mov edx, 0x20000 (128 KiB)
+            0x31, 0xC0, 0x0F, 0x05,                   // xor eax, eax (sys_read); syscall
+            0x48, 0x85, 0xC0, 0x7C,                   // test rax, rax; jl do_close
+        ]);
+        let j_read_err = code.len();
+        code.push(0);
+        code.extend_from_slice(&[0xA8, 0x01, 0x0F, 0x85]); // test al, 1; jnz T_TRUNC
+        trap_relocs.push((code.len(), 0));
+        code.extend_from_slice(&[0, 0, 0, 0]);
+        code.extend_from_slice(&[
+            0x48, 0xD1, 0xE8,                         // shr rax, 1 (nwords)
+            0x48, 0x89, 0x83, 0x00, 0x00, 0x12, 0x00, // mov [rbx+0x120000], rax
+            0x31, 0xC0,                               // xor eax, eax (sys_read)
+            0x48, 0x8D, 0x75, 0xF8,                   // lea rsi, [rbp-8] (1-byte probe)
+            0xBA, 0x01, 0x00, 0x00, 0x00,             // mov edx, 1
+            0x0F, 0x05,                               // syscall
+            0x48, 0x85, 0xC0, 0x0F, 0x8F,             // test rax, rax; jg T_TRUNC
+        ]);
+        trap_relocs.push((code.len(), 0));
+        code.extend_from_slice(&[0, 0, 0, 0]);
+        let do_close_off = code.len();
+        code.extend_from_slice(&[0xB8, 0x03, 0x00, 0x00, 0x00, 0x0F, 0x05]); // sys_close
+        let after_read_off = code.len();
+        code[j_read_err] = (do_close_off - (j_read_err + 1)) as u8;
+        code[j_open_err] = (after_read_off - (j_open_err + 1)) as u8;
+        code[j_no_arg] = (after_read_off - (j_no_arg + 1)) as u8;
+    } else {
+        code.extend_from_slice(&[0x49, 0xBC]);
+        code.extend_from_slice(&(arg0 as u64).to_le_bytes());
+        code.extend_from_slice(&[0x49, 0xBD]);
+        code.extend_from_slice(&(arg1 as u64).to_le_bytes());
+        code.extend_from_slice(&[0x49, 0xBE]);
+        code.extend_from_slice(&(arg2 as u64).to_le_bytes());
+        code.extend_from_slice(&[0x49, 0xC7, 0xC7, 0x00, 0x00, 0x00, 0x00]);
+        emit_cli_arg_parser(&mut code, 2, 0x18, 4);
+        emit_cli_arg_parser(&mut code, 3, 0x20, 5);
+        emit_cli_arg_parser(&mut code, 4, 0x28, 6);
+        emit_cli_arg_parser(&mut code, 5, 0x30, 7);
+    }
+
+    // Push r15..r12 so entry param k is at [rbp+16+8k], zero r11 (arena len), call entry.
+    code.extend_from_slice(&[0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x45, 0x31, 0xDB, 0xE8]);
+    call_relocs.push((code.len(), entry_fn.fn_idx));
+    code.extend_from_slice(&[0, 0, 0, 0]);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x20]); // add rsp, 32
+
+    if entry_is_bytes {
+        // Bytes return ABI: rax = off, rdx = len -> write(1, rbx + rax, rdx); exit(0)
+        code.extend_from_slice(&[
+            0x48, 0x8D, 0x34, 0x03,             // lea rsi, [rbx+rax]
+            0xBF, 0x01, 0x00, 0x00, 0x00,       // mov edi, 1
+            0xB8, 0x01, 0x00, 0x00, 0x00,       // mov eax, 1 (sys_write)
+            0x0F, 0x05,                         // syscall
+            0x31, 0xFF,                         // xor edi, edi
+            0xB8, 0x3C, 0x00, 0x00, 0x00,       // mov eax, 60 (sys_exit)
+            0x0F, 0x05,                         // syscall
+        ]);
+    } else {
+        code.extend_from_slice(&[
+            0x48, 0x83, 0xEC, 0x08,             // sub rsp, 8
+            0x48, 0x89, 0x04, 0x24,             // mov [rsp], rax
+            0xB8, 0x01, 0x00, 0x00, 0x00,       // mov eax, 1 (write)
+            0xBF, 0x01, 0x00, 0x00, 0x00,       // mov edi, 1 (stdout)
+            0x48, 0x89, 0xE6,                   // mov rsi, rsp
+            0xBA, 0x08, 0x00, 0x00, 0x00,       // mov edx, 8
+            0x0F, 0x05,                         // syscall
+            0x48, 0x83, 0xC4, 0x08,             // add rsp, 8
+            0x31, 0xFF,                         // xor edi, edi
+            0xB8, 0x3C, 0x00, 0x00, 0x00,       // mov eax, 60 (exit)
+            0x0F, 0x05,                         // syscall
+        ]);
+    }
+
+    // --- Trap stubs (3 x 12 B) ---
+    let t_trunc_off = code.len();
+    code.extend_from_slice(&[0xBF, 2, 0, 0, 0, 0xB8, 60, 0, 0, 0, 0x0F, 0x05]);
+    let t_oob_off = code.len();
+    code.extend_from_slice(&[0xBF, 1, 0, 0, 0, 0xB8, 60, 0, 0, 0, 0x0F, 0x05]);
+    let t_cap_off = code.len();
+    code.extend_from_slice(&[0xBF, 3, 0, 0, 0, 0xB8, 60, 0, 0, 0, 0x0F, 0x05]);
+
+    let emit_load_op = |c: &mut Vec<u8>, op: &BinOperand, into_rcx: bool| {
+        match *op {
+            BinOperand::Param(p_tok) => {
+                let disp: i32 = 16 + 8 * ((p_tok - PAR_BASE) as i32);
+                c.extend_from_slice(&[0x48, 0x8B, if into_rcx { 0x8D } else { 0x85 }]);
+                c.extend_from_slice(&disp.to_le_bytes());
+            }
+            BinOperand::Reg(r_tok) => {
+                let disp: i32 = -8 * (((r_tok - REG_BASE) as i32) + 1);
+                c.extend_from_slice(&[0x48, 0x8B, if into_rcx { 0x8D } else { 0x85 }]);
+                c.extend_from_slice(&disp.to_le_bytes());
+            }
+            BinOperand::ImmInt(v) => {
+                c.extend_from_slice(&[0x48, if into_rcx { 0xB9 } else { 0xB8 }]);
+                c.extend_from_slice(&(v as u64).to_le_bytes());
+            }
+            BinOperand::ImmTrit(t) => {
+                c.extend_from_slice(&[0x48, if into_rcx { 0xB9 } else { 0xB8 }]);
+                c.extend_from_slice(&((t as i64) as u64).to_le_bytes());
+            }
+            _ => {}
+        }
+    };
+    let emit_store_rax = |c: &mut Vec<u8>, d_tok: u16| {
+        let disp: i32 = -8 * (((d_tok - REG_BASE) as i32) + 1);
+        c.extend_from_slice(&[0x48, 0x89, 0x85]);
+        c.extend_from_slice(&disp.to_le_bytes());
+    };
+
+    // --- Emit each function in stream order ---
+    let mut fn_offsets: BTreeMap<u16, usize> = BTreeMap::new();
+    for func in &module.functions {
+        fn_offsets.insert(func.fn_idx, code.len());
+        let max_reg: usize = func
+            .instructions
+            .iter()
+            .filter_map(|i| i.dest_reg.map(|d| (d - REG_BASE) as usize))
+            .max()
+            .unwrap_or(0);
+        let frame_bytes: u32 = (((8 * (max_reg + 1)) + 15) & !15) as u32;
+        code.extend_from_slice(&[0x55, 0x48, 0x89, 0xE5, 0x48, 0x81, 0xEC]);
+        code.extend_from_slice(&frame_bytes.to_le_bytes());
+
+        let mut label_offsets: Vec<(u16, usize)> = Vec::new();
+        let mut relocs: Vec<RelocPatch> = Vec::new();
+
+        for ins in &func.instructions {
+            match ins.op_tok {
+                0x7F00 | 0x7F05 => {}
+                0x7F01 | 0x7F02 | 0x7F03 | 0x7F04 | 0x7F06 | 0x7F09 | 0x7F57 | 0x7F58 | 0x7F59 => {
+                    emit_load_op(&mut code, &ins.operands[0], false);
+                    if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                }
+                0x7F0D => {
+                    code.extend_from_slice(&[0x45, 0x31, 0xDB]); // xor r11d, r11d
+                    if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                }
+                0x7F50 => {
+                    let is_arr_param = match ins.operands.first() {
+                        Some(BinOperand::Param(p_tok)) => func
+                            .params
+                            .get((*p_tok - PAR_BASE) as usize)
+                            .map(|&(ty, _, _)| ty == TY_ARRAY)
+                            .unwrap_or(false),
+                        _ => false,
+                    };
+                    if is_arr_param {
+                        code.extend_from_slice(&[0x48, 0x8B, 0x83, 0x00, 0x00, 0x12, 0x00]); // mov rax, [rbx+0x120000]
+                    } else {
+                        code.extend_from_slice(&[0x4C, 0x89, 0xD8]); // mov rax, r11
+                    }
+                    if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                }
+                0x7F0E => {
+                    if ins.operands.len() == 3 {
+                        let width: u8 = match ins.operands[1] {
+                            BinOperand::ImmInt(-1) => 1,
+                            BinOperand::ImmInt(-2) => 2,
+                            BinOperand::ImmInt(-4) => 4,
+                            BinOperand::ImmInt(-8) => 8,
+                            _ => return Err(String::from("error[BAD_TYPE]: 3-op IGET mode must be -1, -2, -4, or -8")),
+                        };
+                        emit_load_op(&mut code, &ins.operands[2], true); // rcx = off
+                        // Bounds check: off >= 0 && off + width <= r11 (no wrap)
+                        code.extend_from_slice(&[0x48, 0x85, 0xC9, 0x0F, 0x88]); // test rcx,rcx; js T_OOB
+                        trap_relocs.push((code.len(), 1));
+                        code.extend_from_slice(&[0, 0, 0, 0]);
+                        code.extend_from_slice(&[0x48, 0x8D, 0x41, width]); // lea rax, [rcx+width]
+                        code.extend_from_slice(&[0x48, 0x39, 0xC8, 0x0F, 0x82]); // cmp rax, rcx; jb T_OOB
+                        trap_relocs.push((code.len(), 1));
+                        code.extend_from_slice(&[0, 0, 0, 0]);
+                        code.extend_from_slice(&[0x4C, 0x39, 0xD8, 0x0F, 0x87]); // cmp rax, r11; ja T_OOB
+                        trap_relocs.push((code.len(), 1));
+                        code.extend_from_slice(&[0, 0, 0, 0]);
+                        match width {
+                            1 => code.extend_from_slice(&[0x0F, 0xB6, 0x04, 0x0B]),
+                            2 => code.extend_from_slice(&[0x0F, 0xB7, 0x04, 0x0B]),
+                            4 => code.extend_from_slice(&[0x8B, 0x04, 0x0B]),
+                            _ => code.extend_from_slice(&[0x48, 0x8B, 0x04, 0x0B]),
+                        }
+                        if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                    } else {
+                        // Bounded 2-op input-window u16 read: idx >= nwords (unsigned) -> 0
+                        emit_load_op(&mut code, &ins.operands[1], false);
+                        code.extend_from_slice(&[
+                            0x48, 0x3B, 0x83, 0x00, 0x00, 0x12, 0x00, // cmp rax, [rbx+0x120000]
+                            0x73, 0x0A,                               // jae +10
+                            0x0F, 0xB7, 0x84, 0x43, 0x00, 0x00, 0x10, 0x00, // movzx eax, word [rbx+rax*2+0x100000]
+                            0xEB, 0x02,                               // jmp +2
+                            0x31, 0xC0,                               // xor eax, eax
+                        ]);
+                        if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                    }
+                }
+                0x7F0F => {
+                    let emit_cap_guard = |c: &mut Vec<u8>, tr: &mut Vec<(usize, u8)>, k: u32| {
+                        c.extend_from_slice(&[0x49, 0x8D, 0x83]); // lea rax, [r11+k]
+                        c.extend_from_slice(&k.to_le_bytes());
+                        c.extend_from_slice(&[0x48, 0x3D, 0x00, 0x00, 0x10, 0x00, 0x0F, 0x87]); // cmp rax, 0x100000; ja T_CAP
+                        tr.push((c.len(), 2));
+                        c.extend_from_slice(&[0, 0, 0, 0]);
+                    };
+                    if ins.operands.len() == 3 && ins.operands[1] == BinOperand::ImmInt(-4) {
+                        emit_cap_guard(&mut code, &mut trap_relocs, 4);
+                        emit_load_op(&mut code, &ins.operands[2], false);
+                        code.extend_from_slice(&[0x42, 0x89, 0x04, 0x1B, 0x49, 0x83, 0xC3, 0x04]);
+                    } else if ins.operands.len() == 3 && ins.operands[1] == BinOperand::ImmInt(-8) {
+                        emit_cap_guard(&mut code, &mut trap_relocs, 8);
+                        emit_load_op(&mut code, &ins.operands[2], false);
+                        code.extend_from_slice(&[0x4A, 0x89, 0x04, 0x1B, 0x49, 0x83, 0xC3, 0x08]);
+                    } else if ins.operands.len() == 4 && ins.operands[1] == BinOperand::ImmInt(-9) {
+                        emit_load_op(&mut code, &ins.operands[2], true);
+                        emit_load_op(&mut code, &ins.operands[3], false);
+                        code.extend_from_slice(&[
+                            0x48, 0x85, 0xC9, 0x78, 0x0F,       // test rcx, rcx; js +15 (no-op)
+                            0x48, 0x8D, 0x71, 0x08,             // lea rsi, [rcx+8]
+                            0x4C, 0x39, 0xDE, 0x77, 0x06,       // cmp rsi, r11; ja +6 (no-op)
+                            0x48, 0x89, 0x04, 0x0B,             // mov [rbx+rcx], rax
+                        ]);
+                    } else if ins.operands.len() == 4
+                        && (ins.operands[1] == BinOperand::ImmInt(-2) || ins.operands[1] == BinOperand::ImmInt(-4))
+                    {
+                        let width: u8 = if ins.operands[1] == BinOperand::ImmInt(-2) { 2 } else { 4 };
+                        emit_load_op(&mut code, &ins.operands[3], false);
+                        code.extend_from_slice(&[0x48, 0x89, 0xC2]); // mov rdx, rax
+                        emit_load_op(&mut code, &ins.operands[2], true); // rcx = off
+                        code.extend_from_slice(&[0x48, 0x85, 0xC9, 0x0F, 0x88]); // js T_OOB
+                        trap_relocs.push((code.len(), 1));
+                        code.extend_from_slice(&[0, 0, 0, 0]);
+                        code.extend_from_slice(&[0x48, 0x8D, 0x41, width]); // lea rax, [rcx+width]
+                        code.extend_from_slice(&[0x48, 0x39, 0xC8, 0x0F, 0x82]); // jb T_OOB
+                        trap_relocs.push((code.len(), 1));
+                        code.extend_from_slice(&[0, 0, 0, 0]);
+                        code.extend_from_slice(&[0x4C, 0x39, 0xD8, 0x0F, 0x87]); // ja T_OOB
+                        trap_relocs.push((code.len(), 1));
+                        code.extend_from_slice(&[0, 0, 0, 0]);
+                        if width == 2 {
+                            code.extend_from_slice(&[0x66, 0x89, 0x14, 0x0B]); // mov [rbx+rcx], dx
+                        } else {
+                            code.extend_from_slice(&[0x89, 0x14, 0x0B]);       // mov [rbx+rcx], edx
+                        }
+                    } else {
+                        let k = ins.operands.len().saturating_sub(1) as u32;
+                        emit_cap_guard(&mut code, &mut trap_relocs, k);
+                        for op_b in &ins.operands[1..] {
+                            emit_load_op(&mut code, op_b, false);
+                            code.extend_from_slice(&[0x42, 0x88, 0x04, 0x1B, 0x49, 0xFF, 0xC3]);
+                        }
+                    }
+                    if let Some(d) = ins.dest_reg {
+                        code.extend_from_slice(&[0x4C, 0x89, 0xD8]);
+                        emit_store_rax(&mut code, d);
+                    }
+                }
+                0x7F10 | 0x7F11 | 0x7F12 | 0x7F1E | 0x7F1F | 0x7F20 => {
+                    emit_load_op(&mut code, &ins.operands[0], false);
+                    emit_load_op(&mut code, &ins.operands[1], true);
+                    match ins.op_tok {
+                        0x7F10 => code.extend_from_slice(&[0x48, 0x01, 0xC8]),
+                        0x7F11 => code.extend_from_slice(&[0x48, 0x29, 0xC8]),
+                        0x7F12 => code.extend_from_slice(&[0x48, 0x0F, 0xAF, 0xC1]),
+                        0x7F1E => code.extend_from_slice(&[0x48, 0x21, 0xC8]),
+                        0x7F1F => code.extend_from_slice(&[0x48, 0x09, 0xC8]),
+                        _      => code.extend_from_slice(&[0x48, 0x31, 0xC8]),
+                    }
+                    if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                }
+                0x7F13 | 0x7F14 => {
+                    emit_load_op(&mut code, &ins.operands[0], false);
+                    emit_load_op(&mut code, &ins.operands[1], true);
+                    code.extend_from_slice(&[
+                        0x49, 0x89, 0xC0, 0x48, 0x85, 0xC9, 0x74, 0x1E, 0x48, 0x83, 0xF9, 0xFF,
+                        0x75, 0x11, 0x49, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80,
+                        0x4D, 0x39, 0xC8, 0x75, 0x02, 0xEB, 0x0A, 0x48, 0x99, 0x48, 0xF7, 0xF9,
+                        0xEB, 0x03, 0x48, 0x31, 0xC0,
+                    ]);
+                    if ins.op_tok == 0x7F14 {
+                        code.extend_from_slice(&[0x48, 0x89, 0xD0]);
+                    }
+                    if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                }
+                0x7F15 | 0x7F28 => {
+                    emit_load_op(&mut code, &ins.operands[0], false);
+                    code.extend_from_slice(&[0x48, 0xF7, 0xD8]);
+                    if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                }
+                0x7F16 => {
+                    emit_load_op(&mut code, &ins.operands[0], false);
+                    code.extend_from_slice(&[0x48, 0x89, 0xC2, 0x48, 0xF7, 0xD8, 0x48, 0x0F, 0x48, 0xC2]);
+                    if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                }
+                0x7F21 => {
+                    emit_load_op(&mut code, &ins.operands[0], false);
+                    code.extend_from_slice(&[0x48, 0xF7, 0xD0]);
+                    if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                }
+                0x7F22 | 0x7F23 => {
+                    emit_load_op(&mut code, &ins.operands[0], false);
+                    emit_load_op(&mut code, &ins.operands[1], true);
+                    code.extend_from_slice(&[0x48, 0xD3, if ins.op_tok == 0x7F22 { 0xE0 } else { 0xF8 }]);
+                    if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                }
+                0x7F24 | 0x7F25 | 0x7F26 | 0x7F27 => {
+                    emit_load_op(&mut code, &ins.operands[0], false);
+                    emit_load_op(&mut code, &ins.operands[1], true);
+                    let setcc: u8 = match ins.op_tok {
+                        0x7F24 => 0x94,
+                        0x7F25 => 0x95,
+                        0x7F26 => 0x9C,
+                        _      => 0x9F,
+                    };
+                    code.extend_from_slice(&[
+                        0x48, 0x39, 0xC8, 0x0F, setcc, 0xC0, 0x0F, 0xB6, 0xC0, 0x48, 0x8D, 0x44, 0x00, 0xFF,
+                    ]);
+                    if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                }
+                0x7F29 | 0x7F17 => {
+                    emit_load_op(&mut code, &ins.operands[0], false);
+                    emit_load_op(&mut code, &ins.operands[1], true);
+                    code.extend_from_slice(&[0x48, 0x39, 0xC8, 0x48, 0x0F, 0x4F, 0xC1]);
+                    if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                }
+                0x7F2A | 0x7F18 => {
+                    emit_load_op(&mut code, &ins.operands[0], false);
+                    emit_load_op(&mut code, &ins.operands[1], true);
+                    code.extend_from_slice(&[0x48, 0x39, 0xC8, 0x48, 0x0F, 0x4C, 0xC1]);
+                    if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                }
+                0x7F2B => {
+                    emit_load_op(&mut code, &ins.operands[0], false);
+                    emit_load_op(&mut code, &ins.operands[1], true);
+                    code.extend_from_slice(&[0x48, 0x0F, 0xAF, 0xC1, 0x48, 0xF7, 0xD8]);
+                    if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                }
+                0x7F2C => {
+                    emit_load_op(&mut code, &ins.operands[0], false);
+                    emit_load_op(&mut code, &ins.operands[1], true);
+                    code.extend_from_slice(&[0x48, 0x01, 0xC8]);
+                    emit_load_op(&mut code, &ins.operands[2], true);
+                    code.extend_from_slice(&[
+                        0x48, 0x01, 0xC8, 0x48, 0x83, 0xF8, 0x00, 0x0F, 0x9F, 0xC0,
+                        0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC0, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD0,
+                    ]);
+                    if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                }
+                0x7F2D => {
+                    emit_load_op(&mut code, &ins.operands[0], false);
+                    emit_load_op(&mut code, &ins.operands[1], true);
+                    code.extend_from_slice(&[
+                        0x48, 0x39, 0xC8, 0x0F, 0x9F, 0xC2, 0x0F, 0x9C, 0xC1,
+                        0x0F, 0xB6, 0xD2, 0x0F, 0xB6, 0xC9, 0x29, 0xCA, 0x48, 0x63, 0xC2,
+                    ]);
+                    if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                }
+                0x7F35 | 0x7F3F => {
+                    emit_load_op(&mut code, &ins.operands[0], false);
+                    code.extend_from_slice(&[
+                        0x48, 0x83, 0xF8, 0x00, 0x0F, 0x9F, 0xC0, 0x0F, 0x9C, 0xC2,
+                        0x0F, 0xB6, 0xC0, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD0,
+                    ]);
+                    if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                }
+                0x7F40 => {
+                    if let Some(lbl) = ins.operands.first().and_then(extract_label_id) {
+                        label_offsets.push((lbl, code.len()));
+                    }
+                }
+                0x7F41 => {
+                    if let Some(lbl) = ins.operands.first().and_then(extract_label_id) {
+                        code.push(0xE9);
+                        relocs.push(RelocPatch { patch_offset: code.len(), target_label: lbl });
+                        code.extend_from_slice(&[0, 0, 0, 0]);
+                    }
+                }
+                0x7F42 => {
+                    if let (Some(l_neg), Some(l_zero), Some(l_pos)) = (
+                        ins.operands.get(1).and_then(extract_label_id),
+                        ins.operands.get(2).and_then(extract_label_id),
+                        ins.operands.get(3).and_then(extract_label_id),
+                    ) {
+                        emit_load_op(&mut code, &ins.operands[0], false);
+                        code.extend_from_slice(&[0x48, 0x83, 0xF8, 0x00, 0x0F, 0x8C]);
+                        relocs.push(RelocPatch { patch_offset: code.len(), target_label: l_neg });
+                        code.extend_from_slice(&[0, 0, 0, 0, 0x0F, 0x84]);
+                        relocs.push(RelocPatch { patch_offset: code.len(), target_label: l_zero });
+                        code.extend_from_slice(&[0, 0, 0, 0, 0xE9]);
+                        relocs.push(RelocPatch { patch_offset: code.len(), target_label: l_pos });
+                        code.extend_from_slice(&[0, 0, 0, 0]);
+                    }
+                }
+                0x7F43 | 0x7F44 => {
+                    if let Some(lbl) = ins.operands.get(1).and_then(extract_label_id) {
+                        emit_load_op(&mut code, &ins.operands[0], false);
+                        code.extend_from_slice(&[0x48, 0x83, 0xF8, if ins.op_tok == 0x7F43 { 0x01 } else { 0xFF }, 0x0F, 0x84]);
+                        relocs.push(RelocPatch { patch_offset: code.len(), target_label: lbl });
+                        code.extend_from_slice(&[0, 0, 0, 0]);
+                    }
+                }
+                0x7F45 => {
+                    emit_load_op(&mut code, &ins.operands[0], false);
+                    emit_load_op(&mut code, &ins.operands[1], true);
+                    code.extend_from_slice(&[0x49, 0x89, 0xC0, 0x48, 0x89, 0xCA]);
+                    emit_load_op(&mut code, &ins.operands[2], true);
+                    code.extend_from_slice(&[0x49, 0x83, 0xF8, 0x00, 0x48, 0x0F, 0x44, 0xD1]);
+                    emit_load_op(&mut code, &ins.operands[3], true);
+                    code.extend_from_slice(&[0x49, 0x83, 0xF8, 0x00, 0x48, 0x0F, 0x4F, 0xD1, 0x48, 0x89, 0xD0]);
+                    if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                }
+                0x7F48 => {
+                    if let Some(BinOperand::FnRef(callee_idx)) = ins.operands.first() {
+                        let args = &ins.operands[1..];
+                        for arg in args.iter().rev() {
+                            emit_load_op(&mut code, arg, false);
+                            code.push(0x50); // push rax
+                        }
+                        code.push(0xE8);
+                        call_relocs.push((code.len(), *callee_idx));
+                        code.extend_from_slice(&[0, 0, 0, 0]);
+                        let cleanup: u32 = (args.len() * 8) as u32;
+                        code.extend_from_slice(&[0x48, 0x81, 0xC4]); // add rsp, imm32
+                        code.extend_from_slice(&cleanup.to_le_bytes());
+                        if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                    }
+                }
+                0x7F4A => {
+                    if func.ret_ty_tok == TY_BYTES {
+                        if ins.operands.len() == 3 {
+                            emit_load_op(&mut code, &ins.operands[1], false); // rax = off
+                            emit_load_op(&mut code, &ins.operands[2], true);  // rcx = len
+                            code.extend_from_slice(&[0x48, 0x85, 0xC0, 0x0F, 0x88]); // js T_OOB
+                            trap_relocs.push((code.len(), 1));
+                            code.extend_from_slice(&[0, 0, 0, 0]);
+                            code.extend_from_slice(&[0x48, 0x85, 0xC9, 0x0F, 0x88]); // js T_OOB
+                            trap_relocs.push((code.len(), 1));
+                            code.extend_from_slice(&[0, 0, 0, 0]);
+                            code.extend_from_slice(&[0x48, 0x8D, 0x34, 0x08]); // lea rsi, [rax+rcx]
+                            code.extend_from_slice(&[0x48, 0x39, 0xC6, 0x0F, 0x82]); // cmp rsi, rax; jb T_OOB
+                            trap_relocs.push((code.len(), 1));
+                            code.extend_from_slice(&[0, 0, 0, 0]);
+                            code.extend_from_slice(&[0x4C, 0x39, 0xDE, 0x0F, 0x87]); // cmp rsi, r11; ja T_OOB
+                            trap_relocs.push((code.len(), 1));
+                            code.extend_from_slice(&[0, 0, 0, 0]);
+                            code.extend_from_slice(&[0x48, 0x89, 0xCA, 0xC9, 0xC3]); // mov rdx, rcx; leave; ret
+                        } else {
+                            code.extend_from_slice(&[0x31, 0xC0, 0x4C, 0x89, 0xDA, 0xC9, 0xC3]); // xor eax,eax; mov rdx,r11; leave; ret
+                        }
+                    } else if ins.operands.len() == 3 {
+                        return Err(String::from("error[BAD_TYPE]: 3-op RET requires Bytes return type"));
+                    } else {
+                        emit_load_op(&mut code, &ins.operands[0], false);
+                        code.extend_from_slice(&[0xC9, 0xC3]); // leave; ret
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Resolve per-function branch relocations (first definition wins).
+        for r in &relocs {
+            let target_off = label_offsets
+                .iter()
+                .find(|&&(lbl, _)| lbl == r.target_label)
+                .map(|&(_, off)| off)
+                .ok_or_else(|| format!("Unresolved label 0x{:04X} in fn#{}", r.target_label, func.fn_idx))?;
+            let rel32: i32 = (target_off as i32) - ((r.patch_offset + 4) as i32);
+            code[r.patch_offset..r.patch_offset + 4].copy_from_slice(&rel32.to_le_bytes());
+        }
+    }
+
+    // Resolve CALL relocations across all functions.
+    for &(patch_off, callee_idx) in &call_relocs {
+        let target_off = *fn_offsets
+            .get(&callee_idx)
+            .ok_or_else(|| format!("Unresolved CALL target fn#{}", callee_idx))?;
+        let rel32: i32 = (target_off as i32) - ((patch_off + 4) as i32);
+        code[patch_off..patch_off + 4].copy_from_slice(&rel32.to_le_bytes());
+    }
+
+    // Resolve trap stub relocations.
+    let trap_offs = [t_trunc_off, t_oob_off, t_cap_off];
+    for &(patch_off, trap_kind) in &trap_relocs {
+        let target_off = trap_offs[trap_kind as usize];
+        let rel32: i32 = (target_off as i32) - ((patch_off + 4) as i32);
+        code[patch_off..patch_off + 4].copy_from_slice(&rel32.to_le_bytes());
+    }
+
+    let base_vaddr: u64 = 0x400000;
+    let entry_vaddr: u64 = base_vaddr + 120;
+    let total_size: u64 = 120 + (code.len() as u64);
+
+    let mut elf = vec![0u8; 120];
+    elf[0..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
+    elf[4] = 2;
+    elf[5] = 1;
+    elf[6] = 1;
+    elf[16..18].copy_from_slice(&2u16.to_le_bytes());
+    elf[18..20].copy_from_slice(&0x3Eu16.to_le_bytes());
+    elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+    elf[24..32].copy_from_slice(&entry_vaddr.to_le_bytes());
+    elf[32..40].copy_from_slice(&64u64.to_le_bytes());
+    elf[52..54].copy_from_slice(&64u16.to_le_bytes());
+    elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+    elf[56..58].copy_from_slice(&1u16.to_le_bytes());
+    elf[64..68].copy_from_slice(&1u32.to_le_bytes());
+    elf[68..72].copy_from_slice(&5u32.to_le_bytes());
+    elf[80..88].copy_from_slice(&base_vaddr.to_le_bytes());
+    elf[88..96].copy_from_slice(&base_vaddr.to_le_bytes());
+    elf[96..104].copy_from_slice(&total_size.to_le_bytes());
+    elf[104..112].copy_from_slice(&total_size.to_le_bytes());
+    elf[112..120].copy_from_slice(&0x1000u64.to_le_bytes());
+
+    elf.extend_from_slice(&code);
+    Ok(elf)
+}
+
 fn encode_uleb128(mut val: usize) -> Vec<u8> {
     let mut out = Vec::new();
     loop {
@@ -22413,9 +23006,99 @@ pub fn run_m2_foundation_selftests() -> Result<usize, String> {
     n += selftest_m3_isa_encode_roundtrip()?;
     n += selftest_m2_labels_table()?;
     n += selftest_m2_08_multi_aot_precheck()?;
+    n += selftest_m2_09_multi_aot()?;
     n += selftest_m2_11_arena_elf()?;
     n += selftest_m2_13_stage1_anchor()?;
     Ok(n)
+}
+
+/// M2-09 (D-4): Multi-function x86-64 ELF64 AOT selftests.
+pub fn selftest_m2_09_multi_aot() -> Result<usize, String> {
+    let check_elf = |name: &str, elf: &[u8]| -> Result<(), String> {
+        if elf.len() <= 120 || &elf[0..4] != b"\x7FELF" || elf[4] != 2 || elf[18] != 0x3E {
+            return Err(format!("M2-09 {}: invalid ELF64 header (len={})", name, elf.len()));
+        }
+        Ok(())
+    };
+    let mut checks = 0usize;
+
+    // 1. Call chains + stack params (5 and 8 args) + native execution on Linux
+    let i64_cases: [(&str, &str, &[i64], i64); 4] = [
+        (
+            "mf_call_chain_2",
+            "#[strict]\nfn leaf(x: i64) -> i64 { return x * 3 + 1; }\n#[strict]\nfn main(x: i64) -> i64 { let r: i64 = leaf(x); return r + 5; }\n",
+            &[10],
+            36,
+        ),
+        (
+            "mf_call_chain_9",
+            "#[strict]\nfn f8(x: i64) -> i64 { return x + 1; }\n#[strict]\nfn f7(x: i64) -> i64 { let r: i64 = f8(x); return r + 1; }\n#[strict]\nfn f6(x: i64) -> i64 { let r: i64 = f7(x); return r + 1; }\n#[strict]\nfn f5(x: i64) -> i64 { let r: i64 = f6(x); return r + 1; }\n#[strict]\nfn f4(x: i64) -> i64 { let r: i64 = f5(x); return r + 1; }\n#[strict]\nfn f3(x: i64) -> i64 { let r: i64 = f4(x); return r + 1; }\n#[strict]\nfn f2(x: i64) -> i64 { let r: i64 = f3(x); return r + 1; }\n#[strict]\nfn f1(x: i64) -> i64 { let r: i64 = f2(x); return r + 1; }\n#[strict]\nfn f0(x: i64) -> i64 { let r: i64 = f1(x); return r + 1; }\n",
+            &[100],
+            109,
+        ),
+        (
+            "mf_params_5",
+            "#[strict]\nfn sum5(a: i64, b: i64, c: i64, d: i64, e: i64) -> i64 { return a + b * 2 + c * 3 + d * 4 + e * 5; }\n#[strict]\nfn main(x: i64) -> i64 { let r: i64 = sum5(x, x + 1, x + 2, x + 3, x + 4); return r; }\n",
+            &[1],
+            55,
+        ),
+        (
+            "mf_params_8",
+            "#[strict]\nfn sum8(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64) -> i64 { return a + b + c + d + e + f + g + h; }\n#[strict]\nfn main(x: i64) -> i64 { let r: i64 = sum8(x, 2, 3, 4, 5, 6, 7, 8); return r; }\n",
+            &[1],
+            36,
+        ),
+    ];
+    for &(name, src, args, want) in &i64_cases {
+        let u16s = compile_omni_surface_strict_to_u16(src)?;
+        let elf = compile_pure_u16_to_x86_64_elf_multi(&u16s, args[0], 0, 0)?;
+        check_elf(name, &elf)?;
+        let vm_res = execute_omni_surface_program(src, args.iter().map(|&v| OmniValue::Int(v)).collect())?;
+        if vm_res != OmniValue::Int(want) {
+            return Err(format!("M2-09 {} VM returned {:?}, expected {}", name, vm_res, want));
+        }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            let got = execute_native_elf_i64(&elf, args)?;
+            if got != want {
+                return Err(format!("M2-09 {} native ELF returned {}, expected {}", name, got, want));
+            }
+        }
+        checks += 1;
+    }
+
+    // 2. Bytes threading + 3-op RET (ret_slice) in multi-function mode
+    let bytes_src = "#[strict]\nfn fill(b: bytes, v: i64) -> bytes { let w: bytes = iset(b, v, v + 1, v + 2); return w; }\n#[strict]\nfn main(x: i64) -> bytes { let b: bytes = anew(0); b = fill(b, 10); return ret_slice(b, 1, 2); }\n";
+    let bytes_u16 = compile_omni_surface_strict_to_u16(bytes_src)?;
+    let bytes_elf = compile_pure_u16_to_x86_64_elf_multi(&bytes_u16, 0, 0, 0)?;
+    check_elf("mf_bytes_ret_slice", &bytes_elf)?;
+    let bytes_vm = execute_omni_surface_program(bytes_src, vec![OmniValue::Int(0)])?;
+    if bytes_vm != OmniValue::Bytes(vec![11, 12]) {
+        return Err(format!("M2-09 mf_bytes_ret_slice VM returned {:?}", bytes_vm));
+    }
+    checks += 1;
+
+    // 3. Real multi-function pure-Omni compiler & verifier modules compile cleanly to ELF64
+    let comp_u16 = compile_omni_surface_strict_to_u16(include_str!("pure/compiler.omni"))?;
+    let comp_elf = compile_pure_u16_to_x86_64_elf_multi(&comp_u16, 0, 0, 0)?;
+    check_elf("pure/compiler.omni", &comp_elf)?;
+    checks += 1;
+
+    let ve_u16 = compile_omni_surface_strict_to_u16(OMNI_VERIFIER_ENGINE_SURFACE)?;
+    let ve_elf = compile_pure_u16_to_x86_64_elf_multi(&ve_u16, 0, 0, 0)?;
+    check_elf("pure/verifier_engine.omni", &ve_elf)?;
+    checks += 1;
+
+    let m2_standalone_src = format!(
+        "{}\n#[strict]\nfn m2_standalone_main(arr: array, arg0: i64, arg1: i64, arg2: i64) -> bytes {{\n    let w: bytes = anew(0);\n    return m2_compile_single_x86(w, arr, arg0, arg1, arg2);\n}}\n",
+        M2_COMPILER_OMNI_SRC
+    );
+    let m2_u16 = compile_omni_surface_strict_to_u16(&m2_standalone_src)?;
+    let m2_elf = compile_pure_u16_to_x86_64_elf_multi(&m2_u16, 45, 40, 90)?;
+    check_elf("pure/m2/*.omni", &m2_elf)?;
+    checks += 1;
+
+    Ok(checks)
 }
 
 /// M2-08: multi-function AOT module pre-check selftests.
@@ -22599,6 +23282,16 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
             }
             Err(e) => {
                 eprintln!("[M2-COMPILE FAIL] {}", e);
+                1
+            }
+        },
+        "m2-multi" => match selftest_m2_09_multi_aot() {
+            Ok(n) => {
+                println!("[M2-MULTI PASS] {} multi-function x86-64 ELF64 checks passed (including pure/compiler.omni, pure/verifier_engine.omni, and pure/m2/*.omni!)", n);
+                0
+            }
+            Err(e) => {
+                eprintln!("[M2-MULTI FAIL] {}", e);
                 1
             }
         },
@@ -22893,7 +23586,7 @@ fn main() {
             "harness" | "--harness" => {
                 std::process::exit(run_omni_harness_cli(&cli_args[2..]));
             }
-            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" => {
+            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" => {
                 std::process::exit(run_m2_cli(&cli_args[1..]));
             }
             "agent-driver" | "--agent-driver" => {
