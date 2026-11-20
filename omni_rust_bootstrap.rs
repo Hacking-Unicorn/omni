@@ -23295,6 +23295,8 @@ pub fn run_m2_foundation_selftests() -> Result<usize, String> {
     n += selftest_m3_10_lower_diff()?;
     n += selftest_m3_14_lockstep_frontend()?;
     n += selftest_m2_10_wasm_multi()?;
+    n += selftest_m2_14_verify_diff()?;
+    n += selftest_m3_15_four_backend_parity()?;
     Ok(n)
 }
 
@@ -23662,6 +23664,32 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
                 1
             }
         },
+        "m2-verify" => match selftest_m2_14_verify_diff() {
+            Ok(n) => {
+                println!(
+                    "[M2-VERIFY PASS] {} checks (pure/m2/verify/mod_check.omni == Rust verify_module_for_multi_aot + L1-L12 labels)",
+                    n
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("[M2-VERIFY FAIL] {}", e);
+                1
+            }
+        },
+        "m3-4backend" => match selftest_m3_15_four_backend_parity() {
+            Ok(n) => {
+                println!(
+                    "[M3-4BACKEND PASS] {} programs verified across VM == Wasm-multi == Rust-x86-multi == Pure-Omni-M2-ELF64 (0-byte diff; Stage-1 N/A legacy exemption)",
+                    n
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("[M3-4BACKEND FAIL] {}", e);
+                1
+            }
+        },
         "m2-wasm-multi" => match selftest_m2_10_wasm_multi() {
             Ok(n) => {
                 println!(
@@ -23995,7 +24023,7 @@ fn main() {
             "harness" | "--harness" => {
                 std::process::exit(run_omni_harness_cli(&cli_args[2..]));
             }
-            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-fixed-point" => {
+            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" => {
                 std::process::exit(run_m2_cli(&cli_args[1..]));
             }
             "agent-driver" | "--agent-driver" => {

@@ -25,9 +25,13 @@ jobs:
           ./omni m2-compile
           ./omni m2-multi
           ./omni m2-multi-pure
+          ./omni m2-wasm-multi
+          ./omni m2-verify
           ./omni m2-fixed-point
           ./omni m3-gate
           ./omni m3-lower
+          ./omni m3-lockstep
+          ./omni m3-4backend
           ./omni m3-fixed-point
           ./omni backend-diff --suite
           ./omni selftest

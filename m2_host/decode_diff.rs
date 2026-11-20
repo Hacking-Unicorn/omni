@@ -28,6 +28,20 @@ pub const M2_DECODE_WS_OMNI_SRC: &str = concat!(
     include_str!("../spec/m2/decode_ws_harness.omni")
 );
 
+pub const M2_VERIFY_OMNI_SRC: &str = concat!(
+    include_str!("../pure/m2/util.omni"),
+    "\n",
+    include_str!("../pure/isa/table.omni"),
+    "\n",
+    include_str!("../pure/m2/decode.omni"),
+    "\n",
+    include_str!("../pure/m2/labels.omni"),
+    "\n",
+    include_str!("../pure/m2/verify/mod_check.omni"),
+    "\n",
+    include_str!("../spec/m2/verify_harness.omni")
+);
+
 /// Fixed scratch offsets written by m2d_decode_at_ws (must equal the m2l_scratch_* constants).
 pub const M2D_SCRATCH_OP: usize = 0x7FF00;
 pub const M2D_SCRATCH_NOPS: usize = 0x7FF08;
@@ -2131,6 +2145,214 @@ pub fn selftest_m2_10_wasm_multi() -> Result<usize, String> {
         other => return Err(format!("M2-10 depth-70 expected call-depth BUDGET_EXCEEDED, got {:?}", other)),
     }
 
+    Ok(checks)
+}
+
+/// M2-14 selftest: Pure-Omni iterative multi-AOT module verifier (`pure/m2/verify/mod_check.omni`)
+/// differentially checked against Rust `verify_module_for_multi_aot` across positive multi-fn modules
+/// (including 1,034-line `pure/verifier_engine.omni`) and negative M2-08 / L1-L12 reject cases.
+pub fn selftest_m2_14_verify_diff() -> Result<usize, String> {
+    let vmod = m2_compile_decoder(M2_VERIFY_OMNI_SRC)?;
+    let entry = m2_entry_of(&vmod);
+    let run_pure = |stream: &[u16]| -> Result<(u32, u32), String> {
+        let mut vm = OmniBinaryVm::with_budgets(200_000_000, 64 * 1024 * 1024);
+        let rv = match vm.execute_function(
+            &vmod,
+            entry,
+            vec![
+                OmniValue::Bytes(vec![0u8; 262_144]),
+                OmniValue::U16Array(stream.to_vec()),
+            ],
+        )? {
+            OmniValue::Int(v) => v as u64,
+            other => return Err(format!("M2-14 returned {:?}, expected Int", other)),
+        };
+        Ok(((rv >> 32) as u32, (rv & 0xFFFF_FFFF) as u32))
+    };
+
+    let mut checks = 0usize;
+    let pos_cases: [(&str, &str); 5] = [
+        ("mf_chain", "#[strict]\nfn add1(x: i64) -> i64 { return x + 1; }\nfn main(a: i64) -> i64 { return add1(a) * 2; }\n"),
+        ("mf_buf", "#[strict]\nfn mk(a: i64) -> bytes { let w: bytes = anew(0); w = iset(w, a); return w; }\nfn main(x: i64) -> i64 { let w: bytes = mk(x); return iget(w, 0); }\n"),
+        ("pure_compiler", include_str!("../pure/compiler.omni")),
+        ("pure_m2_util", include_str!("../pure/m2/util.omni")),
+        ("pure_verifier_engine", OMNI_VERIFIER_ENGINE_SURFACE),
+    ];
+    for (name, src) in &pos_cases {
+        let stream = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(src))?;
+        let decoded = decode_omni_token_stream(&stream)?;
+        verify_module_for_multi_aot(&decoded)
+            .map_err(|e| format!("M2-14 pos '{}': Rust rejected: {}", name, e))?;
+        let (ec, eo) = run_pure(&stream).map_err(|e| format!("M2-14 pos '{}': {}", name, e))?;
+        if ec != 0 {
+            return Err(format!("M2-14 pos '{}': Pure-Omni rejected with code={} off={}", name, ec, eo));
+        }
+        checks += 1;
+    }
+
+    // Negative 1: self-recursion (code 5)
+    let self_rec = compile_omni_surface_strict_to_u16(
+        "#[strict]\nfn rec(n: i64) -> i64 { let c: trit = n <=> 0; return if_pos c { 1 + rec(n - 1) } else { 0 }; }\nfn main(n: i64) -> i64 { return rec(n); }\n",
+    )?;
+    if verify_module_for_multi_aot(&decode_omni_token_stream(&self_rec)?).is_ok() {
+        return Err(String::from("M2-14 self-rec: Rust unexpectedly accepted"));
+    }
+    let (ec, _) = run_pure(&self_rec)?;
+    if ec != 5 {
+        return Err(format!("M2-14 self-rec: expected code 5 (RECURSION), got {}", ec));
+    }
+    checks += 1;
+
+    // Negative 2: mutual recursion (code 5)
+    let mut_rec = compile_omni_surface_strict_to_u16(
+        "#[strict]\nfn fa(n: i64) -> i64 { return if_pos n <=> 0 { fb(n - 1) } else { 0 }; }\nfn fb(n: i64) -> i64 { return if_pos n <=> 0 { fa(n - 1) } else { 1 }; }\nfn main(n: i64) -> i64 { return fa(n); }\n",
+    )?;
+    if verify_module_for_multi_aot(&decode_omni_token_stream(&mut_rec)?).is_ok() {
+        return Err(String::from("M2-14 mutual-rec: Rust unexpectedly accepted"));
+    }
+    let (ec, _) = run_pure(&mut_rec)?;
+    if ec != 5 {
+        return Err(format!("M2-14 mutual-rec: expected code 5 (RECURSION), got {}", ec));
+    }
+    checks += 1;
+
+    // Negative 3: bad CALL target (code 3) — patch TOK_SYM_FN target id to 999
+    let mut bad_tgt = compile_omni_surface_strict_to_u16(
+        "#[strict]\nfn f(x: i64) -> i64 { return x + 1; }\nfn main(a: i64) -> i64 { return f(a); }\n",
+    )?;
+    if let Some(p) = bad_tgt.iter().position(|&w| w == TOK_SYM_FN) {
+        bad_tgt[p + 1] = 999;
+    }
+    if verify_module_for_multi_aot(&decode_omni_token_stream(&bad_tgt)?).is_ok() {
+        return Err(String::from("M2-14 bad-target: Rust unexpectedly accepted"));
+    }
+    let (ec, _) = run_pure(&bad_tgt)?;
+    if ec != 3 {
+        return Err(format!("M2-14 bad-target: expected code 3 (BAD_CALL_TARGET), got {}", ec));
+    }
+    checks += 1;
+
+    // Negative 4: CALL arity mismatch (code 4) — duplicate the single arg in CALL
+    let mut bad_arity = compile_omni_surface_strict_to_u16(
+        "#[strict]\nfn f(x: i64) -> i64 { return x + 1; }\nfn main(a: i64) -> i64 { return f(a); }\n",
+    )?;
+    if let Some(p) = bad_arity.iter().position(|&w| w == TOK_SYM_FN) {
+        // Insert an extra param token right after the existing arg (p + 2)
+        let extra = bad_arity[p + 2];
+        bad_arity.insert(p + 3, extra);
+    }
+    if verify_module_for_multi_aot(&decode_omni_token_stream(&bad_arity)?).is_ok() {
+        return Err(String::from("M2-14 bad-arity: Rust unexpectedly accepted"));
+    }
+    let (ec, _) = run_pure(&bad_arity)?;
+    if ec != 4 {
+        return Err(format!("M2-14 bad-arity: expected code 4 (ARITY_MISMATCH), got {}", ec));
+    }
+    checks += 1;
+
+    // Negative 5: unresolved branch target (code 6)
+    let mut bad_lbl = compile_omni_surface_strict_to_u16(
+        "#[strict]\nfn main(x: i64) -> i64 { goto 1; label 1; return x; }\n",
+    )?;
+    // Mutate the JMP target label token (first 0x7EF1) to 0x7EF5 (undefined label 5)
+    if let Some(p) = bad_lbl.iter().position(|&w| w == 0x7EF1) {
+        bad_lbl[p] = 0x7EF5;
+    }
+    let (ec, _) = run_pure(&bad_lbl)?;
+    if ec != 6 {
+        return Err(format!("M2-14 bad-label: expected code 6 (BAD_LABEL), got {}", ec));
+    }
+    checks += 1;
+
+    Ok(checks)
+}
+
+/// M3-15 selftest: 4-backend parity of Pure-Omni M3-compiled multi-function images across:
+///   (a) VM (`OmniBinaryVm`)
+///   (b) Rust x86-64 multi AOT (`M2-09`)
+///   (c) Wasm multi AOT (`M2-10` + depth-64 evaluator)
+///   (d) Pure-Omni M2 x86-64 ELF64 (`M2-15/16`, 0-byte diff vs Rust x86-multi)
+/// Stage-1 is N/A (frozen single-function legacy exemption, explicitly excluded per spec/m3/PLAN.md §7.4).
+pub fn selftest_m3_15_four_backend_parity() -> Result<usize, String> {
+    let m2_mod = m2_compile_decoder(M2_MULTI_OMNI_SRC)?;
+    let m2_entry = m2_entry_of(&m2_mod);
+    let cases: [(&str, &str, Vec<i64>, i64); 3] = [
+        (
+            "m3_15_mf_arith",
+            "#[strict]\nfn sq(x: i64) -> i64 { return x * x; }\nfn main(a: i64) -> i64 { return sq(a + 2) + sq(a - 1); }\n",
+            vec![5],
+            49 + 16,
+        ),
+        (
+            "m3_15_mf_cf_loop",
+            "#[strict]\nfn tri(n: i64) -> i64 { let s: i64 = 0; let i: i64 = 1; while n >= i { s = s + i; i = i + 1; } return s; }\nfn main(n: i64) -> i64 { let t: trit = n <=> 0; return if_pos t { tri(n) } else { 0 }; }\n",
+            vec![10],
+            55,
+        ),
+        (
+            "m3_15_mf_buf_call",
+            "#[strict]\nfn pack2(a: i64, b: i64) -> bytes { let w: bytes = anew(0); w = iset(w, a); w = iset(w, b); return w; }\nfn score(w: bytes) -> i64 { return iget(w, 0) * 10 + iget(w, 1); }\nfn main(x: i64) -> i64 { let w: bytes = pack2(x, x + 3); return score(w); }\n",
+            vec![4],
+            47,
+        ),
+    ];
+
+    let mut checks = 0usize;
+    for (name, src, args, want) in &cases {
+        // Compile via BOTH Pure-Omni M3 seed AND Rust frontend (0-word diff!)
+        let rust_bc = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(src))?;
+        let omni_bc = match m3_lockstep_compile_via_omni(src, true)? {
+            Ok(v) => v,
+            Err((c, l, col)) => return Err(format!("M3-15 '{}': Omni M3 errored ({}, {}:{})", name, c, l, col)),
+        };
+        if omni_bc != rust_bc {
+            return Err(format!("M3-15 '{}': M3 vs Rust bytecode mismatch", name));
+        }
+
+        // (a) VM
+        let decoded = decode_omni_token_stream(&omni_bc)?;
+        let entry = m2_entry_of(&decoded);
+        let vm_args: Vec<OmniValue> = args.iter().map(|&v| OmniValue::Int(v)).collect();
+        let mut vm = OmniBinaryVm::new();
+        let vm_got = match vm.execute_function(&decoded, entry, vm_args)? {
+            OmniValue::Int(v) => v,
+            other => return Err(format!("M3-15 '{}': VM returned {:?}", name, other)),
+        };
+
+        // (c) Wasm multi AOT (M2-10)
+        let wasm = compile_pure_u16_to_wasm_multi(&omni_bc)?;
+        let wasm_got = execute_wasm_module_i64(&wasm, args)?;
+
+        if vm_got != *want || wasm_got != *want {
+            return Err(format!("M3-15 '{}': want={} vm={} wasm={}", name, want, vm_got, wasm_got));
+        }
+
+        // (b) Rust x86-64 multi AOT (M2-09) vs (d) Pure-Omni M2 x86-64 ELF64 (M2-15/16) — 0-byte diff!
+        let a0 = args.first().copied().unwrap_or(0);
+        let rust_elf = compile_pure_u16_to_x86_64_elf_multi(&omni_bc, a0, 0, 0)?;
+        let mut vm_m2 = OmniBinaryVm::with_budgets(100_000_000, 64 * 1024 * 1024);
+        let pure_elf = match vm_m2.execute_function(
+            &m2_mod,
+            m2_entry,
+            vec![
+                OmniValue::Bytes(vec![0u8; 524_288]),
+                OmniValue::U16Array(omni_bc),
+                OmniValue::Int(a0),
+                OmniValue::Int(0),
+                OmniValue::Int(0),
+            ],
+        )? {
+            OmniValue::Bytes(b) => b,
+            other => return Err(format!("M3-15 '{}': M2 returned {:?}", name, other)),
+        };
+        if pure_elf != rust_elf {
+            return Err(format!(
+                "M3-15 '{}': Pure-Omni M2 ELF ({} B) != Rust x86-multi ELF ({} B)",
+                name, pure_elf.len(), rust_elf.len()
+            ));
+        }
+        checks += 1;
+    }
     Ok(checks)
 }
 

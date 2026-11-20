@@ -1,7 +1,7 @@
 //! Omni AOT — standalone two-pass x86-64 ELF64 compiler (64-bit stdout channel),
 //! trap-free WebAssembly v1 compiler & 64-bit stack-machine evaluator, and Two-Pass Stage-1 compiler stream.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use omni_isa::*;
 use omni_ir::*;
 use omni_verifier::{verify_binary_function, verify_module_for_multi_aot};
@@ -1573,9 +1573,105 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
     if !rep.passed {
         return Err(format!("Cannot Wasm-compile unverified binary stream: {:?}", rep.errors));
     }
+    let empty_map: HashMap<u16, usize> = HashMap::new();
+    let body = compile_wasm_single_func_body(func, &empty_map, false)?;
 
+    let mut type_sec = vec![0x01, 0x60];
+    type_sec.extend(encode_uleb128(func.params.len()));
+    type_sec.resize(type_sec.len() + func.params.len(), 0x7E);
+    type_sec.extend_from_slice(&[0x01, 0x7E]);
+
+    let func_sec = vec![0x01, 0x00];
+    let exp_sec = vec![0x01, 0x07, b'o', b'm', b'n', b'i', b'_', b'f', b'n', 0x00, 0x00];
+    let mut code_sec = vec![0x01];
+    code_sec.extend(encode_uleb128(body.len()));
+    code_sec.extend(body);
+
+    let mem_sec = vec![0x01, 0x00, WASM_ISET_MEMORY_PAGES as u8];
+    let mut wasm = vec![0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00];
+    for (sec_id, payload) in [
+        (1u8, type_sec),
+        (3u8, func_sec),
+        (5u8, mem_sec),
+        (7u8, exp_sec),
+        (10u8, code_sec),
+    ] {
+        wasm.push(sec_id);
+        wasm.extend(encode_uleb128(payload.len()));
+        wasm.extend(payload);
+    }
+    Ok(wasm)
+}
+
+/// M2-10: Multi-function WebAssembly v1 AOT compiler supporting `CALL (0x7F48)`,
+/// shared bump-allocated linear memory (via mutable `global 0`), and `omni_fn` entry dispatch.
+pub fn compile_pure_u16_to_wasm_multi(stream: &[u16]) -> Result<Vec<u8>, String> {
+    let module = decode_omni_token_stream(stream)?;
+    if module.functions.is_empty() {
+        return Err(String::from("No function in module"));
+    }
+    verify_module_for_multi_aot(&module)?;
+    let is_multi = true;
+
+    let mut fn_id_to_wasm_idx: HashMap<u16, usize> = HashMap::new();
+    for (idx, f) in module.functions.iter().enumerate() {
+        fn_id_to_wasm_idx.insert(f.fn_idx, idx);
+    }
+    let entry_wasm_idx = fn_id_to_wasm_idx.get(&0).copied().unwrap_or(0);
+
+    let mut type_sec: Vec<u8> = Vec::new();
+    type_sec.extend(encode_uleb128(module.functions.len()));
+    let mut func_sec: Vec<u8> = Vec::new();
+    func_sec.extend(encode_uleb128(module.functions.len()));
+    let mut code_sec: Vec<u8> = Vec::new();
+    code_sec.extend(encode_uleb128(module.functions.len()));
+
+    for (f_idx, func) in module.functions.iter().enumerate() {
+        let rep = verify_binary_function(func);
+        if !rep.passed {
+            return Err(format!("Cannot Wasm-compile unverified function {}: {:?}", func.fn_idx, rep.errors));
+        }
+        let body = compile_wasm_single_func_body(func, &fn_id_to_wasm_idx, is_multi)?;
+        type_sec.push(0x60);
+        type_sec.extend(encode_uleb128(func.params.len()));
+        type_sec.resize(type_sec.len() + func.params.len(), 0x7E);
+        type_sec.extend_from_slice(&[0x01, 0x7E]);
+        func_sec.extend(encode_uleb128(f_idx));
+        code_sec.extend(encode_uleb128(body.len()));
+        code_sec.extend(body);
+    }
+
+    let mut exp_sec = vec![0x01, 0x07, b'o', b'm', b'n', b'i', b'_', b'f', b'n', 0x00];
+    exp_sec.extend(encode_uleb128(entry_wasm_idx));
+
+    let mem_pages = (WASM_ISET_MEMORY_PAGES as usize).max(32);
+    let mut mem_sec = vec![0x01, 0x00];
+    mem_sec.extend(encode_uleb128(mem_pages));
+
+    let mut wasm = vec![0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00];
+    let sections: Vec<(u8, Vec<u8>)> = vec![
+        (1u8, type_sec),
+        (3u8, func_sec),
+        (5u8, mem_sec),
+        (6u8, vec![0x01, 0x7E, 0x01, 0x42, 0x00, 0x0B]),
+        (7u8, exp_sec),
+        (10u8, code_sec),
+    ];
+    for (sec_id, payload) in sections {
+        wasm.push(sec_id);
+        wasm.extend(encode_uleb128(payload.len()));
+        wasm.extend(payload);
+    }
+    Ok(wasm)
+}
+
+fn compile_wasm_single_func_body(
+    func: &BinFunction,
+    fn_id_to_wasm_idx: &HashMap<u16, usize>,
+    is_multi: bool,
+) -> Result<Vec<u8>, String> {
     for ins in &func.instructions {
-        if !is_wasm_aot_supported_opcode(ins.op_tok) {
+        if !is_wasm_aot_supported_opcode(ins.op_tok) && !(is_multi && ins.op_tok == 0x7F48) {
             let lbl = decode_opcode_token(ins.op_tok).map(|s| s.debug_label).unwrap_or("OP_UNKNOWN");
             return Err(format!(
                 "Opcode 0x{:04X} ({}) requires high-level VM runtime state and is not lowered by standalone WebAssembly AOT",
@@ -1609,11 +1705,10 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
         bidx: num_params + max_reg_used + 6,
         s0: scratch0,
     };
-    // Registers that hold an ISET-memory buffer value (defined by ANEW or ISET).
     let wasm_buffer_regs: std::collections::BTreeSet<u16> = func
         .instructions
         .iter()
-        .filter(|ins| matches!(ins.op_tok, 0x7F0D | 0x7F0F))
+        .filter(|ins| matches!(ins.op_tok, 0x7F0D | 0x7F0F | 0x7F48))
         .filter_map(|ins| ins.dest_reg)
         .collect();
 
@@ -1642,6 +1737,10 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
     body.extend(encode_uleb128(1));
     body.extend(encode_uleb128(num_locals));
     body.push(0x7E);
+    if is_multi {
+        body.extend_from_slice(&[0x23, 0x00]); // global.get 0
+        wasm_lset(&mut body, bl.top);
+    }
 
     let emit_wasm_op = |b: &mut Vec<u8>, op: &BinOperand| {
         match *op {
@@ -1840,7 +1939,10 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
                     }
                 }
                 if !handled {
-                    if ins.operands.len() == 2 && matches!(ins.operands[0], BinOperand::Reg(_)) {
+                    if ins.operands.len() == 2
+                        && (matches!(ins.operands[0], BinOperand::Reg(_))
+                            || (is_multi && matches!(ins.operands[0], BinOperand::Param(_))))
+                    {
                         // Runtime byte load from this buffer's own region. OOB yields 0.
                         emit_wasm_op(b, &ins.operands[0]);
                         wasm_buf_split(b, &bl);
@@ -1871,7 +1973,9 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
                 let ops = &ins.operands;
                 // Source buffer value; a non-register source is a fresh empty buffer at `top`.
                 let emit_src = |b: &mut Vec<u8>| {
-                    if matches!(ops.first(), Some(BinOperand::Reg(_))) {
+                    if matches!(ops.first(), Some(BinOperand::Reg(_)))
+                        || (is_multi && matches!(ops.first(), Some(BinOperand::Param(_))))
+                    {
                         emit_wasm_op(b, &ops[0]);
                     } else {
                         wasm_lget(b, bl.top);
@@ -2121,6 +2225,10 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
                     b.extend_from_slice(&[0x55, 0x50]); // !(off > blen - len)
                     b.push(0x71); // i32.and
                     b.extend_from_slice(&[0x45, 0x04, 0x40, 0x00, 0x0B]);
+                    if is_multi {
+                        wasm_lget(b, bl.top);
+                        b.extend_from_slice(&[0x24, 0x00]); // global.set 0
+                    }
                     wasm_lget(b, bl.bbase);
                     wasm_lget(b, scratch0);
                     b.push(0x7C);
@@ -2130,8 +2238,36 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
                     b.push(0x84);
                     b.push(0x0F);
                 } else {
+                    if is_multi {
+                        wasm_lget(b, bl.top);
+                        b.extend_from_slice(&[0x24, 0x00]); // global.set 0
+                    }
                     emit_wasm_op(b, &ins.operands[0]);
                     b.push(0x0F);
+                }
+            }
+            0x7F48 => {
+                if let Some(BinOperand::FnRef(callee_fn_id)) = ins.operands.first() {
+                    if is_multi {
+                        wasm_lget(b, bl.top);
+                        b.extend_from_slice(&[0x24, 0x00]); // global.set 0
+                    }
+                    for arg in &ins.operands[1..] {
+                        emit_wasm_op(b, arg);
+                    }
+                    let callee_widx = fn_id_to_wasm_idx.get(callee_fn_id).copied().unwrap_or(0);
+                    b.push(0x10);
+                    b.extend(encode_uleb128(callee_widx));
+                    if let Some(dest) = ins.dest_reg {
+                        b.push(0x21);
+                        b.extend(encode_uleb128(num_params + (dest - REG_BASE) as usize));
+                    } else {
+                        b.push(0x1A); // drop
+                    }
+                    if is_multi {
+                        b.extend_from_slice(&[0x23, 0x00]); // global.get 0
+                        wasm_lset(b, bl.top);
+                    }
                 }
             }
             _ => {}
@@ -2226,32 +2362,7 @@ pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
         body.extend_from_slice(&[0x42, 0x00]); // fallback i64.const 0
     }
     body.push(0x0B);
-
-    let mut type_sec = vec![0x01, 0x60];
-    type_sec.extend(encode_uleb128(num_params));
-    type_sec.resize(type_sec.len() + num_params, 0x7E);
-    type_sec.extend_from_slice(&[0x01, 0x7E]);
-
-    let func_sec = vec![0x01, 0x00];
-    let exp_sec = vec![0x01, 0x07, b'o', b'm', b'n', b'i', b'_', b'f', b'n', 0x00, 0x00];
-    let mut code_sec = vec![0x01];
-    code_sec.extend(encode_uleb128(body.len()));
-    code_sec.extend(body);
-
-    let mem_sec = vec![0x01, 0x00, WASM_ISET_MEMORY_PAGES as u8];
-    let mut wasm = vec![0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00];
-    for (sec_id, payload) in [
-        (1u8, type_sec),
-        (3u8, func_sec),
-        (5u8, mem_sec),
-        (7u8, exp_sec),
-        (10u8, code_sec),
-    ] {
-        wasm.push(sec_id);
-        wasm.extend(encode_uleb128(payload.len()));
-        wasm.extend(payload);
-    }
-    Ok(wasm)
+    Ok(body)
 }
 
 fn decode_uleb128(bytes: &[u8], pos: &mut usize) -> Result<usize, String> {
@@ -2319,7 +2430,7 @@ fn skip_wasm_to_matching_end(body: &[u8], mut pos: usize) -> Result<usize, Strin
                     return Ok(pos);
                 }
             }
-            0x0C | 0x20 | 0x21 | 0x22 => {
+            0x0C | 0x10 | 0x20 | 0x21 | 0x22 | 0x23 | 0x24 => {
                 let _ = decode_uleb128(body, &mut pos)?;
             }
             0x42 => {
@@ -2361,8 +2472,11 @@ pub fn execute_wasm_module_i64_with_budgets(
         return Err(String::from("Invalid WebAssembly '\0asm' v1 header"));
     }
     let mut pos = 8usize;
-    let mut num_params = 0usize;
-    let mut code_body: Option<&[u8]> = None;
+    let mut type_param_counts: Vec<usize> = Vec::new();
+    let mut func_type_indices: Vec<usize> = Vec::new();
+    let mut fn_bodies: Vec<&[u8]> = Vec::new();
+    let mut entry_func_idx: usize = 0;
+    let mut globals: Vec<i64> = Vec::new();
     let mut memory: Vec<u8> = Vec::new();
 
     while pos < wasm.len() {
@@ -2376,11 +2490,30 @@ pub fn execute_wasm_module_i64_with_budgets(
         if sec_id == 1 {
             let mut p = pos;
             let type_cnt = decode_uleb128(wasm, &mut p)?;
-            if type_cnt == 0 || p >= sec_end || wasm[p] != 0x60 {
+            if type_cnt == 0 {
                 return Err(String::from("Invalid Wasm Type section"));
             }
-            p += 1;
-            num_params = decode_uleb128(wasm, &mut p)?;
+            for _ in 0..type_cnt {
+                if p >= sec_end || wasm[p] != 0x60 {
+                    return Err(String::from("Invalid Wasm Type section"));
+                }
+                p += 1;
+                let np = decode_uleb128(wasm, &mut p)?;
+                p = p.saturating_add(np);
+                let nr = decode_uleb128(wasm, &mut p)?;
+                p = p.saturating_add(nr);
+                if p > sec_end {
+                    return Err(String::from("Truncated Wasm Type entry"));
+                }
+                type_param_counts.push(np);
+            }
+        } else if sec_id == 3 {
+            let mut p = pos;
+            let fn_cnt = decode_uleb128(wasm, &mut p)?;
+            for _ in 0..fn_cnt {
+                let tidx = decode_uleb128(wasm, &mut p)?;
+                func_type_indices.push(tidx);
+            }
         } else if sec_id == 5 {
             let mut p = pos;
             let mem_cnt = decode_uleb128(wasm, &mut p)?;
@@ -2397,33 +2530,89 @@ pub fn execute_wasm_module_i64_with_budgets(
                 let bytes = min_pages.saturating_mul(65536);
                 memory.resize(bytes, 0);
             }
+        } else if sec_id == 6 {
+            let mut p = pos;
+            let g_cnt = decode_uleb128(wasm, &mut p)?;
+            for _ in 0..g_cnt {
+                if p + 2 > sec_end {
+                    return Err(String::from("Truncated Wasm Global section"));
+                }
+                p += 2;
+                let mut init_val = 0i64;
+                if p < sec_end && wasm[p] == 0x42 {
+                    p += 1;
+                    init_val = decode_sleb128(wasm, &mut p)?;
+                }
+                if p < sec_end && wasm[p] == 0x0B {
+                    p += 1;
+                }
+                globals.push(init_val);
+            }
+        } else if sec_id == 7 {
+            let mut p = pos;
+            let exp_cnt = decode_uleb128(wasm, &mut p)?;
+            for _ in 0..exp_cnt {
+                let name_len = decode_uleb128(wasm, &mut p)?;
+                if p + name_len + 1 > sec_end {
+                    return Err(String::from("Truncated Wasm Export section"));
+                }
+                let name = &wasm[p..p + name_len];
+                p += name_len;
+                let kind = wasm[p];
+                p += 1;
+                let idx = decode_uleb128(wasm, &mut p)?;
+                if kind == 0x00 && name == b"omni_fn" {
+                    entry_func_idx = idx;
+                }
+            }
         } else if sec_id == 10 {
             let mut p = pos;
             let fn_cnt = decode_uleb128(wasm, &mut p)?;
             if fn_cnt == 0 {
                 return Err(String::from("Empty Wasm Code section"));
             }
-            let body_len = decode_uleb128(wasm, &mut p)?;
-            if p + body_len > sec_end {
-                return Err(String::from("Truncated Wasm function body"));
+            for _ in 0..fn_cnt {
+                let body_len = decode_uleb128(wasm, &mut p)?;
+                if p + body_len > sec_end {
+                    return Err(String::from("Truncated Wasm function body"));
+                }
+                fn_bodies.push(&wasm[p..p + body_len]);
+                p += body_len;
             }
-            code_body = Some(&wasm[p..p + body_len]);
         }
         pos = sec_end;
     }
 
-    let body = code_body.ok_or_else(|| String::from("Missing Wasm Code section"))?;
-    let mut bpos = 0usize;
-    let decl_cnt = decode_uleb128(body, &mut bpos)?;
-    let mut total_locals = num_params;
-    for _ in 0..decl_cnt {
-        let cnt = decode_uleb128(body, &mut bpos)?;
-        if bpos >= body.len() {
-            return Err(String::from("Truncated Wasm local decl"));
-        }
-        bpos += 1;
-        total_locals += cnt;
+    if fn_bodies.is_empty() || entry_func_idx >= fn_bodies.len() {
+        return Err(String::from("Missing Wasm Code section"));
     }
+
+    let mut fn_code_starts: Vec<usize> = Vec::with_capacity(fn_bodies.len());
+    let mut fn_total_locals: Vec<usize> = Vec::with_capacity(fn_bodies.len());
+    let mut fn_num_params: Vec<usize> = Vec::with_capacity(fn_bodies.len());
+    for (idx, body) in fn_bodies.iter().enumerate() {
+        let tidx = func_type_indices.get(idx).copied().unwrap_or(idx);
+        let np = type_param_counts.get(tidx).copied().unwrap_or(0);
+        let mut bp = 0usize;
+        let decl_cnt = decode_uleb128(body, &mut bp)?;
+        let mut tot = np;
+        for _ in 0..decl_cnt {
+            let cnt = decode_uleb128(body, &mut bp)?;
+            if bp >= body.len() {
+                return Err(String::from("Truncated Wasm local decl"));
+            }
+            bp += 1;
+            tot += cnt;
+        }
+        fn_code_starts.push(bp);
+        fn_total_locals.push(tot);
+        fn_num_params.push(np);
+    }
+
+    let mut cur_fn = entry_func_idx;
+    let mut body = fn_bodies[cur_fn];
+    let mut bpos = fn_code_starts[cur_fn];
+    let total_locals = fn_total_locals[cur_fn];
 
     let frame_bytes = wasm
         .len()
@@ -2444,6 +2633,7 @@ pub fn execute_wasm_module_i64_with_budgets(
     }
     let mut stack: Vec<i64> = Vec::with_capacity(32);
     let mut ctrl_stack: Vec<(u8, usize)> = Vec::with_capacity(8);
+    let mut call_stack: Vec<(usize, usize, Vec<i64>, Vec<(u8, usize)>)> = Vec::with_capacity(8);
     let mut steps_executed: u64 = 0;
 
     while bpos < body.len() {
@@ -2630,6 +2820,43 @@ pub fn execute_wasm_module_i64_with_budgets(
                     stack.push(loaded);
                 }
             }
+            0x10 => {
+                let callee = decode_uleb128(body, &mut bpos)?;
+                if callee >= fn_bodies.len() {
+                    return Err(format!("Wasm call target {} out of range", callee));
+                }
+                if call_stack.len() >= 64 {
+                    return Err(String::from("error[BUDGET_EXCEEDED]: Wasm AOT call depth exceeded (64)"));
+                }
+                let np = fn_num_params[callee];
+                if stack.len() < np {
+                    return Err(String::from("Wasm stack underflow on call"));
+                }
+                let mut callee_locals = vec![0i64; fn_total_locals[callee].max(np)];
+                for i in (0..np).rev() {
+                    callee_locals[i] = stack.pop().unwrap();
+                }
+                call_stack.push((cur_fn, bpos, locals, ctrl_stack));
+                cur_fn = callee;
+                body = fn_bodies[cur_fn];
+                bpos = fn_code_starts[cur_fn];
+                locals = callee_locals;
+                ctrl_stack = Vec::with_capacity(8);
+            }
+            0x1A => {
+                let _ = stack.pop().ok_or("Wasm stack underflow on drop")?;
+            }
+            0x23 => {
+                let gidx = decode_uleb128(body, &mut bpos)?;
+                let v = *globals.get(gidx).ok_or("Wasm global.get out of bounds")?;
+                stack.push(v);
+            }
+            0x24 => {
+                let gidx = decode_uleb128(body, &mut bpos)?;
+                let v = stack.pop().ok_or("Wasm stack underflow on global.set")?;
+                let slot = globals.get_mut(gidx).ok_or("Wasm global.set out of bounds")?;
+                *slot = v;
+            }
             0x1B => {
                 let c = stack.pop().ok_or("Wasm stack underflow on select c")?;
                 let v2 = stack.pop().ok_or("Wasm stack underflow on select v2")?;
@@ -2637,11 +2864,29 @@ pub fn execute_wasm_module_i64_with_budgets(
                 stack.push(if c != 0 { v1 } else { v2 });
             }
             0x0F => {
-                return stack.pop().ok_or_else(|| String::from("Wasm stack empty on return"));
+                let rv = stack.pop().ok_or_else(|| String::from("Wasm stack empty on return"))?;
+                if let Some((prev_fn, prev_bpos, prev_locals, prev_ctrl)) = call_stack.pop() {
+                    cur_fn = prev_fn;
+                    body = fn_bodies[cur_fn];
+                    bpos = prev_bpos;
+                    locals = prev_locals;
+                    ctrl_stack = prev_ctrl;
+                    stack.push(rv);
+                } else {
+                    return Ok(rv);
+                }
             }
             0x0B => {
                 if ctrl_stack.pop().is_none() {
-                    break;
+                    if let Some((prev_fn, prev_bpos, prev_locals, prev_ctrl)) = call_stack.pop() {
+                        cur_fn = prev_fn;
+                        body = fn_bodies[cur_fn];
+                        bpos = prev_bpos;
+                        locals = prev_locals;
+                        ctrl_stack = prev_ctrl;
+                    } else {
+                        break;
+                    }
                 }
             }
             0x00 => {

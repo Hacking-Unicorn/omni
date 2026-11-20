@@ -1,0 +1,5 @@
+// M2-14 test harness for `pure/m2/verify/mod_check.omni`.
+#[strict]
+fn main(w: bytes, arr: array) -> i64 {
+    return m2_verify_module_pure(w, arr);
+}
