@@ -16106,99 +16106,41 @@ fn main(x: i64, y: i64) -> i64 {
         checks += 2;
     }
 
-    // 13AB. Section 4: Compositional Verification Invariants (`spec/trusted_core.md`)
-    checks += run_compositional_invariant_selftests()?;
+    // 13AB..13BG: Independent pure-Omni, verifier-engine, ISA, and frozen-hash suites
+    // executed across adaptive parallel lanes with fixed-order deterministic aggregation.
+    let independent_suites: &[SelftestLaneTask] = &[
+        ("compositional_invariants", run_compositional_invariant_selftests),
+        ("phase7_pure_omni", run_phase7_pure_omni_selftests),
+        ("phase_a_frontend", run_phase_a_pure_omni_frontend_selftests),
+        ("phase_b_driver", run_phase_b_pure_omni_driver_selftests),
+        ("phase_c_host", run_phase_c_pure_omni_host_selftests),
+        ("phase_d_bootstrap", run_phase_d_pure_omni_bootstrap_selftests),
+        ("phase_e_diff", run_phase_e_pure_omni_diff_selftests),
+        ("pure_core_suite", run_pure_omni_core_suite_selftests),
+        ("pure_core_p1", run_pure_core_phase1_frontend_coverage_selftests),
+        ("pure_core_p2", run_pure_core_phase2_tooling_selftests),
+        ("pure_core_p3", run_pure_core_phase3_host_runtime_selftests),
+        ("pure_core_p4", run_pure_core_phase4_selfhost_fixed_point_selftests),
+        ("pure_core_p5", run_pure_core_phase5_default_workflow_selftests),
+        ("pure_core_s1", run_pure_core_phase_s1_real_programs_selftests),
+        ("pure_core_s2", run_pure_core_phase_s2_deepened_tooling_selftests),
+        ("pure_core_s3", run_pure_core_phase_s3_unique_primitives_selftests),
+        ("pure_core_s4", run_pure_core_phase_s4_metrics_and_friction_selftests),
+        ("host_sandbox", run_host_sandbox_selftests),
+        ("verifier_engine_diff", run_verifier_engine_diff_checked),
+        ("if_pos_join_slot", run_if_pos_join_slot_selftests),
+        ("isa_table_drift", run_isa_table_drift_checked),
+        ("buffer_flow_parity", run_buffer_flow_parity_selftests),
+        ("isa_b_multibyte_parity", run_isa_b_multibyte_parity_selftests),
+        ("label_cap_16", run_label_cap_16_selftests),
+        ("frozen_hash_pin", run_frozen_hash_pin_selftests),
+        ("stage1_unsupported_gate", run_stage1_unsupported_gate_selftests),
+    ];
+    checks += run_selftest_tasks_in_lanes(independent_suites)?;
 
-    // 13AC. Section 7: Phase 7 Pure-Omni Self-Hosted Verifier Kernel, Fixed-Point ELF64 Proof & Narrow-Host Runner
-    checks += run_phase7_pure_omni_selftests()?;
-
-    // 13AD. Phase A: Pure-Omni Surface Frontend (`omni-pure-frontend-v1.0.0`)
-    checks += run_phase_a_pure_omni_frontend_selftests()?;
-
-    // 13AE. Phase B: Pure-Omni Driver & Verifier Kernel Integration (`omni-pure-driver-v1.0.0`)
-    checks += run_phase_b_pure_omni_driver_selftests()?;
-
-    // 13AF. Phase C: Pure-Omni Host Runtime over Narrow Host (`omni-pure-host-v1.0.0`)
-    checks += run_phase_c_pure_omni_host_selftests()?;
-
-    // 13AG. Phase D: Pure-Omni Self-Hosting Bootstrap Fixed Point (`omni-pure-selfhost-v1.0.0`)
-    checks += run_phase_d_pure_omni_bootstrap_selftests()?;
-
-    // 13AH. Phase E: Full Pure-Omni Differential Lock (`pure-omni-diff`)
-    checks += run_phase_e_pure_omni_diff_selftests()?;
-
-    // 13AI. Pure-Omni Core Codebase (`pure/*.omni` + `std/*.omni`) & Multi-Module Self-Host Suite
-    checks += run_pure_omni_core_suite_selftests()?;
-
-    // 13AJ. Pure-Core Completion Phase 1: Full Surface Language Coverage in Pure-Omni Frontend
-    checks += run_pure_core_phase1_frontend_coverage_selftests()?;
-
-    // 13AK. Pure-Core Completion Phase 2: High-Value Tooling in Pure Omni
-    checks += run_pure_core_phase2_tooling_selftests()?;
-
-    // 13AL. Pure-Core Completion Phase 3: Complete Pure-Omni Host Runtime as Primary Path
-    checks += run_pure_core_phase3_host_runtime_selftests()?;
-
-    // 13AM. Pure-Core Completion Phase 4: Expand Pure Self-Host Compiler & Lock the Larger Fixed Point
-    checks += run_pure_core_phase4_selfhost_fixed_point_selftests()?;
-
-    // 13AN. Pure-Core Completion Phase 5: Pure-Omni Default Workflows & Legacy-Rust Differential
-    checks += run_pure_core_phase5_default_workflow_selftests()?;
-
-    // 13AO. Strengthening Phase S1: Real Pure-Omni Programs (`pure/programs/*.omni`)
-    checks += run_pure_core_phase_s1_real_programs_selftests()?;
-
-    // 13AP. Strengthening Phase S2: Deepened Pure Tooling for Larger Pure Codebases
-    checks += run_pure_core_phase_s2_deepened_tooling_selftests()?;
-
-    // 13AQ. Strengthening Phase S3: Unique Primitives & Pure Helpers (`std/pack5.omni`, `std/decision.omni`, `std/resource.omni`)
-    checks += run_pure_core_phase_s3_unique_primitives_selftests()?;
-
-    // 13AR. Strengthening Phase S4: Hardening, Health Metrics & Friction Reduction
-    checks += run_pure_core_phase_s4_metrics_and_friction_selftests()?;
-
-    // 13AS. Host FS/DB capability root-jail (PATH_ESCAPE)
-    checks += run_host_sandbox_selftests()?;
-
-    // 13AT. Pure-Omni verifier engine differential against the Rust twin
-    let n_engine = run_verifier_engine_diff_selftests()?;
-    if n_engine < 40 {
-        return Err(format!(
-            "Omni verifier engine differential compared only {n_engine} cases (expected at least 40)"
-        ));
-    }
-    checks += 1;
-
-    // 13AU. Value-returning if_pos/match_trit join slot is a single contiguous SSA dest
-    checks += run_if_pos_join_slot_selftests()?;
-
-    // 13AV. Lockstep shadow mode on compile / run / serve
+    // Sequential: toggles global lockstep shadow mode / emits stdout line (`Vera P1 x=7: ...`).
     checks += run_lockstep_shadow_selftests()?;
-
-    // 13AW. Vera P1 byte-readback sibling (VM + Wasm + x86 assert; Stage-1 record-only)
     checks += run_byte_readback_parity_selftests()?;
-
-    // 13BA. M3-03 shared ISA table (`pure/isa/table.omni`) drift lock vs OMNI_ISA_TABLE + assembler mnemonics
-    let (n_isa, n_isa_neg) = run_isa_table_drift_selftests()?;
-    if n_isa != 128 * 4 + 81 * 6 || n_isa_neg != 9 {
-        return Err(format!("isa-table drift lock compared {n_isa} fields / {n_isa_neg} negatives (expected 998 / 9)"));
-    }
-    checks += 2;
-
-    // 13BB. Per-buffer storage: pack5_flow / two_bufs / append-copy (VM + Wasm + run path; x86 P6)
-    checks += run_buffer_flow_parity_selftests()?;
-
-    // 13BC. ISA-B 3-op IGET / 4-op ISET patches (VM + Wasm + run + x86 assert; Stage-1 must reject)
-    checks += run_isa_b_multibyte_parity_selftests()?;
-
-    // 13BE. C4 label cap 16: 16-label surface fn on VM / Wasm / x86-64 / Stage-1; 17 rejected
-    checks += run_label_cap_16_selftests()?;
-
-    // 13BF. C1 frozen-hash pin: 5 frozen artifacts (Phase D bc/elf, 18-module suite, Stage-1 bc/elf)
-    checks += run_frozen_hash_pin_selftests()?;
-
-    // 13BG. C2 Stage-1 up-front rejection of unsupported opcodes (DROP, IMOD, pack5/ternary-AI)
-    checks += run_stage1_unsupported_gate_selftests()?;
 
     Ok(checks)
 }
@@ -23329,40 +23271,162 @@ pub fn selftest_m2_shape_census() -> Result<usize, String> {
     Ok(1)
 }
 
-/// All Milestone 2 foundation selftests (M2-01 ..).
+/// Returns the adaptive parallel lane count for the monolith selftest runner:
+///   - `OMNI_SELFTEST_LANES=N` overrides explicitly (clamped >= 1).
+///   - Default leaves 1 core free for OS responsiveness: `max(1, available_parallelism - 1)`.
+pub fn omni_selftest_lane_count() -> usize {
+    if let Ok(raw) = std::env::var("OMNI_SELFTEST_LANES") {
+        if let Ok(n) = raw.trim().parse::<usize>() {
+            return n.max(1);
+        }
+    }
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    cores.saturating_sub(1).max(1)
+}
+
+type SelftestLaneTask = (&'static str, fn() -> Result<usize, String>);
+
+/// Executes independent selftest tasks across adaptive parallel lanes using a fixed static
+/// round-robin partition and aggregates results in fixed check order (0..tasks.len()),
+/// guaranteeing byte-identical output and identical check counts on any lane count.
+fn run_selftest_tasks_in_lanes(tasks: &[SelftestLaneTask]) -> Result<usize, String> {
+    let n_tasks = tasks.len();
+    if n_tasks == 0 {
+        return Ok(0);
+    }
+    let lanes = omni_selftest_lane_count().min(n_tasks);
+    if lanes <= 1 {
+        let mut total = 0usize;
+        for &(_name, f) in tasks {
+            total += f()?;
+        }
+        return Ok(total);
+    }
+    let mut queues: Vec<Vec<(usize, SelftestLaneTask)>> = (0..lanes).map(|_| Vec::new()).collect();
+    for (idx, &task) in tasks.iter().enumerate() {
+        queues[idx % lanes].push((idx, task));
+    }
+    let mut handles: Vec<std::thread::JoinHandle<Vec<(usize, Result<usize, String>)>>> =
+        Vec::with_capacity(lanes);
+    let mut fallback: Vec<(usize, Result<usize, String>)> = Vec::new();
+    for queue in queues {
+        let q_worker = queue.clone();
+        match std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                let mut out = Vec::with_capacity(q_worker.len());
+                for (idx, (_name, f)) in q_worker {
+                    out.push((idx, f()));
+                }
+                out
+            }) {
+            Ok(h) => handles.push(h),
+            Err(_) => {
+                // Graceful fallback if threads are unavailable on this host.
+                for (idx, (_name, f)) in queue {
+                    fallback.push((idx, f()));
+                }
+            }
+        }
+    }
+    let mut ordered: Vec<Option<Result<usize, String>>> = (0..n_tasks).map(|_| None).collect();
+    for (idx, res) in fallback {
+        ordered[idx] = Some(res);
+    }
+    for h in handles {
+        let lane_out = h
+            .join()
+            .map_err(|_| String::from("Selftest worker lane panicked"))?;
+        for (idx, res) in lane_out {
+            ordered[idx] = Some(res);
+        }
+    }
+    let mut total = 0usize;
+    for (idx, slot) in ordered.into_iter().enumerate() {
+        let res = slot.ok_or_else(|| format!("Selftest task #{} missing result", idx))?;
+        total += res?;
+    }
+    Ok(total)
+}
+
+fn run_verifier_engine_diff_checked() -> Result<usize, String> {
+    let n_engine = run_verifier_engine_diff_selftests()?;
+    if n_engine < 40 {
+        return Err(format!(
+            "Omni verifier engine differential compared only {n_engine} cases (expected at least 40)"
+        ));
+    }
+    Ok(1)
+}
+
+fn run_isa_table_drift_checked() -> Result<usize, String> {
+    let (n_isa, n_isa_neg) = run_isa_table_drift_selftests()?;
+    if n_isa != 128 * 4 + 81 * 6 || n_isa_neg != 9 {
+        return Err(format!(
+            "isa-table drift lock compared {n_isa} fields / {n_isa_neg} negatives (expected 998 / 9)"
+        ));
+    }
+    Ok(2)
+}
+
+fn selftest_m2_16_fixed_point_count() -> Result<usize, String> {
+    Ok(selftest_m2_16_fixed_point(false)?.0)
+}
+fn selftest_p5_2_zero_shim_sys_count() -> Result<usize, String> {
+    Ok(selftest_p5_2_zero_shim_sys()?.0)
+}
+fn selftest_p7_0_measure_count() -> Result<usize, String> {
+    Ok(selftest_p7_0_measure()?.0)
+}
+fn selftest_p7_0a_canary_count() -> Result<usize, String> {
+    Ok(selftest_p7_0a_canary()?.0)
+}
+fn selftest_p7_1_self_heal_count() -> Result<usize, String> {
+    Ok(selftest_p7_1_self_heal()?.0)
+}
+fn selftest_api_stage1_count() -> Result<usize, String> {
+    Ok(selftest_api_stage1()?.0)
+}
+
+/// All Milestone 2..7 + API Stage 1 foundation selftests (parallel-lane accelerated).
 pub fn run_m2_foundation_selftests() -> Result<usize, String> {
-    let mut n = 0usize;
-    n += selftest_m2_frozen_hashes()?;
-    n += selftest_m2_single_mode_byte_lock()?;
-    n += selftest_m2_shape_census()?;
-    n += selftest_m2_label_reference()?;
-    n += selftest_m2_lint()?;
-    n += selftest_m2_decode_diff()?;
-    n += selftest_m3_isa_encode_roundtrip()?;
-    n += selftest_m2_labels_table()?;
-    n += selftest_m2_08_multi_aot_precheck()?;
-    n += selftest_m2_09_multi_aot()?;
-    n += selftest_m2_11_arena_elf()?;
-    n += selftest_m2_13_stage1_anchor()?;
-    n += selftest_m2_15_pure_multi_compiler()?;
-    n += selftest_m2_16_fixed_point(false)?.0;
-    n += selftest_m3_06_lex_diff()?;
-    n += selftest_m3_07_skim_diff()?;
-    n += selftest_m3_08_expr_diff()?;
-    n += selftest_m3_09_stmt_diff()?;
-    n += selftest_m3_10_lower_diff()?;
+    let parallel_tasks: &[SelftestLaneTask] = &[
+        ("m2_frozen_hashes", selftest_m2_frozen_hashes),
+        ("m2_single_mode_byte_lock", selftest_m2_single_mode_byte_lock),
+        ("m2_shape_census", selftest_m2_shape_census),
+        ("m2_label_reference", selftest_m2_label_reference),
+        ("m2_lint", selftest_m2_lint),
+        ("m2_decode_diff", selftest_m2_decode_diff),
+        ("m3_isa_encode_roundtrip", selftest_m3_isa_encode_roundtrip),
+        ("m2_labels_table", selftest_m2_labels_table),
+        ("m2_08_multi_aot_precheck", selftest_m2_08_multi_aot_precheck),
+        ("m2_09_multi_aot", selftest_m2_09_multi_aot),
+        ("m2_11_arena_elf", selftest_m2_11_arena_elf),
+        ("m2_13_stage1_anchor", selftest_m2_13_stage1_anchor),
+        ("m2_15_pure_multi_compiler", selftest_m2_15_pure_multi_compiler),
+        ("m2_16_fixed_point", selftest_m2_16_fixed_point_count),
+        ("m3_06_lex_diff", selftest_m3_06_lex_diff),
+        ("m3_07_skim_diff", selftest_m3_07_skim_diff),
+        ("m3_08_expr_diff", selftest_m3_08_expr_diff),
+        ("m3_09_stmt_diff", selftest_m3_09_stmt_diff),
+        ("m3_10_lower_diff", selftest_m3_10_lower_diff),
+        ("m2_10_wasm_multi", selftest_m2_10_wasm_multi),
+        ("m2_14_verify_diff", selftest_m2_14_verify_diff),
+        ("m3_15_four_backend_parity", selftest_m3_15_four_backend_parity),
+        ("p4_1_vm_diff", selftest_p4_1_vm_diff),
+        ("p4_3_thin_shim", selftest_p4_3_thin_shim),
+        ("p4_4_wasm_host", selftest_p4_4_wasm_host),
+        ("p5_2_zero_shim_sys", selftest_p5_2_zero_shim_sys_count),
+        ("p7_0_measure", selftest_p7_0_measure_count),
+        ("p7_0a_canary", selftest_p7_0a_canary_count),
+        ("p7_1_self_heal", selftest_p7_1_self_heal_count),
+        ("api_stage1", selftest_api_stage1_count),
+    ];
+    let mut n = run_selftest_tasks_in_lanes(parallel_tasks)?;
+    // Sequential: toggles global M3 lockstep state.
     n += selftest_m3_14_lockstep_frontend()?;
-    n += selftest_m2_10_wasm_multi()?;
-    n += selftest_m2_14_verify_diff()?;
-    n += selftest_m3_15_four_backend_parity()?;
-    n += selftest_p4_1_vm_diff()?;
-    n += selftest_p4_3_thin_shim()?;
-    n += selftest_p4_4_wasm_host()?;
-    n += selftest_p5_2_zero_shim_sys()?.0;
-    n += selftest_p7_0_measure()?.0;
-    n += selftest_p7_0a_canary()?.0;
-    n += selftest_p7_1_self_heal()?.0;
-    n += selftest_api_stage1()?.0;
     Ok(n)
 }
 
