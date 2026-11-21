@@ -1,7 +1,7 @@
-// Stage 1 negative golden (pure verifier): CAP_NARROW_EXPAND (1013)
-// Result of `cap_narrow(old_cap, mask)` used as if masked-off or dynamically-masked capability survived.
 #[strict]
-fn main(old_cap: i64, dyn_mask: i64) -> i64 {
+#[cap(AI)]
+fn main(old_cap: i64, dyn_mask: i64) -> trit {
     let narrowed: i64 = old_cap & dyn_mask;
-    return narrowed;
+    let g: trit = egate(narrowed);
+    return g;
 }

@@ -1,6 +1,5 @@
-// Stage 1 negative golden (pure verifier): TAINT_ON_CONSENSUS (1011)
-// @UNTRUSTED input flows into ternary consensus without a sanitizer.
 #[strict]
-fn main(untrusted_votes: i64, weights: i64) -> i64 {
-    return untrusted_votes ^ weights;
+fn main(v0: trit @untrusted, v1: trit, v2: trit) -> trit {
+    let m: trit = tmaj(v0, v1, v2);
+    return m;
 }

@@ -538,6 +538,9 @@ fn clear_labels_and_regs(ws: bytes) -> bytes {
     w = ws_set(w, 3, 32256);
     w = ws_set(w, 4, 0);
     w = ws_set(w, 5, 0);
+    w = ws_set(w, 16, 0);
+    w = ws_set(w, 17, 0);
+    w = ws_set(w, 18, 0);
     w = ws_set(w, 6, 0);
     w = ws_set(w, 7, 0);
     w = ws_set(w, 8, 0);
@@ -819,6 +822,12 @@ fn handle_dest(ws: bytes, op: i64, dest: i64, tc: i64, cap: i64, off: i64) -> by
     } else {
         w
     };
+    let c_api: trit = ws_get(w, 19) <=> 0;
+    w = if_pos c_api {
+        apply_api_surface_rules(w, op, dslot, cap, req, any, off)
+    } else {
+        w
+    };
     return w;
 }
 
@@ -994,12 +1003,66 @@ fn omni_verify_api_surface(
     return miss_cap * 1010 + bad_taint * 1011 + bad_lin * 1012 + bad_narrow * 1013;
 }
 
+// Wired into `handle_dest` when `ws[19] != 0` (`omni_verify_module_api`):
+// invokes `omni_verify_api_surface` and `omni_verify_cap_narrow_eff` on the live
+// token stream to emit 1010 (MISSING_CAP_TERNARY), 1011 (TAINT_ON_CONSENSUS),
+// and 1013 (CAP_NARROW_EXPAND) at the exact offending instruction offset `off`.
 #[strict]
-fn omni_verify_module(stream: bytes) -> bytes {
+fn apply_api_surface_rules(
+    ws: bytes,
+    op: i64,
+    dslot: i64,
+    cap: i64,
+    req: i64,
+    any_untr: i64,
+    off: i64
+) -> bytes {
+    let w: bytes = ws;
+    let nops: i64 = ws_get(w, 14);
+    let is_band: i64 = is_eq(op, 32542) * is_ge(nops, 2) * is_ge(dslot, 0);
+    let cb: trit = is_band <=> 0;
+    w = if_pos cb {
+        let p1: i64 = ws_get(w, 385);
+        let is_c: i64 = 1 - is_gt(op_flags(p1) & 1, 0);
+        let mval: i64 = op_tok(p1) * is_c;
+        let w1: bytes = ws_set(w, 16, dslot + 1);
+        let w2: bytes = ws_set(w1, 17, is_c);
+        ws_set(w2, 18, mval)
+    } else {
+        w
+    };
+
+    let is_tern_cap: i64 = is_eq(op, 32565) + is_eq(op, 32560) + is_eq(op, 32564);
+    let c1010: i64 = omni_verify_api_surface(1, cap, req, 0, 0, 0, 0);
+    w = append_err_if(w, is_tern_cap * is_eq(c1010, 1010), 1010, off);
+
+    let is_cons: i64 = is_eq(op, 32556) + is_eq(op, 32565) + is_eq(op, 32564);
+    let c1011: i64 = omni_verify_api_surface(2, 0, 0, any_untr, 0, 0, 0);
+    w = append_err_if(w, is_cons * is_eq(c1011, 1011), 1011, off);
+
+    let nslot_p1: i64 = ws_get(w, 16);
+    let uses_narrow: i64 = 0;
+    let i: i64 = 0;
+    while nops - i <=> 0 {
+        let p: i64 = ws_get(w, 384 + i);
+        let is_sl: i64 = is_gt(op_flags(p) & 1, 0);
+        let sl: i64 = token_to_slot(op_tok(p));
+        let hit: i64 = is_sl * is_gt(nslot_p1, 0) * is_eq(sl, nslot_p1 - 1);
+        uses_narrow = uses_narrow + hit;
+        i = i + 1;
+    }
+    let c1013: i64 = omni_verify_api_surface(4, cap, req, 0, ws_get(w, 17), ws_get(w, 18), 0);
+    w = append_err_if(w, is_gt(uses_narrow, 0) * is_eq(c1013, 1013), 1013, off);
+    return w;
+}
+
+#[strict]
+fn omni_verify_module_with_mode(stream: bytes, api_mode: i64) -> bytes {
     let nbytes: i64 = slen(stream);
     let nwords: i64 = nbytes / 2;
     let ws: bytes = init_zero_buf(448);
     ws = ws_set(ws, 1, nwords);
+    ws = ws_set(ws, 19, api_mode);
     let empty: i64 = is_eq(nwords, 0);
     let hdr: i64 = load_u16(stream, 0);
     let bad_hdr: i64 = empty + (1 - is_eq(hdr, 32480));
@@ -1082,4 +1145,14 @@ fn omni_verify_module(stream: bytes) -> bytes {
         i = i + 1;
     }
     return hdr_out;
+}
+
+#[strict]
+fn omni_verify_module_api(stream: bytes) -> bytes {
+    return omni_verify_module_with_mode(stream, 1);
+}
+
+#[strict]
+fn omni_verify_module(stream: bytes) -> bytes {
+    return omni_verify_module_with_mode(stream, 0);
 }

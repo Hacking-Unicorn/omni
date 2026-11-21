@@ -4243,8 +4243,11 @@ pub fn selftest_api_stage1() -> Result<(usize, usize, usize), String> {
     let ve_mod = decode_omni_token_stream(&ve_u16)?;
     let n_vfns = ve_mod.functions.len();
     // Order at end of pure/verifier_engine.omni:
-    //   omni_verify_cap_narrow_eff (-3), omni_verify_api_surface (-2), omni_verify_module (-1)
-    let fn_api_verify = ve_mod.functions[n_vfns - 2].fn_idx;
+    //   omni_verify_cap_narrow_eff (-6), omni_verify_api_surface (-5),
+    //   apply_api_surface_rules (-4), omni_verify_module_with_mode (-3),
+    //   omni_verify_module_api (-2), omni_verify_module (-1)
+    let fn_api_verify = ve_mod.functions[n_vfns - 5].fn_idx;
+    let fn_verify_mod_api = ve_mod.functions[n_vfns - 2].fn_idx;
     for &(op_k, fn_cap, req_cap, taint, mask_c, mask, lin, want) in &[
         (1i64, 8, 8, 0, 0, 0, 0, 0i64),     // ternary cap satisfied -> OK
         (1, 0, 8, 0, 0, 0, 0, 1010),        // MISSING_CAP_TERNARY
@@ -4338,21 +4341,78 @@ pub fn selftest_api_stage1() -> Result<(usize, usize, usize), String> {
     }
     checks += 1;
 
-    // 5. Negative Stage 1 goldens + error_contract.json check + frozen hashes intact.
+    // 5. Negative Stage 1 goldens: compile each real violation golden, run through Pure-Omni
+    //    `omni_verify_module_api` (invoking wired `apply_api_surface_rules` -> `omni_verify_api_surface`
+    //    & `omni_verify_cap_narrow_eff`), assert rejection with exact error code + non-null 1-based
+    //    (line, col) span matching `spec/acceptance/acceptance_manifest.json` & `error_contract.json`,
+    //    and verify all 5 frozen hashes remain intact.
     let err_contract = std::fs::read_to_string("spec/acceptance/error_contract.json")
         .map_err(|e| format!("API-S1 read error_contract.json: {}", e))?;
+    let manifest_txt = std::fs::read_to_string("spec/acceptance/acceptance_manifest.json")
+        .map_err(|e| format!("API-S1 read acceptance_manifest.json: {}", e))?;
     for code_name in &["MISSING_CAP_TERNARY", "TAINT_ON_CONSENSUS", "LINEAR_REFLECT", "CAP_NARROW_EXPAND"] {
         if !err_contract.contains(code_name) {
             return Err(format!("API-S1 error_contract.json missing {}", code_name));
         }
     }
-    for neg_path in &[
-        "spec/acceptance/goldens/neg_missing_cap_ternary.omni",
-        "spec/acceptance/goldens/neg_taint_consensus.omni",
-        "spec/acceptance/goldens/neg_cap_narrow_expand.omni",
-    ] {
+    let neg_cases: &[(&str, &str, i64, usize, usize)] = &[
+        ("spec/acceptance/goldens/neg_missing_cap_ternary.omni", "MISSING_CAP_TERNARY", 1010, 3, 19),
+        ("spec/acceptance/goldens/neg_taint_consensus.omni", "TAINT_ON_CONSENSUS", 1011, 3, 19),
+        ("spec/acceptance/goldens/neg_cap_narrow_expand.omni", "CAP_NARROW_EXPAND", 1013, 5, 19),
+    ];
+    for &(neg_path, exp_code, exp_num, exp_line, exp_col) in neg_cases {
+        // Assert manifest records this negative golden with exact expected code & span.
+        let expected_span_frag = format!(
+            "\"expected_code\": \"{}\", \"expected_num\": {}, \"expected_line\": {}, \"expected_col\": {}",
+            exp_code, exp_num, exp_line, exp_col
+        );
+        if !manifest_txt.contains(&expected_span_frag) {
+            return Err(format!("API-S1 acceptance_manifest.json missing expected entry: {}", expected_span_frag));
+        }
         let src = std::fs::read_to_string(neg_path).map_err(|e| format!("API-S1 read {}: {}", neg_path, e))?;
-        let _ = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(&src))?;
+        let (neg_u16, smap) = with_lockstep_suspended(|| compile_omni_surface_to_u16_with_sourcemap(&src, true))?;
+        let neg_bytes = encode_u16_stream_to_bytes(&neg_u16);
+        let rep_bytes = match vm.execute_function(&ve_mod, fn_verify_mod_api, vec![OmniValue::Bytes(neg_bytes)])? {
+            OmniValue::Bytes(b) => b,
+            other => return Err(format!("API-S1 omni_verify_module_api({}) returned {:?}", neg_path, other)),
+        };
+        if rep_bytes.len() < 48 {
+            return Err(format!("API-S1 pure verifier report too short for {}: {} B", neg_path, rep_bytes.len()));
+        }
+        let r_i64 = |idx: usize| -> i64 {
+            i64::from_le_bytes(rep_bytes[idx * 8..idx * 8 + 8].try_into().unwrap())
+        };
+        let status = r_i64(0);
+        let nfns = r_i64(2);
+        let passed = r_i64(4);
+        let nerr = r_i64(5) as usize;
+        if status != 0 || nfns < 1 || passed != 0 || nerr == 0 {
+            return Err(format!(
+                "API-S1 {} MUST be rejected by Pure-Omni verifier (status={}, nfns={}, passed={}, nerr={})",
+                neg_path, status, nfns, passed, nerr
+            ));
+        }
+        let mut matched_off: Option<usize> = None;
+        for ei in 0..nerr {
+            let code = r_i64(6 + ei * 2);
+            let off = r_i64(6 + ei * 2 + 1) as usize;
+            if code == exp_num {
+                matched_off = Some(off);
+                break;
+            }
+        }
+        let off = matched_off.ok_or_else(|| {
+            let got_codes: Vec<i64> = (0..nerr).map(|ei| r_i64(6 + ei * 2)).collect();
+            format!("API-S1 {} expected pure verifier code {} ({}), got {:?}", neg_path, exp_num, exp_code, got_codes)
+        })?;
+        let (line, col) = smap.offset_to_span.get(&off).copied().unwrap_or((0, 0));
+        let formatted = format!("error[{}] line {}, col {}: pure verifier rejected {}", exp_code, line, col, neg_path);
+        if line != exp_line || col != exp_col || !formatted.starts_with(&format!("error[{}]", exp_code)) {
+            return Err(format!(
+                "API-S1 {} span mismatch: got ({}, {}) want ({}, {}) [{}]",
+                neg_path, line, col, exp_line, exp_col, formatted
+            ));
+        }
     }
     selftest_m2_frozen_hashes()?;
     checks += 1;
