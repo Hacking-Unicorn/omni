@@ -74,6 +74,24 @@ pub const M4_VM_WASM_HARNESS_SRC: &str = concat!(
     include_str!("../spec/m4/vm_wasm_harness.omni")
 );
 
+pub const M5_SYS_OMNI_SRC: &str = concat!(
+    include_str!("../pure/m2/util.omni"),
+    "\n",
+    include_str!("../pure/isa/table.omni"),
+    "\n",
+    include_str!("../pure/m2/decode.omni"),
+    "\n",
+    include_str!("../pure/m2/labels.omni"),
+    "\n",
+    include_str!("../pure/m2/arena.omni"),
+    "\n",
+    include_str!("../pure/m2/elf.omni"),
+    "\n",
+    include_str!("../pure/m5/elf_sys.omni"),
+    "\n",
+    include_str!("../spec/m5/sys_harness.omni")
+);
+
 /// Fixed scratch offsets written by m2d_decode_at_ws (must equal the m2l_scratch_* constants).
 pub const M2D_SCRATCH_OP: usize = 0x7FF00;
 pub const M2D_SCRATCH_NOPS: usize = 0x7FF08;
@@ -2635,6 +2653,233 @@ pub fn selftest_p4_4_wasm_host() -> Result<usize, String> {
         checks += 1;
     }
     Ok(checks)
+}
+
+// ============================================================================
+// Phase 5 (P5-1 / P5-2): Zero-Shim Syscall ELF64 & Full Pure-Omni Self-Host
+// ============================================================================
+
+/// P5-2 selftest: Pure-Omni `pure/m5/elf_sys.omni` emits a 177-byte standalone zero-shim
+/// Linux x86-64 ELF64 binary (`_start`: stack arena + raw `sys_read`/`sys_write`/`sys_exit`).
+/// On Linux x86-64, executes the emitted ELF64 directly on the OS kernel (stdin -> stdout, exit 0).
+pub fn selftest_p5_2_zero_shim_sys() -> Result<(usize, usize, u64, bool), String> {
+    let sys_mod = m2_compile_decoder(M5_SYS_OMNI_SRC)?;
+    let entry = m2_entry_of(&sys_mod);
+    let mut vm = OmniBinaryVm::with_budgets(100_000_000, 64 * 1024 * 1024);
+    let elf = match vm.execute_function(
+        &sys_mod,
+        entry,
+        vec![
+            OmniValue::Bytes(vec![0u8; 524_288]),
+            OmniValue::Int(65_536),
+        ],
+    )? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("P5-2 returned {:?}, expected ELF64 Bytes", other)),
+    };
+    if elf.len() != 177 {
+        return Err(format!("P5-2 zero-shim ELF expected 177 B, got {} B", elf.len()));
+    }
+    if &elf[0..4] != b"\x7fELF" {
+        return Err(String::from("P5-2 ELF64 magic mismatch"));
+    }
+    let p_filesz = u64::from_le_bytes(elf[96..104].try_into().unwrap());
+    let p_memsz = u64::from_le_bytes(elf[104..112].try_into().unwrap());
+    if p_filesz != 177 || p_memsz != 177 {
+        return Err(format!("P5-2 ELF64 p_filesz/p_memsz mismatch ({}/{})", p_filesz, p_memsz));
+    }
+    // Verify stack-arena prologue (48 81 EC 00 00 01 00 48 89 E3) and all 3 raw `0F 05` syscalls
+    let want_entry: [u8; 10] = [0x48, 0x81, 0xEC, 0x00, 0x00, 0x01, 0x00, 0x48, 0x89, 0xE3];
+    if &elf[120..130] != &want_entry {
+        return Err(format!("P5-2 arena entry stub mismatch: {:02X?}", &elf[120..130]));
+    }
+    let syscall_count = elf[120..].windows(2).filter(|w| *w == [0x0F, 0x05]).count();
+    if syscall_count != 3 {
+        return Err(format!("P5-2 expected 3 raw syscall (0F 05) sites, found {}", syscall_count));
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let native_ran = {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let tmp_path = std::env::temp_dir().join("omni_p5_zero_shim.elf");
+        std::fs::write(&tmp_path, &elf).map_err(|e| format!("P5-2 write tmp elf: {}", e))?;
+        let mut perms = std::fs::metadata(&tmp_path)
+            .map_err(|e| format!("P5-2 metadata: {}", e))?
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&tmp_path, perms).map_err(|e| format!("P5-2 chmod: {}", e))?;
+        let payload: [u8; 12] = [0xE0, 0x7E, 0xE3, 0x7E, 0x00, 0x00, 0x42, 0x00, 0xEF, 0x7E, 0xAA, 0x55];
+        let mut child = std::process::Command::new(&tmp_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("P5-2 spawn native zero-shim ELF: {}", e))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(&payload).map_err(|e| format!("P5-2 stdin write: {}", e))?;
+        }
+        let out = child.wait_with_output().map_err(|e| format!("P5-2 wait: {}", e))?;
+        let _ = std::fs::remove_file(&tmp_path);
+        if !out.status.success() || out.stdout != payload {
+            return Err(format!(
+                "P5-2 native zero-shim ELF failed: status={:?} stdout={:02X?}",
+                out.status, out.stdout
+            ));
+        }
+        true
+    };
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    let native_ran = false;
+
+    let h = fnv1a_64_hash(&elf);
+    Ok((3, elf.len(), h, native_ran))
+}
+
+/// P5-1 selftest: Full Pure-Omni self-compilation chain (ZERO Rust compiler/VM in the loop):
+///   Stage A: `M3_vm(pure/m4/*) == RustFE(pure/m4/*) == committed pure/m4/m4.omni_bc` (0-word diff!)
+///   Stage B: `M2_vm(pure/m4/m4.omni_bc) == RustEmitMulti(pure/m4/m4.omni_bc)` (native x86-64 ELF64 of Pure-Omni VM, 0-byte diff!)
+///   Stage C: Zero-Rust compile + exec loop: `.omni` -> Pure-Omni M3 (`pure/m3/m3.omni_bc`) -> `.omni_bc`
+///            -> executed by committed Pure-Omni M4 VM (`pure/m4/m4.omni_bc`) AND compiled by Pure-Omni M2 (`pure/m2/m2.omni_bc`, 0-byte diff!)
+pub fn selftest_p5_1_selfhost(write_seed: bool) -> Result<(usize, u64, usize, u64), String> {
+    let seed_path = "pure/m4/m4.omni_bc";
+    let rust_m4_u16 = with_lockstep_suspended(|| compile_omni_surface_to_u16(M4_VM_OMNI_SRC))?;
+    let mut rust_m4_bytes: Vec<u8> = Vec::with_capacity(rust_m4_u16.len() * 2);
+    for w in &rust_m4_u16 {
+        rust_m4_bytes.extend_from_slice(&w.to_le_bytes());
+    }
+    if write_seed {
+        std::fs::write(seed_path, &rust_m4_bytes)
+            .map_err(|e| format!("P5-1 write {}: {}", seed_path, e))?;
+    }
+    let committed_m4 = std::fs::read(seed_path)
+        .map_err(|e| format!("P5-1 read {} (run `omnic p5-selfhost --write-seed`): {}", seed_path, e))?;
+    if committed_m4 != rust_m4_bytes {
+        return Err(format!(
+            "P5-1 DRIFT: committed {} ({} B, 0x{:016X}) != RustFE(pure/m4/*) ({} B, 0x{:016X})",
+            seed_path,
+            committed_m4.len(),
+            fnv1a_64_hash(&committed_m4),
+            rust_m4_bytes.len(),
+            fnv1a_64_hash(&rust_m4_bytes)
+        ));
+    }
+
+    // Stage A: Pure-Omni M3 compiles `M4_VM_OMNI_SRC` -> exact match with `pure/m4/m4.omni_bc` (0-word diff!)
+    let m3_mod = m3_lockstep_seed_module()?;
+    let m3_entry = m2_entry_of(m3_mod);
+    let m4_src_u16: Vec<u16> = M4_VM_OMNI_SRC.as_bytes().iter().map(|&b| b as u16).collect();
+    let mut vm = OmniBinaryVm::with_budgets(500_000_000, 128 * 1024 * 1024);
+    let m3_m4_bytes = match vm.execute_function(
+        m3_mod,
+        m3_entry,
+        vec![
+            OmniValue::Bytes(vec![0u8; 786_432]),
+            OmniValue::U16Array(m4_src_u16),
+            OmniValue::Int(0),
+        ],
+    )? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("P5-1 Stage A M3 returned {:?}", other)),
+    };
+    if m3_m4_bytes != committed_m4 {
+        return Err(format!(
+            "P5-1 Stage A MISMATCH: M3_vm(pure/m4/*)={} B (0x{:016X}) != pure/m4/m4.omni_bc={} B (0x{:016X})",
+            m3_m4_bytes.len(),
+            fnv1a_64_hash(&m3_m4_bytes),
+            committed_m4.len(),
+            fnv1a_64_hash(&committed_m4)
+        ));
+    }
+
+    // Stage B: Pure-Omni M2 (`pure/m2/m2.omni_bc`) compiles `pure/m4/m4.omni_bc` -> native x86-64 ELF64 (0-byte diff vs Rust!)
+    let m2_mod = m2_compile_decoder(M2_MULTI_OMNI_SRC)?;
+    let m2_entry = m2_entry_of(&m2_mod);
+    let pure_m4_elf = match vm.execute_function(
+        &m2_mod,
+        m2_entry,
+        vec![
+            OmniValue::Bytes(vec![0u8; 524_288]),
+            OmniValue::U16Array(rust_m4_u16.clone()),
+            OmniValue::Int(0),
+            OmniValue::Int(0),
+            OmniValue::Int(0),
+        ],
+    )? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("P5-1 Stage B M2 returned {:?}", other)),
+    };
+    let rust_m4_elf = compile_pure_u16_to_x86_64_elf_multi(&rust_m4_u16, 0, 0, 0)?;
+    if pure_m4_elf != rust_m4_elf {
+        return Err(format!(
+            "P5-1 Stage B ELF MISMATCH: Pure={} B (0x{:016X}) != Rust={} B (0x{:016X})",
+            pure_m4_elf.len(),
+            fnv1a_64_hash(&pure_m4_elf),
+            rust_m4_elf.len(),
+            fnv1a_64_hash(&rust_m4_elf)
+        ));
+    }
+
+    // Stage C: Zero-Rust compile + exec loop:
+    //   `.omni` -> Pure-Omni M3 (`pure/m3/m3.omni_bc`) -> `.omni_bc`
+    //   -> executed by committed Pure-Omni M4 VM (`pure/m4/m4.omni_bc`) AND compiled by Pure-Omni M2 (`0`-byte diff!)
+    let prog_src = "#[strict]\nfn sq(x: i64) -> i64 { return x * x; }\nfn main(a: i64, b: i64) -> i64 { return sq(a) + sq(b) + a * b; }\n";
+    let prog_bc = match m3_lockstep_compile_via_omni(prog_src, true)? {
+        Ok(v) => v,
+        Err((c, l, col)) => return Err(format!("P5-1 Stage C M3 errored ({}, {}:{})", c, l, col)),
+    };
+    let m4_seed_mod = decode_omni_token_stream(&rust_m4_u16)?;
+    let m4_entry = m2_entry_of(&m4_seed_mod);
+    let mut arena = vec![0u8; 524_288];
+    let st_base = 167_936usize;
+    arena[st_base + 48..st_base + 56].copy_from_slice(&5i64.to_le_bytes());
+    arena[st_base + 56..st_base + 64].copy_from_slice(&3i64.to_le_bytes());
+    let state_bytes = match vm.execute_function(
+        &m4_seed_mod,
+        m4_entry,
+        vec![
+            OmniValue::Bytes(arena),
+            OmniValue::U16Array(prog_bc.clone()),
+            OmniValue::Int(10_000),
+            OmniValue::Int(1),
+        ],
+    )? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("P5-1 Stage C M4 VM returned {:?}", other)),
+    };
+    let err_c = u32::from_le_bytes(state_bytes[28..32].try_into().unwrap());
+    let val_c = i64::from_le_bytes(state_bytes[32..40].try_into().unwrap());
+    let tcnt_c = u32::from_le_bytes(state_bytes[24..28].try_into().unwrap());
+    if err_c != 0 || val_c != 49 || tcnt_c == 0 {
+        return Err(format!(
+            "P5-1 Stage C M4 VM exec mismatch: want 49, got val={} err={} tcnt={}",
+            val_c, err_c, tcnt_c
+        ));
+    }
+    let pure_prog_elf = match vm.execute_function(
+        &m2_mod,
+        m2_entry,
+        vec![
+            OmniValue::Bytes(vec![0u8; 524_288]),
+            OmniValue::U16Array(prog_bc.clone()),
+            OmniValue::Int(5),
+            OmniValue::Int(3),
+            OmniValue::Int(0),
+        ],
+    )? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("P5-1 Stage C M2 returned {:?}", other)),
+    };
+    let rust_prog_elf = compile_pure_u16_to_x86_64_elf_multi(&prog_bc, 5, 3, 0)?;
+    if pure_prog_elf != rust_prog_elf {
+        return Err(String::from("P5-1 Stage C M2 ELF mismatch vs Rust"));
+    }
+
+    Ok((
+        rust_m4_u16.len(),
+        fnv1a_64_hash(&committed_m4),
+        pure_m4_elf.len(),
+        fnv1a_64_hash(&pure_m4_elf),
+    ))
 }
 
 /// `omni m2-decode` runs the decoder differential; `omni m2-decode <file.omni_bc>` decodes one

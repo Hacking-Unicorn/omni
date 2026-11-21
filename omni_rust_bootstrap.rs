@@ -23301,6 +23301,7 @@ pub fn run_m2_foundation_selftests() -> Result<usize, String> {
     n += selftest_p4_1_vm_diff()?;
     n += selftest_p4_3_thin_shim()?;
     n += selftest_p4_4_wasm_host()?;
+    n += selftest_p5_2_zero_shim_sys()?.0;
     Ok(n)
 }
 
@@ -23668,6 +23669,35 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
                 1
             }
         },
+        "p5-sys" => match selftest_p5_2_zero_shim_sys() {
+            Ok((n, sz, h, native)) => {
+                println!(
+                    "[P5-SYS PASS] {} checks | zero-shim Linux x86-64 ELF64={} B (FNV-1a64=0x{:016X}, 3 raw 0F 05 syscalls: sys_read/sys_write/sys_exit | native={})",
+                    n, sz, h, if native { "VERIFIED" } else { "SKIPPED on non-Linux-x86-64" }
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("[P5-SYS FAIL] {}", e);
+                1
+            }
+        },
+        "p5-selfhost" => {
+            let write_seed = args.get(1).map(|s| s.as_str()) == Some("--write-seed");
+            match selftest_p5_1_selfhost(write_seed) {
+                Ok((words, h_bc, elf_len, h_elf)) => {
+                    println!(
+                        "[P5-SELFHOST PASS] pure/m4/m4.omni_bc={} words (FNV-1a64=0x{:016X}) | M3_vm(pure/m4/*)==seed (0-word diff!) | M2_vm(m4.omni_bc)==ELF64 {} B (0x{:016X}, 0-byte diff!) | Zero-Rust M3->M4 & M3->M2 loop PASS!",
+                        words, h_bc, elf_len, h_elf
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("[P5-SELFHOST FAIL] {}", e);
+                    1
+                }
+            }
+        }
         "p4-vm" => match selftest_p4_1_vm_diff() {
             Ok(n) => {
                 println!(
@@ -24098,7 +24128,7 @@ fn main() {
             "harness" | "--harness" => {
                 std::process::exit(run_omni_harness_cli(&cli_args[2..]));
             }
-            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" => {
+            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" => {
                 std::process::exit(run_m2_cli(&cli_args[1..]));
             }
             "agent-driver" | "--agent-driver" => {

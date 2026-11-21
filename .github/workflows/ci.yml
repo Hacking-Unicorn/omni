@@ -36,6 +36,8 @@ jobs:
           ./omni p4-vm
           ./omni p4-shim
           ./omni p4-wasm
+          ./omni p5-sys
+          ./omni p5-selfhost
           ./omni backend-diff --suite
           ./omni selftest
           ./omni pure-bootstrap

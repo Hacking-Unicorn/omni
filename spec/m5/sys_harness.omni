@@ -1,0 +1,8 @@
+// Phase 5 (P5-2) harness for `pure/m5/elf_sys.omni`.
+// Returns the emitted standalone zero-shim Linux x86-64 ELF64 binary via ret_slice.
+#[strict]
+fn main(w: bytes, arena_bytes: i64) -> bytes {
+    let w_done: bytes = m5s_emit_zero_shim_elf(w, arena_bytes);
+    let n: i64 = ld_u64(w_done, m2l_regs());
+    return ret_slice(w_done, m2l_out(), n);
+}

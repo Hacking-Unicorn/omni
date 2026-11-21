@@ -557,6 +557,7 @@ pub const M2_PURE_MODULES: &[(&str, &str)] = &[
     ("pure/m2/util.omni+pure/isa/table.omni+pure/m2/decode.omni+pure/m2/labels.omni+spec/m2/labels_harness.omni", M2_LABELS_OMNI_SRC),
     ("pure/m2/util.omni+pure/isa/table.omni+pure/m2/decode.omni+pure/m2/labels.omni+pure/m2/verify/mod_check.omni+spec/m2/verify_harness.omni", M2_VERIFY_OMNI_SRC),
     ("pure/m2/util.omni+pure/isa/table.omni+pure/m2/decode.omni+pure/m2/labels.omni+pure/m4/arena.omni+pure/m4/ops_core.omni+pure/m4/vm.omni+spec/m4/vm_harness.omni", M4_VM_OMNI_SRC),
+    ("pure/m2/util.omni+pure/isa/table.omni+pure/m2/decode.omni+pure/m2/labels.omni+pure/m2/arena.omni+pure/m2/elf.omni+pure/m5/elf_sys.omni+spec/m5/sys_harness.omni", M5_SYS_OMNI_SRC),
     ("pure/m2/util.omni+pure/isa/table.omni+pure/m2/decode.omni+pure/m2/labels.omni+pure/m2/arena.omni+pure/m2/elf.omni+spec/m2/elf_harness.omni", M2_ELF_OMNI_SRC),
     ("pure/m2/util.omni+pure/isa/table.omni+pure/m2/decode.omni+pure/m2/labels.omni+pure/m2/arena.omni+pure/m2/elf.omni+pure/m2/emit_x86.omni+pure/m2/driver.omni+spec/m2/compiler_harness.omni", M2_COMPILER_OMNI_SRC),
     ("pure/m2/util.omni+pure/isa/table.omni+pure/m2/decode.omni+pure/m2/labels.omni+pure/m2/arena.omni+pure/m2/elf.omni+pure/m2/emit_x86.omni+pure/m2/emit_multi.omni+spec/m2/multi_harness.omni", M2_MULTI_OMNI_SRC),
