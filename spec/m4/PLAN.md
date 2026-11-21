@@ -27,4 +27,11 @@ mission-aligned safeguards:
 - `omni serve` / live HTTP host, `repair_cmd` / shell execution, runtime source parsing,
   and `emit_asm` stay Rust-side dev tooling only.
 - Raw syscall intrinsics + minimal assembly entry stub (replacing the thin shim) are
-  explicitly Phase 5/6 work.
+  completed in Phase 5 (`pure/m5/elf_sys.omni`, `omnic p5-sys`).
+
+## Status (Verified 2026-11-20 on Windows & Linux x86-64, `6e416d4`)
+- **P4-1 (`omnic p4-vm`)**: 11/11 PASS (`pure/m4/arena.omni` 147 lines + `pure/m4/ops_core.omni` 277 lines + `pure/m4/vm.omni` 436 lines = 860 lines, `m2-lint` 0 gated findings).
+- **P4-2 (`omnic p4-exec`)**: PASS (raw `.omni_bc` execution with `--trace`).
+- **P4-3 (`omnic p4-shim`)**: 3/3 PASS (`p4_shim/mod.rs`: `read_bytes`, `write_bytes`, `spawn`).
+- **P4-4 (`omnic p4-wasm`)**: 3/3 PASS (full `pure/m4/vm.omni` compiles to `62,213`-B Wasm v1 `0x557AA8121383D047` + VM core executes on M2-10 Wasm-multi host).
+- **P4-5**: 64 KiB binary trace ring (`0x70000..0x7FFFF`, 4,096 × 16-B records) verified inside `p4-vm`, `p4-shim`, and `p4-exec --trace`.

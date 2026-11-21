@@ -1,6 +1,8 @@
 # Omni Phase 5 Plan — Full Self-Compilation (Zero Rust in the Loop) & Zero-Shim Syscall Intrinsics
 
-**Status:** Phase 4 (`6e416d4`) verified clean on Windows & Linux. Phase 5 begins.
+**Status:** Phase 5 (`3e623e1`) completed and verified clean on both Windows and Linux x86-64 (2026-11-20):
+- **`omnic p5-selfhost`**: PASS — `pure/m4/m4.omni_bc` (`25,026` words / `50,052` B, `FNV-1a64=0x44FB7C039E69843C`) matches `M3_vm(pure/m4/*)` with `0`-word diff, compiles via `M2_vm(pure/m4/m4.omni_bc)` to `109,740`-B x86-64 ELF64 (`FNV-1a64=0xA7A6CA9D72BBD84C`, `0`-byte diff vs Rust), and passes the zero-Rust M3→M4 & M3→M2 compile+exec loop.
+- **`omnic p5-sys`**: 5/5 PASS — `pure/m5/elf_sys.omni` (73 lines, `m2-lint` 0 findings) emits a standalone `177`-byte zero-shim Linux x86-64 ELF64 (`FNV-1a64=0x4C5943AD64761FA1`) with 3 raw `0F 05` syscalls (`sys_read`/`sys_write`/`sys_exit`), verified natively on Linux x86-64 (`native=VERIFIED`).
 
 ## Goals
 

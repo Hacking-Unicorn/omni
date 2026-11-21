@@ -16,12 +16,15 @@ jobs:
       - name: Install Rust stable toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Run standalone monolith selftest (fixed-point + M2 lint/elf + 4-backend diff + pure-omni-diff + acceptance-diff + harness)
+      - name: Run standalone monolith selftest (fixed-point + M2/M3/P4/P5 gates + 4-backend diff + pure-omni-diff + acceptance-diff + harness)
         run: |
           rustc -O omni_rust_bootstrap.rs -o omni
+          ./omni --help
           ./omni fixed-point
+          ./omni pure-bootstrap
           ./omni m2-lint
           ./omni m2-elf
+          ./omni m2-lock > /tmp/m2_lock_check.tsv && diff -u spec/m2/single_mode_lock.tsv /tmp/m2_lock_check.tsv
           ./omni m2-compile
           ./omni m2-multi
           ./omni m2-multi-pure
@@ -29,6 +32,10 @@ jobs:
           ./omni m2-verify
           ./omni m2-fixed-point
           ./omni m3-gate
+          ./omni m3-lex
+          ./omni m3-skim
+          ./omni m3-expr
+          ./omni m3-stmt
           ./omni m3-lower
           ./omni m3-lockstep
           ./omni m3-4backend
@@ -36,11 +43,12 @@ jobs:
           ./omni p4-vm
           ./omni p4-shim
           ./omni p4-wasm
+          ./omni compile-surface spec/acceptance/goldens/seed6_clamp.omni /tmp/seed6_clamp.omni_bc
+          ./omni p4-exec /tmp/seed6_clamp.omni_bc 150 10 90 --trace
           ./omni p5-sys
           ./omni p5-selfhost
           ./omni backend-diff --suite
           ./omni selftest
-          ./omni pure-bootstrap
           ./omni pure-omni-diff
           ./omni acceptance-diff
           ./omni harness --spec
@@ -53,7 +61,9 @@ jobs:
         env:
           CARGO_INCREMENTAL: "0"
         run: |
+          cargo check --release -p omni-aot
           cargo build --release --workspace
+          cargo run --release -p omni-cli -- --help
           cargo run --release -p omni-cli -- selftest
           cargo run --release -p omni-cli -- pure-bootstrap
           cargo run --release -p omni-cli -- pure-omni-diff

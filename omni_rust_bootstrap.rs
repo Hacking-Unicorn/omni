@@ -10002,6 +10002,7 @@ pub fn run_acceptance_suite_selftest() -> Result<usize, String> {
                 || !raw.contains("\"seed0_risk\"")
                 || !raw.contains("\"stdlib_macro_pipeline_golden\"")
                 || !raw.contains("\"neg_taint_on_ret\"")
+                || !raw.contains("\"neg_circular_include\"")
             {
                 return Err(format!("Malformed acceptance_manifest.json at '{}'", p.display()));
             }
@@ -23837,7 +23838,7 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
             }
         }
         _ => {
-            eprintln!("usage: omni m2-frozen | m2-lock | m2-census | m2-labels | m2-lint [file.omni|file.omni_asm]... | m2-decode | m2-elf");
+            eprintln!("usage: omni m2-frozen | m2-lock | m2-census | m2-labels | m2-lint [file.omni|file.omni_asm]... | m2-decode [file.omni_bc] | m2-elf | m2-compile | m2-multi | m2-multi-pure | m2-wasm-multi | m2-verify | m2-fixed-point [--write-seed] | m3-lex | m3-skim | m3-expr | m3-stmt | m3-lower | m3-lockstep | m3-4backend | m3-fixed-point [--write-seed] | p4-vm | p4-exec <file.omni_bc> [a0] [a1] [a2] [--trace] | p4-shim | p4-wasm | p5-sys | p5-selfhost [--write-seed]");
             2
         }
     }
@@ -24125,6 +24126,47 @@ fn main() {
     }
     if cli_args.len() >= 2 {
         match cli_args[1].as_str() {
+            "--help" | "-h" | "help" => {
+                println!("Omni v2.0 — 16-bit Token-Stream ISA, Static Verifier, Pure-Omni Self-Hosted Compiler/VM & 4-Backend AOT");
+                println!("usage: omni <command> [args...]");
+                println!();
+                println!("Verification & Self-Hosting Gates:");
+                println!("  selftest                          Run full unit, differential, M2/M3/P4/P5 selftest suite");
+                println!("  fixed-point                       Verify Stage-1 == Stage-2 x86-64 ELF64 fixed point");
+                println!("  pure-bootstrap                    Verify Phase D & 18-module core suite FNV-1a64 hashes");
+                println!("  pure-omni-diff                    Run 49 Pure-Omni differential checks");
+                println!("  acceptance-diff                   Run 41 executable acceptance goldens");
+                println!("  backend-diff --suite              Run 4-backend differential suite (vm/wasm/x86/stage1)");
+                println!("  m2-lint [file.omni]...            Lint registered pure/m2, m3, m4, m5 & isa modules");
+                println!("  m2-elf | m2-compile | m2-multi | m2-multi-pure | m2-wasm-multi | m2-verify | m2-fixed-point [--write-seed]");
+                println!("  m2-frozen | m2-lock | m2-census | m2-labels | m2-decode [file.omni_bc]");
+                println!("  m3-gate [dir] | m3-lex | m3-skim | m3-expr | m3-stmt | m3-lower | m3-lockstep | m3-4backend | m3-fixed-point [--write-seed]");
+                println!("  p4-vm | p4-shim | p4-wasm | p4-exec <file.omni_bc> [a0] [a1] [a2] [--trace]");
+                println!("  p5-sys | p5-selfhost [--write-seed]");
+                println!();
+                println!("Compilation, Execution & Tooling:");
+                println!("  run <file.omni|file.omni_bc> [args...]   Compile/verify and execute on VM");
+                println!("  eval \"<omni source>\" [args...]           Evaluate inline .omni program");
+                println!("  repl                                     Interactive surface language REPL");
+                println!("  compile-surface <in.omni> <out.omni_bc>  Compile surface .omni to .omni_bc");
+                println!("  compile-elf <in> <out.elf> [a0 a1 a2]    Compile .omni/.omni_bc to x86-64 ELF64");
+                println!("  compile-wasm <in> <out.wasm>             Compile .omni/.omni_bc to 64-bit Wasm v1");
+                println!("  run-wasm <in.omni|.omni_bc|.wasm> [args] Execute via built-in 64-bit Wasm interpreter");
+                println!("  assemble <in.omni_asm> <out.omni_bc>     Assemble text .omni_asm to .omni_bc");
+                println!("  surface-to-asm <in.omni>                 Lower surface .omni to text .omni_asm");
+                println!("  inspect | disasm <in.omni>               Inspect AST, disassembly & verifier report");
+                println!("  debug-lens | hex <in.omni_bc>            Format binary token stream");
+                println!("  fe-dump --tokens|--ast|--packets|--lock  M3 frontend canonical dump / lock check");
+                println!("  explain <ERROR_CODE>                     Explain structured error code & retry hint");
+                println!("  harness [--spec|--version-check]         Machine-readable JSON verification harness");
+                println!("  agent-driver [--list-strategies|--strict] Closed-loop repair agent driver");
+                println!("  serve [--port <p>] <file.omni>           Start capability-gated live HTTP/KV host");
+                return;
+            }
+            "--version" | "-V" | "version" => {
+                println!("omni 2.0.0 (omni-harness-v1.0.0)");
+                return;
+            }
             "harness" | "--harness" => {
                 std::process::exit(run_omni_harness_cli(&cli_args[2..]));
             }

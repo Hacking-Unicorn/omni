@@ -46,5 +46,8 @@
     {"id": "neg_corrupt_pack5", "file": "goldens/neg_corrupt_pack5.omni", "strict": true, "expected_code": "CORRUPT_PACK5", "expected_line": 5, "expected_col": 23},
     {"id": "neg_ambiguous_grammar", "file": "goldens/neg_ambiguous_grammar.omni", "strict": true, "expected_code": "AMBIGUOUS_GRAMMAR", "expected_line": 2, "expected_col": 19},
     {"id": "neg_syntax_error", "file": "goldens/neg_syntax_error.omni", "strict": false, "expected_code": "SYNTAX_ERROR", "expected_line": 2, "expected_col": 13}
+  ],
+  "deferred_multi_file_goldens": [
+    {"id": "neg_circular_include", "file": "goldens/neg_circular_include.omni", "expected_code": "CIRCULAR_INCLUDE", "reason": "Requires filesystem/VFS include resolution rather than single-string surface compilation; verified by selftest 6g (resolve_omni_surface_includes), spec/m3/fixtures/neg_circular_include.omni (M3 corpus.tsv), and M2_GOLDEN_SOURCES."}
   ]
 }
