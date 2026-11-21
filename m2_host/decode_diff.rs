@@ -3062,7 +3062,7 @@ pub fn p7_measure_program_with_opts(
     src: &str,
     args: [i64; 3],
     expected_val: i64,
-    compact_zero_imm: bool,
+    emit_mode: M2EmitMode,
 ) -> Result<(P7BenchMetrics, Vec<u8>, i64), String> {
     let t_fe = std::time::Instant::now();
     let bc = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(src))?;
@@ -3076,7 +3076,7 @@ pub fn p7_measure_program_with_opts(
     }
     let zero_loads = p7_count_m2_zero_imm_loads(&decoded);
     let t_emit = std::time::Instant::now();
-    let elf = compile_pure_u16_to_x86_64_elf_multi_opts(&bc, args[0], args[1], args[2], compact_zero_imm)?;
+    let elf = compile_pure_u16_to_x86_64_elf_multi_mode(&bc, args[0], args[1], args[2], emit_mode)?;
     let emit_us = t_emit.elapsed().as_micros() as i64;
     let mut vm = OmniBinaryVm::with_budgets(50_000_000, 64 * 1024 * 1024);
     let t_vm = std::time::Instant::now();
@@ -3183,7 +3183,7 @@ pub fn p7_measure_program(
     let n_jfns = judge_mod.functions.len();
     let hist_fn = judge_mod.functions[n_jfns - 5].fn_idx;
     let (m, _elf, _zl) = p7_measure_program_with_opts(
-        m4_mod, m4_run_fn, judge_mod, trace_fn, hist_fn, name, src, args, expected_val, false,
+        m4_mod, m4_run_fn, judge_mod, trace_fn, hist_fn, name, src, args, expected_val, M2EmitMode::Compact,
     )?;
     Ok(m)
 }
@@ -3570,7 +3570,7 @@ pub fn selftest_p7_0a_canary() -> Result<(usize, i64, i64, i64, bool), String> {
         for _ in 0..5 {
             let (m, _elf, zl) = p7_measure_program_with_opts(
                 &m4_mod, m4_run_fn, &judge_mod, judge_trace_fn, judge_hist_fn,
-                bname, bsrc, bargs, want, false,
+                bname, bsrc, bargs, want, M2EmitMode::Legacy,
             )?;
             zero_loads_per_bench[bi] = zl;
             arr.push(m);
@@ -3632,7 +3632,7 @@ pub fn selftest_p7_0a_canary() -> Result<(usize, i64, i64, i64, bool), String> {
         for r in 0..5 {
             let (cm, celf, _zl) = p7_measure_program_with_opts(
                 &m4_mod, m4_run_fn, &judge_mod, judge_trace_fn, judge_hist_fn,
-                bname, bsrc, bargs, want, true,
+                bname, bsrc, bargs, want, M2EmitMode::CanaryZeroImm,
             )?;
             let bm = &base_runs[bi][r];
             let expected_delta = 8 * zero_loads_per_bench[bi];
@@ -3709,7 +3709,7 @@ pub fn selftest_p7_0a_canary() -> Result<(usize, i64, i64, i64, bool), String> {
         for r in 0..5 {
             let (nm, _nelf, _zl) = p7_measure_program_with_opts(
                 &m4_mod, m4_run_fn, &judge_mod, judge_trace_fn, judge_hist_fn,
-                bname, &neutral_src, bargs, want, false,
+                bname, &neutral_src, bargs, want, M2EmitMode::Legacy,
             )?;
             let bm = &base_runs[bi][r];
             b_bc[r] = bm.bc_words;
@@ -3748,7 +3748,7 @@ pub fn selftest_p7_0a_canary() -> Result<(usize, i64, i64, i64, bool), String> {
     let closed_src = "#[strict]\nfn main(n: i64) -> i64 {\n    return (n * (n + 1)) / 2;\n}\n";
     let (closed_m, _celf, _zl) = p7_measure_program_with_opts(
         &m4_mod, m4_run_fn, &judge_mod, judge_trace_fn, judge_hist_fn,
-        "bench_loop_sum_closed", closed_src, [100, 0, 0], 5050, false,
+        "bench_loop_sum_closed", closed_src, [100, 0, 0], 5050, M2EmitMode::Legacy,
     )?;
     let bm1 = &base_runs[1][0];
     let dm3 = call_judge(&mut vm, 0, bm1.bc_words, closed_m.bc_words, 0, 0, 0)?;
@@ -3763,10 +3763,55 @@ pub fn selftest_p7_0a_canary() -> Result<(usize, i64, i64, i64, bool), String> {
     }
     checks += 1;
 
-    // Check 6: Frozen hashes untouched.
+    // Check 6: Live production M2 emitter (`M2EmitMode::Compact`: disp8 + 3-tier imm + sub/add rsp imm8)
+    // vs `M2EmitMode::Legacy` across all 5 benchmarks -> +1t ADOPT on all 5/5, strictly attributed to
+    // `M2_EMITTER` (2), zero histogram drift, and native Linux x86-64 execution verified.
+    let mut prod_v = [0i64; 5];
+    let mut prod_m3 = [0i64; 5];
+    let mut prod_m2 = [0i64; 5];
+    let mut prod_m4 = [0i64; 5];
+    let mut prod_saved_bytes = 0i64;
+    for (bi, &(bname, bsrc, bargs, want)) in P7_BENCHMARK_CORPUS.iter().enumerate() {
+        let (pm, pelf, _zl) = p7_measure_program_with_opts(
+            &m4_mod, m4_run_fn, &judge_mod, judge_trace_fn, judge_hist_fn,
+            bname, bsrc, bargs, want, M2EmitMode::Compact,
+        )?;
+        let bm = &base_runs[bi][0];
+        if pm.elf_bytes >= bm.elf_bytes {
+            return Err(format!("P7 M2-Compact {} did not shrink ELF ({} -> {})", bname, bm.elf_bytes, pm.elf_bytes));
+        }
+        if bm.hist_alu != pm.hist_alu || bm.hist_mem != pm.hist_mem || bm.hist_ctrl != pm.hist_ctrl || bm.hist_call_ret != pm.hist_call_ret {
+            return Err(format!("P7 M2-Compact {} altered trace histogram", bname));
+        }
+        if p7_verify_native_elf_i64(bname, &pelf, want)? {
+            native_verified = true;
+        }
+        prod_saved_bytes += bm.elf_bytes - pm.elf_bytes;
+        prod_m3[bi] = call_judge(&mut vm, 0, bm.bc_words, pm.bc_words, 0, 0, 0)?;
+        prod_m2[bi] = call_judge(&mut vm, 0, bm.elf_bytes, pm.elf_bytes, 0, 0, 0)?;
+        let vs = call_judge(&mut vm, 0, bm.vm_steps, pm.vm_steps, 0, 0, 0)?;
+        let va = call_judge(&mut vm, 0, bm.arena_bytes, pm.arena_bytes, 0, 0, 0)?;
+        prod_m4[bi] = call_judge(&mut vm, 3, vs, va, 0, 0, 0)?;
+        prod_v[bi] = call_judge(&mut vm, 3, prod_m3[bi], prod_m2[bi], prod_m4[bi], 0, 0)?;
+    }
+    let pm3 = call_judge(&mut vm, 3, prod_m3[0], prod_m3[1], prod_m3[2], prod_m3[3], prod_m3[4])?;
+    let pm2 = call_judge(&mut vm, 3, prod_m2[0], prod_m2[1], prod_m2[2], prod_m2[3], prod_m2[4])?;
+    let pm4 = call_judge(&mut vm, 3, prod_m4[0], prod_m4[1], prod_m4[2], prod_m4[3], prod_m4[4])?;
+    let prod_suite = call_judge(&mut vm, 3, prod_v[0], prod_v[1], prod_v[2], prod_v[3], prod_v[4])?;
+    let prod_adopt = call_judge(&mut vm, 4, 1, prod_suite, 0, 0, 0)?;
+    let prod_attr = call_attr(&mut vm, pm3, pm2, pm4)?;
+    if prod_saved_bytes <= total_saved_bytes || prod_suite != 1 || prod_adopt != 1 || prod_attr != 2 {
+        return Err(format!(
+            "P7 M2-Compact gate failed: saved={}B suite={} adopt={} attr={}",
+            prod_saved_bytes, prod_suite, prod_adopt, prod_attr
+        ));
+    }
+    checks += 1;
+
+    // Check 7: Frozen hashes untouched.
     selftest_m2_frozen_hashes()?;
     checks += 1;
 
-    Ok((checks, total_saved_bytes, canary_attr, neutral_attr, native_verified))
+    Ok((checks, prod_saved_bytes, canary_attr, neutral_attr, native_verified))
 }
 

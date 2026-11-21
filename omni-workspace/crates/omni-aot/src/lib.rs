@@ -954,33 +954,55 @@ pub fn compile_pure_u16_to_x86_64_elf_multi(
     let t_cap_off = code.len();
     code.extend_from_slice(&[0xBF, 3, 0, 0, 0, 0xB8, 60, 0, 0, 0, 0x0F, 0x05]);
 
+    let emit_load_imm = |c: &mut Vec<u8>, v: i64, into_rcx: bool| {
+        if v == 0 {
+            c.extend_from_slice(&[0x31, if into_rcx { 0xC9 } else { 0xC0 }]);
+        } else if v >= 1 && v <= i32::MAX as i64 {
+            c.push(if into_rcx { 0xB9 } else { 0xB8 });
+            c.extend_from_slice(&(v as u32).to_le_bytes());
+        } else if v >= i32::MIN as i64 && v <= -1 {
+            c.extend_from_slice(&[0x48, 0xC7, if into_rcx { 0xC1 } else { 0xC0 }]);
+            c.extend_from_slice(&(v as i32).to_le_bytes());
+        } else {
+            c.extend_from_slice(&[0x48, if into_rcx { 0xB9 } else { 0xB8 }]);
+            c.extend_from_slice(&(v as u64).to_le_bytes());
+        }
+    };
+    let emit_load_frame = |c: &mut Vec<u8>, disp: i32, into_rcx: bool| {
+        if disp >= -128 && disp <= 127 {
+            c.extend_from_slice(&[0x48, 0x8B, if into_rcx { 0x4D } else { 0x45 }, disp as i8 as u8]);
+        } else {
+            c.extend_from_slice(&[0x48, 0x8B, if into_rcx { 0x8D } else { 0x85 }]);
+            c.extend_from_slice(&disp.to_le_bytes());
+        }
+    };
     let emit_load_op = |c: &mut Vec<u8>, op: &BinOperand, into_rcx: bool| {
         match *op {
             BinOperand::Param(p_tok) => {
                 let disp: i32 = 16 + 8 * ((p_tok - PAR_BASE) as i32);
-                c.extend_from_slice(&[0x48, 0x8B, if into_rcx { 0x8D } else { 0x85 }]);
-                c.extend_from_slice(&disp.to_le_bytes());
+                emit_load_frame(c, disp, into_rcx);
             }
             BinOperand::Reg(r_tok) => {
                 let disp: i32 = -8 * (((r_tok - REG_BASE) as i32) + 1);
-                c.extend_from_slice(&[0x48, 0x8B, if into_rcx { 0x8D } else { 0x85 }]);
-                c.extend_from_slice(&disp.to_le_bytes());
+                emit_load_frame(c, disp, into_rcx);
             }
             BinOperand::ImmInt(v) => {
-                c.extend_from_slice(&[0x48, if into_rcx { 0xB9 } else { 0xB8 }]);
-                c.extend_from_slice(&(v as u64).to_le_bytes());
+                emit_load_imm(c, v, into_rcx);
             }
             BinOperand::ImmTrit(t) => {
-                c.extend_from_slice(&[0x48, if into_rcx { 0xB9 } else { 0xB8 }]);
-                c.extend_from_slice(&((t as i64) as u64).to_le_bytes());
+                emit_load_imm(c, t as i64, into_rcx);
             }
             _ => {}
         }
     };
     let emit_store_rax = |c: &mut Vec<u8>, d_tok: u16| {
         let disp: i32 = -8 * (((d_tok - REG_BASE) as i32) + 1);
-        c.extend_from_slice(&[0x48, 0x89, 0x85]);
-        c.extend_from_slice(&disp.to_le_bytes());
+        if disp >= -128 && disp <= 127 {
+            c.extend_from_slice(&[0x48, 0x89, 0x45, disp as i8 as u8]);
+        } else {
+            c.extend_from_slice(&[0x48, 0x89, 0x85]);
+            c.extend_from_slice(&disp.to_le_bytes());
+        }
     };
 
     let mut fn_offsets: BTreeMap<u16, usize> = BTreeMap::new();
@@ -993,8 +1015,12 @@ pub fn compile_pure_u16_to_x86_64_elf_multi(
             .max()
             .unwrap_or(0);
         let frame_bytes: u32 = (((8 * (max_reg + 1)) + 15) & !15) as u32;
-        code.extend_from_slice(&[0x55, 0x48, 0x89, 0xE5, 0x48, 0x81, 0xEC]);
-        code.extend_from_slice(&frame_bytes.to_le_bytes());
+        if frame_bytes <= 127 {
+            code.extend_from_slice(&[0x55, 0x48, 0x89, 0xE5, 0x48, 0x83, 0xEC, frame_bytes as u8]);
+        } else {
+            code.extend_from_slice(&[0x55, 0x48, 0x89, 0xE5, 0x48, 0x81, 0xEC]);
+            code.extend_from_slice(&frame_bytes.to_le_bytes());
+        }
 
         let mut label_offsets: Vec<(u16, usize)> = Vec::new();
         let mut relocs: Vec<RelocPatch> = Vec::new();
@@ -1290,8 +1316,12 @@ pub fn compile_pure_u16_to_x86_64_elf_multi(
                         call_relocs.push((code.len(), *callee_idx));
                         code.extend_from_slice(&[0, 0, 0, 0]);
                         let cleanup: u32 = (args.len() * 8) as u32;
-                        code.extend_from_slice(&[0x48, 0x81, 0xC4]);
-                        code.extend_from_slice(&cleanup.to_le_bytes());
+                        if cleanup > 0 && cleanup <= 127 {
+                            code.extend_from_slice(&[0x48, 0x83, 0xC4, cleanup as u8]);
+                        } else if cleanup > 127 {
+                            code.extend_from_slice(&[0x48, 0x81, 0xC4]);
+                            code.extend_from_slice(&cleanup.to_le_bytes());
+                        }
                         if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
                     }
                 }

@@ -87,6 +87,25 @@ Sharpen the measurement engine with repeated-run consensus, subsystem attributio
 
 ---
 
+## First Improvement Target — M2 Multi-Function Emitter (`pure/m2/emit_multi.omni`)
+
+4 flag-safe x86-64 compact encodings applied in lockstep across `pure/m2/emit_multi.omni`, `omni_rust_bootstrap.rs`, and `omni-workspace/crates/omni-aot/src/lib.rs` (leaving single-mode `emit_x86.omni`, `spec/m2/single_mode_lock.tsv`, and all 5 frozen FNV-1a64 hashes untouched):
+
+1. **`disp8` frame loads & stores** (`Reg r <= 15`, `Param p <= 13`): 4 B vs 7 B (−3 B/op)
+2. **3-tier compact immediates**: `0` → `xor r32, r32` (2 B), `1..2³¹−1` → `mov r32, imm32` (5 B), `−2³¹..−1` → `mov r64, imm32` (7 B), else 10 B
+3. **Compact function prologue** (`frame_bytes <= 127` → `sub rsp, imm8`, −3 B/fn)
+4. **Compact `CALL` stack cleanup** (`0` args → omit −7 B; `1..15` args → `add rsp, imm8` −3 B/call)
+
+### Measured Results (`p7-measure`, `p7-canary`, `m2-fixed-point`, `m3-fixed-point`, `p5-selfhost`)
+
+- **5 P7 Benchmarks:** `3,724 B → 3,401 B` (**−323 B**), 5/5 `+1t` (ADOPT), strictly attributed to `2 (M2_EMITTER)`, 0 trace-histogram drift.
+- **`pure/m2/m2.omni_bc` ELF64 (`m2-fixed-point`):** `137,246 B → 93,561 B` (**−43,685 B / −31.8%**, `0x763478CC11DB8026`, 0-byte diff vs Rust; regenerated seed `33,551` words, `0xC30924711C8C95E9`).
+- **`pure/m4/m4.omni_bc` ELF64 (`p5-selfhost`):** `109,740 B → 75,632 B` (**−34,108 B / −31.1%**, `0xBF4ABC26A91C2DE0`, 0-byte diff vs Rust).
+- **`pure/verifier_engine.omni` E2E ELF64 (`m3-fixed-point`):** `41,285 B → 30,063 B` (**−11,222 B / −27.2%**, `0xA9290A98CF42DD6B`, 0-byte diff vs Rust).
+- **All 5 frozen FNV-1a64 hashes + zero-shim `p5-sys` (177 B, `0x4C5943AD64761FA1`) + `single_mode_lock.tsv`:** 100% intact.
+
+---
+
 ## Hard Rules (All of Phase 7)
 
 - The verifier, determinism, and capability model are never self-modified.
