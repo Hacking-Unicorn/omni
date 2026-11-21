@@ -1,0 +1,58 @@
+// ==============================================================================
+// OMNI NEW-LEVEL API (STAGE 1) — PUBLIC ENTRY POINTS & HARNESS
+// `pure/api/api_main.omni`
+// ==============================================================================
+//
+// Dispatches Stage 1 ternary capability surface for M3->M4 VM and M2-multi AOT:
+//   mode 0: api_route_trit(cond=a, neg=b, zero=c, pos=d) -> i64 (-1/0/+1)
+//   mode 1: api_consensus(votes_packed=a, weights_packed=b) -> i64 (-1/0/+1)
+//   mode 2: api_expert_pack5(expert_id=a, packed_trits=b) -> i64
+//   mode 3: api_cap_narrow(old_cap=a, mask=b) -> i64
+//   mode 4: api_vote5(a, b, c, d, e) -> i64 (-1/0/+1)
+//   mode 5: api_pack5_verdict(a, b, c, d, e) -> i64 (0..=242)
+// ==============================================================================
+
+#[strict]
+fn api_dispatch_lo(mode: i64, a: i64, b: i64, c: i64, d: i64) -> i64 {
+    let r: i64 = if_pos mode <=> 0 {
+        let r1: i64 = if_pos mode <=> 1 {
+            api_expert_pack5(a, b)
+        } else {
+            p7_trit_to_i64(api_consensus(a, b))
+        };
+        r1
+    } else {
+        p7_trit_to_i64(api_route_trit(p7_i64_to_trit(a), b, c, d))
+    };
+    return r;
+}
+
+#[strict]
+fn api_dispatch_hi(mode: i64, a: i64, b: i64, c: i64, d: i64, e: i64) -> i64 {
+    let r: i64 = if_pos mode <=> 3 {
+        let r1: i64 = if_pos mode <=> 4 {
+            api_pack5_verdict(p7_i64_to_trit(a), p7_i64_to_trit(b), p7_i64_to_trit(c), p7_i64_to_trit(d), p7_i64_to_trit(e))
+        } else {
+            p7_trit_to_i64(api_vote5(p7_i64_to_trit(a), p7_i64_to_trit(b), p7_i64_to_trit(c), p7_i64_to_trit(d), p7_i64_to_trit(e)))
+        };
+        r1
+    } else {
+        api_cap_narrow(a, b)
+    };
+    return r;
+}
+
+#[strict]
+fn api_stage1_dispatch6(mode: i64, a: i64, b: i64, c: i64, d: i64, e: i64) -> i64 {
+    let r: i64 = if_pos mode <=> 2 {
+        api_dispatch_hi(mode, a, b, c, d, e)
+    } else {
+        api_dispatch_lo(mode, a, b, c, d)
+    };
+    return r;
+}
+
+#[strict]
+fn main(mode: i64, a: i64, b: i64, c: i64) -> i64 {
+    return api_stage1_dispatch6(mode, a, b, c, 0, 0);
+}

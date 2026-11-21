@@ -86,6 +86,14 @@ pub const P7_HEAL_OMNI_SRC: &str = concat!(
     include_str!("../spec/m7/heal_harness.omni"),
 );
 
+pub const API_STAGE1_OMNI_SRC: &str = concat!(
+    include_str!("../pure/m7/judge.omni"),
+    "\n",
+    include_str!("../pure/api/ternary.omni"),
+    "\n",
+    include_str!("../pure/api/api_main.omni"),
+);
+
 pub const M5_SYS_OMNI_SRC: &str = concat!(
     include_str!("../pure/m2/util.omni"),
     "\n",
@@ -4129,5 +4137,226 @@ pub fn selftest_p7_1_self_heal() -> Result<(usize, u64, i64), String> {
     checks += 1;
 
     Ok((checks, rollback.content_hash, log_cnt))
+}
+
+// ==============================================================================
+// OMNI NEW-LEVEL API (STAGE 1): PURE TERNARY CAPABILITY SURFACE, CAP_NARROW,
+// PURE-OMNI VERIFIER RULES (1010..1013) & 7 STAGE 1 GOLDENS
+// ==============================================================================
+
+pub fn selftest_api_stage1() -> Result<(usize, usize, usize), String> {
+    let mut checks = 0usize;
+
+    // 1. Compile Stage 1 Pure-Omni API (`pure/m7/judge.omni + pure/api/ternary.omni + api_main.omni`)
+    //    via Rust reference AND Pure-Omni M3 (`pure/m3/m3.omni_bc`, 0-word diff!) and lower via
+    //    Rust M2-multi AND Pure-Omni M2 (`pure/m2/m2.omni_bc`, 0-byte diff!).
+    let api_u16 = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(API_STAGE1_OMNI_SRC))?;
+    let api_m3_u16 = match m3_lockstep_compile_via_omni(API_STAGE1_OMNI_SRC, true)? {
+        Ok(v) => v,
+        Err((c, l, col)) => return Err(format!("API-S1 Pure-Omni M3 errored ({}, {}:{})", c, l, col)),
+    };
+    if api_m3_u16 != api_u16 {
+        return Err(format!(
+            "API-S1 Pure-Omni M3 diff on pure/api/ternary.omni: m3={}w vs rust={}w",
+            api_m3_u16.len(),
+            api_u16.len()
+        ));
+    }
+
+    let api_elf_rust = compile_pure_u16_to_x86_64_elf_multi(&api_u16, 0, 1, 2)?;
+    let m2_u16 = decode_bytes_to_u16_stream(
+        &std::fs::read("pure/m2/m2.omni_bc").map_err(|e| format!("API-S1 read m2 seed: {}", e))?,
+    );
+    let m2_mod = decode_omni_token_stream(&m2_u16)?;
+    let m2_entry = m2_entry_of(&m2_mod);
+    let mut vm_m2 = OmniBinaryVm::with_budgets(500_000_000, 128 * 1024 * 1024);
+    let api_elf_pure = match vm_m2.execute_function(
+        &m2_mod,
+        m2_entry,
+        vec![
+            OmniValue::U16Array(api_u16.clone()),
+            OmniValue::Int(0),
+            OmniValue::Int(1),
+            OmniValue::Int(2),
+        ],
+    )? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("API-S1 Pure-Omni M2 returned {:?}", other)),
+    };
+    if api_elf_pure != api_elf_rust {
+        return Err(format!(
+            "API-S1 Pure-Omni M2 diff on pure/api/ternary.omni: pure={}B vs rust={}B",
+            api_elf_pure.len(),
+            api_elf_rust.len()
+        ));
+    }
+    checks += 1;
+
+    // 2. Execute all 6 Stage 1 entry modes identically on Rust VM and Pure-Omni M4 VM.
+    let api_mod = decode_omni_token_stream(&api_u16)?;
+    let n_afns = api_mod.functions.len();
+    let api_dispatch6 = api_mod.functions[n_afns - 2].fn_idx;
+    let m4_u16 = decode_bytes_to_u16_stream(
+        &std::fs::read("pure/m4/m4.omni_bc").map_err(|e| format!("API-S1 read m4 seed: {}", e))?,
+    );
+    let m4_mod = decode_omni_token_stream(&m4_u16)?;
+    let m4_run_fn = m4_mod.functions[m4_mod.functions.len() - 2].fn_idx;
+    let mut vm = OmniBinaryVm::with_budgets(50_000_000, 64 * 1024 * 1024);
+    for &(mode, a, b, c, d, e, want) in &[
+        (0i64, -1, -7, 0, 9, 0, -1i64),   // route_trit(-1t, -7, 0, 9) -> -1t
+        (0, 0, -7, 0, 9, 0, 0),           // route_trit(0t, -7, 0, 9) -> 0t
+        (0, 1, -7, 0, 9, 0, 1),           // route_trit(+1t, -7, 0, 9) -> +1t
+        (1, 242, 242, 0, 0, 0, 1),        // consensus([+1..+1], [+1..+1]) -> +1t
+        (1, 0, 242, 0, 0, 0, -1),         // consensus([-1..-1], [+1..+1]) -> -1t
+        (1, 250, 242, 0, 0, 0, 0),        // corrupt byte >242 -> 0t fail-closed
+        (2, 3, 242, 0, 0, 0, 778),        // expert_pack5(3, [+1..+1]) -> (3<<8)|(5+5) = 778
+        (2, 3, 250, 0, 0, 0, -1),         // expert_pack5(3, corrupt) -> -1
+        (3, 15, 3, 0, 0, 0, 3),           // cap_narrow(0b1111, 0b0011) -> 0b0011
+        (3, 6, 3, 0, 0, 0, 2),            // cap_narrow(0b0110, 0b0011) -> 0b0010
+        (4, 1, 1, 0, -1, 1, 1),           // vote5 -> +1t
+        (5, 0, 1, 0, 0, 0, 124),          // pack5_verdict -> 124 (exact parity with P7)
+    ] {
+        let got = match vm.execute_function(
+            &api_mod,
+            api_dispatch6,
+            vec![
+                OmniValue::Int(mode),
+                OmniValue::Int(a),
+                OmniValue::Int(b),
+                OmniValue::Int(c),
+                OmniValue::Int(d),
+                OmniValue::Int(e),
+            ],
+        )? {
+            OmniValue::Int(v) => v,
+            other => return Err(format!("API-S1 mode {} returned {:?}", mode, other)),
+        };
+        if got != want {
+            return Err(format!("API-S1 mode {}({},{},{}) got {} want {}", mode, a, b, c, got, want));
+        }
+    }
+    checks += 1;
+
+    // 3. Pure-Omni Verifier Stage 1 rules (`pure/verifier_engine.omni::omni_verify_api_surface`,
+    //    Pure-Omni ONLY — Rust verifier untouched!).
+    let ve_u16 = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(OMNI_VERIFIER_ENGINE_SURFACE))?;
+    let ve_mod = decode_omni_token_stream(&ve_u16)?;
+    let n_vfns = ve_mod.functions.len();
+    // Order at end of pure/verifier_engine.omni:
+    //   omni_verify_cap_narrow_eff (-3), omni_verify_api_surface (-2), omni_verify_module (-1)
+    let fn_api_verify = ve_mod.functions[n_vfns - 2].fn_idx;
+    for &(op_k, fn_cap, req_cap, taint, mask_c, mask, lin, want) in &[
+        (1i64, 8, 8, 0, 0, 0, 0, 0i64),     // ternary cap satisfied -> OK
+        (1, 0, 8, 0, 0, 0, 0, 1010),        // MISSING_CAP_TERNARY
+        (2, 0, 0, 0, 0, 0, 0, 0),           // clean consensus -> OK
+        (2, 0, 0, 1, 0, 0, 0, 1011),        // TAINT_ON_CONSENSUS
+        (3, 0, 0, 0, 0, 0, 0, 0),           // linear dropped/transferred -> OK
+        (3, 0, 0, 0, 0, 0, 1, 1012),        // LINEAR_REFLECT
+        (4, 15, 2, 0, 1, 3, 0, 0),          // cap_narrow const mask surviving bit -> OK
+        (4, 15, 8, 0, 1, 3, 0, 1013),       // CAP_NARROW_EXPAND (masked-off bit)
+        (4, 15, 1, 0, 0, 15, 0, 1013),      // CAP_NARROW_EXPAND (dynamic mask -> 0 surviving caps)
+        (4, 15, 0, 0, 0, 15, 0, 0),         // dynamic narrowed cap stored/passed with req_cap=0 -> OK
+    ] {
+        let got = match vm.execute_function(
+            &ve_mod,
+            fn_api_verify,
+            vec![
+                OmniValue::Int(op_k),
+                OmniValue::Int(fn_cap),
+                OmniValue::Int(req_cap),
+                OmniValue::Int(taint),
+                OmniValue::Int(mask_c),
+                OmniValue::Int(mask),
+                OmniValue::Int(lin),
+            ],
+        )? {
+            OmniValue::Int(v) => v,
+            other => return Err(format!("API-S1 pure verifier returned {:?}", other)),
+        };
+        if got != want {
+            return Err(format!("API-S1 pure verifier case op={} got {} want {}", op_k, got, want));
+        }
+    }
+    checks += 1;
+
+    // 4. Positive Stage 1 goldens: M3 0-word diff + M4 VM == Rust VM + M2-multi ELF64 0-byte diff.
+    let pos_goldens: &[(&str, [i64; 3], i64)] = &[
+        ("spec/acceptance/goldens/ternary_route_golden.omni", [20, 0, 0], 1),
+        ("spec/acceptance/goldens/consensus_golden.omni", [242, 242, 0], 1),
+        ("spec/acceptance/goldens/expert_pack5_golden.omni", [3, 242, 0], 778),
+        ("spec/acceptance/goldens/cap_narrow_golden.omni", [15, 0, 0], 3),
+    ];
+    for &(path, args, want) in pos_goldens {
+        let src = std::fs::read_to_string(path).map_err(|e| format!("API-S1 read {}: {}", path, e))?;
+        let rust_u16 = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(&src))?;
+        let m3_u16_g = match m3_lockstep_compile_via_omni(&src, true)? {
+            Ok(v) => v,
+            Err((c, l, col)) => return Err(format!("API-S1 M3 on {} errored ({}, {}:{})", path, c, l, col)),
+        };
+        if m3_u16_g != rust_u16 {
+            return Err(format!("API-S1 M3 0-word diff failed on {}", path));
+        }
+        let elf_r = compile_pure_u16_to_x86_64_elf_multi(&rust_u16, args[0], args[1], args[2])?;
+        let elf_p = match vm_m2.execute_function(
+            &m2_mod,
+            m2_entry,
+            vec![
+                OmniValue::U16Array(rust_u16.clone()),
+                OmniValue::Int(args[0]),
+                OmniValue::Int(args[1]),
+                OmniValue::Int(args[2]),
+            ],
+        )? {
+            OmniValue::Bytes(b) => b,
+            other => return Err(format!("API-S1 M2 on {} returned {:?}", path, other)),
+        };
+        if elf_p != elf_r {
+            return Err(format!("API-S1 M2 0-byte diff failed on {}", path));
+        }
+        let arena_out = match vm.execute_function(
+            &m4_mod,
+            m4_run_fn,
+            vec![
+                OmniValue::Bytes(vec![0u8; 524_288]),
+                OmniValue::U16Array(rust_u16),
+                OmniValue::Int(args[0]),
+                OmniValue::Int(args[1]),
+                OmniValue::Int(args[2]),
+                OmniValue::Int(50_000),
+                OmniValue::Int(0),
+            ],
+        )? {
+            OmniValue::Bytes(b) => b,
+            other => return Err(format!("API-S1 M4 VM on {} returned {:?}", path, other)),
+        };
+        let st = 167_936usize;
+        let err_c = u32::from_le_bytes(arena_out[st + 28..st + 32].try_into().unwrap());
+        let ret_v = i64::from_le_bytes(arena_out[st + 32..st + 40].try_into().unwrap());
+        if err_c != 0 || ret_v != want {
+            return Err(format!("API-S1 M4 VM {} mismatch: got {} (err {}) want {}", path, ret_v, err_c, want));
+        }
+    }
+    checks += 1;
+
+    // 5. Negative Stage 1 goldens + error_contract.json check + frozen hashes intact.
+    let err_contract = std::fs::read_to_string("spec/acceptance/error_contract.json")
+        .map_err(|e| format!("API-S1 read error_contract.json: {}", e))?;
+    for code_name in &["MISSING_CAP_TERNARY", "TAINT_ON_CONSENSUS", "LINEAR_REFLECT", "CAP_NARROW_EXPAND"] {
+        if !err_contract.contains(code_name) {
+            return Err(format!("API-S1 error_contract.json missing {}", code_name));
+        }
+    }
+    for neg_path in &[
+        "spec/acceptance/goldens/neg_missing_cap_ternary.omni",
+        "spec/acceptance/goldens/neg_taint_consensus.omni",
+        "spec/acceptance/goldens/neg_cap_narrow_expand.omni",
+    ] {
+        let src = std::fs::read_to_string(neg_path).map_err(|e| format!("API-S1 read {}: {}", neg_path, e))?;
+        let _ = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(&src))?;
+    }
+    selftest_m2_frozen_hashes()?;
+    checks += 1;
+
+    Ok((checks, api_u16.len(), api_elf_rust.len()))
 }
 

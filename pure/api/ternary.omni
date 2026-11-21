@@ -1,0 +1,78 @@
+// ==============================================================================
+// OMNI NEW-LEVEL API (STAGE 1) — PURE TERNARY CAPABILITY SURFACE
+// `pure/api/ternary.omni`
+// ==============================================================================
+//
+// Link order: `pure/m7/judge.omni`, this file.
+// Library-first Pure-Omni ternary capability surface (zero `pure/m3/` syntax
+// changes, zero new opcodes, zero recursion, zero ANEW, zero IDIV/IMOD,
+// zero PACK5 opcodes -> 100% `m2-lint` and M2-multi ELF64 clean).
+//
+// Reuses `pure/m7/judge.omni` (`p7_vote5`, `p7_pack5_byte`, `p7_unpack5_trit`,
+// `p7_trit_to_i64`) without duplicating its logic.
+// ==============================================================================
+
+// 3-way ternary routing — returns balanced trit `{-1t, 0t, +1t}` from routed arm.
+#[strict]
+fn api_route_trit(cond: trit, neg_v: i64, zero_v: i64, pos_v: i64) -> trit {
+    let routed: i64 = sel_trit(cond, neg_v, zero_v, pos_v);
+    return routed <=> 0;
+}
+
+// Weighted balanced-ternary consensus over two 5-trit `@PACK5`-compatible radix-3
+// bytes (`0..=242`): returns `sign(sum_{i=0..4} votes[i] * weights[i])`.
+// Returns `0t` fail-closed if either packed byte is out of range (`> 242` or `< 0`).
+#[strict]
+fn api_consensus(votes_packed: i64, weights_packed: i64) -> trit {
+    let ok_v: i64 = sel_trit(votes_packed <=> 0, 0, 1, 1) * sel_trit(votes_packed <=> 242, 1, 1, 0);
+    let ok_w: i64 = sel_trit(weights_packed <=> 0, 0, 1, 1) * sel_trit(weights_packed <=> 242, 1, 1, 0);
+    let acc: i64 = 0;
+    let i: i64 = 0;
+    while i < 5 {
+        let vt: trit = p7_unpack5_trit(votes_packed, i);
+        let wt: trit = p7_unpack5_trit(weights_packed, i);
+        acc = acc + p7_trit_to_i64(vt) * p7_trit_to_i64(wt);
+        i = i + 1;
+    }
+    let final_acc: i64 = acc * ok_v * ok_w;
+    return final_acc <=> 0;
+}
+
+// `@PACK5` expert routing (Pure-Omni): routes a 5-trit packed input (`0..=242`)
+// to `expert_id`, returning `(expert_id << 8) | ((score + 5) & 255)` where
+// `score` is the sum of the 5 unpacked trits (`-5..=+5`), or `-1` if corrupt byte.
+#[strict]
+fn api_expert_pack5(expert_id: i64, packed_trits: i64) -> i64 {
+    let ok_lo: i64 = sel_trit(packed_trits <=> 0, 0, 1, 1);
+    let ok_hi: i64 = sel_trit(packed_trits <=> 242, 1, 1, 0);
+    let ok: i64 = ok_lo * ok_hi;
+    let score: i64 = 0;
+    let i: i64 = 0;
+    while i < 5 {
+        let t: trit = p7_unpack5_trit(packed_trits, i);
+        score = score + p7_trit_to_i64(t);
+        i = i + 1;
+    }
+    let valid_res: i64 = (expert_id << 8) | ((score + 5) & 255);
+    let res: i64 = if_pos ok <=> 0 { valid_res } else { -1 };
+    return res;
+}
+
+// Thin re-export wrapper around `pure/m7/judge.omni::p7_vote5`.
+#[strict]
+fn api_vote5(t0: trit, t1: trit, t2: trit, t3: trit, t4: trit) -> trit {
+    return p7_vote5(t0, t1, t2, t3, t4);
+}
+
+// Thin re-export wrapper around `pure/m7/judge.omni::p7_pack5_byte`.
+#[strict]
+fn api_pack5_verdict(t0: trit, t1: trit, t2: trit, t3: trit, t4: trit) -> i64 {
+    return p7_pack5_byte(t0, t1, t2, t3, t4);
+}
+
+// Strict capability narrowing: result contains ONLY capability bits present in
+// BOTH `old_cap` and `mask` (`result ⊆ old_cap`). Pure, zero new opcodes.
+#[strict]
+fn api_cap_narrow(old_cap: i64, mask: i64) -> i64 {
+    return old_cap & mask;
+}
