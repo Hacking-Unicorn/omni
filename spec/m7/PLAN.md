@@ -106,6 +106,25 @@ Sharpen the measurement engine with repeated-run consensus, subsystem attributio
 
 ---
 
+## Second Improvement Target — M4 VM Hot Paths (`pure/m4/vm.omni` + `pure/m4/arena.omni`)
+
+Profile-guided tuning driven by the P4-5 trace ring (`bench_loop_sum`: 404/809 control-flow ops; `bench_arena_buf`: 136/271 control-flow ops):
+
+1. **O(1) Pre-Indexed Label Cache (`0x20000..0x23FFF`):** Populates 16 local label slots per function once at load time (`m4v_index_fn_labels` / `m4v_record_lbl_slot`) so taken branches (`JMP`/`BR_TRIT`/`BR_POS`/`BR_NEG`) resolve via one `ld_u32` instead of an O(N) full-function decode scan (`m4v_lookup_label`, with fallback for >16 labels).
+2. **Guarded Opcode-Family Dispatch (`m4v_exec_pure_val`):** Evaluates only the matching family (`MOV`, `m4o_arith`, `m4o_bit_cmp`, `m4o_trit`, `SEL`/`SLEN`) instead of calling all three unconditionally per step.
+3. **`LABEL`/`NOP` Fast Path (`m4v_step_noncall`):** Skips `m4v_exec_alu_mem` completely on `LABEL` (`0x7F40`) and `NOP` (`0x7F00`).
+4. **Single `m2d_ins_scan` per Step (`m4v_step_one`):** Reuses `nops` across `m4v_exec_alu_mem`/`m4v_exec_call`/`m4v_exec_ret` and skips `res_peek` when `trace_mode == 0`.
+
+### Measured Results (`p7-measure`, `p4-vm`, `p4-wasm`, `p5-selfhost`)
+
+- **`bench_loop_sum` VM runtime:** `581,512 us → 314,397 us` (**−45.9% / 1.85× faster**).
+- **`bench_arena_buf` VM runtime:** `292,346 us → 115,114 us` (**−60.6% / 2.54× faster**).
+- **Total 5-benchmark VM runtime:** `897,069 us → 455,642 us` (**−49.2% / ~2.0× faster**).
+- **Regenerated seed `pure/m4/m4.omni_bc`:** `26,076` words (`0x00299F8C0BB3F88A`, `0`-word diff vs Rust), M2 ELF64 = `78,020` B (`0xF66A7081E2B43319`, `0`-byte diff vs Rust).
+- **0 change** in `vm_steps`, `trace_ops`, 4-class trace histograms, or all 5 frozen FNV-1a64 hashes; `m2-lint` 16/16 (`0` findings).
+
+---
+
 ## Hard Rules (All of Phase 7)
 
 - The verifier, determinism, and capability model are never self-modified.

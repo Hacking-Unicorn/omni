@@ -10,6 +10,8 @@
 //   0x70000 .. 0x7FFFF (458752..524287) : TRACE_RING    (4096 x 16 B: step_u32, fn_u16, op_u16, pc_u32, res_lo32)
 
 #[strict]
+fn m4a_lbl_cache() -> i64 { return 131072; }
+#[strict]
 fn m4a_fn_tbl() -> i64 { return 163840; }
 #[strict]
 fn m4a_state() -> i64 { return 167936; }
