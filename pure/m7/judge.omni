@@ -1,0 +1,203 @@
+// ==============================================================================
+// OMNI PHASE 7 (P7-0) — BALANCED-TERNARY MEASUREMENT DECISION LAYER
+// `pure/m7/judge.omni`
+// ==============================================================================
+//
+// Boundary rule: time, bytes, fuel/steps, and arena usage are measured in plain
+// `i64` integers and converted to balanced trits `{-1t, 0t, +1t}` strictly at
+// the decision point:
+//   +1t = better / ADOPT
+//    0t = neutral (within noise band) / HOLD
+//   -1t = worse (regression or gate failure) / REJECT
+//
+// Invariants: `#[strict]`, zero recursion, zero ANEW, zero IDIV/IMOD,
+// zero PACK5 opcodes (pure radix-3 arithmetic compatible with `@PACK5`),
+// `<= 12` labels and `<= 120` SSA per function (`m2-lint` clean).
+// ==============================================================================
+
+// Convert a trit `{-1t, 0t, +1t}` to an `i64` `{-1, 0, +1}` branchlessly.
+#[strict]
+fn p7_trit_to_i64(t: trit) -> i64 {
+    return sel_trit(t, -1, 0, 1);
+}
+
+// Convert an `i64` to a balanced trit `{-1t, 0t, +1t}` via `TCMP`.
+#[strict]
+fn p7_i64_to_trit(v: i64) -> trit {
+    return v <=> 0;
+}
+
+// Thresholding without division (lower-is-better metric):
+//   delta = base - cand
+//   delta >  band -> +1t (better)
+//   delta < -band -> -1t (worse)
+//   otherwise     ->  0t (neutral / inside noise band)
+#[strict]
+fn p7_cmp_band(base: i64, cand: i64, band: i64) -> trit {
+    let delta: i64 = base - cand;
+    let hi: trit = delta <=> band;
+    let lo: trit = (delta + band) <=> 0;
+    let hi_is_pos: i64 = sel_trit(hi, 0, 0, 1);
+    let lo_is_neg: i64 = sel_trit(lo, -1, 0, 0);
+    return (hi_is_pos + lo_is_neg) <=> 0;
+}
+
+// 3-run ternary consensus voting (identical to `std/trit.omni::std_consensus3`).
+#[strict]
+fn p7_vote3(t0: trit, t1: trit, t2: trit) -> trit {
+    return tmaj(t0, t1, t2);
+}
+
+// 5-run balanced-ternary majority vote (`sign(t0 + t1 + t2 + t3 + t4)`).
+#[strict]
+fn p7_vote5(t0: trit, t1: trit, t2: trit, t3: trit, t4: trit) -> trit {
+    let s: i64 = p7_trit_to_i64(t0) + p7_trit_to_i64(t1) + p7_trit_to_i64(t2) + p7_trit_to_i64(t3) + p7_trit_to_i64(t4);
+    return s <=> 0;
+}
+
+// Combine two metric verdicts under the strict no-regression rule:
+//   - If either is -1t -> -1t (regression dominates)
+//   - Else if either is +1t -> +1t (improvement without regression)
+//   - Else -> 0t (neutral)
+#[strict]
+fn p7_combine2(a: trit, b: trit) -> trit {
+    let va: i64 = p7_trit_to_i64(a);
+    let vb: i64 = p7_trit_to_i64(b);
+    let neg_a: i64 = sel_trit(a, 1, 0, 0);
+    let neg_b: i64 = sel_trit(b, 1, 0, 0);
+    let has_neg: i64 = neg_a + neg_b;
+    let res: i64 = if_pos has_neg <=> 0 {
+        -1
+    } else {
+        let sum: i64 = va + vb;
+        if_pos sum <=> 0 { 1 } else { 0 }
+    };
+    return res <=> 0;
+}
+
+// Aggregate 5 benchmark verdicts into a single suite verdict (no-regression rule):
+//   - Any benchmark == -1t -> -1t (REJECT)
+//   - Else any benchmark == +1t -> +1t (ADOPT)
+//   - Else (all 0t) -> 0t (HOLD)
+#[strict]
+fn p7_aggregate_suite5(v0: trit, v1: trit, v2: trit, v3: trit, v4: trit) -> trit {
+    let c01: trit = p7_combine2(v0, v1);
+    let c23: trit = p7_combine2(v2, v3);
+    let c0123: trit = p7_combine2(c01, c23);
+    return p7_combine2(c0123, v4);
+}
+
+// Written Adopt/Reject Rule:
+//   gates_ok == 0 -> -1t (REJECT: gate failure always rejects)
+//   gates_ok != 0 -> match_trit suite_verdict { neg => -1t, zero => 0t, pos => +1t }
+#[strict]
+fn p7_adopt_rule(gates_ok: i64, suite_verdict: trit) -> trit {
+    let out_i: i64 = if_pos gates_ok <=> 0 {
+        match_trit suite_verdict {
+            neg => -1,
+            zero => 0,
+            pos => 1
+        }
+    } else {
+        -1
+    };
+    return out_i <=> 0;
+}
+
+// Judge a single benchmark across 4 core metrics:
+//   (bc_words, elf_bytes, vm_steps, arena_bytes) with per-metric noise bands.
+// Returns +1t (better), 0t (neutral), or -1t (worse / regression on any metric).
+#[strict]
+fn p7_judge_metrics4(
+    base_bc: i64, cand_bc: i64, band_bc: i64,
+    base_elf: i64, cand_elf: i64, band_elf: i64,
+    base_steps: i64, cand_steps: i64, band_steps: i64,
+    base_arena: i64, cand_arena: i64, band_arena: i64
+) -> trit {
+    let t_bc: trit = p7_cmp_band(base_bc, cand_bc, band_bc);
+    let t_elf: trit = p7_cmp_band(base_elf, cand_elf, band_elf);
+    let t_steps: trit = p7_cmp_band(base_steps, cand_steps, band_steps);
+    let t_arena: trit = p7_cmp_band(base_arena, cand_arena, band_arena);
+    let c01: trit = p7_combine2(t_bc, t_elf);
+    let c23: trit = p7_combine2(t_steps, t_arena);
+    return p7_combine2(c01, c23);
+}
+
+// `@PACK5` radix-3 packing (5 balanced trits -> 1 byte in `0..=242`, byte-exact vs `pack5_encode`):
+//   byte = (t0 + 1)*1 + (t1 + 1)*3 + (t2 + 1)*9 + (t3 + 1)*27 + (t4 + 1)*81
+#[strict]
+fn p7_pack5_byte(t0: trit, t1: trit, t2: trit, t3: trit, t4: trit) -> i64 {
+    let u0: i64 = p7_trit_to_i64(t0) + 1;
+    let u1: i64 = p7_trit_to_i64(t1) + 1;
+    let u2: i64 = p7_trit_to_i64(t2) + 1;
+    let u3: i64 = p7_trit_to_i64(t3) + 1;
+    let u4: i64 = p7_trit_to_i64(t4) + 1;
+    return u0 + u1 * 3 + u2 * 9 + u3 * 27 + u4 * 81;
+}
+
+// Helper: integer quotient `v / 3` for `0 <= v <= 242` with zero `IDIV`/`IMOD`.
+#[strict]
+fn p7_div3_q(v: i64) -> i64 {
+    let q: i64 = 0;
+    let r: i64 = v;
+    while r >= 3 {
+        r = r - 3;
+        q = q + 1;
+    }
+    return q;
+}
+
+// `@PACK5` radix-3 unpack: extract trit at `idx` (`0..=4`) from `packed_byte` (`0..=242`).
+// Returns `0t` if `packed_byte > 242` or `idx` out of range.
+#[strict]
+fn p7_unpack5_trit(packed_byte: i64, idx: i64) -> trit {
+    let ok_lo: i64 = if_neg packed_byte <=> 0 { 0 } else { 1 };
+    let ok_hi: i64 = if_pos packed_byte <=> 242 { 0 } else { 1 };
+    let ok: i64 = ok_lo * ok_hi;
+    let out_i: i64 = if_pos ok <=> 0 {
+        let cur: i64 = packed_byte;
+        let k: i64 = 0;
+        while k < idx {
+            cur = p7_div3_q(cur);
+            k = k + 1;
+        }
+        let q: i64 = p7_div3_q(cur);
+        let rem: i64 = cur - q * 3;
+        rem - 1
+    } else {
+        0
+    };
+    return out_i <=> 0;
+}
+
+// P4-5 trace-ring verifier & summary reader (Pure-Omni):
+// Reads the live 64 KiB trace ring (`0x70000..0x7FFFF`, 4096 x 16 B records) from a
+// 512 KiB M4 VM arena buffer (`w`), verifies monotonic `step_idx` for all recorded
+// entries `0..min(trace_cnt, 4096)`, and returns:
+//   - `-1` if any step index is non-monotonic (corrupt trace)
+//   - `(trace_cnt << 32) | checksum_lo32` when valid.
+#[strict]
+fn p7_verify_trace_ring(w: bytes) -> i64 {
+    let trace_cnt: i64 = ld_u32(w, 167960);
+    let cap: i64 = imin(trace_cnt, 4096);
+    let i: i64 = 0;
+    let prev_step: i64 = -1;
+    let ok: i64 = 1;
+    let csum: i64 = 0;
+    while i < cap {
+        let off: i64 = 458752 + i * 16;
+        let step_idx: i64 = ld_u32(w, off);
+        let op_tok: i64 = ld_u16(w, off + 6);
+        let mono: i64 = if_pos step_idx <=> prev_step { 1 } else { 0 };
+        ok = ok * mono;
+        prev_step = step_idx;
+        csum = (csum + op_tok) & 2147483647;
+        i = i + 1;
+    }
+    let res: i64 = if_pos ok <=> 0 {
+        (trace_cnt << 32) | csum
+    } else {
+        -1
+    };
+    return res;
+}

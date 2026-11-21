@@ -47,6 +47,7 @@ jobs:
           ./omni p4-exec /tmp/seed6_clamp.omni_bc 150 10 90 --trace
           ./omni p5-sys
           ./omni p5-selfhost
+          ./omni p7-measure
           ./omni backend-diff --suite
           ./omni selftest
           ./omni pure-omni-diff

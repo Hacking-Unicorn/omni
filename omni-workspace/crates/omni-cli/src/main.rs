@@ -1039,6 +1039,7 @@ fn main() {
                 println!("  m3-gate [dir] | m3-lex | m3-skim | m3-expr | m3-stmt | m3-lower | m3-lockstep | m3-4backend | m3-fixed-point [--write-seed]");
                 println!("  p4-vm | p4-shim | p4-wasm | p4-exec <file.omni_bc> [a0] [a1] [a2] [--trace]");
                 println!("  p5-sys | p5-selfhost [--write-seed]");
+                println!("  p7-measure                        Phase 7 (P7-0) benchmark corpus, P4-5 trace ring & ternary verdict gate");
                 println!();
                 println!("Compilation, Execution & Tooling:");
                 println!("  run <file.omni|file.omni_bc> [args...]   Compile/verify and execute on VM");
@@ -1105,7 +1106,7 @@ fn main() {
                     }
                 }
             }
-            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" => {
+            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" => {
                 std::process::exit(monolith::run_m2_cli(&args[1..]));
             }
             "selftest" => {

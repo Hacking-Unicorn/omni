@@ -74,6 +74,12 @@ pub const M4_VM_WASM_HARNESS_SRC: &str = concat!(
     include_str!("../spec/m4/vm_wasm_harness.omni")
 );
 
+pub const P7_JUDGE_OMNI_SRC: &str = concat!(
+    include_str!("../pure/m7/judge.omni"),
+    "\n",
+    include_str!("../spec/m7/judge_harness.omni"),
+);
+
 pub const M5_SYS_OMNI_SRC: &str = concat!(
     include_str!("../pure/m2/util.omni"),
     "\n",
@@ -2903,3 +2909,371 @@ pub fn m2_decode_cli(args: &[String]) -> i32 {
         }
     }
 }
+
+// ==============================================================================
+// PHASE 7 (P7-0): MEASUREMENT CORPUS, P4-5 TRACE-RING FEEDBACK & BALANCED-TERNARY VERDICT ENGINE
+// ==============================================================================
+
+#[derive(Clone, Debug)]
+pub struct P7BenchMetrics {
+    pub name: &'static str,
+    pub compile_us: i64,
+    pub bc_words: i64,
+    pub elf_bytes: i64,
+    pub vm_steps: i64,
+    pub trace_ops: i64,
+    pub arena_bytes: i64,
+    pub trace_csum: i64,
+    pub ret_val: i64,
+}
+
+/// Fixed 5-benchmark corpus for Phase 7 (P7-0):
+/// (name, .omni source, [a0, a1, a2], expected_i64_result).
+pub const P7_BENCHMARK_CORPUS: &[(&str, &str, [i64; 3], i64)] = &[
+    (
+        "bench_clamp",
+        "#[strict]\nfn main(x: i64, lo: i64, hi: i64) -> i64 {\n    let lower: i64 = imax(x, lo);\n    let clamped: i64 = imin(lower, hi);\n    return clamped;\n}\n",
+        [150, 10, 90],
+        90,
+    ),
+    (
+        "bench_loop_sum",
+        "#[strict]\nfn main(n: i64) -> i64 {\n    let acc: i64 = 0;\n    let i: i64 = 1;\n    while i <= n {\n        acc = acc + i;\n        i = i + 1;\n    }\n    return acc;\n}\n",
+        [100, 0, 0],
+        5050,
+    ),
+    (
+        "bench_branch_tree",
+        "#[strict]\nfn main(x: i64) -> i64 {\n    let c: trit = x <=> 10;\n    let r: i64 = match_trit c {\n        neg => x - 5,\n        zero => 100,\n        pos => x + 50\n    };\n    return r;\n}\n",
+        [20, 0, 0],
+        70,
+    ),
+    (
+        "bench_multi_call",
+        "#[strict]\nfn sq(x: i64) -> i64 {\n    return x * x;\n}\n#[strict]\nfn main(a: i64, b: i64) -> i64 {\n    return sq(a) + sq(b) + a * b;\n}\n",
+        [17, 23, 0],
+        1209,
+    ),
+    (
+        "bench_arena_buf",
+        "#[strict]\nfn main(n: i64) -> i64 {\n    let buf: bytes = anew(0);\n    let i: i64 = 0;\n    while i < n {\n        buf = iset_i64(buf, i);\n        i = i + 1;\n    }\n    let sum: i64 = 0;\n    let k: i64 = 0;\n    while k < n {\n        sum = sum + ld_u64(buf, k * 8);\n        k = k + 1;\n    }\n    return sum;\n}\n",
+        [16, 0, 0],
+        120,
+    ),
+];
+
+/// Measures one `.omni` program end-to-end:
+///   1. Compile `.omni` -> `.omni_bc` (measuring `compile_us` and `bc_words`)
+///   2. Lower `.omni_bc` -> native x86-64 ELF64 via M2-multi (`elf_bytes`)
+///   3. Execute `.omni_bc` on Pure-Omni M4 VM (`m4_vm_run_i64`) with P4-5 trace ring active
+///   4. Verify live P4-5 trace ring in Pure-Omni (`pure/m7/judge.omni::p7_verify_trace_ring`)
+pub fn p7_measure_program(
+    m4_mod: &BinModule,
+    m4_run_fn: u16,
+    judge_mod: &BinModule,
+    trace_fn: u16,
+    name: &'static str,
+    src: &str,
+    args: [i64; 3],
+    expected_val: i64,
+) -> Result<P7BenchMetrics, String> {
+    let t0 = std::time::Instant::now();
+    let bc = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(src))?;
+    let compile_us = t0.elapsed().as_micros() as i64;
+    let decoded = decode_omni_token_stream(&bc)?;
+    for f in &decoded.functions {
+        let rep = verify_binary_function(f);
+        if !rep.passed {
+            return Err(format!("P7-0 {} failed verifier: {:?}", name, rep.errors));
+        }
+    }
+    let elf = compile_pure_u16_to_x86_64_elf_multi(&bc, args[0], args[1], args[2])?;
+    let mut vm = OmniBinaryVm::with_budgets(50_000_000, 64 * 1024 * 1024);
+    let arena_out = match vm.execute_function(
+        m4_mod,
+        m4_run_fn,
+        vec![
+            OmniValue::Bytes(vec![0u8; 524_288]),
+            OmniValue::U16Array(bc.clone()),
+            OmniValue::Int(args[0]),
+            OmniValue::Int(args[1]),
+            OmniValue::Int(args[2]),
+            OmniValue::Int(200_000),
+            OmniValue::Int(1), // trace_mode = 1 (P4-5 binary trace ring active)
+        ],
+    )? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("P7-0 {} M4 VM returned {:?}", name, other)),
+    };
+    if arena_out.len() != 524_288 {
+        return Err(format!("P7-0 {} expected 512 KiB arena, got {}", name, arena_out.len()));
+    }
+    let st = 167_936usize;
+    let heap_top = u32::from_le_bytes(arena_out[st + 16..st + 20].try_into().unwrap()) as i64;
+    let trace_cnt = u32::from_le_bytes(arena_out[st + 24..st + 28].try_into().unwrap()) as i64;
+    let err_code = u32::from_le_bytes(arena_out[st + 28..st + 32].try_into().unwrap());
+    let ret_val = i64::from_le_bytes(arena_out[st + 32..st + 40].try_into().unwrap());
+    let steps = u32::from_le_bytes(arena_out[st + 44..st + 48].try_into().unwrap()) as i64;
+    if err_code != 0 || ret_val != expected_val {
+        return Err(format!(
+            "P7-0 {} exec mismatch: want {}, got val={} err={}",
+            name, expected_val, ret_val, err_code
+        ));
+    }
+    if trace_cnt <= 0 || steps <= 0 {
+        return Err(format!(
+            "P7-0 {} produced empty trace/steps (steps={}, trace_cnt={})",
+            name, steps, trace_cnt
+        ));
+    }
+    let trace_summary = match vm.execute_function(judge_mod, trace_fn, vec![OmniValue::Bytes(arena_out)])? {
+        OmniValue::Int(v) => v,
+        other => return Err(format!("P7-0 {} p7_verify_trace_ring returned {:?}", name, other)),
+    };
+    if trace_summary < 0 {
+        return Err(format!("P7-0 {} Pure-Omni trace-ring verifier rejected trace", name));
+    }
+    let ring_cnt = trace_summary >> 32;
+    if ring_cnt != trace_cnt {
+        return Err(format!(
+            "P7-0 {} trace count mismatch: VM_STATE={} vs Pure-Omni ring={}",
+            name, trace_cnt, ring_cnt
+        ));
+    }
+    Ok(P7BenchMetrics {
+        name,
+        compile_us,
+        bc_words: bc.len() as i64,
+        elf_bytes: elf.len() as i64,
+        vm_steps: steps,
+        trace_ops: trace_cnt,
+        arena_bytes: heap_top,
+        trace_csum: trace_summary & 0x7FFF_FFFF,
+        ret_val,
+    })
+}
+
+/// P7-0 Hard Gate (`omnic p7-measure`):
+/// Verifies the fixed 5-benchmark corpus, live P4-5 trace-ring feed, Pure-Omni balanced-ternary
+/// verdict engine (`pure/m7/judge.omni`), `@PACK5` packing parity, and written adopt/reject rules
+/// (+1t better, 0t neutral, -1t worse / regression / gate-fail) with all frozen hashes unchanged.
+pub fn selftest_p7_0_measure() -> Result<(usize, Vec<P7BenchMetrics>, u8), String> {
+    let mut checks = 0usize;
+
+    // Compile pure/m7/judge.omni + harness and M4 VM once.
+    let judge_u16 = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(P7_JUDGE_OMNI_SRC))?;
+    let judge_mod = decode_omni_token_stream(&judge_u16)?;
+    let n_jfns = judge_mod.functions.len();
+    if n_jfns < 5 {
+        return Err(format!("P7-0 judge module too small: {} fns", n_jfns));
+    }
+    // Function order at end of judge_harness.omni:
+    //   p7_judge_metrics_entry (-4), p7_trace_ring_entry (-3), p7_judge_dispatch6 (-2), main (-1)
+    let judge_metrics_fn = judge_mod.functions[n_jfns - 4].fn_idx;
+    let judge_trace_fn = judge_mod.functions[n_jfns - 3].fn_idx;
+    let judge_main = judge_mod.functions[n_jfns - 2].fn_idx;
+
+    let m4_u16 = if let Ok(raw) = std::fs::read("pure/m4/m4.omni_bc") {
+        decode_bytes_to_u16_stream(&raw)
+    } else {
+        with_lockstep_suspended(|| compile_omni_surface_to_u16(M4_VM_OMNI_SRC))?
+    };
+    let m4_mod = decode_omni_token_stream(&m4_u16)?;
+    let m4_run_fn = m4_mod.functions[m4_mod.functions.len() - 2].fn_idx;
+
+    let mut vm = OmniBinaryVm::with_budgets(50_000_000, 64 * 1024 * 1024);
+    let call_judge = |vm: &mut OmniBinaryVm, mode: i64, a: i64, b: i64, c: i64, d: i64, e: i64| -> Result<i64, String> {
+        match vm.execute_function(
+            &judge_mod,
+            judge_main,
+            vec![
+                OmniValue::Int(mode),
+                OmniValue::Int(a),
+                OmniValue::Int(b),
+                OmniValue::Int(c),
+                OmniValue::Int(d),
+                OmniValue::Int(e),
+            ],
+        )? {
+            OmniValue::Int(v) => Ok(v),
+            other => Err(format!("P7-0 judge mode={} returned {:?}", mode, other)),
+        }
+    };
+
+    // Check 1: M2-multi ELF64 compilation of pure/m7/judge.omni succeeds (validates full Pure-Omni AOT compliance).
+    let judge_elf = compile_pure_u16_to_x86_64_elf_multi(&judge_u16, 0, 100, 80)?;
+    if judge_elf.len() < 120 || &judge_elf[0..4] != &[0x7F, b'E', b'L', b'F'] {
+        return Err(String::from("P7-0 pure/m7/judge.omni failed M2-multi ELF64 emission"));
+    }
+    checks += 1;
+
+    // Check 2: Thresholding without division (p7_cmp_band, mode 0).
+    for &(base, cand, band, want) in &[
+        (100i64, 80, 5, 1i64),  // delta=+20 > 5 -> +1t (better)
+        (100, 95, 5, 0),        // delta=+5 == band -> 0t (inside band)
+        (100, 100, 5, 0),       // delta=0 -> 0t (neutral)
+        (100, 105, 5, 0),       // delta=-5 == -band -> 0t (inside band)
+        (100, 120, 5, -1),      // delta=-20 < -5 -> -1t (worse)
+        (50, 49, 0, 1),         // band=0 strict improvement -> +1t
+        (50, 51, 0, -1),        // band=0 strict regression -> -1t
+    ] {
+        let got = call_judge(&mut vm, 0, base, cand, band, 0, 0)?;
+        if got != want {
+            return Err(format!("P7-0 p7_cmp_band({},{},{}) got {} want {}", base, cand, band, got, want));
+        }
+    }
+    checks += 1;
+
+    // Check 3: Consensus voting across noisy runs (p7_vote3 mode 1, p7_vote5 mode 2).
+    for &(t0, t1, t2, want) in &[
+        (1i64, 1, 0, 1i64),
+        (1, -1, 0, 0),
+        (-1, -1, 1, -1),
+        (0, 0, 1, 1),
+        (0, 0, 0, 0),
+    ] {
+        let got = call_judge(&mut vm, 1, t0, t1, t2, 0, 0)?;
+        if got != want {
+            return Err(format!("P7-0 p7_vote3({},{},{}) got {} want {}", t0, t1, t2, got, want));
+        }
+    }
+    for &(t0, t1, t2, t3, t4, want) in &[
+        (1i64, 1, 1, -1, 0, 1i64),
+        (-1, -1, 0, 0, 1, -1),
+        (1, -1, 1, -1, 0, 0),
+    ] {
+        let got = call_judge(&mut vm, 2, t0, t1, t2, t3, t4)?;
+        if got != want {
+            return Err(format!("P7-0 p7_vote5 got {} want {}", got, want));
+        }
+    }
+    checks += 1;
+
+    // Check 4: @PACK5 packing & unpacking exact parity with Rust pack5_encode / pack5_decode.
+    for &(t0, t1, t2, t3, t4) in &[
+        (-1i8, -1, -1, -1, -1),
+        (0, 0, 0, 0, 0),
+        (1, 1, 1, 1, 1),
+        (1, 0, -1, 1, 0),
+        (0, 1, 0, 0, 0),
+        (0, -1, 0, 0, 0),
+    ] {
+        let rust_b = pack5_encode(&[t0, t1, t2, t3, t4])[0] as i64;
+        let omni_b = call_judge(&mut vm, 5, t0 as i64, t1 as i64, t2 as i64, t3 as i64, t4 as i64)?;
+        if omni_b != rust_b {
+            return Err(format!("P7-0 @PACK5 pack mismatch: omni={} rust={}", omni_b, rust_b));
+        }
+        let rust_unpacked = pack5_decode(&[rust_b as u8], 5).map_err(|e| e.to_string())?;
+        for idx in 0..5 {
+            let omni_t = call_judge(&mut vm, 6, omni_b, idx as i64, 0, 0, 0)?;
+            if omni_t != rust_unpacked[idx] as i64 {
+                return Err(format!("P7-0 @PACK5 unpack mismatch at byte {} idx {}: omni={} rust={}", omni_b, idx, omni_t, rust_unpacked[idx]));
+            }
+        }
+    }
+    // Invalid @PACK5 byte (> 242) safely returns 0t.
+    if call_judge(&mut vm, 6, 250, 0, 0, 0, 0)? != 0 {
+        return Err(String::from("P7-0 @PACK5 invalid byte >242 must return 0t"));
+    }
+    checks += 1;
+
+    // Check 5: Execute all 5 fixed benchmarks end-to-end (M3 compile, M2 ELF64, M4 VM + P4-5 trace ring).
+    let mut baseline: Vec<P7BenchMetrics> = Vec::with_capacity(P7_BENCHMARK_CORPUS.len());
+    for &(bname, bsrc, bargs, want) in P7_BENCHMARK_CORPUS {
+        let m = p7_measure_program(&m4_mod, m4_run_fn, &judge_mod, judge_trace_fn, bname, bsrc, bargs, want)?;
+        baseline.push(m);
+    }
+    // Also verify corrupted (non-monotonic) trace ring is rejected by Pure-Omni p7_verify_trace_ring.
+    let mut bad_arena = vec![0u8; 524_288];
+    bad_arena[167_960..167_964].copy_from_slice(&2u32.to_le_bytes()); // trace_cnt = 2
+    bad_arena[458_752..458_756].copy_from_slice(&5u32.to_le_bytes()); // entry 0 step = 5
+    bad_arena[458_768..458_772].copy_from_slice(&3u32.to_le_bytes()); // entry 1 step = 3 (non-monotonic!)
+    let bad_res = match vm.execute_function(&judge_mod, judge_trace_fn, vec![OmniValue::Bytes(bad_arena)])? {
+        OmniValue::Int(v) => v,
+        other => return Err(format!("P7-0 bad trace check returned {:?}", other)),
+    };
+    if bad_res != -1 {
+        return Err(format!("P7-0 non-monotonic trace ring must return -1, got {}", bad_res));
+    }
+    checks += 1;
+
+    let judge_pair = |vm: &mut OmniBinaryVm, base: &P7BenchMetrics, cand: &P7BenchMetrics, band_bc: i64, band_elf: i64, band_steps: i64, band_arena: i64| -> Result<i64, String> {
+        match vm.execute_function(
+            &judge_mod,
+            judge_metrics_fn,
+            vec![
+                OmniValue::Int(base.bc_words), OmniValue::Int(cand.bc_words), OmniValue::Int(band_bc),
+                OmniValue::Int(base.elf_bytes), OmniValue::Int(cand.elf_bytes), OmniValue::Int(band_elf),
+                OmniValue::Int(base.vm_steps), OmniValue::Int(cand.vm_steps), OmniValue::Int(band_steps),
+                OmniValue::Int(base.arena_bytes), OmniValue::Int(cand.arena_bytes), OmniValue::Int(band_arena),
+            ],
+        )? {
+            OmniValue::Int(v) => Ok(v),
+            other => Err(format!("P7-0 p7_judge_metrics_entry returned {:?}", other)),
+        }
+    };
+
+    // Check 6: End-to-end KNOWN BETTER change (+1t / ADOPT).
+    // Tighter verified implementation of bench_loop_sum: closed-form `n * (n + 1) / 2` -> same output 5050,
+    // strictly smaller bc_words, smaller elf_bytes, and dramatically fewer vm_steps & trace_ops!
+    let better_src = "#[strict]\nfn main(n: i64) -> i64 {\n    return (n * (n + 1)) / 2;\n}\n";
+    let better_m = p7_measure_program(&m4_mod, m4_run_fn, &judge_mod, judge_trace_fn, "bench_loop_sum_better", better_src, [100, 0, 0], 5050)?;
+    let v_better = judge_pair(&mut vm, &baseline[1], &better_m, 0, 0, 0, 0)?;
+    let suite_better = call_judge(&mut vm, 3, 0, v_better, 0, 0, 0)?;
+    let adopt_better = call_judge(&mut vm, 4, 1, suite_better, 0, 0, 0)?;
+    let packed_better = call_judge(&mut vm, 5, 0, v_better, 0, 0, 0)? as u8;
+    if v_better != 1 || suite_better != 1 || adopt_better != 1 || packed_better != pack5_encode(&[0, 1, 0, 0, 0])[0] {
+        return Err(format!(
+            "P7-0 known-better must judge +1t (ADOPT): v={} suite={} adopt={} pack5={}",
+            v_better, suite_better, adopt_better, packed_better
+        ));
+    }
+    checks += 1;
+
+    // Check 7: End-to-end KNOWN WORSE change (-1t / REJECT).
+    // Bloated verified implementation of bench_loop_sum: extra redundant arithmetic inside the loop -> same output 5050,
+    // strictly larger bc_words, larger elf_bytes, and more vm_steps & trace_ops!
+    let worse_src = "#[strict]\nfn main(n: i64) -> i64 {\n    let acc: i64 = 0;\n    let i: i64 = 1;\n    while i <= n {\n        let t0: i64 = i + 0;\n        let t1: i64 = t0 * 1;\n        acc = acc + t1;\n        i = i + 1;\n    }\n    return acc;\n}\n";
+    let worse_m = p7_measure_program(&m4_mod, m4_run_fn, &judge_mod, judge_trace_fn, "bench_loop_sum_worse", worse_src, [100, 0, 0], 5050)?;
+    let v_worse = judge_pair(&mut vm, &baseline[1], &worse_m, 0, 0, 0, 0)?;
+    let suite_worse = call_judge(&mut vm, 3, 0, v_worse, 0, 0, 0)?;
+    let adopt_worse = call_judge(&mut vm, 4, 1, suite_worse, 0, 0, 0)?;
+    if v_worse != -1 || suite_worse != -1 || adopt_worse != -1 {
+        return Err(format!(
+            "P7-0 known-worse must judge -1t (REJECT): v={} suite={} adopt={}",
+            v_worse, suite_worse, adopt_worse
+        ));
+    }
+    checks += 1;
+
+    // Check 8: End-to-end KNOWN NEUTRAL change (0t / HOLD).
+    let v_neutral = judge_pair(&mut vm, &baseline[1], &baseline[1], 0, 0, 0, 0)?;
+    let suite_neutral = call_judge(&mut vm, 3, 0, v_neutral, 0, 0, 0)?;
+    let adopt_neutral = call_judge(&mut vm, 4, 1, suite_neutral, 0, 0, 0)?;
+    let packed_neutral = call_judge(&mut vm, 5, 0, v_neutral, 0, 0, 0)? as u8;
+    if v_neutral != 0 || suite_neutral != 0 || adopt_neutral != 0 || packed_neutral != 121 {
+        return Err(format!(
+            "P7-0 known-neutral must judge 0t (HOLD): v={} suite={} adopt={} pack5={}",
+            v_neutral, suite_neutral, adopt_neutral, packed_neutral
+        ));
+    }
+    checks += 1;
+
+    // Check 9: No-regression rule (mixed +1/-1 -> -1t REJECT) and gate-failure rule (gates_ok=0 -> -1t REJECT).
+    let suite_mixed = call_judge(&mut vm, 3, 1, 1, -1, 0, 1)?;
+    let adopt_gate_fail = call_judge(&mut vm, 4, 0, 1, 0, 0, 0)?;
+    if suite_mixed != -1 || adopt_gate_fail != -1 {
+        return Err(format!(
+            "P7-0 no-regression/gate-fail violated: mixed={} gate_fail={}",
+            suite_mixed, adopt_gate_fail
+        ));
+    }
+    checks += 1;
+
+    // Check 10: All frozen FNV-1a64 hashes untouched.
+    selftest_m2_frozen_hashes()?;
+    checks += 1;
+
+    Ok((checks, baseline, packed_better))
+}
+

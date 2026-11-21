@@ -23303,6 +23303,7 @@ pub fn run_m2_foundation_selftests() -> Result<usize, String> {
     n += selftest_p4_3_thin_shim()?;
     n += selftest_p4_4_wasm_host()?;
     n += selftest_p5_2_zero_shim_sys()?.0;
+    n += selftest_p7_0_measure()?.0;
     Ok(n)
 }
 
@@ -23670,6 +23671,25 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
                 1
             }
         },
+        "p7-measure" => match selftest_p7_0_measure() {
+            Ok((n, metrics, packed_better)) => {
+                for m in &metrics {
+                    println!(
+                        "  [P7-BENCH] {:<18} ret={:<5} bc={}w elf={}B steps={} trace={} arena={}B compile={}us",
+                        m.name, m.ret_val, m.bc_words, m.elf_bytes, m.vm_steps, m.trace_ops, m.arena_bytes, m.compile_us
+                    );
+                }
+                println!(
+                    "[P7-MEASURE PASS] {} checks (5 fixed benchmarks + P4-5 trace ring + pure/m7/judge.omni ternary +1t/0t/-1t + @PACK5 byte={} + frozen hashes intact)",
+                    n, packed_better
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("[P7-MEASURE FAIL] {}", e);
+                1
+            }
+        },
         "p5-sys" => match selftest_p5_2_zero_shim_sys() {
             Ok((n, sz, h, native)) => {
                 println!(
@@ -23838,7 +23858,7 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
             }
         }
         _ => {
-            eprintln!("usage: omni m2-frozen | m2-lock | m2-census | m2-labels | m2-lint [file.omni|file.omni_asm]... | m2-decode [file.omni_bc] | m2-elf | m2-compile | m2-multi | m2-multi-pure | m2-wasm-multi | m2-verify | m2-fixed-point [--write-seed] | m3-lex | m3-skim | m3-expr | m3-stmt | m3-lower | m3-lockstep | m3-4backend | m3-fixed-point [--write-seed] | p4-vm | p4-exec <file.omni_bc> [a0] [a1] [a2] [--trace] | p4-shim | p4-wasm | p5-sys | p5-selfhost [--write-seed]");
+            eprintln!("usage: omni m2-frozen | m2-lock | m2-census | m2-labels | m2-lint [file.omni|file.omni_asm]... | m2-decode [file.omni_bc] | m2-elf | m2-compile | m2-multi | m2-multi-pure | m2-wasm-multi | m2-verify | m2-fixed-point [--write-seed] | m3-lex | m3-skim | m3-expr | m3-stmt | m3-lower | m3-lockstep | m3-4backend | m3-fixed-point [--write-seed] | p4-vm | p4-exec <file.omni_bc> [a0] [a1] [a2] [--trace] | p4-shim | p4-wasm | p5-sys | p5-selfhost [--write-seed] | p7-measure");
             2
         }
     }
@@ -24143,6 +24163,7 @@ fn main() {
                 println!("  m3-gate [dir] | m3-lex | m3-skim | m3-expr | m3-stmt | m3-lower | m3-lockstep | m3-4backend | m3-fixed-point [--write-seed]");
                 println!("  p4-vm | p4-shim | p4-wasm | p4-exec <file.omni_bc> [a0] [a1] [a2] [--trace]");
                 println!("  p5-sys | p5-selfhost [--write-seed]");
+                println!("  p7-measure                        Phase 7 (P7-0) benchmark corpus, P4-5 trace ring & ternary verdict gate");
                 println!();
                 println!("Compilation, Execution & Tooling:");
                 println!("  run <file.omni|file.omni_bc> [args...]   Compile/verify and execute on VM");
@@ -24170,7 +24191,7 @@ fn main() {
             "harness" | "--harness" => {
                 std::process::exit(run_omni_harness_cli(&cli_args[2..]));
             }
-            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" => {
+            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" => {
                 std::process::exit(run_m2_cli(&cli_args[1..]));
             }
             "agent-driver" | "--agent-driver" => {

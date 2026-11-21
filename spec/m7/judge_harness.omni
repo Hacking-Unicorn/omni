@@ -1,0 +1,79 @@
+// Phase 7 (P7-0) harness for `pure/m7/judge.omni`.
+// Exposes mode-dispatched entry points for differential testing across Rust VM & Pure-Omni M4 VM.
+//   mode 0: p7_cmp_band(a, b, c) -> i64 (-1, 0, +1)
+//   mode 1: p7_vote3(a, b, c) -> i64
+//   mode 2: p7_vote5(a, b, c, d, e) -> i64
+//   mode 3: p7_aggregate_suite5(a, b, c, d, e) -> i64
+//   mode 4: p7_adopt_rule(gates_ok=a, suite_verdict=b) -> i64
+//   mode 5: p7_pack5_byte(a, b, c, d, e) -> i64 (0..=242)
+//   mode 6: p7_unpack5_trit(packed=a, idx=b) -> i64 (-1, 0, +1)
+
+#[strict]
+fn p7_dispatch_lo(mode: i64, a: i64, b: i64, c: i64, d: i64, e: i64) -> i64 {
+    let r: i64 = if_pos mode <=> 0 {
+        let r1: i64 = if_pos mode <=> 1 {
+            p7_trit_to_i64(p7_vote5(p7_i64_to_trit(a), p7_i64_to_trit(b), p7_i64_to_trit(c), p7_i64_to_trit(d), p7_i64_to_trit(e)))
+        } else {
+            p7_trit_to_i64(p7_vote3(p7_i64_to_trit(a), p7_i64_to_trit(b), p7_i64_to_trit(c)))
+        };
+        r1
+    } else {
+        p7_trit_to_i64(p7_cmp_band(a, b, c))
+    };
+    return r;
+}
+
+#[strict]
+fn p7_dispatch_hi(mode: i64, a: i64, b: i64, c: i64, d: i64, e: i64) -> i64 {
+    let r: i64 = if_pos mode <=> 3 {
+        let r1: i64 = if_pos mode <=> 4 {
+            let r2: i64 = if_pos mode <=> 5 {
+                p7_trit_to_i64(p7_unpack5_trit(a, b))
+            } else {
+                p7_pack5_byte(p7_i64_to_trit(a), p7_i64_to_trit(b), p7_i64_to_trit(c), p7_i64_to_trit(d), p7_i64_to_trit(e))
+            };
+            r2
+        } else {
+            p7_trit_to_i64(p7_adopt_rule(a, p7_i64_to_trit(b)))
+        };
+        r1
+    } else {
+        p7_trit_to_i64(p7_aggregate_suite5(p7_i64_to_trit(a), p7_i64_to_trit(b), p7_i64_to_trit(c), p7_i64_to_trit(d), p7_i64_to_trit(e)))
+    };
+    return r;
+}
+
+#[strict]
+fn p7_judge_metrics_entry(
+    base_bc: i64, cand_bc: i64, band_bc: i64,
+    base_elf: i64, cand_elf: i64, band_elf: i64,
+    base_steps: i64, cand_steps: i64, band_steps: i64,
+    base_arena: i64, cand_arena: i64, band_arena: i64
+) -> i64 {
+    return p7_trit_to_i64(p7_judge_metrics4(
+        base_bc, cand_bc, band_bc,
+        base_elf, cand_elf, band_elf,
+        base_steps, cand_steps, band_steps,
+        base_arena, cand_arena, band_arena
+    ));
+}
+
+#[strict]
+fn p7_trace_ring_entry(w: bytes) -> i64 {
+    return p7_verify_trace_ring(w);
+}
+
+#[strict]
+fn p7_judge_dispatch6(mode: i64, a: i64, b: i64, c: i64, d: i64, e: i64) -> i64 {
+    let r: i64 = if_pos mode <=> 2 {
+        p7_dispatch_hi(mode, a, b, c, d, e)
+    } else {
+        p7_dispatch_lo(mode, a, b, c, d, e)
+    };
+    return r;
+}
+
+#[strict]
+fn main(mode: i64, a: i64, b: i64, c: i64) -> i64 {
+    return p7_judge_dispatch6(mode, a, b, c, 0, 0);
+}
