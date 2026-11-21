@@ -1,0 +1,334 @@
+// M2-14: Pure-Omni iterative multi-AOT module verifier (`pure/m2/verify/mod_check.omni`).
+// Verifies module decode, unique fn_idx, CALL targets & arities, acyclic call graph
+// (iterative Kahn topological sort — no recursion), and L1-L12 label-key parity using
+// `pure/m2/labels.omni`. All functions obey M2 lint budgets (<= 120 SSA, <= 12 labels,
+// linear bytes discipline).
+//
+// Arena band layout (inside m2l_out() = 0x28000):
+//   0x28000 .. 0x29FFF : FN_TABLE   (512 x 16 B: fn_idx, pcnt, ins_start, ins_cnt)
+//   0x2A000 .. 0x2DFFF : CALL_EDGES (2048 x 8 B: caller_slot, callee_slot)
+//   0x2E000 .. 0x2E7FF : INDEG      (512 x 4 B)
+//   0x2E800 .. 0x2EFFF : QUEUE      (512 x 4 B)
+//   0x2F000 .. 0x2F03F : STATE      (fn_cnt, edge_cnt, err_code, err_off, qtail)
+//
+// Error codes (packed as (err_code << 32) | err_off; 0 = PASS):
+//   0 = PASS
+//   1 = DECODE_ERROR
+//   2 = DUPLICATE_FN_IDX
+//   3 = BAD_CALL_TARGET
+//   4 = ARITY_MISMATCH
+//   5 = RECURSION (call graph cycle)
+//   6 = BAD_LABEL (invalid label key >= 4080 or unresolved branch target)
+
+#[strict]
+fn m2v_fn_tbl() -> i64 { return 163840; }
+#[strict]
+fn m2v_edges() -> i64 { return 172032; }
+#[strict]
+fn m2v_indeg() -> i64 { return 188416; }
+#[strict]
+fn m2v_queue() -> i64 { return 190464; }
+#[strict]
+fn m2v_state() -> i64 { return 192512; }
+
+#[strict]
+fn m2v_set_err(w: bytes, code: i64, off: i64) -> bytes {
+    let cur: i64 = ld_u32(w, m2v_state() + 8);
+    let c: trit = cur <=> 0;
+    let out: bytes = if_pos c {
+        w
+    } else {
+        let w1: bytes = st_u32(w, m2v_state() + 8, code);
+        let w2: bytes = st_u32(w1, m2v_state() + 12, off);
+        w2
+    };
+    return out;
+}
+
+#[strict]
+fn m2v_find_fn(w: bytes, fn_cnt: i64, target_id: i64) -> i64 {
+    let i: i64 = 0;
+    let found: i64 = -1;
+    let go: i64 = m2u_lt(0, fn_cnt);
+    while go <=> 0 {
+        let fid: i64 = ld_u32(w, m2v_fn_tbl() + i * 16);
+        let hit: i64 = m2u_eq(fid, target_id);
+        found = m2u_sel(hit, i, found);
+        i = i + 1;
+        go = (1 - hit) * m2u_lt(i, fn_cnt);
+    }
+    return found;
+}
+
+#[strict]
+fn m2v_record_fn(w: bytes, arr: array, n: i64, pos: i64) -> bytes {
+    let fn_cnt: i64 = ld_u32(w, m2v_state());
+    let fid: i64 = m2d_fn_idx(arr, n, pos);
+    let dup: i64 = m2v_find_fn(w, fn_cnt, fid);
+    let out: bytes = if_pos m2u_ge(dup, 0) <=> 0 {
+        m2v_set_err(w, 2, pos)
+    } else {
+        let pcnt: i64 = m2d_fn_pcnt(arr, n, pos);
+        let sig: i64 = m2d_fn_sig(arr, n, pos);
+        let icnt: i64 = m2u_tok(arr, n, sig + 2);
+        let base: i64 = m2v_fn_tbl() + fn_cnt * 16;
+        let w1: bytes = st_u32(w, base, fid);
+        let w2: bytes = st_u32(w1, base + 4, pcnt);
+        let w3: bytes = st_u32(w2, base + 8, sig + 3);
+        let w4: bytes = st_u32(w3, base + 12, icnt);
+        let w5: bytes = st_u32(w4, m2v_indeg() + fn_cnt * 4, 0);
+        st_u32(w5, m2v_state(), fn_cnt + 1)
+    };
+    return out;
+}
+
+#[strict]
+fn m2v_collect_fns(w_in: bytes, arr: array, n: i64) -> bytes {
+    let w0: bytes = st_u32(w_in, m2v_state(), 0);
+    let w1: bytes = st_u32(w0, m2v_state() + 4, 0);
+    let w2: bytes = st_u32(w1, m2v_state() + 8, 0);
+    let w: bytes = st_u32(w2, m2v_state() + 12, 0);
+    let pos: i64 = 1;
+    let go: i64 = m2u_lt(pos, n);
+    while go <=> 0 {
+        let tok: i64 = m2u_tok(arr, n, pos);
+        let is_end: i64 = m2u_eq(tok, 32495);
+        let is_fn: i64 = m2u_eq(tok, 32483);
+        w = if_pos is_fn <=> 0 {
+            m2v_record_fn(w, arr, n, pos)
+        } else {
+            w
+        };
+        let nxt: i64 = m2u_sel(is_end, n, m2d_item_scan(arr, n, pos));
+        let bad: i64 = m2d_is_err(nxt);
+        pos = m2u_sel(bad, n, nxt);
+        go = (1 - is_end) * (1 - bad) * m2u_lt(pos, n);
+    }
+    return w;
+}
+
+#[strict]
+fn m2v_check_lbl_op(w: bytes, packed: i64, off: i64) -> bytes {
+    let slot: i64 = m2lbl_slot_of(packed);
+    let ok_slot: i64 = m2u_ge(slot, 0);
+    let out: bytes = if_pos ok_slot <=> 0 {
+        let def: i64 = m2lbl_lookup(w, slot);
+        let w1: bytes = if_pos m2u_ge(def, 0) <=> 0 {
+            w
+        } else {
+            m2v_set_err(w, 6, off)
+        };
+        w1
+    } else {
+        m2v_set_err(w, 6, off)
+    };
+    return out;
+}
+
+#[strict]
+fn m2v_check_br_targets(w: bytes, arr: array, n: i64, off: i64, op: i64, p0: i64) -> bytes {
+    let p1: i64 = m2d_operand(arr, n, m2d_next(p0));
+    let w1: bytes = m2v_check_lbl_op(w, p1, off);
+    let out: bytes = if_pos m2u_eq(op, 32578) <=> 0 {
+        let p2: i64 = m2d_operand(arr, n, m2d_next(p1));
+        let p3: i64 = m2d_operand(arr, n, m2d_next(p2));
+        let w2: bytes = m2v_check_lbl_op(w1, p2, off);
+        m2v_check_lbl_op(w2, p3, off)
+    } else {
+        w1
+    };
+    return out;
+}
+
+#[strict]
+fn m2v_check_branch_ins(w: bytes, arr: array, n: i64, off: i64, op: i64) -> bytes {
+    let p0: i64 = m2d_operand(arr, n, off + 1);
+    let out: bytes = if_pos m2u_eq(op, 32576) <=> 0 {
+        let sl: i64 = m2lbl_slot_of(p0);
+        let w1: bytes = if_pos m2u_lt(sl, 0) <=> 0 {
+            m2v_set_err(w, 6, off)
+        } else {
+            w
+        };
+        w1
+    } else {
+        let w2: bytes = if_pos m2u_eq(op, 32577) <=> 0 {
+            m2v_check_lbl_op(w, p0, off)
+        } else {
+            m2v_check_br_targets(w, arr, n, off, op, p0)
+        };
+        w2
+    };
+    return out;
+}
+
+#[strict]
+fn m2v_add_call_edge(w: bytes, caller_slot: i64, cslot: i64, got_args: i64, off: i64) -> bytes {
+    let need_args: i64 = ld_u32(w, m2v_fn_tbl() + cslot * 16 + 4);
+    let out: bytes = if_pos m2u_eq(need_args, got_args) <=> 0 {
+        let ecnt: i64 = ld_u32(w, m2v_state() + 4);
+        let eoff: i64 = m2v_edges() + ecnt * 8;
+        let w1: bytes = st_u32(w, eoff, caller_slot);
+        let w2: bytes = st_u32(w1, eoff + 4, cslot);
+        let w3: bytes = st_u32(w2, m2v_state() + 4, ecnt + 1);
+        let ind: i64 = ld_u32(w3, m2v_indeg() + cslot * 4);
+        st_u32(w3, m2v_indeg() + cslot * 4, ind + 1)
+    } else {
+        m2v_set_err(w, 4, off)
+    };
+    return out;
+}
+
+#[strict]
+fn m2v_check_call_ins(w: bytes, arr: array, n: i64, caller_slot: i64, off: i64) -> bytes {
+    let fn_cnt: i64 = ld_u32(w, m2v_state());
+    let op_start: i64 = off + 3 + m2d_ins_has_dest(arr, n, off);
+    let p0: i64 = m2d_operand(arr, n, op_start);
+    let is_fref: i64 = m2u_eq(m2d_kind(p0), m2k_fn_ref());
+    let out: bytes = if_pos is_fref <=> 0 {
+        let callee_id: i64 = m2d_uval(p0);
+        let cslot: i64 = m2v_find_fn(w, fn_cnt, callee_id);
+        let w1: bytes = if_pos m2u_ge(cslot, 0) <=> 0 {
+            let got_args: i64 = m2d_ins_nops(arr, n, off) - 1;
+            m2v_add_call_edge(w, caller_slot, cslot, got_args, off)
+        } else {
+            m2v_set_err(w, 3, off)
+        };
+        w1
+    } else {
+        m2v_set_err(w, 3, off)
+    };
+    return out;
+}
+
+#[strict]
+fn m2v_step_ins(w: bytes, arr: array, n: i64, fslot: i64, cur: i64) -> bytes {
+    let op: i64 = m2d_ins_op(arr, n, cur);
+    let is_call: i64 = m2u_eq(op, 32584);
+    let is_br: i64 = m2u_ge(op, 32576) * m2u_ge(32580, op);
+    let w1: bytes = if_pos is_call <=> 0 {
+        m2v_check_call_ins(w, arr, n, fslot, cur)
+    } else {
+        w
+    };
+    let w2: bytes = if_pos is_br <=> 0 {
+        m2v_check_branch_ins(w1, arr, n, cur, op)
+    } else {
+        w1
+    };
+    return w2;
+}
+
+#[strict]
+fn m2v_check_fn_body(w_in: bytes, arr: array, n: i64, fslot: i64) -> bytes {
+    let base: i64 = m2v_fn_tbl() + fslot * 16;
+    let ins_start: i64 = ld_u32(w_in, base + 8);
+    let ins_cnt: i64 = ld_u32(w_in, base + 12);
+    let w0: bytes = m2lbl_clear_all(w_in);
+    let w: bytes = m2lbl_collect_fn(w0, arr, n, ins_start, ins_cnt);
+    let cur: i64 = ins_start;
+    let i: i64 = 0;
+    let go: i64 = m2u_lt(0, ins_cnt);
+    while go <=> 0 {
+        w = m2v_step_ins(w, arr, n, fslot, cur);
+        let sc: i64 = m2d_ins_scan(arr, n, cur);
+        cur = m2d_next(sc);
+        i = i + 1;
+        go = m2u_lt(i, ins_cnt);
+    }
+    return w;
+}
+
+#[strict]
+fn m2v_kahn_seed(w_in: bytes, fn_cnt: i64) -> bytes {
+    let w: bytes = st_u32(w_in, m2v_state() + 16, 0);
+    let i: i64 = 0;
+    while m2u_lt(i, fn_cnt) <=> 0 {
+        let ind: i64 = ld_u32(w, m2v_indeg() + i * 4);
+        w = if_pos m2u_eq(ind, 0) <=> 0 {
+            let qt: i64 = ld_u32(w, m2v_state() + 16);
+            let w1: bytes = st_u32(w, m2v_queue() + qt * 4, i);
+            st_u32(w1, m2v_state() + 16, qt + 1)
+        } else {
+            w
+        };
+        i = i + 1;
+    }
+    return w;
+}
+
+#[strict]
+fn m2v_kahn_relax_edge(w: bytes, dst: i64) -> bytes {
+    let nv: i64 = ld_u32(w, m2v_indeg() + dst * 4) - 1;
+    let w1: bytes = st_u32(w, m2v_indeg() + dst * 4, nv);
+    let out: bytes = if_pos m2u_eq(nv, 0) <=> 0 {
+        let qt: i64 = ld_u32(w1, m2v_state() + 16);
+        let w2: bytes = st_u32(w1, m2v_queue() + qt * 4, dst);
+        st_u32(w2, m2v_state() + 16, qt + 1)
+    } else {
+        w1
+    };
+    return out;
+}
+
+#[strict]
+fn m2v_kahn_relax_node(w_in: bytes, u: i64, edge_cnt: i64) -> bytes {
+    let w: bytes = w_in;
+    let e: i64 = 0;
+    while m2u_lt(e, edge_cnt) <=> 0 {
+        let src: i64 = ld_u32(w, m2v_edges() + e * 8);
+        w = if_pos m2u_eq(src, u) <=> 0 {
+            let dst: i64 = ld_u32(w, m2v_edges() + e * 8 + 4);
+            m2v_kahn_relax_edge(w, dst)
+        } else {
+            w
+        };
+        e = e + 1;
+    }
+    return w;
+}
+
+#[strict]
+fn m2v_check_acyclic(w_in: bytes) -> bytes {
+    let fn_cnt: i64 = ld_u32(w_in, m2v_state());
+    let edge_cnt: i64 = ld_u32(w_in, m2v_state() + 4);
+    let w: bytes = m2v_kahn_seed(w_in, fn_cnt);
+    let qhead: i64 = 0;
+    let go: i64 = m2u_lt(qhead, ld_u32(w, m2v_state() + 16));
+    while go <=> 0 {
+        let u: i64 = ld_u32(w, m2v_queue() + qhead * 4);
+        qhead = qhead + 1;
+        w = m2v_kahn_relax_node(w, u, edge_cnt);
+        go = m2u_lt(qhead, ld_u32(w, m2v_state() + 16));
+    }
+    w = if_pos m2u_lt(qhead, fn_cnt) <=> 0 {
+        m2v_set_err(w, 5, 0)
+    } else {
+        w
+    };
+    return w;
+}
+
+// Entrypoint: verifies `arr` (.omni_bc u16 stream) inside pre-allocated `w_in` arena.
+// Returns 0 on PASS, or `(err_code << 32) | err_off` on reject.
+#[strict]
+fn m2_verify_module_pure(w_in: bytes, arr: array) -> i64 {
+    let n: i64 = slen(arr);
+    let scan: i64 = m2d_module_scan(arr);
+    let res: i64 = if_pos m2d_is_err(scan) <=> 0 {
+        (1 << 32) | m2d_err_off(scan)
+    } else {
+        let w: bytes = m2v_collect_fns(w_in, arr, n);
+        let fn_cnt: i64 = ld_u32(w, m2v_state());
+        let i: i64 = 0;
+        while m2u_lt(i, fn_cnt) <=> 0 {
+            w = m2v_check_fn_body(w, arr, n, i);
+            i = i + 1;
+        }
+        w = m2v_check_acyclic(w);
+        let ec: i64 = ld_u32(w, m2v_state() + 8);
+        let eo: i64 = ld_u32(w, m2v_state() + 12);
+        (ec << 32) | eo
+    };
+    return res;
+}

@@ -1,0 +1,27 @@
+// Q8e: 8 value if_pos (16 labels) + 1 do_while (1 label) = 17 labels. Rejected today and
+// must stay rejected after C4 (cap 16).
+fn main(x: i64) -> i64 {
+    let c = x <=> 0;
+    let acc = 0;
+    let r0 = if_pos c { 1 } else { 0 };
+    acc = acc + r0;
+    let r1 = if_pos c { 2 } else { 0 };
+    acc = acc + r1;
+    let r2 = if_pos c { 3 } else { 0 };
+    acc = acc + r2;
+    let r3 = if_pos c { 4 } else { 0 };
+    acc = acc + r3;
+    let r4 = if_pos c { 5 } else { 0 };
+    acc = acc + r4;
+    let r5 = if_pos c { 6 } else { 0 };
+    acc = acc + r5;
+    let r6 = if_pos c { 7 } else { 0 };
+    acc = acc + r6;
+    let r7 = if_pos c { 8 } else { 0 };
+    acc = acc + r7;
+    let i = 0;
+    do_while {
+        i = i + 1;
+    } 2 <=> i;
+    return acc + i;
+}

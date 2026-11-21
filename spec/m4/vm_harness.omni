@@ -1,0 +1,11 @@
+// Phase 4 (P4-1/P4-2/P4-4/P4-5) harness for `pure/m4/vm.omni`.
+// 4-param multi-AOT-compliant entry (passes a0, a1, a2 via VM_STATE +48/+56/+64).
+// Returns 64-byte VM_STATE slice via ret_slice.
+#[strict]
+fn main(w: bytes, arr: array, fuel: i64, trace_mode: i64) -> bytes {
+    let a0: i64 = ld_u64(w, m4a_state() + 48);
+    let a1: i64 = ld_u64(w, m4a_state() + 56);
+    let a2: i64 = ld_u64(w, m4a_state() + 64);
+    let out: bytes = m4_vm_run_i64(w, arr, a0, a1, a2, fuel, trace_mode);
+    return ret_slice(out, m4a_state(), 64);
+}

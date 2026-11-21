@@ -26,6 +26,8 @@
     {"id": "pack5_direct_aot", "file": "goldens/pack5_direct_aot.omni", "locked_u16_tokens": null, "args": [], "expected_result": "2422", "expected_backend": "aot"},
     {"id": "route_kv_golden", "file": "goldens/route_kv_golden.omni", "locked_u16_tokens": null, "args": ["42"], "expected_result": "200000777", "expected_backend": "vm"},
     {"id": "route_db_query_golden", "file": "goldens/route_db_query_golden.omni", "locked_u16_tokens": null, "args": ["42"], "expected_result": "200000420", "expected_backend": "vm"},
+    {"id": "route_db_get_miss_golden", "file": "goldens/route_db_get_miss_golden.omni", "locked_u16_tokens": null, "args": ["42"], "expected_result": "199999999", "expected_backend": "vm"},
+    {"id": "route_db_query_miss_golden", "file": "goldens/route_db_query_miss_golden.omni", "locked_u16_tokens": null, "args": ["42"], "expected_result": "199999999", "expected_backend": "vm"},
     {"id": "stdlib_macro_pipeline_golden", "file": "goldens/stdlib_macro_pipeline_golden.omni", "locked_u16_tokens": null, "args": ["45", "10", "40"], "expected_result": "100", "expected_backend": "vm"}
   ],
   "negative_goldens": [
@@ -44,5 +46,8 @@
     {"id": "neg_corrupt_pack5", "file": "goldens/neg_corrupt_pack5.omni", "strict": true, "expected_code": "CORRUPT_PACK5", "expected_line": 5, "expected_col": 23},
     {"id": "neg_ambiguous_grammar", "file": "goldens/neg_ambiguous_grammar.omni", "strict": true, "expected_code": "AMBIGUOUS_GRAMMAR", "expected_line": 2, "expected_col": 19},
     {"id": "neg_syntax_error", "file": "goldens/neg_syntax_error.omni", "strict": false, "expected_code": "SYNTAX_ERROR", "expected_line": 2, "expected_col": 13}
+  ],
+  "deferred_multi_file_goldens": [
+    {"id": "neg_circular_include", "file": "goldens/neg_circular_include.omni", "expected_code": "CIRCULAR_INCLUDE", "reason": "Requires filesystem/VFS include resolution rather than single-string surface compilation; verified by selftest 6g (resolve_omni_surface_includes), spec/m3/fixtures/neg_circular_include.omni (M3 corpus.tsv), and M2_GOLDEN_SOURCES."}
   ]
 }

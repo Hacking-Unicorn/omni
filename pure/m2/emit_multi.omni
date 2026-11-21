@@ -1,0 +1,906 @@
+// ==============================================================================
+// pure/m2/emit_multi.omni  (Milestone 2, M2-15) — Pure-Omni multi-function x86-64 compiler
+// ==============================================================================
+// Link order: pure/m2/util.omni, pure/isa/table.omni, pure/m2/decode.omni,
+//             pure/m2/labels.omni, pure/m2/arena.omni, pure/m2/elf.omni,
+//             pure/m2/emit_x86.omni, this file.
+// Emits multi-function Linux x86-64 ELF64 binaries byte-for-byte identical to
+// `compile_pure_u16_to_x86_64_elf_multi` (M2-09 / D-4): stack args [rbp+16+8k],
+// 1 MiB arena in rbx, 128 KiB input window at rbx+0x100000, nwords at rbx+0x120000,
+// trap stubs T_TRUNC/T_OOB/T_CAP, forward/backward CALL, 3-op RET, ISA-B IGET/ISET.
+// Iterative, zero recursion, zero ANEW, gated by `omni m2-lint` with 0 findings.
+// ==============================================================================
+
+// Multi-mode global slots (in 0x24000..0x27FFF):
+//   6=t_trunc, 7=t_oob, 8=t_cap, 9=entry_fn, 10=entry_is_bytes,
+//   11=cur_is_bytes, 12=cur_arr_mask, 13=lbase
+//   16..1039 = fn_offsets[0..1023] (stored as code_off + 1; 0 = unset)
+//   1040..1071 = CALL arg operand scratch (up to 32 args for reverse push)
+#[strict]
+fn m2mg_t_trunc() -> i64 { return 6; }
+#[strict]
+fn m2mg_t_oob() -> i64 { return 7; }
+#[strict]
+fn m2mg_t_cap() -> i64 { return 8; }
+#[strict]
+fn m2mg_entry_fn() -> i64 { return 9; }
+#[strict]
+fn m2mg_entry_bytes() -> i64 { return 10; }
+#[strict]
+fn m2mg_cur_bytes() -> i64 { return 11; }
+#[strict]
+fn m2mg_arr_mask() -> i64 { return 12; }
+#[strict]
+fn m2mg_lbase() -> i64 { return 13; }
+
+// Multi-mode operand loader: Param k -> [rbp+16+8k], Reg r -> [rbp-8*(r+1)], Imm/Trit -> imm64.
+#[strict]
+fn m2m_load_op(arena: bytes, packed: i64, into_rcx: i64) -> bytes {
+    let kind: i64 = m2d_kind(packed);
+    let is_reg: trit = m2u_eq(kind, 1) <=> 0;
+    let is_par: trit = m2u_eq(kind, 2) <=> 0;
+    let is_trit: trit = m2u_eq(kind, 4) <=> 0;
+    let is_imm: trit = m2u_eq(kind, 5) <=> 0;
+    let r1: bytes = if_pos is_reg {
+        let disp: i64 = 0 - 8 * (m2d_uval(packed) + 1);
+        let w: bytes = m2x_b3(arena, 72, 139, 133 + into_rcx * 8);
+        m2a_emit_u32(w, disp)
+    } else {
+        arena
+    };
+    let r2: bytes = if_pos is_par {
+        let disp: i64 = 16 + 8 * m2d_uval(packed);
+        let w: bytes = m2x_b3(r1, 72, 139, 133 + into_rcx * 8);
+        m2a_emit_u32(w, disp)
+    } else {
+        r1
+    };
+    let r3: bytes = if_pos is_imm {
+        let w: bytes = m2a_emit_u16(r2, 72 | ((184 + into_rcx) << 8));
+        m2a_emit_u64(w, m2d_ival(packed))
+    } else {
+        r2
+    };
+    let r4: bytes = if_pos is_trit {
+        let w: bytes = m2a_emit_u16(r3, 72 | ((184 + into_rcx) << 8));
+        m2a_emit_u64(w, m2d_uval(packed) - 1)
+    } else {
+        r3
+    };
+    return r4;
+}
+
+// Emits a rel32 to trap stub `trap_slot` (6=T_TRUNC, 7=T_OOB, 8=T_CAP); 0 in pass 1.
+#[strict]
+fn m2m_trap_rel32(arena: bytes, trap_slot: i64, pass: i64) -> bytes {
+    let p2: trit = m2u_eq(pass, 2) <=> 0;
+    let r: bytes = if_pos p2 {
+        let tgt: i64 = ld_u64(arena, m2l_regs() + (trap_slot << 3));
+        let cur: i64 = ld_u64(arena, m2l_regs()) - 120;
+        m2a_emit_u32(arena, tgt - (cur + 4))
+    } else {
+        m2a_emit_u32(arena, 0)
+    };
+    return r;
+}
+
+// Emits a rel32 to function `fn_idx`; 0 in pass 1.
+#[strict]
+fn m2m_fn_rel32(arena: bytes, fn_idx: i64, pass: i64) -> bytes {
+    let p2: trit = m2u_eq(pass, 2) <=> 0;
+    let r: bytes = if_pos p2 {
+        let tgt: i64 = ld_u64(arena, m2l_regs() + ((16 + fn_idx) << 3)) - 1;
+        let cur: i64 = ld_u64(arena, m2l_regs()) - 120;
+        m2a_emit_u32(arena, tgt - (cur + 4))
+    } else {
+        m2a_emit_u32(arena, 0)
+    };
+    return r;
+}
+
+// Emits a rel32 to a per-function label slot (offset by lbase in 0x20000..0x23FFF).
+#[strict]
+fn m2m_lbl_rel32(arena: bytes, packed_lbl: i64, pass: i64) -> bytes {
+    let p2: trit = m2u_eq(pass, 2) <=> 0;
+    let r: bytes = if_pos p2 {
+        let lbase: i64 = ld_u64(arena, m2l_regs() + 104);
+        let raw_slot: i64 = m2lbl_slot_of(packed_lbl);
+        let loc_slot: i64 = m2u_sel(m2u_ge(raw_slot, 4080), raw_slot - 4080, raw_slot + 16);
+        let tgt: i64 = m2lbl_lookup(arena, lbase + loc_slot);
+        let cur: i64 = ld_u64(arena, m2l_regs()) - 120;
+        m2a_emit_u32(arena, tgt - (cur + 4))
+    } else {
+        m2a_emit_u32(arena, 0)
+    };
+    return r;
+}
+
+// Emits the bytes-entry argv[1] reader + D-7 odd/probe T_TRUNC checks.
+#[strict]
+fn m2m_stub_read_input(arena: bytes, pass: i64) -> bytes {
+    let w: bytes = m2x_b4(arena, 72, 131, 125, 8);          // 48 83 7D 08
+    w = m2x_b3(w, 2, 124, 91);                              // 02 7C 5B
+    w = m2x_b4(w, 72, 139, 125, 24);                        // 48 8B 7D 18
+    w = m2x_b4(w, 49, 246, 49, 210);                        // 31 F6 31 D2
+    w = m2a_emit_u8(w, 184);                                // B8
+    w = m2a_emit_u32(w, 2);                                 // 02 00 00 00
+    w = m2a_emit_u16(w, 1295);                              // 0F 05
+    w = m2x_b3(w, 72, 133, 192);                            // 48 85 C0
+    w = m2a_emit_u16(w, 18296);                             // 78 47 (0x4778)
+    w = m2x_b3(w, 72, 137, 199);                            // 48 89 C7
+    w = m2x_b3(w, 72, 141, 179);                            // 48 8D B3
+    w = m2a_emit_u32(w, 1048576);                           // 00 00 10 00
+    w = m2a_emit_u8(w, 186);                                // BA
+    w = m2a_emit_u32(w, 131072);                            // 00 00 02 00 (128 KiB)
+    w = m2x_b4(w, 49, 192, 15, 5);                          // 31 C0 0F 05
+    w = m2x_b3(w, 72, 133, 192);                            // 48 85 C0
+    w = m2a_emit_u16(w, 10364);                             // 7C 28 (0x287C)
+    w = m2x_b4(w, 168, 1, 15, 133);                         // A8 01 0F 85
+    w = m2m_trap_rel32(w, m2mg_t_trunc(), pass);
+    w = m2x_b3(w, 72, 209, 232);                            // 48 D1 E8
+    w = m2x_b3(w, 72, 137, 131);                            // 48 89 83
+    w = m2a_emit_u32(w, 1179648);                           // 00 00 12 00
+    w = m2a_emit_u16(w, 49201);                             // 31 C0 (0xC031)
+    w = m2x_b4(w, 72, 141, 117, 248);                       // 48 8D 75 F8
+    w = m2a_emit_u8(w, 186);                                // BA
+    w = m2a_emit_u32(w, 1);                                 // 01 00 00 00
+    w = m2a_emit_u16(w, 1295);                              // 0F 05
+    w = m2x_b4(w, 72, 133, 192, 15);                        // 48 85 C0 0F
+    w = m2a_emit_u8(w, 143);                                // 8F
+    w = m2m_trap_rel32(w, m2mg_t_trunc(), pass);
+    w = m2a_emit_u8(w, 184);                                // B8
+    w = m2a_emit_u32(w, 3);                                 // 03 00 00 00
+    w = m2a_emit_u16(w, 1295);                              // 0F 05
+    return w;
+}
+
+// Emits the bytes-entry defaults + 3 CLI parsers + input reader.
+#[strict]
+fn m2m_stub_bytes_setup(arena: bytes, arg0: i64, arg1: i64, arg2: i64, pass: i64) -> bytes {
+    let w: bytes = m2x_b3(arena, 73, 199, 196);             // 49 C7 C4
+    w = m2a_emit_u32(w, 0);
+    w = m2a_emit_u16(w, 48457);                             // 49 BD
+    w = m2a_emit_u64(w, arg0);
+    w = m2a_emit_u16(w, 48713);                             // 49 BE
+    w = m2a_emit_u64(w, arg1);
+    w = m2a_emit_u16(w, 48969);                             // 49 BF
+    w = m2a_emit_u64(w, arg2);
+    w = m2x_cli_parser(w, 3, 32, 5);
+    w = m2x_cli_parser(w, 4, 40, 6);
+    w = m2x_cli_parser(w, 5, 48, 7);
+    w = m2m_stub_read_input(w, pass);
+    return w;
+}
+
+// Emits the multi-mode entry stub + 3 trap stubs (recording trap offsets in globals 6..8).
+#[strict]
+fn m2m_emit_entry_stub(arena: bytes, is_bytes: i64, entry_fn: i64, arg0: i64, arg1: i64, arg2: i64, pass: i64) -> bytes {
+    // push rbp; mov rbp, rsp; sub rsp, 0x120010 (1179664); mov rbx, rsp; mov qword [rbx+0x120000], 0
+    let w: bytes = m2e_emit_fn_prologue(arena, 1179664);
+    w = m2x_b3(w, 72, 137, 227);                            // 48 89 E3
+    w = m2x_b3(w, 72, 199, 131);                            // 48 C7 83
+    w = m2a_emit_u32(w, 1179648);                           // 00 00 12 00
+    w = m2a_emit_u32(w, 0);
+    let cb: trit = is_bytes <=> 0;
+    let w2: bytes = if_pos cb {
+        m2m_stub_bytes_setup(w, arg0, arg1, arg2, pass)
+    } else {
+        m2x_prologue_i64(w, arg0, arg1, arg2)
+    };
+    // push r15..r12; xor r11d, r11d; call entry_fn; add rsp, 32
+    let w3: bytes = m2x_b4(w2, 65, 87, 65, 86);             // 41 57 41 56
+    w3 = m2x_b4(w3, 65, 85, 65, 84);                        // 41 55 41 54
+    w3 = m2x_b4(w3, 69, 49, 219, 232);                      // 45 31 DB E8
+    w3 = m2m_fn_rel32(w3, entry_fn, pass);
+    w3 = m2x_b4(w3, 72, 131, 196, 32);                      // 48 83 C4 20
+    let w4: bytes = if_pos cb {
+        let t: bytes = m2x_b4(w3, 72, 141, 52, 3);          // 48 8D 34 03
+        t = m2a_emit_u8(t, 191);                            // BF
+        t = m2a_emit_u32(t, 1);
+        t = m2a_emit_u8(t, 184);                            // B8
+        t = m2a_emit_u32(t, 1);
+        t = m2a_emit_u16(t, 1295);                          // 0F 05
+        t = m2x_b3(t, 49, 255, 184);                        // 31 FF B8
+        t = m2a_emit_u32(t, 60);
+        m2a_emit_u16(t, 1295)
+    } else {
+        let t: bytes = m2x_b4(w3, 72, 131, 236, 8);         // 48 83 EC 08
+        t = m2x_b4(t, 72, 137, 4, 36);                      // 48 89 04 24
+        t = m2a_emit_u8(t, 184);
+        t = m2a_emit_u32(t, 1);
+        t = m2a_emit_u8(t, 191);
+        t = m2a_emit_u32(t, 1);
+        t = m2x_b4(t, 72, 137, 230, 186);
+        t = m2a_emit_u32(t, 8);
+        t = m2a_emit_u16(t, 1295);
+        t = m2x_b4(t, 72, 131, 196, 8);
+        t = m2x_b3(t, 49, 255, 184);
+        t = m2a_emit_u32(t, 60);
+        m2a_emit_u16(t, 1295)
+    };
+    let off_trunc: i64 = ld_u64(w4, m2l_regs()) - 120;
+    let w5: bytes = m2a_g_set(w4, m2mg_t_trunc(), off_trunc);
+    w5 = m2e_emit_trap_stub(w5, 2);
+    let off_oob: i64 = ld_u64(w5, m2l_regs()) - 120;
+    w5 = m2a_g_set(w5, m2mg_t_oob(), off_oob);
+    w5 = m2e_emit_trap_stub(w5, 1);
+    let off_cap: i64 = ld_u64(w5, m2l_regs()) - 120;
+    w5 = m2a_g_set(w5, m2mg_t_cap(), off_cap);
+    w5 = m2e_emit_trap_stub(w5, 3);
+    return w5;
+}
+
+// Emits multi-mode rbx-arena OOB bounds check for [rcx .. rcx + width) <= r11.
+#[strict]
+fn m2m_oob_check(arena: bytes, width: i64, pass: i64) -> bytes {
+    let w: bytes = m2x_b3(arena, 72, 133, 201);             // 48 85 C9
+    w = m2a_emit_u16(w, 34831);                             // 0F 88 (0x880F)
+    w = m2m_trap_rel32(w, m2mg_t_oob(), pass);
+    w = m2x_b4(w, 72, 141, 65, width);                      // 48 8D 41 width
+    w = m2x_b3(w, 72, 57, 200);                             // 48 39 C8
+    w = m2a_emit_u16(w, 33295);                             // 0F 82 (0x820F)
+    w = m2m_trap_rel32(w, m2mg_t_oob(), pass);
+    w = m2x_b3(w, 76, 57, 216);                             // 4C 39 D8
+    w = m2a_emit_u16(w, 34575);                             // 0F 87 (0x870F)
+    w = m2m_trap_rel32(w, m2mg_t_oob(), pass);
+    return w;
+}
+
+// Emits multi-mode append capacity guard (r11 + k <= 0x100000, else T_CAP).
+#[strict]
+fn m2m_cap_guard(arena: bytes, k: i64, pass: i64) -> bytes {
+    let w: bytes = m2x_b3(arena, 73, 141, 131);             // 49 8D 83
+    w = m2a_emit_u32(w, k);
+    w = m2a_emit_u16(w, 15688);                             // 48 3D (0x3D48)
+    w = m2a_emit_u32(w, 1048576);                           // 00 00 10 00
+    w = m2a_emit_u16(w, 34575);                             // 0F 87
+    w = m2m_trap_rel32(w, m2mg_t_cap(), pass);
+    return w;
+}
+
+// Emits multi-mode MOV/ANEW/SLEN (typed SLEN: ARRAY param -> [rbx+0x120000], else r11).
+#[strict]
+fn m2m_emit_basic(arena: bytes, op: i64, d: i64, op0: i64) -> bytes {
+    let is_mov: trit = (m2u_in(op, 32513, 32516) + m2u_eq(op, 32518) + m2u_eq(op, 32521) + m2u_in(op, 32599, 32601)) <=> 0;
+    let is_anew: trit = m2u_eq(op, 32525) <=> 0;
+    let is_slen: trit = m2u_eq(op, 32592) <=> 0;
+    let r1: bytes = if_pos is_mov {
+        let w: bytes = m2m_load_op(arena, op0, 0);
+        m2x_store_rax(w, d)
+    } else {
+        arena
+    };
+    let r2: bytes = if_pos is_anew {
+        let w: bytes = m2x_b3(r1, 69, 49, 219);
+        m2x_store_rax(w, d)
+    } else {
+        r1
+    };
+    let r3: bytes = if_pos is_slen {
+        let mask: i64 = ld_u64(r2, m2l_regs() + 96);
+        let is_par: i64 = m2u_eq(m2d_kind(op0), 2);
+        let bit: i64 = (mask >> m2d_uval(op0)) & 1;
+        let is_arr: trit = (is_par * bit) <=> 0;
+        let w: bytes = if_pos is_arr {
+            let t: bytes = m2x_b3(r2, 72, 139, 131);        // 48 8B 83
+            m2a_emit_u32(t, 1179648)                        // 00 00 12 00
+        } else {
+            m2x_b3(r2, 76, 137, 216)                        // 4C 89 D8
+        };
+        m2x_store_rax(w, d)
+    } else {
+        r2
+    };
+    return r3;
+}
+
+// Emits multi-mode IGET (3-op ISA-B ld_u8/16/32/64 from [rbx+rcx], or 2-op bounded input window).
+#[strict]
+fn m2m_emit_iget(arena: bytes, nops: i64, p1: i64, p2: i64, d: i64, pass: i64) -> bytes {
+    let is_3op: trit = m2u_eq(nops, 3) <=> 0;
+    let r: bytes = if_pos is_3op {
+        let mv: i64 = m2d_ival(p1);
+        let width: i64 = 0 - mv;
+        let w: bytes = m2m_load_op(arena, p2, 1);
+        w = m2m_oob_check(w, width, pass);
+        let c1: trit = m2u_eq(width, 1) <=> 0;
+        let c2: trit = m2u_eq(width, 2) <=> 0;
+        let c4: trit = m2u_eq(width, 4) <=> 0;
+        let c8: trit = m2u_eq(width, 8) <=> 0;
+        let w1: bytes = if_pos c1 { m2x_b4(w, 15, 182, 4, 11) } else { w };
+        let w2: bytes = if_pos c2 { m2x_b4(w1, 15, 183, 4, 11) } else { w1 };
+        let w3: bytes = if_pos c4 { m2x_b3(w2, 139, 4, 11) } else { w2 };
+        let w4: bytes = if_pos c8 { m2x_b4(w3, 72, 139, 4, 11) } else { w3 };
+        m2x_store_rax(w4, d)
+    } else {
+        let w: bytes = m2m_load_op(arena, p1, 0);
+        w = m2x_b3(w, 72, 59, 131);                         // 48 3B 83
+        w = m2a_emit_u32(w, 1179648);                       // 00 00 12 00
+        w = m2a_emit_u16(w, 2675);                          // 73 0A (0x0A73)
+        w = m2x_b4(w, 15, 183, 132, 67);                    // 0F B7 84 43
+        w = m2a_emit_u32(w, 1048576);                       // 00 00 10 00
+        w = m2x_b4(w, 235, 2, 49, 192);                     // EB 02 31 C0
+        m2x_store_rax(w, d)
+    };
+    return r;
+}
+
+// Emits multi-mode 4-op ISET (-9 patch no-op on OOB, or -2/-4 ISA-B st_u16/st_u32).
+#[strict]
+fn m2m_emit_iset_patch(arena: bytes, mv: i64, p2: i64, p3: i64, pass: i64) -> bytes {
+    let is_m9: trit = m2u_eq(mv, 0 - 9) <=> 0;
+    let r: bytes = if_pos is_m9 {
+        let t: bytes = m2m_load_op(arena, p2, 1);
+        t = m2m_load_op(t, p3, 0);
+        t = m2x_b3(t, 72, 133, 201);                        // 48 85 C9
+        t = m2a_emit_u16(t, 3448);                          // 78 0D (0x0D78)
+        t = m2x_b4(t, 72, 141, 113, 8);                     // 48 8D 71 08
+        t = m2x_b3(t, 76, 57, 222);                         // 4C 39 DE
+        t = m2a_emit_u16(t, 1143);                          // 77 04 (0x0477)
+        m2x_b4(t, 72, 137, 4, 11)                           // 48 89 04 0B
+    } else {
+        let width: i64 = 0 - mv;
+        let t: bytes = m2m_load_op(arena, p3, 0);
+        t = m2x_b3(t, 72, 137, 194);                        // 48 89 C2
+        t = m2m_load_op(t, p2, 1);
+        t = m2m_oob_check(t, width, pass);
+        let c2: trit = m2u_eq(width, 2) <=> 0;
+        if_pos c2 {
+            m2x_b4(t, 102, 137, 20, 11)                     // 66 89 14 0B
+        } else {
+            m2x_b3(t, 137, 20, 11)                          // 89 14 0B
+        }
+    };
+    return r;
+}
+
+// Emits multi-mode ISET (0x7F0F) into the rbx arena with cap/OOB guards.
+#[strict]
+fn m2m_emit_iset(arena: bytes, arr: array, n: i64, ops_start: i64, nops: i64, d: i64, pass: i64) -> bytes {
+    let p0: i64 = m2d_operand(arr, n, ops_start);
+    let pos1: i64 = m2d_next(p0);
+    let p1: i64 = m2d_operand(arr, n, pos1);
+    let pos2: i64 = m2d_next(p1);
+    let p2: i64 = m2d_operand(arr, n, pos2);
+    let p3: i64 = m2d_operand(arr, n, m2d_next(p2));
+    let m_imm: i64 = m2u_eq(m2d_kind(p1), 5);
+    let mv: i64 = m2d_ival(p1);
+    let is_m4: i64 = m2u_eq(nops, 3) * m_imm * m2u_eq(mv, 0 - 4);
+    let is_m8: i64 = m2u_eq(nops, 3) * m_imm * m2u_eq(mv, 0 - 8);
+    let is_patch: i64 = m2u_eq(nops, 4) * m_imm * (m2u_eq(mv, 0 - 9) + m2u_eq(mv, 0 - 2) + m2u_eq(mv, 0 - 4));
+    let is_bytes: i64 = 1 - is_m4 - is_m8 - is_patch;
+    let c4: trit = is_m4 <=> 0;
+    let c8: trit = is_m8 <=> 0;
+    let cp: trit = is_patch <=> 0;
+    let cb: trit = is_bytes <=> 0;
+    let w1: bytes = if_pos c4 {
+        let t: bytes = m2m_cap_guard(arena, 4, pass);
+        t = m2m_load_op(t, p2, 0);
+        t = m2x_b4(t, 66, 137, 4, 27);                      // 42 89 04 1B
+        m2x_b4(t, 73, 131, 195, 4)                          // 49 83 C3 04
+    } else {
+        arena
+    };
+    let w2: bytes = if_pos c8 {
+        let t: bytes = m2m_cap_guard(w1, 8, pass);
+        t = m2m_load_op(t, p2, 0);
+        t = m2x_b4(t, 74, 137, 4, 27);                      // 4A 89 04 1B
+        m2x_b4(t, 73, 131, 195, 8)                          // 49 83 C3 08
+    } else {
+        w1
+    };
+    let w3: bytes = if_pos cp {
+        m2m_emit_iset_patch(w2, mv, p2, p3, pass)
+    } else {
+        w2
+    };
+    let w4: bytes = if_pos cb {
+        let t: bytes = m2m_cap_guard(w3, nops - 1, pass);
+        let cur: i64 = pos1;
+        let k: i64 = 1;
+        while nops - k <=> 0 {
+            let pk: i64 = m2d_operand(arr, n, cur);
+            t = m2m_load_op(t, pk, 0);
+            t = m2x_b4(t, 66, 136, 4, 27);                  // 42 88 04 1B
+            t = m2x_b3(t, 73, 255, 195);                    // 49 FF C3
+            cur = m2d_next(pk);
+            k = k + 1;
+        }
+        t
+    } else {
+        w3
+    };
+    return m2x_store_r11_opt(w4, d);
+}
+
+// Multi-mode binary ALU (arith + bit/shift).
+#[strict]
+fn m2m_emit_alu_arith(arena: bytes, op: i64, d: i64, op0: i64, op1: i64) -> bytes {
+    let w: bytes = m2m_load_op(arena, op0, 0);
+    w = m2m_load_op(w, op1, 1);
+    let c_add: trit = m2u_eq(op, 32528) <=> 0;
+    let c_sub: trit = m2u_eq(op, 32529) <=> 0;
+    let c_mul: trit = m2u_eq(op, 32530) <=> 0;
+    let r1: bytes = if_pos c_add { m2x_b3(w, 72, 1, 200) } else { w };
+    let r2: bytes = if_pos c_sub { m2x_b3(r1, 72, 41, 200) } else { r1 };
+    let r3: bytes = if_pos c_mul { m2x_b4(r2, 72, 15, 175, 193) } else { r2 };
+    return m2x_store_rax(r3, d);
+}
+
+#[strict]
+fn m2m_emit_alu_bit(arena: bytes, op: i64, d: i64, op0: i64, op1: i64) -> bytes {
+    let w: bytes = m2m_load_op(arena, op0, 0);
+    w = m2m_load_op(w, op1, 1);
+    let c_and: trit = m2u_eq(op, 32542) <=> 0;
+    let c_or: trit = m2u_eq(op, 32543) <=> 0;
+    let c_xor: trit = m2u_eq(op, 32544) <=> 0;
+    let c_sh: trit = m2u_in(op, 32546, 32547) <=> 0;
+    let r1: bytes = if_pos c_and { m2x_b3(w, 72, 33, 200) } else { w };
+    let r2: bytes = if_pos c_or { m2x_b3(r1, 72, 9, 200) } else { r1 };
+    let r3: bytes = if_pos c_xor { m2x_b3(r2, 72, 49, 200) } else { r2 };
+    let r4: bytes = if_pos c_sh {
+        let modrm: i64 = m2u_sel(m2u_eq(op, 32546), 224, 248);
+        m2x_b3(r3, 72, 211, modrm)
+    } else {
+        r3
+    };
+    return m2x_store_rax(r4, d);
+}
+
+#[strict]
+fn m2m_emit_cmp(arena: bytes, op: i64, d: i64, op0: i64, op1: i64) -> bytes {
+    let w: bytes = m2m_load_op(arena, op0, 0);
+    w = m2m_load_op(w, op1, 1);
+    let c_cmp: trit = m2u_in(op, 32548, 32551) <=> 0;
+    let c_tcmp: trit = m2u_eq(op, 32557) <=> 0;
+    let r1: bytes = if_pos c_cmp {
+        let setcc: i64 = m2u_eq(op, 32548) * 148 + m2u_eq(op, 32549) * 149 + m2u_eq(op, 32550) * 156 + m2u_eq(op, 32551) * 159;
+        let t: bytes = m2x_b3(w, 72, 57, 200);
+        t = m2x_b3(t, 15, setcc, 192);
+        t = m2x_b3(t, 15, 182, 192);
+        t = m2x_b4(t, 72, 141, 68, 0);
+        m2a_emit_u8(t, 255)
+    } else {
+        w
+    };
+    let r2: bytes = if_pos c_tcmp {
+        let t: bytes = m2x_b3(r1, 72, 57, 200);
+        t = m2x_b3(t, 15, 159, 194);
+        t = m2x_b3(t, 15, 156, 193);
+        t = m2x_b3(t, 15, 182, 210);
+        t = m2x_b3(t, 15, 182, 201);
+        t = m2a_emit_u16(t, 51753);
+        m2x_b3(t, 72, 99, 194)
+    } else {
+        r1
+    };
+    return m2x_store_rax(r2, d);
+}
+
+#[strict]
+fn m2m_emit_minmax_txor(arena: bytes, op: i64, d: i64, op0: i64, op1: i64) -> bytes {
+    let w: bytes = m2m_load_op(arena, op0, 0);
+    w = m2m_load_op(w, op1, 1);
+    let c_min: trit = (m2u_eq(op, 32535) + m2u_eq(op, 32553)) <=> 0;
+    let c_max: trit = (m2u_eq(op, 32536) + m2u_eq(op, 32554)) <=> 0;
+    let c_txor: trit = m2u_eq(op, 32555) <=> 0;
+    let r1: bytes = if_pos c_min {
+        let t: bytes = m2x_b3(w, 72, 57, 200);
+        m2x_b4(t, 72, 15, 79, 193)
+    } else {
+        w
+    };
+    let r2: bytes = if_pos c_max {
+        let t: bytes = m2x_b3(r1, 72, 57, 200);
+        m2x_b4(t, 72, 15, 76, 193)
+    } else {
+        r1
+    };
+    let r3: bytes = if_pos c_txor {
+        let t: bytes = m2x_b4(r2, 72, 15, 175, 193);
+        m2x_b3(t, 72, 247, 216)
+    } else {
+        r2
+    };
+    return m2x_store_rax(r3, d);
+}
+
+// Emits multi-mode IDIV/IMOD (0x7F13/0x7F14) (keeps m2m_emit_alu_misc <= 12 labels).
+#[strict]
+fn m2m_emit_div_mod(arena: bytes, op: i64, d: i64, op0: i64, op1: i64) -> bytes {
+    let t: bytes = m2m_load_op(arena, op0, 0);
+    t = m2m_load_op(t, op1, 1);
+    t = m2x_b3(t, 73, 137, 192);
+    t = m2x_b4(t, 72, 133, 201, 116);
+    t = m2x_b4(t, 30, 72, 131, 249);
+    t = m2x_b3(t, 255, 117, 17);
+    t = m2a_emit_u16(t, 47433);
+    t = m2a_emit_u32(t, 0);
+    t = m2x_b4(t, 0, 0, 0, 128);
+    t = m2x_b4(t, 77, 57, 200, 117);
+    t = m2x_b3(t, 2, 235, 10);
+    t = m2x_b4(t, 72, 153, 72, 247);
+    t = m2x_b3(t, 249, 235, 3);
+    t = m2x_b3(t, 72, 49, 192);
+    let is_mod: trit = m2u_eq(op, 32532) <=> 0;
+    let t2: bytes = if_pos is_mod { m2x_b3(t, 72, 137, 208) } else { t };
+    return m2x_store_rax(t2, d);
+}
+
+#[strict]
+fn m2m_emit_alu_misc(arena: bytes, op: i64, d: i64, op0: i64, op1: i64, op2: i64) -> bytes {
+    let c_div: trit = m2u_in(op, 32531, 32532) <=> 0;
+    let c_neg: trit = (m2u_eq(op, 32533) + m2u_eq(op, 32552)) <=> 0;
+    let c_abs: trit = m2u_eq(op, 32534) <=> 0;
+    let c_not: trit = m2u_eq(op, 32545) <=> 0;
+    let c_maj: trit = (m2u_eq(op, 32556) + m2u_eq(op, 32565) + m2u_eq(op, 32575)) <=> 0;
+    let r1: bytes = if_pos c_div { m2m_emit_div_mod(arena, op, d, op0, op1) } else { arena };
+    let r2: bytes = if_pos c_neg {
+        let t: bytes = m2m_load_op(r1, op0, 0);
+        t = m2x_b3(t, 72, 247, 216);
+        m2x_store_rax(t, d)
+    } else {
+        r1
+    };
+    let r3: bytes = if_pos c_abs {
+        let t: bytes = m2m_load_op(r2, op0, 0);
+        t = m2x_b3(t, 72, 137, 194);
+        t = m2x_b3(t, 72, 247, 216);
+        t = m2x_b4(t, 72, 15, 72, 194);
+        m2x_store_rax(t, d)
+    } else {
+        r2
+    };
+    let r4: bytes = if_pos c_not {
+        let t: bytes = m2m_load_op(r3, op0, 0);
+        t = m2x_b3(t, 72, 247, 208);
+        m2x_store_rax(t, d)
+    } else {
+        r3
+    };
+    let r5: bytes = if_pos c_maj {
+        let is_tmaj: trit = m2u_eq(op, 32556) <=> 0;
+        let t: bytes = m2m_load_op(r4, op0, 0);
+        let t2: bytes = if_pos is_tmaj {
+            let u: bytes = m2m_load_op(t, op1, 1);
+            u = m2x_b3(u, 72, 1, 200);
+            u = m2m_load_op(u, op2, 1);
+            m2x_b3(u, 72, 1, 200)
+        } else {
+            t
+        };
+        let t3: bytes = m2x_b4(t2, 72, 131, 248, 0);
+        t3 = m2x_b3(t3, 15, 159, 192);
+        t3 = m2x_b3(t3, 15, 156, 194);
+        t3 = m2x_b3(t3, 15, 182, 192);
+        t3 = m2x_b3(t3, 15, 182, 210);
+        t3 = m2x_b3(t3, 72, 41, 208);
+        m2x_store_rax(t3, d)
+    } else {
+        r4
+    };
+    return r5;
+}
+
+// Emits multi-mode CALL (0x7F48): reverse-push args, E8 rel32, add rsp, 8*nargs, store d.
+#[strict]
+fn m2m_emit_call(arena: bytes, arr: array, n: i64, ops_start: i64, nops: i64, d: i64, pass: i64) -> bytes {
+    let p0: i64 = m2d_operand(arr, n, ops_start);
+    let callee: i64 = m2d_uval(p0);
+    let nargs: i64 = nops - 1;
+    let w: bytes = arena;
+    let cur: i64 = m2d_next(p0);
+    let k: i64 = 0;
+    while nargs - k <=> 0 {
+        let pk: i64 = m2d_operand(arr, n, cur);
+        w = m2a_g_set(w, 1040 + k, pk);
+        cur = m2d_next(pk);
+        k = k + 1;
+    }
+    let j: i64 = nargs - 1;
+    while j + 1 <=> 0 {
+        let pj: i64 = ld_u64(w, m2l_regs() + ((1040 + j) << 3));
+        w = m2m_load_op(w, pj, 0);
+        w = m2a_emit_u8(w, 80);                             // 50 (push rax)
+        j = j - 1;
+    }
+    w = m2a_emit_u8(w, 232);                                // E8 (call rel32)
+    w = m2m_fn_rel32(w, callee, pass);
+    w = m2x_b3(w, 72, 129, 196);                            // 48 81 C4
+    w = m2a_emit_u32(w, nargs * 8);
+    return m2x_store_rax(w, d);
+}
+
+// Emits multi-mode SEL_TRIT (0x7F45) and RET (0x7F4A: i64, 1-op bytes, 3-op bytes ret_slice).
+#[strict]
+fn m2m_emit_sel_ret(arena: bytes, op: i64, nops: i64, d: i64, op0: i64, op1: i64, op2: i64, op3: i64, is_bytes: i64, pass: i64) -> bytes {
+    let c_sel: trit = m2u_eq(op, 32581) <=> 0;
+    let c_ret: trit = m2u_eq(op, 32586) <=> 0;
+    let r1: bytes = if_pos c_sel {
+        let t: bytes = m2m_load_op(arena, op0, 0);
+        t = m2m_load_op(t, op1, 1);
+        t = m2x_b3(t, 73, 137, 192);
+        t = m2x_b3(t, 72, 137, 202);
+        t = m2m_load_op(t, op2, 1);
+        t = m2x_b4(t, 73, 131, 248, 0);
+        t = m2x_b4(t, 72, 15, 68, 209);
+        t = m2m_load_op(t, op3, 1);
+        t = m2x_b4(t, 73, 131, 248, 0);
+        t = m2x_b4(t, 72, 15, 79, 209);
+        t = m2x_b3(t, 72, 137, 208);
+        m2x_store_rax(t, d)
+    } else {
+        arena
+    };
+    let r2: bytes = if_pos c_ret {
+        let cb: trit = is_bytes <=> 0;
+        if_pos cb {
+            let c3: trit = m2u_eq(nops, 3) <=> 0;
+            if_pos c3 {
+                let t: bytes = m2m_load_op(r1, op1, 0);
+                t = m2m_load_op(t, op2, 1);
+                t = m2x_b3(t, 72, 133, 192);                // 48 85 C0
+                t = m2a_emit_u16(t, 34831);                 // 0F 88
+                t = m2m_trap_rel32(t, m2mg_t_oob(), pass);
+                t = m2x_b3(t, 72, 133, 201);                // 48 85 C9
+                t = m2a_emit_u16(t, 34831);                 // 0F 88
+                t = m2m_trap_rel32(t, m2mg_t_oob(), pass);
+                t = m2x_b4(t, 72, 141, 52, 8);              // 48 8D 34 08
+                t = m2x_b3(t, 72, 57, 198);                 // 48 39 C6
+                t = m2a_emit_u16(t, 33295);                 // 0F 82
+                t = m2m_trap_rel32(t, m2mg_t_oob(), pass);
+                t = m2x_b3(t, 76, 57, 222);                 // 4C 39 DE
+                t = m2a_emit_u16(t, 34575);                 // 0F 87
+                t = m2m_trap_rel32(t, m2mg_t_oob(), pass);
+                t = m2x_b3(t, 72, 137, 202);                // 48 89 CA
+                m2a_emit_u16(t, 50121)                      // C9 C3 (0xC3C9)
+            } else {
+                let t: bytes = m2a_emit_u16(r1, 49201);     // 31 C0
+                t = m2x_b3(t, 76, 137, 218);                // 4C 89 DA
+                m2a_emit_u16(t, 50121)                      // C9 C3
+            }
+        } else {
+            let t: bytes = m2m_load_op(r1, op0, 0);
+            m2a_emit_u16(t, 50121)                          // C9 C3
+        }
+    } else {
+        r1
+    };
+    return r2;
+}
+
+// Emits multi-mode LABEL / JMP / BR_TRIT / BR_POS / BR_NEG using per-function lbase.
+#[strict]
+fn m2m_emit_branch(arena: bytes, op: i64, op0: i64, op1: i64, op2: i64, op3: i64, pass: i64) -> bytes {
+    let c_lbl: trit = (m2u_eq(op, 32576) * m2u_eq(pass, 1)) <=> 0;
+    let c_jmp: trit = m2u_eq(op, 32577) <=> 0;
+    let c_brt: trit = m2u_eq(op, 32578) <=> 0;
+    let c_brpn: trit = m2u_in(op, 32579, 32580) <=> 0;
+    let r1: bytes = if_pos c_lbl {
+        let lbase: i64 = ld_u64(arena, m2l_regs() + 104);
+        let raw_slot: i64 = m2lbl_slot_of(op0);
+        let loc_slot: i64 = m2u_sel(m2u_ge(raw_slot, 4080), raw_slot - 4080, raw_slot + 16);
+        let code_off: i64 = ld_u64(arena, m2l_regs()) - 120;
+        m2lbl_define(arena, lbase + loc_slot, code_off)
+    } else {
+        arena
+    };
+    let r2: bytes = if_pos c_jmp {
+        let t: bytes = m2a_emit_u8(r1, 233);
+        m2m_lbl_rel32(t, op0, pass)
+    } else {
+        r1
+    };
+    let r3: bytes = if_pos c_brt {
+        let t: bytes = m2m_load_op(r2, op0, 0);
+        t = m2x_b4(t, 72, 131, 248, 0);
+        t = m2a_emit_u16(t, 35855);
+        t = m2m_lbl_rel32(t, op1, pass);
+        t = m2a_emit_u16(t, 33807);
+        t = m2m_lbl_rel32(t, op2, pass);
+        t = m2a_emit_u8(t, 233);
+        m2m_lbl_rel32(t, op3, pass)
+    } else {
+        r2
+    };
+    let r4: bytes = if_pos c_brpn {
+        let t: bytes = m2m_load_op(r3, op0, 0);
+        let cmpv: i64 = m2u_sel(m2u_eq(op, 32579), 1, 255);
+        t = m2x_b4(t, 72, 131, 248, cmpv);
+        t = m2a_emit_u16(t, 33807);
+        m2m_lbl_rel32(t, op1, pass)
+    } else {
+        r3
+    };
+    return r4;
+}
+
+// Multi-mode ALU dispatcher.
+#[strict]
+fn m2m_emit_alu_group(arena: bytes, op: i64, d: i64, p0: i64, p1: i64, p2: i64) -> bytes {
+    let c_ar: trit = m2u_in(op, 32528, 32530) <=> 0;
+    let c_bit: trit = (m2u_in(op, 32542, 32544) + m2u_in(op, 32546, 32547)) <=> 0;
+    let c_cmp: trit = (m2u_in(op, 32548, 32551) + m2u_eq(op, 32557)) <=> 0;
+    let c_mm: trit = (m2u_in(op, 32535, 32536) + m2u_in(op, 32553, 32555)) <=> 0;
+    let c_misc: trit = (m2u_in(op, 32531, 32534) + m2u_eq(op, 32545) + m2u_eq(op, 32552) + m2u_eq(op, 32556) + m2u_eq(op, 32565) + m2u_eq(op, 32575)) <=> 0;
+    let r1: bytes = if_pos c_ar { m2m_emit_alu_arith(arena, op, d, p0, p1) } else { arena };
+    let r2: bytes = if_pos c_bit { m2m_emit_alu_bit(r1, op, d, p0, p1) } else { r1 };
+    let r3: bytes = if_pos c_cmp { m2m_emit_cmp(r2, op, d, p0, p1) } else { r2 };
+    let r4: bytes = if_pos c_mm { m2m_emit_minmax_txor(r3, op, d, p0, p1) } else { r3 };
+    let r5: bytes = if_pos c_misc { m2m_emit_alu_misc(r4, op, d, p0, p1, p2) } else { r4 };
+    return r5;
+}
+
+// Multi-mode control-flow & CALL dispatcher.
+#[strict]
+fn m2m_emit_ctl_group(arena: bytes, arr: array, n: i64, ops_start: i64, nops: i64, op: i64, d: i64, p0: i64, p1: i64, p2: i64, p3: i64, pass: i64, is_bytes: i64) -> bytes {
+    let c_br: trit = m2u_in(op, 32576, 32580) <=> 0;
+    let c_call: trit = m2u_eq(op, 32584) <=> 0;
+    let c_sr: trit = (m2u_eq(op, 32581) + m2u_eq(op, 32586)) <=> 0;
+    let r1: bytes = if_pos c_br { m2m_emit_branch(arena, op, p0, p1, p2, p3, pass) } else { arena };
+    let r2: bytes = if_pos c_call { m2m_emit_call(r1, arr, n, ops_start, nops, d, pass) } else { r1 };
+    let r3: bytes = if_pos c_sr { m2m_emit_sel_ret(r2, op, nops, d, p0, p1, p2, p3, is_bytes, pass) } else { r2 };
+    return r3;
+}
+
+// Dispatches one instruction in multi-mode.
+#[strict]
+fn m2m_emit_one_ins(arena: bytes, arr: array, n: i64, cur: i64, pass: i64, is_bytes: i64) -> bytes {
+    let has_d: i64 = m2d_ins_has_dest(arr, n, cur);
+    let d: i64 = m2d_ins_dest(arr, n, cur);
+    let op: i64 = m2d_ins_op(arr, n, cur);
+    let ops_start: i64 = cur + 1 + has_d * 3;
+    let p0: i64 = m2d_operand(arr, n, ops_start);
+    let p1: i64 = m2d_operand(arr, n, m2d_next(p0));
+    let p2: i64 = m2d_operand(arr, n, m2d_next(p1));
+    let p3: i64 = m2d_operand(arr, n, m2d_next(p2));
+    let scan: i64 = m2d_ins_scan(arr, n, cur);
+    let nops: i64 = (scan >> 20) & 65535;
+    let c_basic: trit = (m2u_in(op, 32513, 32516) + m2u_eq(op, 32518) + m2u_eq(op, 32521) + m2u_eq(op, 32525) + m2u_eq(op, 32592) + m2u_in(op, 32599, 32601)) <=> 0;
+    let c_iget: trit = m2u_eq(op, 32526) <=> 0;
+    let c_iset: trit = m2u_eq(op, 32527) <=> 0;
+    let c_alu: trit = (m2u_in(op, 32528, 32557) + m2u_eq(op, 32565) + m2u_eq(op, 32575)) <=> 0;
+    let c_ctl: trit = m2u_in(op, 32576, 32586) <=> 0;
+    let r1: bytes = if_pos c_basic { m2m_emit_basic(arena, op, d, p0) } else { arena };
+    let r2: bytes = if_pos c_iget { m2m_emit_iget(r1, nops, p1, p2, d, pass) } else { r1 };
+    let r3: bytes = if_pos c_iset { m2m_emit_iset(r2, arr, n, ops_start, nops, d, pass) } else { r2 };
+    let r4: bytes = if_pos c_alu { m2m_emit_alu_group(r3, op, d, p0, p1, p2) } else { r3 };
+    let r5: bytes = if_pos c_ctl { m2m_emit_ctl_group(r4, arr, n, ops_start, nops, op, d, p0, p1, p2, p3, pass, is_bytes) } else { r4 };
+    return r5;
+}
+
+// Scans one function body to find max_reg (for frame size) and returns next word offset after body.
+// Packs `(max_reg << 24) | body_end_pos`.
+#[strict]
+fn m2m_scan_fn_meta(arr: array, n: i64, ins_start: i64, ins_cnt: i64) -> i64 {
+    let max_r: i64 = 0;
+    let cur: i64 = ins_start;
+    let ii: i64 = 0;
+    while ins_cnt - ii <=> 0 {
+        let d: i64 = m2d_ins_dest(arr, n, cur);
+        max_r = m2u_sel(m2u_ge(d, max_r), d, max_r);
+        let nxt: i64 = m2d_decode_at(arr, n, cur);
+        cur = m2u_sel(m2d_is_err(nxt), n, nxt);
+        ii = ii + 1;
+    }
+    return (max_r << 24) | (cur & 16777215);
+}
+
+// Builds the 32-bit bitmask of TY_ARRAY (0x7F89 = 32649) params for a function header at `fn_pos`.
+#[strict]
+fn m2m_param_arr_mask(arr: array, n: i64, fn_pos: i64, p_cnt: i64) -> i64 {
+    let mask: i64 = 0;
+    let k: i64 = 0;
+    while p_cnt - k <=> 0 {
+        let ty: i64 = m2u_tok(arr, n, fn_pos + 3 + k * 3 + 1);
+        let is_arr: i64 = m2u_eq(ty, 32649);
+        mask = mask | (is_arr << k);
+        k = k + 1;
+    }
+    return mask;
+}
+
+// Skips any leading SCHEMA_DEF (0x7EE1) and EXPERT_DEF (0x7EE2) headers after MOD_BEGIN.
+#[strict]
+fn m2m_first_fn_pos(arr: array, n: i64) -> i64 {
+    let pos: i64 = 1;
+    let going: i64 = 1;
+    while going <=> 0 {
+        let tok: i64 = m2u_tok(arr, n, pos);
+        let is_sch: i64 = m2u_eq(tok, 32481);
+        let is_exp: i64 = m2u_eq(tok, 32482);
+        let fcnt: i64 = m2u_tok(arr, n, pos + 2);
+        pos = m2u_sel(is_sch, pos + 3 + fcnt * 2, m2u_sel(is_exp, pos + 5, pos));
+        going = (is_sch + is_exp) * m2u_lt(pos, n);
+    }
+    return pos;
+}
+
+// Finds entry function (fn_idx == 0 else last) and its is_bytes flag.
+// Returns `(entry_is_bytes << 16) | entry_fn_idx`.
+#[strict]
+fn m2m_find_entry(arr: array, n: i64, first_fn: i64) -> i64 {
+    let pos: i64 = first_fn;
+    let found0: i64 = 0;
+    let entry_id: i64 = 0;
+    let entry_b: i64 = 0;
+    while m2u_eq(m2u_tok(arr, n, pos), 32483) <=> 0 {
+        let fid: i64 = m2u_tok(arr, n, pos + 1);
+        let p_cnt: i64 = m2u_tok(arr, n, pos + 2);
+        let sig_pos: i64 = pos + 3 + p_cnt * 3;
+        let ret_ty: i64 = m2u_tok(arr, n, sig_pos);
+        let is_b: i64 = m2u_eq(ret_ty, 32646);
+        let ins_cnt: i64 = m2u_tok(arr, n, sig_pos + 2);
+        let meta: i64 = m2m_scan_fn_meta(arr, n, sig_pos + 3, ins_cnt);
+        let is0: i64 = m2u_eq(fid, 0);
+        let take: i64 = is0 + (1 - found0) * (1 - is0);
+        entry_id = m2u_sel(take, fid, entry_id);
+        entry_b = m2u_sel(take, is_b, entry_b);
+        found0 = found0 | is0;
+        pos = meta & 16777215;
+    }
+    return (entry_b << 16) | (entry_id & 65535);
+}
+
+// Runs one full pass (pass=1 or pass=2) over all functions in the module.
+#[strict]
+fn m2m_run_all_fns(arena: bytes, arr: array, n: i64, first_fn: i64, pass: i64) -> bytes {
+    let w: bytes = m2a_g_set(arena, m2mg_lbase(), 0);
+    let pos: i64 = first_fn;
+    while m2u_eq(m2u_tok(arr, n, pos), 32483) <=> 0 {
+        let fid: i64 = m2u_tok(arr, n, pos + 1);
+        let p_cnt: i64 = m2u_tok(arr, n, pos + 2);
+        let sig_pos: i64 = pos + 3 + p_cnt * 3;
+        let ret_ty: i64 = m2u_tok(arr, n, sig_pos);
+        let is_b: i64 = m2u_eq(ret_ty, 32646);
+        let ins_cnt: i64 = m2u_tok(arr, n, sig_pos + 2);
+        let ins_start: i64 = sig_pos + 3;
+        let meta: i64 = m2m_scan_fn_meta(arr, n, ins_start, ins_cnt);
+        let max_r: i64 = meta >> 24;
+        let frame_bytes: i64 = ((8 * (max_r + 1)) + 15) & (0 - 16);
+        let fn_off: i64 = ld_u64(w, m2l_regs()) - 120;
+        w = m2a_g_set(w, 16 + fid, fn_off + 1);
+        w = m2a_g_set(w, m2mg_arr_mask(), m2m_param_arr_mask(arr, n, pos, p_cnt));
+        w = m2e_emit_fn_prologue(w, frame_bytes);
+        let cur: i64 = ins_start;
+        let ii: i64 = 0;
+        while ins_cnt - ii <=> 0 {
+            w = m2m_emit_one_ins(w, arr, n, cur, pass, is_b);
+            let nxt: i64 = m2d_decode_at(arr, n, cur);
+            cur = m2u_sel(m2d_is_err(nxt), n, nxt);
+            ii = ii + 1;
+        }
+        let lb: i64 = ld_u64(w, m2l_regs() + 104);
+        w = m2a_g_set(w, m2mg_lbase(), lb + 16);
+        pos = meta & 16777215;
+    }
+    return w;
+}
+
+// Top-level Pure-Omni two-pass multi-function u16 -> x86-64 ELF64 compiler (in-place into arena).
+#[strict]
+fn m2_compile_multi_x86_into(arena: bytes, arr: array, arg0: i64, arg1: i64, arg2: i64) -> bytes {
+    let n: i64 = slen(arr);
+    let first_fn: i64 = m2m_first_fn_pos(arr, n);
+    let einfo: i64 = m2m_find_entry(arr, n, first_fn);
+    let entry_fn: i64 = einfo & 65535;
+    let entry_b: i64 = einfo >> 16;
+    let w: bytes = m2a_init(arena, n, 1, entry_b);
+    // Pass 1: emit placeholder header + entry stub + trap stubs + all functions (records fn_offsets & labels).
+    w = m2e_emit_elf64_hdr(w, 120);
+    w = m2m_emit_entry_stub(w, entry_b, entry_fn, arg0, arg1, arg2, 1);
+    w = m2m_run_all_fns(w, arr, n, first_fn, 1);
+    let total_size: i64 = ld_u64(w, m2l_regs());
+    // Pass 2: reset out_len = 0, emit final header + entry stub + trap stubs + all functions with resolved rel32.
+    w = m2a_g_set(w, m2g_out_len(), 0);
+    w = m2e_emit_elf64_hdr(w, total_size);
+    w = m2m_emit_entry_stub(w, entry_b, entry_fn, arg0, arg1, arg2, 2);
+    w = m2m_run_all_fns(w, arr, n, first_fn, 2);
+    return w;
+}
+
+// Top-level Pure-Omni two-pass multi-function u16 -> x86-64 ELF64 compiler (M2-15, returns slice).
+#[strict]
+fn m2_compile_multi_x86(arena: bytes, arr: array, arg0: i64, arg1: i64, arg2: i64) -> bytes {
+    return m2a_finish_slice(m2_compile_multi_x86_into(arena, arr, arg0, arg1, arg2));
+}

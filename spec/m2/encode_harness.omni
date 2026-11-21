@@ -1,0 +1,9 @@
+// Harness for M3-04 (pure/isa/encode.omni) round-trip selftest.
+// Linked after pure/m2/util.omni + pure/isa/table.omni + pure/m2/decode.omni + pure/isa/encode.omni.
+#[strict]
+fn enc_roundtrip_main(arr: array) -> bytes {
+    let n: i64 = slen(arr);
+    let out: bytes = anew(0);
+    let r: bytes = enc_reencode_module(out, arr, n);
+    return r;
+}

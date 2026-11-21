@@ -1,0 +1,621 @@
+// ==============================================================================
+// pure/m3/stmt.omni  (Milestone 3, M3-09) — Iterative statement & block parser
+// ==============================================================================
+// Iterative, zero recursion, zero ANEW, every fn <= 12 labels / <= 120 SSA.
+// Extends `pure/m3/expr.omni` with a unified parse-stack state machine for:
+//   - blocks `{ stmt* }`
+//   - `let`, `=`, `+=`/`-=`/`*=`, `while`, `do_while`, `label`, `goto`, `return`, `respond*`, expr-stmt
+//   - `if_pos`/`if_neg ... { ... } else { ... }`
+//   - `match_trit ... { neg => ..., zero => ..., pos => ... }`
+// Completes Pass P across full function bodies.
+// ==============================================================================
+
+include "pure/m3/expr.omni";
+
+// Consumes an optional trailing `;` at `ti`.
+#[strict]
+fn m3p_skip_semi(arena: bytes, ntok: i64) -> bytes {
+    let ti: i64 = ld_u64(arena, 96);
+    let ok: i64 = m2u_lt(ti, ntok);
+    let h0: i64 = ld_u64(arena, m3l_out() + ((ti * ok) << 4));
+    let v0: i64 = ld_u64(arena, m3l_out() + ((ti * ok) << 4) + 8);
+    let is_sc: i64 = ok * m2u_eq(h0 & 65535, 5) * m2u_eq(v0, 59);
+    return iset_patch_i64(arena, 96, ti + is_sc);
+}
+
+// Appends `stmt_id` to the `BLOCK` frame (`fkind == 10`) on top of `m3l_pstack()`, setting `p_state = 2`.
+#[strict]
+fn m3p_block_append(arena: bytes, stmt_id: i64) -> bytes {
+    let sp: i64 = ld_u64(arena, 192);
+    let off: i64 = m3l_pstack() + ((sp - 1) << 4) + 8;
+    let fw1: i64 = ld_u64(arena, off);
+    let head: i64 = fw1 & 65535;
+    let tail: i64 = (fw1 >> 16) & 65535;
+    let has_tail: trit = tail <=> 0;
+    let u: bytes = if_pos has_tail { m3e_ast_set_next(arena, tail, stmt_id) } else { arena };
+    let nhead: i64 = m2u_sel(m2u_eq(head, 0), stmt_id, head);
+    u = iset_patch_i64(u, off, nhead | (stmt_id << 16));
+    return iset_patch_i64(u, 208, 2);
+}
+
+// Expects `{` at `ti`, advances `ti`, pushes `BLOCK` frame (10), sets `p_state = 2`.
+#[strict]
+fn m3p_enter_block(arena: bytes, ntok: i64) -> bytes {
+    let ti: i64 = ld_u64(arena, 96);
+    let ok: i64 = m2u_lt(ti, ntok);
+    let h0: i64 = ld_u64(arena, m3l_out() + ((ti * ok) << 4));
+    let v0: i64 = ld_u64(arena, m3l_out() + ((ti * ok) << 4) + 8);
+    let is_lb: trit = (ok * m2u_eq(h0 & 65535, 5) * m2u_eq(v0, 123)) <=> 0;
+    let r: bytes = if_pos is_lb {
+        let u: bytes = m3e_ps_push(arena, 10, 0, (h0 >> 32) & 65535, (h0 >> 48) & 65535, 0);
+        u = iset_patch_i64(u, 96, ti + 1);
+        iset_patch_i64(u, 208, 2)
+    } else {
+        m3a_set_err(arena, m3err_syntax(), (h0 >> 32) & 65535, (h0 >> 48) & 65535)
+    };
+    return r;
+}
+
+// Parses optional `: ty` annotation on `let` starting at token `k` (split to stay <= 8 labels).
+#[strict]
+fn m3p_let_ty_ann(arena: bytes, src: array, ntok: i64, k: i64, nl: i64, nc: i64) -> bytes {
+    let strict: i64 = ld_u64(arena, 144);
+    let ok2: i64 = m2u_lt(k, ntok);
+    let h2: i64 = ld_u64(arena, m3l_out() + ((k * ok2) << 4));
+    let v2: i64 = ld_u64(arena, m3l_out() + ((k * ok2) << 4) + 8);
+    let has_col: trit = (ok2 * m2u_eq(h2 & 65535, 5) * m2u_eq(v2, 58)) <=> 0;
+    let r: bytes = if_pos has_col {
+        let kt: i64 = k + 1;
+        let okt: i64 = m2u_lt(kt, ntok);
+        let ht: i64 = ld_u64(arena, m3l_out() + ((kt * okt) << 4));
+        let vt: i64 = ld_u64(arena, m3l_out() + ((kt * okt) << 4) + 8);
+        let is_tid: trit = (okt * m2u_eq(ht & 65535, 8)) <=> 0;
+        if_pos is_tid {
+            let ty: i64 = m3s_map_type(m3s_hash(src, vt, (ht >> 16) & 65535, 1), strict);
+            let bad: trit = m2u_lt(ty, 0) <=> 0;
+            if_pos bad {
+                let ec: i64 = m2u_sel(m2u_eq(ty, 0 - 2), m3err_ambiguous(), m3err_bad_type());
+                m3a_set_err(arena, ec, (ht >> 32) & 65535, (ht >> 48) & 65535)
+            } else {
+                let u: bytes = iset_patch_i64(arena, 96, kt + 1);
+                u = m3s_consume_at(u, src, ntok);
+                iset_patch_i64(u, 216, kt)
+            }
+        } else {
+            m3a_set_err(arena, m3err_syntax(), (ht >> 32) & 65535, (ht >> 48) & 65535)
+        }
+    } else {
+        let bad_s: trit = strict <=> 0;
+        if_pos bad_s {
+            m3a_set_err(arena, m3err_bad_type(), nl, nc)
+        } else {
+            let u: bytes = iset_patch_i64(arena, 96, k);
+            iset_patch_i64(u, 216, 0)
+        }
+    };
+    return r;
+}
+
+// Parses `let name [: ty] =` header, pushes `ST_LET` (11), sets `p_state = 0`.
+#[strict]
+fn m3p_start_let(arena: bytes, src: array, ntok: i64, ti: i64) -> bytes {
+    let j: i64 = ti + 1;
+    let ok1: i64 = m2u_lt(j, ntok);
+    let h1: i64 = ld_u64(arena, m3l_out() + ((j * ok1) << 4));
+    let is_id: trit = (ok1 * m2u_eq(h1 & 65535, 8)) <=> 0;
+    let r: bytes = if_pos is_id {
+        let nl: i64 = (h1 >> 32) & 65535;
+        let nc: i64 = (h1 >> 48) & 65535;
+        let u1: bytes = m3p_let_ty_ann(arena, src, ntok, j + 1, nl, nc);
+        let te: i64 = ld_u64(u1, 96);
+        let no_e: i64 = m2u_eq(ld_u64(u1, 40), 0);
+        let he: i64 = ld_u64(u1, m3l_out() + ((te * m2u_lt(te, ntok)) << 4));
+        let ve: i64 = ld_u64(u1, m3l_out() + ((te * m2u_lt(te, ntok)) << 4) + 8);
+        let ok_eq: trit = (no_e * m2u_lt(te, ntok) * m2u_eq(he & 65535, 5) * m2u_eq(ve, 61)) <=> 0;
+        if_pos ok_eq {
+            let ty_ti: i64 = ld_u64(u1, 216);
+            let u2: bytes = m3e_ps_push(u1, 11, j, nl, nc, ty_ti);
+            u2 = iset_patch_i64(u2, 96, te + 1);
+            iset_patch_i64(u2, 208, 0)
+        } else {
+            let e0: trit = no_e <=> 0;
+            if_pos e0 { m3a_set_err(u1, m3err_syntax(), (he >> 32) & 65535, (he >> 48) & 65535) } else { u1 }
+        }
+    } else {
+        m3a_set_err(arena, m3err_syntax(), (h1 >> 32) & 65535, (h1 >> 48) & 65535)
+    };
+    return r;
+}
+
+// Parses `label N [;]` (`is_goto == 0`) or `goto N [;]` (`is_goto == 1`).
+#[strict]
+fn m3p_parse_lbl_goto(arena: bytes, ntok: i64, ti: i64, is_goto: i64) -> bytes {
+    let j: i64 = ti + 1;
+    let ok: i64 = m2u_lt(j, ntok);
+    let h1: i64 = ld_u64(arena, m3l_out() + ((j * ok) << 4));
+    let v1: i64 = ld_u64(arena, m3l_out() + ((j * ok) << 4) + 8);
+    let is_int: trit = (ok * m2u_eq(h1 & 65535, 7)) <=> 0;
+    let r: bytes = if_pos is_int {
+        let ll: i64 = (h1 >> 32) & 65535;
+        let lc: i64 = (h1 >> 48) & 65535;
+        let rng: trit = m2u_in(v1, 0, 15) <=> 0;
+        if_pos rng {
+            let u: bytes = m3e_ast_new(arena, 20 + is_goto, 0, ll, lc, v1);
+            let sid: i64 = ld_u64(u, 200);
+            u = iset_patch_i64(u, 96, j + 1);
+            u = m3p_skip_semi(u, ntok);
+            m3p_block_append(u, sid)
+        } else {
+            m3a_set_err(arena, m3err_unresolved_label(), ll, lc)
+        }
+    } else {
+        m3a_set_err(arena, m3err_syntax(), (h1 >> 32) & 65535, (h1 >> 48) & 65535)
+    };
+    return r;
+}
+
+// Starts a non-let statement (`return`/`respond*`/`while`/`do_while`/`label`/`goto`/assign/expr).
+#[strict]
+fn m3p_start_stmt_other(arena: bytes, ntok: i64, ti: i64, kh: i64, is_id: i64, sl: i64, sc: i64) -> bytes {
+    let is_ret_f: i64 = is_id * m2u_eq(kh, 99497919);
+    let is_rsp_f: i64 = is_id * (m2u_eq(kh, 160119590) + m2u_eq(kh, 2015157561) + m2u_eq(kh, 1281037654));
+    let is_wh_f: i64 = is_id * m2u_eq(kh, 231090382);
+    let is_dw_f: i64 = is_id * m2u_eq(kh, 1219963402);
+    let is_lb_f: i64 = is_id * m2u_eq(kh, 1989613565);
+    let is_gt_f: i64 = is_id * m2u_eq(kh, 1973620710);
+    let j: i64 = ti + 1;
+    let okj: i64 = m2u_lt(j, ntok);
+    let hj: i64 = ld_u64(arena, m3l_out() + ((j * okj) << 4));
+    let vj: i64 = ld_u64(arena, m3l_out() + ((j * okj) << 4) + 8);
+    let aop: i64 = is_id * okj * m2u_eq(hj & 65535, 5) * (m2u_eq(vj, 61) + m2u_eq(vj, 43 | (61 << 8)) * 11 + m2u_eq(vj, 45 | (61 << 8)) * 12 + m2u_eq(vj, 42 | (61 << 8)) * 13);
+    let is_as_f: i64 = (1 - is_ret_f - is_rsp_f - is_wh_f - is_dw_f - is_lb_f - is_gt_f) * m2u_lt(0, aop);
+    let is_ex_f: i64 = 1 - is_ret_f - is_rsp_f - is_wh_f - is_dw_f - is_lb_f - is_gt_f - is_as_f;
+    let c_ret: trit = (is_ret_f + is_rsp_f) <=> 0;
+    let c_wh: trit = is_wh_f <=> 0;
+    let c_dw: trit = is_dw_f <=> 0;
+    let c_lg: trit = (is_lb_f + is_gt_f) <=> 0;
+    let c_as: trit = is_as_f <=> 0;
+    let c_ex: trit = is_ex_f <=> 0;
+    let r1: bytes = if_pos c_ret {
+        let u: bytes = m3e_ps_push(arena, 13, 0, sl, sc, 0);
+        u = iset_patch_i64(u, 96, ti + is_ret_f);
+        iset_patch_i64(u, 208, 0)
+    } else { arena };
+    let r2: bytes = if_pos c_wh {
+        let u: bytes = m3e_ps_push(r1, 15, 0, sl, sc, 0);
+        u = iset_patch_i64(u, 96, ti + 1);
+        iset_patch_i64(u, 208, 0)
+    } else { r1 };
+    let r3: bytes = if_pos c_dw {
+        let u: bytes = m3e_ps_push(r2, 17, 0, sl, sc, 0);
+        u = iset_patch_i64(u, 96, ti + 1);
+        m3p_enter_block(u, ntok)
+    } else { r2 };
+    let r4: bytes = if_pos c_lg { m3p_parse_lbl_goto(r3, ntok, ti, is_gt_f) } else { r3 };
+    let r5: bytes = if_pos c_as {
+        let u: bytes = m3e_ps_push(r4, 12, ti, sl, sc, m2u_sel(m2u_eq(aop, 1), 0, aop));
+        u = iset_patch_i64(u, 96, ti + 2);
+        iset_patch_i64(u, 208, 0)
+    } else { r4 };
+    let r6: bytes = if_pos c_ex {
+        let u: bytes = m3e_ps_push(r5, 14, 0, sl, sc, 0);
+        iset_patch_i64(u, 208, 0)
+    } else { r5 };
+    return r6;
+}
+
+// Finishes a `BLOCK` frame (`fkind == 10`) after consuming `}`, delivering `head` to parent frame.
+#[strict]
+fn m3p_finish_block(arena: bytes, src: array, ntok: i64) -> bytes {
+    let sp: i64 = ld_u64(arena, 192);
+    let bhead: i64 = ld_u64(arena, m3l_pstack() + ((sp - 1) << 4) + 8) & 65535;
+    let u: bytes = iset_patch_i64(arena, 192, sp - 1);
+    u = iset_patch_i64(u, 200, bhead);
+    let nsp: i64 = sp - 1;
+    let is_top: trit = m2u_eq(nsp, 0) <=> 0;
+    let r: bytes = if_pos is_top {
+        iset_patch_i64(u, 208, 3) // DONE
+    } else {
+        let poff: i64 = m3l_pstack() + ((nsp - 1) << 4);
+        let pw0: i64 = ld_u64(u, poff);
+        let pw1: i64 = ld_u64(u, poff + 8);
+        let pk: i64 = pw0 & 65535;
+        let pl: i64 = (pw0 >> 32) & 65535;
+        let pc: i64 = (pw0 >> 48) & 65535;
+        let c_wh: trit = m2u_eq(pk, 16) <=> 0;
+        let c_dw: trit = m2u_eq(pk, 17) <=> 0;
+        let c_it: trit = m2u_eq(pk, 20) <=> 0;
+        let c_ie: trit = m2u_eq(pk, 21) <=> 0;
+        let c_ma: trit = m2u_eq(pk, 23) <=> 0;
+        let r1: bytes = if_pos c_wh {
+            let t: bytes = iset_patch_i64(u, 192, nsp - 1);
+            t = m3p_skip_semi(t, ntok);
+            t = m3e_ast_new(t, 19, 0, pl, pc, (pw1 & 65535) | (bhead << 16));
+            m3p_block_append(t, ld_u64(t, 200))
+        } else { u };
+        let r2: bytes = if_pos c_dw {
+            let t: bytes = iset_patch_i64(r1, poff, 18 | ((pl & 65535) << 32) | ((pc & 65535) << 48));
+            t = iset_patch_i64(t, poff + 8, bhead);
+            iset_patch_i64(t, 208, 0)
+        } else { r1 };
+        let r3: bytes = if_pos c_it { m3p_if_after_then(r2, src, ntok, poff, pw0, pw1, bhead) } else { r2 };
+        let r4: bytes = if_pos c_ie {
+            let t: bytes = iset_patch_i64(r3, 192, nsp - 1);
+            let br_op: i64 = (pw0 >> 16) & 65535;
+            t = m3e_ast_new(t, 9, br_op, pl, pc, pw1 | (bhead << 32));
+            iset_patch_i64(t, 208, 1)
+        } else { r3 };
+        if_pos c_ma { m3p_match_store_arm(r4, src, ntok, poff, bhead) } else { r4 }
+    };
+    return r;
+}
+
+// After `if_pos`/`if_neg` then-block: expects `else` + `{`, converts `IF_THEN` (20) -> `IF_ELSE` (21).
+#[strict]
+fn m3p_if_after_then(arena: bytes, src: array, ntok: i64, poff: i64, pw0: i64, pw1: i64, bhead: i64) -> bytes {
+    let ti: i64 = ld_u64(arena, 96);
+    let ok: i64 = m2u_lt(ti, ntok);
+    let h0: i64 = ld_u64(arena, m3l_out() + ((ti * ok) << 4));
+    let v0: i64 = ld_u64(arena, m3l_out() + ((ti * ok) << 4) + 8);
+    let is_el: trit = (ok * m2u_eq(h0 & 65535, 8) * m2u_eq(m3s_hash(src, v0, (h0 >> 16) & 65535, 0), 1035951088)) <=> 0;
+    let r: bytes = if_pos is_el {
+        let br_op: i64 = (pw0 >> 16) & 65535;
+        let pl: i64 = (pw0 >> 32) & 65535;
+        let pc: i64 = (pw0 >> 48) & 65535;
+        let u: bytes = iset_patch_i64(arena, poff, 21 | (br_op << 16) | (pl << 32) | (pc << 48));
+        u = iset_patch_i64(u, poff + 8, (pw1 & 65535) | (bhead << 16));
+        u = iset_patch_i64(u, 96, ti + 1);
+        m3p_enter_block(u, ntok)
+    } else {
+        m3a_set_err(arena, m3err_syntax(), (h0 >> 32) & 65535, (h0 >> 48) & 65535)
+    };
+    return r;
+}
+
+// Starts the next `neg|zero|pos => ...` arm inside `match_trit` (`fkind == 23`), or closes `}` -> `MatchTrit`.
+#[strict]
+fn m3p_match_next_arm(arena: bytes, src: array, ntok: i64, poff: i64) -> bytes {
+    let ti: i64 = ld_u64(arena, 96);
+    let pw0: i64 = ld_u64(arena, poff);
+    let pw1: i64 = ld_u64(arena, poff + 8);
+    let aux: i64 = (pw0 >> 16) & 65535;
+    let pmask: i64 = aux >> 8;
+    let pl: i64 = (pw0 >> 32) & 65535;
+    let pc: i64 = (pw0 >> 48) & 65535;
+    let ok: i64 = m2u_lt(ti, ntok);
+    let h0: i64 = ld_u64(arena, m3l_out() + ((ti * ok) << 4));
+    let v0: i64 = ld_u64(arena, m3l_out() + ((ti * ok) << 4) + 8);
+    let is_rb: trit = (ok * m2u_eq(h0 & 65535, 5) * m2u_eq(v0, 125)) <=> 0;
+    let r: bytes = if_pos is_rb {
+        let all3: trit = m2u_eq(pmask, 7) <=> 0;
+        if_pos all3 {
+            let sp: i64 = ld_u64(arena, 192);
+            let u: bytes = iset_patch_i64(arena, 192, sp - 1);
+            u = iset_patch_i64(u, 96, ti + 1);
+            u = m3e_ast_new(u, 10, 0, pl, pc, pw1);
+            iset_patch_i64(u, 208, 1)
+        } else {
+            m3a_set_err(arena, m3err_syntax(), pl, pc)
+        }
+    } else {
+        let ok2: i64 = m2u_ge(ntok, ti + 2);
+        let h1: i64 = ld_u64(arena, m3l_out() + (((ti + 1) * ok2) << 4));
+        let v1: i64 = ld_u64(arena, m3l_out() + (((ti + 1) * ok2) << 4) + 8);
+        let ah: i64 = m3s_hash(src, v0 * ok, ((h0 >> 16) & 65535) * ok, 0);
+        let aid: i64 = m2u_eq(h0 & 65535, 8) * (m2u_eq(ah, 949595969) + m2u_eq(ah, 191883107) * 2 + m2u_eq(ah, 1412654217) * 3);
+        let ok_arm: trit = (ok2 * m2u_lt(0, aid) * m2u_eq(h1 & 65535, 5) * m2u_eq(v1, 61 | (62 << 8))) <=> 0;
+        if_pos ok_arm {
+            let naux: i64 = aid | (pmask << 8);
+            let u: bytes = iset_patch_i64(arena, poff, 23 | (naux << 16) | (pl << 32) | (pc << 48));
+            let j: i64 = ti + 2;
+            u = iset_patch_i64(u, 96, j);
+            let okj: i64 = m2u_lt(j, ntok);
+            let hj: i64 = ld_u64(u, m3l_out() + ((j * okj) << 4));
+            let vj: i64 = ld_u64(u, m3l_out() + ((j * okj) << 4) + 8);
+            let is_lb: trit = (okj * m2u_eq(hj & 65535, 5) * m2u_eq(vj, 123)) <=> 0;
+            if_pos is_lb { m3p_enter_block(u, ntok) } else { iset_patch_i64(u, 208, 0) }
+        } else {
+            m3a_set_err(arena, m3err_syntax(), (h0 >> 32) & 65535, (h0 >> 48) & 65535)
+        }
+    };
+    return r;
+}
+
+// Stores completed arm `head` into `MATCH_ARM_LOOP` frame `poff`, skips optional `,`, advances to next arm.
+#[strict]
+fn m3p_match_store_arm(arena: bytes, src: array, ntok: i64, poff: i64, head: i64) -> bytes {
+    let pw0: i64 = ld_u64(arena, poff);
+    let pw1: i64 = ld_u64(arena, poff + 8);
+    let aux: i64 = (pw0 >> 16) & 65535;
+    let aid: i64 = aux & 255;
+    let pmask: i64 = (aux >> 8) | (1 << (aid - 1));
+    let sh: i64 = aid << 4; // 16, 32, or 48
+    let cmask: i64 = (0 - 1) ^ (65535 << sh);
+    let nw1: i64 = (pw1 & cmask) | ((head & 65535) << sh);
+    let pl: i64 = (pw0 >> 32) & 65535;
+    let pc: i64 = (pw0 >> 48) & 65535;
+    let u: bytes = iset_patch_i64(arena, poff, 23 | ((pmask << 8) << 16) | (pl << 32) | (pc << 48));
+    u = iset_patch_i64(u, poff + 8, nw1);
+    let ti: i64 = ld_u64(u, 96);
+    let ok: i64 = m2u_lt(ti, ntok);
+    let h0: i64 = ld_u64(u, m3l_out() + ((ti * ok) << 4));
+    let v0: i64 = ld_u64(u, m3l_out() + ((ti * ok) << 4) + 8);
+    let is_cm: i64 = ok * m2u_eq(h0 & 65535, 5) * m2u_eq(v0, 44);
+    u = iset_patch_i64(u, 96, ti + is_cm);
+    return m3p_match_next_arm(u, src, ntok, poff);
+}
+
+// State 2 handler (`BLOCK_NEXT`): if `}` closes block, else dispatches next statement.
+#[strict]
+fn m3p_step_block(arena: bytes, src: array, ntok: i64) -> bytes {
+    let w: bytes = m3s_consume_at(arena, src, ntok);
+    let ti: i64 = ld_u64(w, 96);
+    let ok: trit = (m2u_lt(ti, ntok) * m2u_eq(ld_u64(w, 40), 0)) <=> 0;
+    let r: bytes = if_pos ok {
+        let h0: i64 = ld_u64(w, m3l_out() + (ti << 4));
+        let v0: i64 = ld_u64(w, m3l_out() + (ti << 4) + 8);
+        let k: i64 = h0 & 65535;
+        let is_rb: trit = (m2u_eq(k, 5) * m2u_eq(v0, 125)) <=> 0;
+        if_pos is_rb {
+            let u: bytes = iset_patch_i64(w, 96, ti + 1);
+            m3p_finish_block(u, src, ntok)
+        } else {
+            let is_id: i64 = m2u_eq(k, 8);
+            let kh: i64 = m3s_hash(src, v0 * is_id, ((h0 >> 16) & 65535) * is_id, 0);
+            let is_let: trit = (is_id * m2u_eq(kh, 1349190650)) <=> 0;
+            if_pos is_let {
+                m3p_start_let(w, src, ntok, ti)
+            } else {
+                m3p_start_stmt_other(w, ntok, ti, kh, is_id, (h0 >> 32) & 65535, (h0 >> 48) & 65535)
+            }
+        }
+    } else {
+        let e0: trit = m2u_eq(ld_u64(w, 40), 0) <=> 0;
+        if_pos e0 { m3a_set_err(w, m3err_syntax(), 1, 1) } else { w }
+    };
+    return r;
+}
+
+// Delivers completed expression `cur_node` to an enclosing statement/control frame (`fkind >= 11`).
+#[strict]
+fn m3p_deliver_expr_a(arena: bytes, src: array, ntok: i64, sp: i64, fk: i64) -> bytes {
+    let poff: i64 = m3l_pstack() + ((sp - 1) << 4);
+    let pw0: i64 = ld_u64(arena, poff);
+    let pw1: i64 = ld_u64(arena, poff + 8);
+    let aux: i64 = (pw0 >> 16) & 65535;
+    let pl: i64 = (pw0 >> 32) & 65535;
+    let pc: i64 = (pw0 >> 48) & 65535;
+    let expr_id: i64 = ld_u64(arena, 200);
+    let c_let: trit = m2u_eq(fk, 11) <=> 0;
+    let c_asg: trit = m2u_eq(fk, 12) <=> 0;
+    let c_ret: trit = m2u_eq(fk, 13) <=> 0;
+    let c_exp: trit = m2u_eq(fk, 14) <=> 0;
+    let r1: bytes = if_pos c_let {
+        let u: bytes = iset_patch_i64(arena, 192, sp - 1);
+        u = m3p_skip_semi(m3s_consume_at(u, src, ntok), ntok);
+        u = m3e_ast_new(u, 16, 0, pl, pc, aux | (expr_id << 16) | (pw1 << 32));
+        m3p_block_append(u, ld_u64(u, 200))
+    } else { arena };
+    let r2: bytes = if_pos c_asg {
+        let u: bytes = iset_patch_i64(r1, 192, sp - 1);
+        u = m3p_skip_semi(m3s_consume_at(u, src, ntok), ntok);
+        let is_cmp: trit = m2u_lt(0, pw1) <=> 0;
+        let u2: bytes = if_pos is_cmp {
+            let nh: i64 = ld_u64(u, m3l_out() + (aux << 4));
+            let nv: i64 = ld_u64(u, m3l_out() + (aux << 4) + 8);
+            let t: bytes = m3e_ast_new(u, 4, 0, pl, pc, (nv & m2u_mask32()) | (((nh >> 16) & 65535) << 32));
+            let vid: i64 = ld_u64(t, 200);
+            m3e_ast_new(t, 6, pw1, pl, pc, vid | (expr_id << 32))
+        } else { u };
+        let rhs_id: i64 = ld_u64(u2, 200);
+        let u3: bytes = m3e_ast_new(u2, 17, 0, pl, pc, aux | (rhs_id << 16));
+        m3p_block_append(u3, ld_u64(u3, 200))
+    } else { r1 };
+    let r3: bytes = if_pos c_ret {
+        let u: bytes = iset_patch_i64(r2, 192, sp - 1);
+        u = m3p_skip_semi(m3s_consume_at(u, src, ntok), ntok);
+        u = m3e_ast_new(u, 22, 0, pl, pc, expr_id);
+        m3p_block_append(u, ld_u64(u, 200))
+    } else { r2 };
+    let r4: bytes = if_pos c_exp {
+        let u: bytes = iset_patch_i64(r3, 192, sp - 1);
+        u = m3p_skip_semi(m3s_consume_at(u, src, ntok), ntok);
+        u = m3e_ast_new(u, 23, 0, pl, pc, expr_id);
+        m3p_block_append(u, ld_u64(u, 200))
+    } else { r3 };
+    return r4;
+}
+
+// Delivers completed expression `cur_node` to control frames (`fkind` 15, 18, 19, 22, 23).
+#[strict]
+fn m3p_deliver_expr_b(arena: bytes, src: array, ntok: i64, sp: i64, fk: i64) -> bytes {
+    let poff: i64 = m3l_pstack() + ((sp - 1) << 4);
+    let pw0: i64 = ld_u64(arena, poff);
+    let pw1: i64 = ld_u64(arena, poff + 8);
+    let aux: i64 = (pw0 >> 16) & 65535;
+    let pl: i64 = (pw0 >> 32) & 65535;
+    let pc: i64 = (pw0 >> 48) & 65535;
+    let expr_id: i64 = ld_u64(arena, 200);
+    let c_wh: trit = m2u_eq(fk, 15) <=> 0;
+    let c_dw: trit = m2u_eq(fk, 18) <=> 0;
+    let c_if: trit = m2u_eq(fk, 19) <=> 0;
+    let c_ms: trit = m2u_eq(fk, 22) <=> 0;
+    let c_ma: trit = m2u_eq(fk, 23) <=> 0;
+    let r1: bytes = if_pos c_wh {
+        let u: bytes = iset_patch_i64(arena, poff, 16 | (pl << 32) | (pc << 48));
+        u = iset_patch_i64(u, poff + 8, expr_id);
+        m3p_enter_block(u, ntok)
+    } else { arena };
+    let r2: bytes = if_pos c_dw {
+        let u: bytes = iset_patch_i64(r1, 192, sp - 1);
+        u = m3p_skip_semi(u, ntok);
+        u = m3e_ast_new(u, 18, 0, pl, pc, (pw1 & 65535) | (expr_id << 16));
+        m3p_block_append(u, ld_u64(u, 200))
+    } else { r1 };
+    let r3: bytes = if_pos c_if {
+        let u: bytes = iset_patch_i64(r2, poff, 20 | (aux << 16) | (pl << 32) | (pc << 48));
+        u = iset_patch_i64(u, poff + 8, expr_id);
+        m3p_enter_block(u, ntok)
+    } else { r2 };
+    let r4: bytes = if_pos c_ms {
+        let ti: i64 = ld_u64(r3, 96);
+        let ok: i64 = m2u_lt(ti, ntok);
+        let h0: i64 = ld_u64(r3, m3l_out() + ((ti * ok) << 4));
+        let v0: i64 = ld_u64(r3, m3l_out() + ((ti * ok) << 4) + 8);
+        let is_lb: trit = (ok * m2u_eq(h0 & 65535, 5) * m2u_eq(v0, 123)) <=> 0;
+        if_pos is_lb {
+            let u: bytes = iset_patch_i64(r3, poff, 23 | (pl << 32) | (pc << 48));
+            u = iset_patch_i64(u, poff + 8, expr_id);
+            u = iset_patch_i64(u, 96, ti + 1);
+            m3p_match_next_arm(u, src, ntok, poff)
+        } else {
+            m3a_set_err(r3, m3err_syntax(), (h0 >> 32) & 65535, (h0 >> 48) & 65535)
+        }
+    } else { r3 };
+    let r5: bytes = if_pos c_ma {
+        let ew0: i64 = ld_u64(r4, m3l_ast() + (expr_id << 4));
+        let u: bytes = m3e_ast_new(r4, 23, 0, (ew0 >> 16) & 65535, (ew0 >> 32) & 65535, expr_id);
+        m3p_match_store_arm(u, src, ntok, poff, ld_u64(u, 200))
+    } else { r4 };
+    return r5;
+}
+
+// Unified State 0 (`EXPR_OPERAND`): handles `if_pos`/`if_neg`/`match_trit` or delegates to `m3e_step_operand_tok`.
+#[strict]
+fn m3p_step_operand(arena: bytes, src: array, ntok: i64) -> bytes {
+    let w: bytes = m3s_consume_at(arena, src, ntok);
+    let ti: i64 = ld_u64(w, 96);
+    let ok: trit = (m2u_lt(ti, ntok) * m2u_eq(ld_u64(w, 40), 0)) <=> 0;
+    let r: bytes = if_pos ok {
+        let h0: i64 = ld_u64(w, m3l_out() + (ti << 4));
+        let v0: i64 = ld_u64(w, m3l_out() + (ti << 4) + 8);
+        let is_id: i64 = m2u_eq(h0 & 65535, 8);
+        let kh: i64 = m3s_hash(src, v0 * is_id, ((h0 >> 16) & 65535) * is_id, 0);
+        let is_ip: i64 = is_id * m2u_eq(kh, 1534962155);
+        let is_in: i64 = is_id * m2u_eq(kh, 831556955);
+        let is_mt: i64 = is_id * m2u_eq(kh, 979191656);
+        let c_if: trit = (is_ip + is_in) <=> 0;
+        let c_mt: trit = is_mt <=> 0;
+        if_pos c_if {
+            let u: bytes = m3e_ps_push(w, 19, m2u_sel(is_ip, 1, 2), (h0 >> 32) & 65535, (h0 >> 48) & 65535, 0);
+            iset_patch_i64(u, 96, ti + 1)
+        } else {
+            if_pos c_mt {
+                let u: bytes = m3e_ps_push(w, 22, 0, (h0 >> 32) & 65535, (h0 >> 48) & 65535, 0);
+                iset_patch_i64(u, 96, ti + 1)
+            } else {
+                m3e_step_operand_tok(w, src, ntok, ti)
+            }
+        }
+    } else {
+        let e0: trit = m2u_eq(ld_u64(w, 40), 0) <=> 0;
+        if_pos e0 { m3a_set_err(w, m3err_syntax(), 1, 1) } else { w }
+    };
+    return r;
+}
+
+// Unified State 1 (`EXPR_AFTER`): reduces unary/binops, closes expr delimiters, or delivers to stmt/control frame.
+#[strict]
+fn m3p_step_after(arena: bytes, src: array, ntok: i64) -> bytes {
+    let w: bytes = m3e_reduce_unary(arena, 0);
+    let ti: i64 = ld_u64(w, 96);
+    let ok: i64 = m2u_lt(ti, ntok) * m2u_eq(ld_u64(w, 40), 0);
+    let h0: i64 = ld_u64(w, m3l_out() + ((ti * ok) << 4));
+    let v0: i64 = ld_u64(w, m3l_out() + ((ti * ok) << 4) + 8);
+    let binfo: i64 = ok * m2u_eq(h0 & 65535, 6) * m3e_binop_info(v0);
+    let is_bin: trit = binfo <=> 0;
+    let r: bytes = if_pos is_bin {
+        let prec: i64 = binfo >> 8;
+        let op_id: i64 = binfo & 255;
+        let u: bytes = m3e_reduce_bin(w, 0, prec);
+        let lhs: i64 = ld_u64(u, 200);
+        let u2: bytes = m3e_ps_push(u, 1, prec, (h0 >> 32) & 65535, (h0 >> 48) & 65535, op_id | (lhs << 32));
+        u2 = iset_patch_i64(u2, 96, ti + 1);
+        iset_patch_i64(u2, 208, 0)
+    } else {
+        let u: bytes = m3e_reduce_bin(w, 0, 1);
+        let sp: i64 = ld_u64(u, 192);
+        let fk: i64 = ld_u64(u, m3l_pstack() + ((sp - 1) << 4)) & 65535;
+        let c_p: trit = m2u_eq(fk, 3) <=> 0;
+        let c_c: trit = m2u_eq(fk, 4) <=> 0;
+        let c_t: trit = m2u_eq(fk, 5) <=> 0;
+        let c_a: trit = m2u_in(fk, 11, 14) <=> 0;
+        let c_b: trit = m2u_ge(fk, 15) <=> 0;
+        let r1: bytes = if_pos c_p { m3e_close_paren(u, ntok, sp) } else { u };
+        let r2: bytes = if_pos c_c { m3e_close_call(r1, src, ntok, sp) } else { r1 };
+        let r3: bytes = if_pos c_t { m3e_close_tritvec(r2, ntok, sp) } else { r2 };
+        let r4: bytes = if_pos c_a { m3p_deliver_expr_a(r3, src, ntok, sp, fk) } else { r3 };
+        if_pos c_b { m3p_deliver_expr_b(r4, src, ntok, sp, fk) } else { r4 }
+    };
+    return r;
+}
+
+// Parses one function body `{ stmt* }` starting at token `body_start` with `fn_strict`.
+// Leaves the root statement-list head node ID in global offset 200 (`cur_node`).
+#[strict]
+fn m3p_parse_fn_body(arena: bytes, src: array, ntok: i64, body_start: i64, fn_strict: i64) -> bytes {
+    let w: bytes = iset_patch_i64(arena, 88, 1);
+    w = iset_patch_i64(w, 96, body_start);
+    w = iset_patch_i64(w, 144, fn_strict);
+    w = iset_patch_i64(w, 192, 0);
+    w = iset_patch_i64(w, 200, 0);
+    w = m3p_enter_block(w, ntok);
+    let going: i64 = m2u_eq(ld_u64(w, 40), 0) * m2u_lt(ld_u64(w, 208), 3);
+    while going <=> 0 {
+        let st: i64 = ld_u64(w, 208);
+        let c0: trit = m2u_eq(st, 0) <=> 0;
+        let c1: trit = m2u_eq(st, 1) <=> 0;
+        let c2: trit = m2u_eq(st, 2) <=> 0;
+        let w1: bytes = if_pos c0 { m3p_step_operand(w, src, ntok) } else { w };
+        let w2: bytes = if_pos c1 { m3p_step_after(w1, src, ntok) } else { w1 };
+        let w3: bytes = if_pos c2 { m3p_step_block(w2, src, ntok) } else { w2 };
+        w = w3;
+        going = m2u_eq(ld_u64(w, 40), 0) * m2u_lt(ld_u64(w, 208), 3);
+    }
+    return w;
+}
+
+// Top-level Pass L + Pass S + Pass P: lexes, skims, parses all fn bodies (or returns fn `target_fn`'s AST).
+// When `target_fn >= 0`, parses all fns (validating full module), then returns `target_fn`'s AST pool slice.
+#[strict]
+fn m3_parse_all(arena: bytes, src: array, strict_arg: i64, target_fn: i64) -> bytes {
+    let w: bytes = m3_lex_into(arena, src, strict_arg);
+    let ntok: i64 = ld_u64(w, 64);
+    let going: i64 = m2u_eq(ld_u64(w, 40), 0) * m2u_lt(0, ntok);
+    while going <=> 0 {
+        w = m3s_parse_top(w, src, ntok);
+        let ti: i64 = ld_u64(w, 96);
+        let err: i64 = ld_u64(w, 40);
+        going = m2u_lt(ti, ntok) * m2u_eq(err, 0);
+    }
+    w = m3s_finalize_sigs(w, src);
+    let fcnt: i64 = ld_u64(w, 104);
+    let fi: i64 = 0;
+    let pg: i64 = m2u_eq(ld_u64(w, 40), 0) * m2u_lt(fi, fcnt);
+    while pg <=> 0 {
+        let base: i64 = m3l_fntab() + (fi << 5);
+        let w1: i64 = ld_u64(w, base + 8);
+        let w2: i64 = ld_u64(w, base + 16);
+        let fstr: i64 = (w1 >> 48) & 1;
+        let bstart: i64 = w2 & m2u_mask32();
+        w = m3p_parse_fn_body(w, src, ntok, bstart, fstr);
+        fi = fi + 1;
+        pg = m2u_eq(ld_u64(w, 40), 0) * m2u_lt(fi, fcnt) * (1 - m2u_eq(fi - 1, target_fn));
+    }
+    let err: i64 = ld_u64(w, 40);
+    let has_err: trit = err <=> 0;
+    let w3: bytes = if_pos has_err {
+        let el: i64 = ld_u64(w, 48);
+        let ec: i64 = ld_u64(w, 56);
+        let hdr: i64 = 65535 | ((err & 65535) << 16) | ((el & 65535) << 32) | ((ec & 65535) << 48);
+        let u: bytes = iset_patch_i64(w, m3l_ast(), hdr);
+        iset_patch_i64(u, m3l_ast() + 8, 0)
+    } else {
+        let root: i64 = ld_u64(w, 200);
+        let top: i64 = ld_u64(w, 88);
+        let u: bytes = iset_patch_i64(w, m3l_ast(), root | (top << 16) | (fcnt << 32));
+        iset_patch_i64(u, m3l_ast() + 8, 0)
+    };
+    let nbytes: i64 = m2u_sel(m2u_lt(0, err), 16, ld_u64(w3, 88) << 4);
+    return ret_slice(w3, m3l_ast(), nbytes);
+}

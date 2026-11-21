@@ -1,0 +1,6 @@
+// Q6 control: one include, indented include line is stripped by trim_start.
+    include "std/prelude.omni";
+fn main(x: i64, lo: i64, hi: i64) -> i64 {
+    let c: i64 = std_clamp(x, lo, hi);
+    return c;
+}

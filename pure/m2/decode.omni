@@ -1,0 +1,576 @@
+// ==============================================================================
+// pure/m2/decode.omni  (Milestone 2, M2-04) — the shared u16 token-stream decoder
+// ==============================================================================
+// Shared with Raven Encoder (ISA core). Read-only over the token window; iterative
+// (no recursion: FieldKV nesting is walked one step at a time); every fn <= 12 labels,
+// <= 120 SSA (enforced by `omni m2-lint`). Link order: util.omni, pure/isa/table.omni
+// (Raven, f600102: the ONLY copy of opcode metadata), then this file.
+// Reference: decode_omni_token_stream / parse_one_operand (omni_rust_bootstrap.rs:557-737);
+// differential test: selftest_m2_decode_diff (m2_host/decode_diff.rs).
+//
+// INPUTS. `arr: array` is the u16 token window (arena tokens band 0x00000-0x1FFFF);
+// `n` = slen(arr) words; every `off`/`pos` is a WORD offset into that window
+// (word w sits at arena byte 2*w). Only in-bounds 2-op IGET on the array is used.
+//
+// ENTRY (Raven's shape):
+//   m2d_decode_at(arr, n, off) -> next      decode the instruction starting at word `off`;
+//                                           returns the word offset after its INS_END, or a
+//                                           negative error (m2d_err_code / m2d_err_off). Pure.
+//   m2d_decode_at_ws(arr, n, off, ws) -> ws  same decode, and patches four i64 LE scratch
+//                                           words into the arena `ws` (needs slen(ws) >=
+//                                           m2l_scratch_end(); the ISA table rodata must sit
+//                                           at m2l_isa_tbl() = 0x81000 for the meta word):
+//     M2D_SCRATCH_OP   = 0x7FF00 (524032)  opcode token (0x7F00..; the raw op word)
+//     M2D_SCRATCH_NOPS = 0x7FF08 (524040)  top-level operand count (-1 on error)
+//     M2D_SCRATCH_NEXT = 0x7FF10 (524048)  next word offset, or the negative error
+//     M2D_SCRATCH_META = 0x7FF18 (524056)  m2d_op_meta: table flags | cap << 8, or -1
+//   (0x7FF20-0x7FFFF reserved for decoder scratch.) Constants: m2l_scratch_*(). Scalar
+//   readers: m2d_ins_op, m2d_ins_nops, m2d_ins_dest, m2d_ins_ty, m2d_ins_tc, m2d_operand,
+//   m2d_op_meta. Helpers for the encoder: m2u_sext16, m2u_sext32 (util.omni), m2k_*().
+//   Accept/reject is exactly the Rust decoder's (it does not consult opcode metadata);
+//   the meta word only publishes what pure/isa/table.omni says about the opcode.
+//
+// M2 ARENA LAYOUT (multi mode, D-8; compile-time constants m2l_*):
+//   0x00000-0x1FFFF tokens (128 KiB = 65,536 words; larger input is a hard reject, never a
+//                   silent truncation — m2d_window_ok; native trap in M2-09)
+//   0x20000-0x23FFF label table (4096 x u32)   0x24000-0x27FFF register / pass state
+//   0x28000-0x7FEFF output                     0x7FF00-0x7FFFF decoder scratch (above)
+//   0x80000+ belongs to M3 (Raven/Scarlett) and 0x100000-0x2FFFFF to the host runtime.
+//
+// PACKED OPERAND WORD (m2d_operand; never 0, always >= 0):
+//   bits 0..19 next word offset | bits 20..51 value (u32) | bits 52..55 kind
+//   kind (m2k_*) 1 REG (value = reg index 0..191)   2 PARAM (0..31)   3 LABEL (raw token 0x7EF0+k)
+//        4 TRIT (value = t+1)               5 IMM (i16/i32 sign-extended, stored as u32)
+//        6 ENG_SPAN (value = len; span = words next-len .. next-1)
+//        7 SCHEMA_REF  8 FN_REF  9 SKILL_REF (value = index)
+//        10 FIELD_KV (value = field idx; the wrapped operand follows at `next`)
+// ERRORS: negative = -(code * 2^20 + word_off). Codes: 1 no MOD_BEGIN, 2 schema header,
+//   3 schema fields, 4 expert header, 5 fn header, 6 fn signature, 7 EOF in fn body,
+//   8 SSA header, 9 missing INS_END (off = instruction start), 10 invalid operand token
+//   (off = token), 11 unexpected structural token (off = tag), 12 EOF inside an operand,
+//   13 truncated English span. Structural codes 2..6 report the tag offset.
+//
+// RECORD OUTPUT (m2d_decode_module, for differential tests / encoder round trips): i64 LE
+//   words appended to the caller's bytes arena:
+//   schema  3, s_id, f_cnt, f_cnt x (a | b<<16)      expert 4, (e | in<<16 | out<<32 | rank<<48)
+//   fn      1, fn_idx, p_cnt, ret_ty, cap, ins_cnt, p_cnt x (name | ty<<16 | tc<<32)
+//   ins     2, word_off, dest (-1 = none), op, ty, tc, operand words..., 0
+//   end     15, status (0 or error code), end_off or error off, n_fns
+// Not part of PURE_OMNI_CORE_SUITE_MODULES (frozen suite hash untouched).
+// ==============================================================================
+
+#[strict]
+fn m2l_tokens() -> i64 { return 0; }
+#[strict]
+fn m2l_labels() -> i64 { return 131072; }
+#[strict]
+fn m2l_regs() -> i64 { return 147456; }
+#[strict]
+fn m2l_out() -> i64 { return 163840; }
+#[strict]
+fn m2l_out_end() -> i64 { return 524032; }
+#[strict]
+fn m2l_scratch() -> i64 { return 524032; }
+#[strict]
+fn m2l_scratch_op() -> i64 { return 524032; }
+#[strict]
+fn m2l_scratch_nops() -> i64 { return 524040; }
+#[strict]
+fn m2l_scratch_next() -> i64 { return 524048; }
+#[strict]
+fn m2l_scratch_meta() -> i64 { return 524056; }
+#[strict]
+fn m2l_scratch_end() -> i64 { return 524288; }
+#[strict]
+fn m2l_window_words() -> i64 { return 65536; }
+
+// Opcode metadata lives ONLY in pure/isa/table.omni (Raven, f600102): rodata at logical
+// 0x81000 = isa_band_base + isa_rodata_rel. M2 keeps no copy; it reads the table's records.
+#[strict]
+fn m2l_isa_tbl() -> i64 {
+    let r: i64 = isa_band_base(0) + isa_rodata_rel(0);
+    return r;
+}
+
+// Operand kind codes (bits 52..55 of a packed operand word). Exported for the encoder.
+#[strict]
+fn m2k_reg() -> i64 { return 1; }
+#[strict]
+fn m2k_param() -> i64 { return 2; }
+#[strict]
+fn m2k_label() -> i64 { return 3; }
+#[strict]
+fn m2k_trit() -> i64 { return 4; }
+#[strict]
+fn m2k_imm() -> i64 { return 5; }
+#[strict]
+fn m2k_eng() -> i64 { return 6; }
+#[strict]
+fn m2k_schema_ref() -> i64 { return 7; }
+#[strict]
+fn m2k_fn_ref() -> i64 { return 8; }
+#[strict]
+fn m2k_skill_ref() -> i64 { return 9; }
+#[strict]
+fn m2k_field_kv() -> i64 { return 10; }
+
+// Opcode metadata word for op token `op`, read from the ISA table at byte `tb` of `t`:
+// flags | cap << 8 (flags per table.omni: 1 dest, 2 sink_safe, 4 sanitizer, 8 x86 AOT,
+// 16 Wasm AOT), or -1 when `op` is outside 0x7F00..0x7F7F or the table is not present.
+#[strict]
+fn m2d_op_meta(t: bytes, tb: i64, op: i64) -> i64 {
+    let i: i64 = isa_op_index(op);
+    let have: i64 = m2u_ge(slen(t), tb + isa_tbl_len(0));
+    let ok: i64 = m2u_ge(i, 0) * have;
+    let c: trit = ok <=> 0;
+    let r: i64 = if_pos c {
+        let f: i64 = isa_op_flags(t, tb, i);
+        let cap: i64 = isa_op_cap(t, tb, i);
+        f | (cap << 8)
+    } else {
+        0 - 1
+    };
+    return r;
+}
+
+// 1 if the token window fits the 128 KiB multi-mode window, else 0 (caller must reject).
+#[strict]
+fn m2d_window_ok(n: i64) -> i64 {
+    let r: i64 = m2u_ge(m2l_window_words(), n);
+    return r;
+}
+
+#[strict]
+fn m2d_err(code: i64, off: i64) -> i64 {
+    let r: i64 = 0 - (code * 1048576 + off);
+    return r;
+}
+
+#[strict]
+fn m2d_is_err(w: i64) -> i64 {
+    let r: i64 = m2u_lt(w, 0);
+    return r;
+}
+
+#[strict]
+fn m2d_err_code(w: i64) -> i64 {
+    let r: i64 = (0 - w) >> 20;
+    return r;
+}
+
+#[strict]
+fn m2d_err_off(w: i64) -> i64 {
+    let r: i64 = (0 - w) & 1048575;
+    return r;
+}
+
+#[strict]
+fn m2d_pack(kind: i64, val: i64, np: i64) -> i64 {
+    let v: i64 = val & m2u_mask32();
+    let r: i64 = np | (v << 20) | (kind << 52);
+    return r;
+}
+
+#[strict]
+fn m2d_next(w: i64) -> i64 {
+    let r: i64 = w & 1048575;
+    return r;
+}
+
+#[strict]
+fn m2d_kind(w: i64) -> i64 {
+    let r: i64 = (w >> 52) & 15;
+    return r;
+}
+
+#[strict]
+fn m2d_uval(w: i64) -> i64 {
+    let r: i64 = (w >> 20) & m2u_mask32();
+    return r;
+}
+
+#[strict]
+fn m2d_ival(w: i64) -> i64 {
+    let r: i64 = m2u_sext32(m2d_uval(w));
+    return r;
+}
+
+// REG / PARAM / LABEL / TRIT: packed word, or 0 when `tok` is none of them.
+#[strict]
+fn m2d_op_simple(tok: i64, pos: i64) -> i64 {
+    let is_reg: i64 = m2u_in(tok, 32256, 32447);
+    let is_par: i64 = m2u_in(tok, 32448, 32479);
+    let is_lbl: i64 = m2u_in(tok, 32496, 32511);
+    let is_tr: i64 = m2u_in(tok, 32487, 32489);
+    let kind: i64 = is_reg + is_par * 2 + is_lbl * 3 + is_tr * 4;
+    let val: i64 = is_reg * (tok - 32256) + is_par * (tok - 32448) + is_lbl * tok + is_tr * (tok - 32487);
+    let any: i64 = is_reg + is_par + is_lbl + is_tr;
+    let r: i64 = any * m2d_pack(kind, val, pos + 1);
+    return r;
+}
+
+// IMM_I16 / IMM_I32 / ENG_SPAN / SYM_* / FIELD_KV: packed word or error, or 0 if none.
+#[strict]
+fn m2d_op_ext(arr: array, n: i64, tok: i64, pos: i64) -> i64 {
+    let t1: i64 = m2u_tok(arr, n, pos + 1);
+    let t2: i64 = m2u_tok(arr, n, pos + 2);
+    let h1: i64 = m2u_lt(pos + 1, n);
+    let h2: i64 = m2u_lt(pos + 2, n);
+    let is_i16: i64 = m2u_eq(tok, 32485);
+    let is_i32: i64 = m2u_eq(tok, 32486);
+    let is_eng: i64 = m2u_eq(tok, 32490);
+    let is_sch: i64 = m2u_eq(tok, 32491);
+    let is_fn: i64 = m2u_eq(tok, 32492);
+    let is_sk: i64 = m2u_eq(tok, 32493);
+    let is_kv: i64 = m2u_eq(tok, 32494);
+    let is_sym: i64 = is_sch + is_fn + is_sk + is_kv;
+    let eof1: i64 = m2d_err(12, pos + 1);
+    let w16: i64 = m2u_sel(h1, m2d_pack(5, m2u_sext16(t1), pos + 2), eof1);
+    let v32: i64 = m2u_sext32((t1 << 16) | (t2 & 65535));
+    let w32: i64 = m2u_sel(h1 * h2, m2d_pack(5, v32, pos + 3), m2d_err(12, pos + 1 + h1));
+    let fits: i64 = m2u_ge(n, pos + 2 + t1);
+    let weng0: i64 = m2u_sel(fits, m2d_pack(6, t1, pos + 2 + t1), m2d_err(13, pos));
+    let weng: i64 = m2u_sel(h1, weng0, eof1);
+    let skind: i64 = is_sch * 7 + is_fn * 8 + is_sk * 9 + is_kv * 10;
+    let wsym: i64 = m2u_sel(h1, m2d_pack(skind, t1, pos + 2), eof1);
+    let r: i64 = is_i16 * w16 + is_i32 * w32 + is_eng * weng + is_sym * wsym;
+    return r;
+}
+
+// One operand step at `pos` (parse_one_operand). FIELD_KV returns only its prefix step.
+#[strict]
+fn m2d_operand(arr: array, n: i64, pos: i64) -> i64 {
+    let have: i64 = m2u_in(pos, 0, n - 1);
+    let tok: i64 = m2u_tok(arr, n, pos);
+    let s: i64 = m2d_op_simple(tok, pos);
+    let e: i64 = m2d_op_ext(arr, n, tok, pos);
+    let r: i64 = s + e;
+    let none: i64 = m2u_eq(r, 0);
+    let r2: i64 = m2u_sel(none, m2d_err(10, pos), r);
+    let out: i64 = m2u_sel(have, r2, m2d_err(12, pos));
+    return out;
+}
+
+#[strict]
+fn m2d_ins_has_dest(arr: array, n: i64, off: i64) -> i64 {
+    let r: i64 = m2u_in(m2u_tok(arr, n, off), 32256, 32447);
+    return r;
+}
+
+// Destination register index, or -1.
+#[strict]
+fn m2d_ins_dest(arr: array, n: i64, off: i64) -> i64 {
+    let d: i64 = m2d_ins_has_dest(arr, n, off);
+    let r: i64 = m2u_sel(d, m2u_tok(arr, n, off) - 32256, 0 - 1);
+    return r;
+}
+
+#[strict]
+fn m2d_ins_op(arr: array, n: i64, off: i64) -> i64 {
+    let d: i64 = m2d_ins_has_dest(arr, n, off);
+    let r: i64 = m2u_tok(arr, n, off + d);
+    return r;
+}
+
+// Type token (TY_VOID 0x7F80 when there is no destination).
+#[strict]
+fn m2d_ins_ty(arr: array, n: i64, off: i64) -> i64 {
+    let d: i64 = m2d_ins_has_dest(arr, n, off);
+    let r: i64 = m2u_sel(d, m2u_tok(arr, n, off + 2), 32640);
+    return r;
+}
+
+// Taint/cap token (pack_tc(false, PURE) = 0x7FC0 when there is no destination).
+#[strict]
+fn m2d_ins_tc(arr: array, n: i64, off: i64) -> i64 {
+    let d: i64 = m2d_ins_has_dest(arr, n, off);
+    let r: i64 = m2u_sel(d, m2u_tok(arr, n, off + 3), 32704);
+    return r;
+}
+
+// Header errors of the instruction at `off` (EOF in body, truncated SSA header), else 0.
+#[strict]
+fn m2d_ins_hdr_err(arr: array, n: i64, off: i64) -> i64 {
+    let eof: i64 = m2u_ge(off, n);
+    let d: i64 = m2d_ins_has_dest(arr, n, off);
+    let short: i64 = d * m2u_lt(n, off + 4);
+    let r: i64 = eof * m2d_err(7, off) + (1 - eof) * short * m2d_err(8, off);
+    return r;
+}
+
+// Scans the instruction at `off`: (next | top-level operand count << 20), or an error.
+#[strict]
+fn m2d_ins_scan(arr: array, n: i64, off: i64) -> i64 {
+    let herr: i64 = m2d_ins_hdr_err(arr, n, off);
+    let res: i64 = herr;
+    let cur: i64 = off + 1 + 3 * m2d_ins_has_dest(arr, n, off);
+    let pend: i64 = 0;
+    let nops: i64 = 0;
+    let go: i64 = m2u_eq(herr, 0);
+    while go <=> 0 {
+        let inb: i64 = m2u_lt(cur, n);
+        let at_end: i64 = (1 - pend) * inb * m2u_eq(m2u_tok(arr, n, cur), 32484);
+        let eof: i64 = (1 - pend) * (1 - inb);
+        let w: i64 = m2d_operand(arr, n, cur);
+        let werr: i64 = (1 - at_end) * (1 - eof) * m2d_is_err(w);
+        let kv: i64 = m2u_eq(m2d_kind(w), 10) * (1 - m2d_is_err(w));
+        res = at_end * (cur + 1 + nops * 1048576) + eof * m2d_err(9, off) + werr * w;
+        let cont: i64 = (1 - at_end) * (1 - eof) * (1 - werr);
+        nops = nops + cont * (1 - kv);
+        pend = cont * kv;
+        cur = m2u_sel(cont, m2d_next(w), cur);
+        go = cont;
+    }
+    return res;
+}
+
+// Raven's entry: next word offset after the instruction at `off`, or a negative error.
+#[strict]
+fn m2d_decode_at(arr: array, n: i64, off: i64) -> i64 {
+    let s: i64 = m2d_ins_scan(arr, n, off);
+    let r: i64 = m2u_sel(m2d_is_err(s), s, m2d_next(s));
+    return r;
+}
+
+// Top-level operand count of the (valid) instruction at `off`; -1 on a decode error.
+#[strict]
+fn m2d_ins_nops(arr: array, n: i64, off: i64) -> i64 {
+    let s: i64 = m2d_ins_scan(arr, n, off);
+    let r: i64 = m2u_sel(m2d_is_err(s), 0 - 1, s >> 20);
+    return r;
+}
+
+// Same decode; writes op / nops / next / meta to the fixed scratch words (M2D_SCRATCH_*).
+// The opcode metadata comes from the ISA table rodata at m2l_isa_tbl() inside `ws`.
+#[strict]
+fn m2d_decode_at_ws(arr: array, n: i64, off: i64, ws: bytes) -> bytes {
+    let s: i64 = m2d_ins_scan(arr, n, off);
+    let bad: i64 = m2d_is_err(s);
+    let op: i64 = m2d_ins_op(arr, n, off);
+    let w: bytes = iset_patch_i64(ws, m2l_scratch_meta(), m2d_op_meta(ws, m2l_isa_tbl(), op));
+    w = iset_patch_i64(w, m2l_scratch_op(), op);
+    w = iset_patch_i64(w, m2l_scratch_nops(), m2u_sel(bad, 0 - 1, s >> 20));
+    w = iset_patch_i64(w, m2l_scratch_next(), m2u_sel(bad, s, m2d_next(s)));
+    return w;
+}
+
+// FN_DEF at tag offset `pos`: header readers (valid streams only).
+#[strict]
+fn m2d_fn_idx(arr: array, n: i64, pos: i64) -> i64 {
+    let r: i64 = m2u_tok(arr, n, pos + 1);
+    return r;
+}
+
+#[strict]
+fn m2d_fn_pcnt(arr: array, n: i64, pos: i64) -> i64 {
+    let r: i64 = m2u_tok(arr, n, pos + 2);
+    return r;
+}
+
+// Param k packed as name | ty << 16 | tc << 32.
+#[strict]
+fn m2d_fn_param(arr: array, n: i64, pos: i64, k: i64) -> i64 {
+    let b: i64 = pos + 3 + 3 * k;
+    let r: i64 = m2u_tok(arr, n, b) | (m2u_tok(arr, n, b + 1) << 16) | (m2u_tok(arr, n, b + 2) << 32);
+    return r;
+}
+
+// Word offset of ret_ty (then cap_mask, ins_cnt); the body starts 3 words later.
+#[strict]
+fn m2d_fn_sig(arr: array, n: i64, pos: i64) -> i64 {
+    let r: i64 = pos + 3 + 3 * m2d_fn_pcnt(arr, n, pos);
+    return r;
+}
+
+// Validates the FN_DEF at `pos`: returns the word after its last instruction, or an error.
+#[strict]
+fn m2d_fn_scan(arr: array, n: i64, pos: i64) -> i64 {
+    let h: i64 = m2u_ge(n, pos + 3);
+    let sig: i64 = m2d_fn_sig(arr, n, pos);
+    let hs: i64 = h * m2u_ge(n, sig + 3);
+    let res: i64 = m2u_sel(h, m2d_err(6, pos), m2d_err(5, pos));
+    let cnt: i64 = m2u_tok(arr, n, sig + 2) * hs;
+    let cur: i64 = sig + 3;
+    let i: i64 = 0;
+    let go: i64 = hs * m2u_lt(0, cnt);
+    res = m2u_sel(hs, cur, res);
+    while go <=> 0 {
+        let s: i64 = m2d_ins_scan(arr, n, cur);
+        let bad: i64 = m2d_is_err(s);
+        cur = m2u_sel(bad, cur, m2d_next(s));
+        res = m2u_sel(bad, s, cur);
+        i = i + 1;
+        go = (1 - bad) * m2u_lt(i, cnt);
+    }
+    return res;
+}
+
+#[strict]
+fn m2d_schema_scan(arr: array, n: i64, pos: i64) -> i64 {
+    let h: i64 = m2u_ge(n, pos + 3);
+    let end: i64 = pos + 3 + 2 * m2u_tok(arr, n, pos + 2);
+    let ok: i64 = h * m2u_ge(n, end);
+    let r: i64 = m2u_sel(ok, end, m2u_sel(h, m2d_err(3, pos), m2d_err(2, pos)));
+    return r;
+}
+
+#[strict]
+fn m2d_expert_scan(n: i64, pos: i64) -> i64 {
+    let r: i64 = m2u_sel(m2u_ge(n, pos + 5), pos + 5, m2d_err(4, pos));
+    return r;
+}
+
+// Next structural offset after the item whose tag is at `pos`, or an error.
+// MOD_END returns n + 1 (stop marker): the module ends there.
+#[strict]
+fn m2d_item_scan(arr: array, n: i64, pos: i64) -> i64 {
+    let tag: i64 = m2u_tok(arr, n, pos);
+    let is_fn: i64 = m2u_eq(tag, 32483);
+    let c: trit = is_fn <=> 0;
+    let f: i64 = if_pos c { m2d_fn_scan(arr, n, pos) } else { 0 };
+    let sch: i64 = m2u_eq(tag, 32481) * m2d_schema_scan(arr, n, pos);
+    let ex: i64 = m2u_eq(tag, 32482) * m2d_expert_scan(n, pos);
+    let end: i64 = m2u_eq(tag, 32495);
+    let known: i64 = is_fn + m2u_eq(tag, 32481) + m2u_eq(tag, 32482) + end;
+    let r: i64 = f + sch + ex + end * (n + 1) + (1 - known) * m2d_err(11, pos);
+    return r;
+}
+
+// Pass 0 over the whole module: (end_off | n_fns << 20), or an error.
+// end_off is the word after MOD_END, or n when the stream ends without one (as Rust).
+#[strict]
+fn m2d_module_scan(arr: array) -> i64 {
+    let n: i64 = slen(arr);
+    let ok0: i64 = m2u_lt(0, n) * m2u_eq(m2u_tok(arr, n, 0), 32480);
+    let res: i64 = m2d_err(1, 0);
+    let pos: i64 = 1;
+    let nfns: i64 = 0;
+    let go: i64 = ok0;
+    res = m2u_sel(ok0, n, res);
+    while go <=> 0 {
+        let more: i64 = m2u_lt(pos, n);
+        let r: i64 = m2d_item_scan(arr, n, pos);
+        let bad: i64 = more * m2d_is_err(r);
+        let fin: i64 = more * m2u_eq(r, n + 1);
+        nfns = nfns + more * (1 - bad) * m2u_eq(m2u_tok(arr, n, pos), 32483);
+        res = m2u_sel(bad, r, m2u_sel(fin, pos + 1, m2u_sel(more, 0, n)));
+        pos = m2u_sel(more * (1 - bad) * (1 - fin), r, pos);
+        go = more * (1 - bad) * (1 - fin);
+    }
+    let out: i64 = m2u_sel(m2d_is_err(res), res, res + nfns * 1048576);
+    return out;
+}
+
+#[strict]
+fn m2d_put_ins(arr: array, n: i64, off: i64, out: bytes) -> bytes {
+    let o: bytes = iset_i64(out, 2);
+    o = iset_i64(o, off);
+    o = iset_i64(o, m2d_ins_dest(arr, n, off));
+    o = iset_i64(o, m2d_ins_op(arr, n, off));
+    o = iset_i64(o, m2d_ins_ty(arr, n, off));
+    o = iset_i64(o, m2d_ins_tc(arr, n, off));
+    let cur: i64 = off + 1 + 3 * m2d_ins_has_dest(arr, n, off);
+    let pend: i64 = 0;
+    let go: i64 = 1 - m2u_eq(m2u_tok(arr, n, cur), 32484);
+    while go <=> 0 {
+        let w: i64 = m2d_operand(arr, n, cur);
+        o = iset_i64(o, w);
+        pend = m2u_eq(m2d_kind(w), 10);
+        cur = m2d_next(w);
+        go = 1 - (1 - pend) * m2u_eq(m2u_tok(arr, n, cur), 32484);
+    }
+    o = iset_i64(o, 0);
+    return o;
+}
+
+#[strict]
+fn m2d_put_fn_hdr(arr: array, n: i64, pos: i64, out: bytes) -> bytes {
+    let sig: i64 = m2d_fn_sig(arr, n, pos);
+    let pc: i64 = m2d_fn_pcnt(arr, n, pos);
+    let o: bytes = iset_i64(out, 1);
+    o = iset_i64(o, m2d_fn_idx(arr, n, pos));
+    o = iset_i64(o, pc);
+    o = iset_i64(o, m2u_tok(arr, n, sig));
+    o = iset_i64(o, m2u_tok(arr, n, sig + 1));
+    o = iset_i64(o, m2u_tok(arr, n, sig + 2));
+    let k: i64 = 0;
+    while pc - k <=> 0 {
+        o = iset_i64(o, m2d_fn_param(arr, n, pos, k));
+        k = k + 1;
+    }
+    return o;
+}
+
+#[strict]
+fn m2d_put_fn(arr: array, n: i64, pos: i64, out: bytes) -> bytes {
+    let o: bytes = m2d_put_fn_hdr(arr, n, pos, out);
+    let sig: i64 = m2d_fn_sig(arr, n, pos);
+    let cnt: i64 = m2u_tok(arr, n, sig + 2);
+    let cur: i64 = sig + 3;
+    let i: i64 = 0;
+    while cnt - i <=> 0 {
+        o = m2d_put_ins(arr, n, cur, o);
+        cur = m2d_decode_at(arr, n, cur);
+        i = i + 1;
+    }
+    return o;
+}
+
+#[strict]
+fn m2d_put_schema(arr: array, n: i64, pos: i64, out: bytes) -> bytes {
+    let fc: i64 = m2u_tok(arr, n, pos + 2);
+    let o: bytes = iset_i64(out, 3);
+    o = iset_i64(o, m2u_tok(arr, n, pos + 1));
+    o = iset_i64(o, fc);
+    let k: i64 = 0;
+    while fc - k <=> 0 {
+        let b: i64 = pos + 3 + 2 * k;
+        o = iset_i64(o, m2u_tok(arr, n, b) | (m2u_tok(arr, n, b + 1) << 16));
+        k = k + 1;
+    }
+    return o;
+}
+
+#[strict]
+fn m2d_put_expert(arr: array, n: i64, pos: i64, out: bytes) -> bytes {
+    let a: i64 = m2u_tok(arr, n, pos + 1) | (m2u_tok(arr, n, pos + 2) << 16);
+    let b: i64 = (m2u_tok(arr, n, pos + 3) << 32) | (m2u_tok(arr, n, pos + 4) << 48);
+    let o: bytes = iset_i64(out, 4);
+    o = iset_i64(o, a | b);
+    return o;
+}
+
+// Pass 1 over a module that m2d_module_scan accepted: appends every item record.
+#[strict]
+fn m2d_put_items(arr: array, end: i64, out: bytes) -> bytes {
+    let n: i64 = slen(arr);
+    let o: bytes = out;
+    let pos: i64 = 1;
+    let go: i64 = m2u_lt(pos, end) * (1 - m2u_eq(m2u_tok(arr, n, pos), 32495));
+    while go <=> 0 {
+        let tag: i64 = m2u_tok(arr, n, pos);
+        let cf: trit = m2u_eq(tag, 32483) <=> 0;
+        o = if_pos cf { m2d_put_fn(arr, n, pos, o) } else { o };
+        let cs: trit = m2u_eq(tag, 32481) <=> 0;
+        o = if_pos cs { m2d_put_schema(arr, n, pos, o) } else { o };
+        let ce: trit = m2u_eq(tag, 32482) <=> 0;
+        o = if_pos ce { m2d_put_expert(arr, n, pos, o) } else { o };
+        pos = m2d_item_scan(arr, n, pos);
+        go = m2u_lt(pos, end) * (1 - m2u_eq(m2u_tok(arr, n, pos), 32495));
+    }
+    return o;
+}
+
+// Whole-module decode into records (two passes: validate, then write); ends with an end record.
+#[strict]
+fn m2d_decode_module(arr: array, out: bytes) -> bytes {
+    let s: i64 = m2d_module_scan(arr);
+    let bad: i64 = m2d_is_err(s);
+    let c: trit = (1 - bad) <=> 0;
+    let o: bytes = if_pos c { m2d_put_items(arr, m2d_next(s), out) } else { out };
+    o = iset_i64(o, 15);
+    o = iset_i64(o, bad * m2d_err_code(s));
+    o = iset_i64(o, m2u_sel(bad, m2d_err_off(s), m2d_next(s)));
+    o = iset_i64(o, (1 - bad) * (s >> 20));
+    return o;
+}

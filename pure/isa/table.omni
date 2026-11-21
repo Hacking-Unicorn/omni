@@ -1,0 +1,505 @@
+// pure/isa/table.omni: shared ISA rodata (M3-03); drift-locked by run_isa_table_drift_selftests.
+// M3 band slot rel 0x01000-0x01FFF (logical 0x81000): mn @+0 81x16B {op idx u8, ty u8 (ty-0x7F80; 255 ret_ty; 240..244 dest-less shape), len u8, name[13]}; op @+1296 128x8B {idx, 0x7F, cap u16, flags u8 (1 dest, 2 sink_safe, 4 sanitizer, 8 x86_aot, 16 wasm_aot), 0 x3}; intrinsics @rel 0x01910-0x01FFF.
+
+#[strict]
+fn isa_mn_rows_0(t: bytes) -> bytes {
+    let o: bytes = t;
+    o = iset(o, 6, 1, 4, 67, 73, 78, 84, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 6, 1, 3, 77, 79, 86, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 8, 4, 4, 67, 83, 84, 82, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 9, 3, 5, 67, 84, 82, 73, 84, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 1, 10, 5, 65, 82, 69, 78, 65, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 13, 6, 4, 65, 78, 69, 87, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 14, 1, 4, 73, 71, 69, 84, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 15, 6, 4, 73, 83, 69, 84, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 80, 1, 4, 83, 76, 69, 78, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 81, 4, 4, 83, 67, 65, 84, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 81, 4, 5, 83, 67, 79, 78, 67, 0, 0, 0, 0, 0, 0, 0, 0);
+    return o;
+}
+
+#[strict]
+fn isa_mn_rows_1(t: bytes) -> bytes {
+    let o: bytes = t;
+    o = iset(o, 85, 1, 3, 83, 50, 73, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 86, 4, 3, 73, 50, 83, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 16, 1, 4, 73, 65, 68, 68, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 17, 1, 4, 73, 83, 85, 66, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 18, 1, 4, 73, 77, 85, 76, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 19, 1, 4, 73, 68, 73, 86, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 20, 1, 4, 73, 77, 79, 68, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 21, 1, 4, 73, 78, 69, 71, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 22, 1, 4, 73, 65, 66, 83, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 23, 1, 4, 73, 77, 73, 78, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 24, 1, 4, 73, 77, 65, 88, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    return o;
+}
+
+#[strict]
+fn isa_mn_rows_2(t: bytes) -> bytes {
+    let o: bytes = t;
+    o = iset(o, 30, 1, 4, 66, 65, 78, 68, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 31, 1, 3, 66, 79, 82, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 32, 1, 4, 66, 88, 79, 82, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 33, 1, 4, 66, 78, 79, 84, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 34, 1, 3, 83, 72, 76, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 35, 1, 3, 83, 72, 82, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 36, 3, 3, 67, 69, 81, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 37, 3, 3, 67, 78, 69, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 38, 3, 3, 67, 76, 84, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 39, 3, 3, 67, 71, 84, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 40, 3, 4, 84, 78, 79, 84, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    return o;
+}
+
+#[strict]
+fn isa_mn_rows_3(t: bytes) -> bytes {
+    let o: bytes = t;
+    o = iset(o, 41, 3, 4, 84, 65, 78, 68, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 42, 3, 3, 84, 79, 82, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 43, 3, 4, 84, 88, 79, 82, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 44, 3, 4, 84, 77, 65, 74, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 45, 3, 4, 84, 67, 77, 80, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 48, 6, 5, 80, 65, 67, 75, 53, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 48, 6, 6, 84, 80, 65, 67, 75, 53, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 49, 7, 7, 85, 78, 80, 65, 67, 75, 53, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 49, 7, 8, 84, 85, 78, 80, 65, 67, 75, 53, 0, 0, 0, 0, 0);
+    o = iset(o, 52, 1, 4, 84, 68, 79, 84, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 53, 3, 5, 69, 71, 65, 84, 69, 0, 0, 0, 0, 0, 0, 0, 0);
+    return o;
+}
+
+#[strict]
+fn isa_mn_rows_4(t: bytes) -> bytes {
+    let o: bytes = t;
+    o = iset(o, 54, 3, 9, 76, 79, 79, 75, 65, 72, 69, 65, 68, 0, 0, 0, 0);
+    o = iset(o, 63, 3, 6, 84, 76, 79, 71, 73, 67, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 69, 255, 8, 83, 69, 76, 95, 84, 82, 73, 84, 0, 0, 0, 0, 0);
+    o = iset(o, 69, 255, 4, 67, 77, 79, 86, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 72, 1, 4, 67, 65, 76, 76, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 72, 1, 8, 67, 65, 76, 76, 95, 73, 54, 52, 0, 0, 0, 0, 0);
+    o = iset(o, 72, 3, 9, 67, 65, 76, 76, 95, 84, 82, 73, 84, 0, 0, 0, 0);
+    o = iset(o, 72, 6, 10, 67, 65, 76, 76, 95, 66, 89, 84, 69, 83, 0, 0, 0);
+    o = iset(o, 72, 7, 13, 67, 65, 76, 76, 95, 84, 82, 73, 84, 95, 86, 69, 67);
+    o = iset(o, 72, 4, 8, 67, 65, 76, 76, 95, 83, 84, 82, 0, 0, 0, 0, 0);
+    o = iset(o, 2, 1, 8, 66, 79, 82, 82, 79, 87, 95, 82, 0, 0, 0, 0, 0);
+    return o;
+}
+
+#[strict]
+fn isa_mn_rows_5(t: bytes) -> bytes {
+    let o: bytes = t;
+    o = iset(o, 3, 1, 8, 66, 79, 82, 82, 79, 87, 95, 87, 0, 0, 0, 0, 0);
+    o = iset(o, 4, 1, 4, 77, 79, 86, 69, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 87, 4, 7, 83, 65, 78, 95, 83, 81, 76, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 88, 4, 7, 83, 65, 78, 95, 68, 79, 77, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 89, 4, 7, 83, 65, 78, 95, 80, 82, 77, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 93, 1, 5, 70, 78, 86, 49, 65, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 100, 1, 6, 68, 66, 95, 71, 69, 84, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 100, 1, 6, 75, 86, 95, 71, 69, 84, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 101, 1, 6, 68, 66, 95, 81, 82, 89, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 104, 1, 6, 68, 66, 95, 67, 78, 84, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 107, 1, 6, 75, 86, 95, 80, 85, 84, 0, 0, 0, 0, 0, 0, 0);
+    return o;
+}
+
+#[strict]
+fn isa_mn_rows_6(t: bytes) -> bytes {
+    let o: bytes = t;
+    o = iset(o, 107, 1, 6, 68, 66, 95, 80, 85, 84, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 108, 1, 5, 82, 79, 85, 84, 69, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 108, 1, 8, 72, 84, 84, 80, 95, 83, 82, 86, 0, 0, 0, 0, 0);
+    o = iset(o, 109, 1, 7, 82, 69, 81, 95, 80, 65, 82, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 110, 1, 8, 82, 83, 80, 95, 74, 83, 79, 78, 0, 0, 0, 0, 0);
+    o = iset(o, 111, 4, 8, 82, 83, 80, 95, 72, 84, 77, 76, 0, 0, 0, 0, 0);
+    o = iset(o, 112, 1, 8, 65, 85, 84, 72, 95, 86, 69, 82, 0, 0, 0, 0, 0);
+    o = iset(o, 0, 240, 3, 78, 79, 80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 5, 241, 4, 68, 82, 79, 80, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 74, 241, 3, 82, 69, 84, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 64, 242, 5, 76, 65, 66, 69, 76, 0, 0, 0, 0, 0, 0, 0, 0);
+    return o;
+}
+
+#[strict]
+fn isa_mn_rows_7(t: bytes) -> bytes {
+    let o: bytes = t;
+    o = iset(o, 65, 242, 3, 74, 77, 80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 67, 243, 6, 66, 82, 95, 80, 79, 83, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 68, 243, 6, 66, 82, 95, 78, 69, 71, 0, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 66, 244, 7, 66, 82, 95, 84, 82, 73, 84, 0, 0, 0, 0, 0, 0);
+    return o;
+}
+
+#[strict]
+fn isa_op_rows_0(t: bytes) -> bytes {
+    let o: bytes = t;
+    o = iset(o, 0, 127, 0, 0, 24, 0, 0, 0);
+    o = iset(o, 1, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 2, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 3, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 4, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 5, 127, 0, 0, 24, 0, 0, 0);
+    o = iset(o, 6, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 7, 127, 0, 0, 1, 0, 0, 0);
+    o = iset(o, 8, 127, 0, 0, 1, 0, 0, 0);
+    o = iset(o, 9, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 10, 127, 0, 0, 1, 0, 0, 0);
+    o = iset(o, 11, 127, 0, 0, 1, 0, 0, 0);
+    o = iset(o, 12, 127, 0, 0, 1, 0, 0, 0);
+    o = iset(o, 13, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 14, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 15, 127, 0, 0, 25, 0, 0, 0);
+    return o;
+}
+
+#[strict]
+fn isa_op_rows_1(t: bytes) -> bytes {
+    let o: bytes = t;
+    o = iset(o, 16, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 17, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 18, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 19, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 20, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 21, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 22, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 23, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 24, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 25, 127, 0, 0, 1, 0, 0, 0);
+    o = iset(o, 26, 127, 0, 0, 1, 0, 0, 0);
+    o = iset(o, 27, 127, 0, 0, 1, 0, 0, 0);
+    o = iset(o, 28, 127, 0, 0, 1, 0, 0, 0);
+    o = iset(o, 29, 127, 0, 0, 1, 0, 0, 0);
+    o = iset(o, 30, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 31, 127, 0, 0, 25, 0, 0, 0);
+    return o;
+}
+
+#[strict]
+fn isa_op_rows_2(t: bytes) -> bytes {
+    let o: bytes = t;
+    o = iset(o, 32, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 33, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 34, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 35, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 36, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 37, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 38, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 39, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 40, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 41, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 42, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 43, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 44, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 45, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 46, 127, 0, 0, 1, 0, 0, 0);
+    o = iset(o, 47, 127, 0, 0, 1, 0, 0, 0);
+    return o;
+}
+
+#[strict]
+fn isa_op_rows_3(t: bytes) -> bytes {
+    let o: bytes = t;
+    o = iset(o, 48, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 49, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 50, 127, 16, 0, 1, 0, 0, 0);
+    o = iset(o, 51, 127, 16, 0, 3, 0, 0, 0);
+    o = iset(o, 52, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 53, 127, 16, 0, 27, 0, 0, 0);
+    o = iset(o, 54, 127, 16, 0, 3, 0, 0, 0);
+    o = iset(o, 55, 127, 16, 0, 3, 0, 0, 0);
+    o = iset(o, 56, 127, 16, 0, 3, 0, 0, 0);
+    o = iset(o, 57, 127, 16, 0, 3, 0, 0, 0);
+    o = iset(o, 58, 127, 0, 0, 1, 0, 0, 0);
+    o = iset(o, 59, 127, 0, 0, 1, 0, 0, 0);
+    o = iset(o, 60, 127, 0, 0, 1, 0, 0, 0);
+    o = iset(o, 61, 127, 0, 0, 1, 0, 0, 0);
+    o = iset(o, 62, 127, 0, 0, 1, 0, 0, 0);
+    o = iset(o, 63, 127, 0, 0, 25, 0, 0, 0);
+    return o;
+}
+
+#[strict]
+fn isa_op_rows_4(t: bytes) -> bytes {
+    let o: bytes = t;
+    o = iset(o, 64, 127, 0, 0, 24, 0, 0, 0);
+    o = iset(o, 65, 127, 0, 0, 24, 0, 0, 0);
+    o = iset(o, 66, 127, 0, 0, 24, 0, 0, 0);
+    o = iset(o, 67, 127, 0, 0, 24, 0, 0, 0);
+    o = iset(o, 68, 127, 0, 0, 24, 0, 0, 0);
+    o = iset(o, 69, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 70, 127, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 71, 127, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 72, 127, 0, 0, 1, 0, 0, 0);
+    o = iset(o, 73, 127, 0, 0, 0, 0, 0, 0);
+    o = iset(o, 74, 127, 0, 0, 26, 0, 0, 0);
+    o = iset(o, 75, 127, 0, 0, 1, 0, 0, 0);
+    o = iset(o, 76, 127, 0, 0, 1, 0, 0, 0);
+    o = iset(o, 77, 127, 0, 0, 1, 0, 0, 0);
+    o = iset(o, 78, 127, 0, 0, 1, 0, 0, 0);
+    o = iset(o, 79, 127, 0, 0, 0, 0, 0, 0);
+    return o;
+}
+
+#[strict]
+fn isa_op_rows_5(t: bytes) -> bytes {
+    let o: bytes = t;
+    o = iset(o, 80, 127, 0, 0, 25, 0, 0, 0);
+    o = iset(o, 81, 127, 0, 0, 1, 0, 0, 0);
+    o = iset(o, 82, 127, 0, 0, 1, 0, 0, 0);
+    o = iset(o, 83, 127, 0, 0, 1, 0, 0, 0);
+    o = iset(o, 84, 127, 0, 0, 1, 0, 0, 0);
+    o = iset(o, 85, 127, 0, 0, 1, 0, 0, 0);
+    o = iset(o, 86, 127, 0, 0, 1, 0, 0, 0);
+    o = iset(o, 87, 127, 0, 0, 29, 0, 0, 0);
+    o = iset(o, 88, 127, 0, 0, 29, 0, 0, 0);
+    o = iset(o, 89, 127, 16, 0, 29, 0, 0, 0);
+    o = iset(o, 90, 127, 0, 0, 5, 0, 0, 0);
+    o = iset(o, 91, 127, 0, 0, 5, 0, 0, 0);
+    o = iset(o, 92, 127, 0, 0, 5, 0, 0, 0);
+    o = iset(o, 93, 127, 0, 0, 1, 0, 0, 0);
+    o = iset(o, 94, 127, 0, 0, 1, 0, 0, 0);
+    o = iset(o, 95, 127, 0, 0, 1, 0, 0, 0);
+    return o;
+}
+
+#[strict]
+fn isa_op_rows_6(t: bytes) -> bytes {
+    let o: bytes = t;
+    o = iset(o, 96, 127, 2, 0, 1, 0, 0, 0);
+    o = iset(o, 97, 127, 2, 0, 3, 0, 0, 0);
+    o = iset(o, 98, 127, 2, 0, 1, 0, 0, 0);
+    o = iset(o, 99, 127, 2, 0, 3, 0, 0, 0);
+    o = iset(o, 100, 127, 1, 0, 3, 0, 0, 0);
+    o = iset(o, 101, 127, 1, 0, 3, 0, 0, 0);
+    o = iset(o, 102, 127, 2, 0, 3, 0, 0, 0);
+    o = iset(o, 103, 127, 2, 0, 3, 0, 0, 0);
+    o = iset(o, 104, 127, 1, 0, 1, 0, 0, 0);
+    o = iset(o, 105, 127, 2, 0, 3, 0, 0, 0);
+    o = iset(o, 106, 127, 1, 0, 3, 0, 0, 0);
+    o = iset(o, 107, 127, 2, 0, 3, 0, 0, 0);
+    o = iset(o, 108, 127, 4, 0, 3, 0, 0, 0);
+    o = iset(o, 109, 127, 4, 0, 1, 0, 0, 0);
+    o = iset(o, 110, 127, 4, 0, 3, 0, 0, 0);
+    o = iset(o, 111, 127, 4, 0, 3, 0, 0, 0);
+    return o;
+}
+
+#[strict]
+fn isa_op_rows_7(t: bytes) -> bytes {
+    let o: bytes = t;
+    o = iset(o, 112, 127, 128, 0, 5, 0, 0, 0);
+    o = iset(o, 113, 127, 4, 0, 1, 0, 0, 0);
+    o = iset(o, 114, 127, 0, 2, 1, 0, 0, 0);
+    o = iset(o, 115, 127, 0, 2, 3, 0, 0, 0);
+    o = iset(o, 116, 127, 0, 2, 3, 0, 0, 0);
+    o = iset(o, 117, 127, 0, 1, 3, 0, 0, 0);
+    o = iset(o, 118, 127, 8, 0, 3, 0, 0, 0);
+    o = iset(o, 119, 127, 8, 0, 3, 0, 0, 0);
+    o = iset(o, 120, 127, 8, 0, 3, 0, 0, 0);
+    o = iset(o, 121, 127, 8, 0, 3, 0, 0, 0);
+    o = iset(o, 122, 127, 8, 0, 3, 0, 0, 0);
+    o = iset(o, 123, 127, 8, 0, 3, 0, 0, 0);
+    o = iset(o, 124, 127, 64, 0, 3, 0, 0, 0);
+    o = iset(o, 125, 127, 16, 0, 3, 0, 0, 0);
+    o = iset(o, 126, 127, 32, 0, 3, 0, 0, 0);
+    o = iset(o, 127, 127, 32, 0, 3, 0, 0, 0);
+    return o;
+}
+
+#[strict]
+fn isa_tbl_append(a: bytes) -> bytes {
+    let t: bytes = a;
+    t = isa_mn_rows_0(t);
+    t = isa_mn_rows_1(t);
+    t = isa_mn_rows_2(t);
+    t = isa_mn_rows_3(t);
+    t = isa_mn_rows_4(t);
+    t = isa_mn_rows_5(t);
+    t = isa_mn_rows_6(t);
+    t = isa_mn_rows_7(t);
+    t = isa_op_rows_0(t);
+    t = isa_op_rows_1(t);
+    t = isa_op_rows_2(t);
+    t = isa_op_rows_3(t);
+    t = isa_op_rows_4(t);
+    t = isa_op_rows_5(t);
+    t = isa_op_rows_6(t);
+    t = isa_op_rows_7(t);
+    return t;
+}
+
+#[strict]
+fn isa_band_base(x: i64) -> i64 {
+    return 524288;
+}
+
+#[strict]
+fn isa_rodata_rel(x: i64) -> i64 {
+    return 4096;
+}
+
+#[strict]
+fn isa_op_off(x: i64) -> i64 {
+    return 1296;
+}
+
+#[strict]
+fn isa_tbl_len(x: i64) -> i64 {
+    return 2320;
+}
+
+#[strict]
+fn isa_intr_rel(x: i64) -> i64 {
+    return 6416;
+}
+
+#[strict]
+fn isa_intr_end_rel(x: i64) -> i64 {
+    return 8192;
+}
+
+#[strict]
+fn isa_op_count(x: i64) -> i64 {
+    return 128;
+}
+
+#[strict]
+fn isa_mn_count(x: i64) -> i64 {
+    return 81;
+}
+
+#[strict]
+fn isa_tbl_build(x: i64) -> bytes {
+    let t: bytes = isa_tbl_append(anew(0));
+    return t;
+}
+
+#[strict]
+fn isa_is_eq(a: i64, b: i64) -> i64 {
+    let c: trit = a <=> b;
+    let r: i64 = sel_trit(c, 0, 1, 0);
+    return r;
+}
+
+#[strict]
+fn isa_is_lt(a: i64, b: i64) -> i64 {
+    let c: trit = a <=> b;
+    let r: i64 = sel_trit(c, 1, 0, 0);
+    return r;
+}
+
+#[strict]
+fn isa_u16_at(t: bytes, off: i64) -> i64 {
+    let v: i64 = ld_u16(t, off);
+    return v;
+}
+
+#[strict]
+fn isa_op_index(tok: i64) -> i64 {
+    let i: i64 = tok - 32512;
+    let ok: i64 = (1 - isa_is_lt(i, 0)) * isa_is_lt(i, 128);
+    let r: i64 = ok * i + (1 - ok) * (0 - 1);
+    return r;
+}
+
+#[strict]
+fn isa_op_rec(b: i64, i: i64) -> i64 {
+    let v: i64 = b + 1296 + i * 8;
+    return v;
+}
+
+#[strict]
+fn isa_op_tok(t: bytes, b: i64, i: i64) -> i64 {
+    let v: i64 = isa_u16_at(t, isa_op_rec(b, i));
+    return v;
+}
+
+#[strict]
+fn isa_op_cap(t: bytes, b: i64, i: i64) -> i64 {
+    let v: i64 = isa_u16_at(t, isa_op_rec(b, i) + 2);
+    return v;
+}
+
+#[strict]
+fn isa_op_flags(t: bytes, b: i64, i: i64) -> i64 {
+    let v: i64 = ld_u8(t, isa_op_rec(b, i) + 4);
+    return v;
+}
+
+#[strict]
+fn isa_op_flag(t: bytes, b: i64, i: i64, bit: i64) -> i64 {
+    let f: i64 = isa_op_flags(t, b, i);
+    let v: i64 = (f >> bit) & 1;
+    return v;
+}
+
+#[strict]
+fn isa_mn_rec(b: i64, m: i64) -> i64 {
+    let v: i64 = b + m * 16;
+    return v;
+}
+
+#[strict]
+fn isa_mn_op(t: bytes, b: i64, m: i64) -> i64 {
+    let v: i64 = 32512 + ld_u8(t, isa_mn_rec(b, m));
+    return v;
+}
+
+#[strict]
+fn isa_mn_tyb(t: bytes, b: i64, m: i64) -> i64 {
+    let v: i64 = ld_u8(t, isa_mn_rec(b, m) + 1);
+    return v;
+}
+
+#[strict]
+fn isa_mn_shape(t: bytes, b: i64, m: i64) -> i64 {
+    let y: i64 = isa_mn_tyb(t, b, m);
+    let s: i64 = (1 - isa_is_lt(y, 240)) * isa_is_lt(y, 255);
+    let v: i64 = s * (y - 239);
+    return v;
+}
+
+#[strict]
+fn isa_mn_ty(t: bytes, b: i64, m: i64, ret_ty: i64) -> i64 {
+    let y: i64 = isa_mn_tyb(t, b, m);
+    let fixed: i64 = isa_is_lt(y, 240);
+    let from_ret: i64 = isa_is_eq(y, 255);
+    let v: i64 = fixed * (32640 + y) + from_ret * ret_ty;
+    return v;
+}
+
+#[strict]
+fn isa_mn_len(t: bytes, b: i64, m: i64) -> i64 {
+    let v: i64 = ld_u8(t, isa_mn_rec(b, m) + 2);
+    return v;
+}
+
+#[strict]
+fn isa_mn_ch(t: bytes, b: i64, m: i64, k: i64) -> i64 {
+    let v: i64 = ld_u8(t, isa_mn_rec(b, m) + 3 + k);
+    return v;
+}
+
+#[strict]
+fn isa_mn_eq(t: bytes, b: i64, m: i64, s: bytes, off: i64, len: i64) -> i64 {
+    let ok: i64 = isa_is_eq(isa_mn_len(t, b, m), len);
+    let n: i64 = ok * len;
+    let k: i64 = 0;
+    while n - k <=> 0 {
+        ok = ok * isa_is_eq(isa_mn_ch(t, b, m, k), ld_u8(s, off + k));
+        k = k + 1;
+    }
+    return ok;
+}
+
+#[strict]
+fn isa_mn_find(t: bytes, b: i64, s: bytes, off: i64, len: i64) -> i64 {
+    let r: i64 = 0 - 1;
+    let m: i64 = 81;
+    while m <=> 0 {
+        m = m - 1;
+        let hit: i64 = isa_mn_eq(t, b, m, s, off, len);
+        r = hit * m + (1 - hit) * r;
+    }
+    return r;
+}

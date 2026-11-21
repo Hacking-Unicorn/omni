@@ -1,0 +1,5 @@
+// L7 DIV_DIVISOR: immediate divisor 0 / -1 is forbidden.
+fn main(a: i64) -> i64 {
+    let r: i64 = a % 0;
+    return r;
+}

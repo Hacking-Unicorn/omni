@@ -1,0 +1,74 @@
+// ==============================================================================
+// pure/m2/util.omni  (Milestone 2, M2-04)
+// Branch-free scalar helpers shared by every pure/m2 module. 0/1 flags, no labels.
+// Not part of PURE_OMNI_CORE_SUITE_MODULES (frozen suite hash untouched).
+// ==============================================================================
+
+#[strict]
+fn m2u_eq(a: i64, b: i64) -> i64 {
+    let c: trit = a <=> b;
+    let r: i64 = sel_trit(c, 0, 1, 0);
+    return r;
+}
+
+#[strict]
+fn m2u_lt(a: i64, b: i64) -> i64 {
+    let c: trit = a <=> b;
+    let r: i64 = sel_trit(c, 1, 0, 0);
+    return r;
+}
+
+#[strict]
+fn m2u_ge(a: i64, b: i64) -> i64 {
+    let c: trit = a <=> b;
+    let r: i64 = sel_trit(c, 0, 1, 1);
+    return r;
+}
+
+// 1 if lo <= x <= hi, else 0.
+#[strict]
+fn m2u_in(x: i64, lo: i64, hi: i64) -> i64 {
+    let a: i64 = m2u_ge(x, lo);
+    let b: i64 = m2u_ge(hi, x);
+    let r: i64 = a * b;
+    return r;
+}
+
+// c ? a : b for a 0/1 flag c (both arms already evaluated: callers pass scalars only).
+#[strict]
+fn m2u_sel(c: i64, a: i64, b: i64) -> i64 {
+    let r: i64 = c * a + (1 - c) * b;
+    return r;
+}
+
+#[strict]
+fn m2u_sext16(v: i64) -> i64 {
+    let neg: i64 = m2u_ge(v, 32768);
+    let r: i64 = v - neg * 65536;
+    return r;
+}
+
+#[strict]
+fn m2u_sext32(v: i64) -> i64 {
+    let half: i64 = 1 << 31;
+    let neg: i64 = m2u_ge(v, half);
+    let r: i64 = v - neg * (half << 1);
+    return r;
+}
+
+#[strict]
+fn m2u_mask32() -> i64 {
+    let r: i64 = (1 << 32) - 1;
+    return r;
+}
+
+// Token word at `pos` of the u16 token window `arr` (n = slen(arr) words), or -1 when
+// pos is outside 0..n-1. Only ever does an in-bounds 2-op IGET on an ARRAY (lint L-4).
+#[strict]
+fn m2u_tok(arr: array, n: i64, pos: i64) -> i64 {
+    let have: i64 = m2u_in(pos, 0, n - 1);
+    let idx: i64 = pos * have;
+    let t: i64 = iget(arr, idx);
+    let r: i64 = t * have + (have - 1);
+    return r;
+}

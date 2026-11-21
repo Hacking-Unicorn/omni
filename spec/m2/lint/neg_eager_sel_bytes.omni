@@ -1,0 +1,8 @@
+// L1 EAGER_SEL_BYTES: sel_trit evaluates every arm, so a bytes arm is never lazy.
+fn main(c: i64) -> i64 {
+    let w: bytes = anew(0);
+    let t: trit = c <=> 0;
+    let w2: bytes = sel_trit(t, w, w, w);
+    let n: i64 = slen(w2);
+    return n;
+}

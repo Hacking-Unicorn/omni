@@ -1,0 +1,3583 @@
+//! Omni AOT — standalone two-pass x86-64 ELF64 compiler (64-bit stdout channel),
+//! trap-free WebAssembly v1 compiler & 64-bit stack-machine evaluator, and Two-Pass Stage-1 compiler stream.
+
+use std::collections::{BTreeMap, HashMap};
+use omni_isa::*;
+use omni_ir::*;
+use omni_verifier::{verify_binary_function, verify_module_for_multi_aot};
+
+// 12. STEP 6 (PURE RUST): TWO-PASS x86-64 ELF & REAL INSTRUCTION-LOWERING WASM AOT
+// ==============================================================================
+
+#[derive(Clone, Copy, Debug)]
+struct RelocPatch {
+    patch_offset: usize,
+    target_label: u16,
+}
+
+fn collect_func_pack5_map(func: &BinFunction) -> BTreeMap<u16, (Vec<u8>, usize, bool)> {
+    let mut reg_pack5: BTreeMap<u16, (Vec<u8>, usize, bool)> = BTreeMap::new();
+    for ins in &func.instructions {
+        match ins.op_tok {
+            0x7F0D => {
+                if let Some(d) = ins.dest_reg {
+                    reg_pack5.insert(d, (Vec::new(), 0, false));
+                }
+            }
+            0x7F0F => {
+                let is_typed_write = (ins.operands.len() == 3
+                    && (ins.operands[1] == BinOperand::ImmInt(-4) || ins.operands[1] == BinOperand::ImmInt(-8)))
+                    || (ins.operands.len() == 4 && ins.operands[1] == BinOperand::ImmInt(-9));
+                if let Some(d) = ins.dest_reg {
+                    if is_typed_write {
+                        // Runtime width/patch write: not a compile-time pack5 constant.
+                        reg_pack5.remove(&d);
+                    } else {
+                        let (mut bytes, mut complete) = match ins.operands.first() {
+                            Some(BinOperand::Reg(s)) => match reg_pack5.get(s) {
+                                Some((b, _, _)) => (b.clone(), true),
+                                // Unknown source buffer: its bytes are not a compile-time constant.
+                                None => (Vec::new(), false),
+                            },
+                            _ => (Vec::new(), true),
+                        };
+                        for op_b in &ins.operands[1..] {
+                            if let BinOperand::ImmInt(v) = *op_b {
+                                bytes.push((v & 0xFF) as u8);
+                            } else {
+                                complete = false;
+                            }
+                        }
+                        if complete {
+                            let n_trits = bytes.len() * 5;
+                            reg_pack5.insert(d, (bytes, n_trits, false));
+                        } else {
+                            // Dynamic ISET byte: must not const-fold later IGETs
+                            // (skipping non-immediates would yield a stale/partial buffer).
+                            reg_pack5.remove(&d);
+                        }
+                    }
+                }
+            }
+            0x7F31 => {
+                if let (Some(d), Some(BinOperand::Reg(s))) = (ins.dest_reg, ins.operands.first()) {
+                    let bytes = reg_pack5.get(s).map(|(b, _, _)| b.clone()).unwrap_or_default();
+                    let n_trits = match ins.operands.get(1) {
+                        Some(BinOperand::ImmInt(n)) => (*n).max(0) as usize,
+                        _ => bytes.len() * 5,
+                    };
+                    reg_pack5.insert(d, (bytes, n_trits, true));
+                }
+            }
+            0x7F30 => {
+                if let (Some(d), Some(BinOperand::Reg(s))) = (ins.dest_reg, ins.operands.first()) {
+                    if let Some((bytes, n_trits, _)) = reg_pack5.get(s).cloned() {
+                        reg_pack5.insert(d, (bytes, n_trits, false));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    reg_pack5
+}
+
+#[inline]
+fn pack5_word_from_bytes(bytes: &[u8], n_trits: usize) -> i64 {
+    let mut word: u64 = (n_trits & 0xFF) as u64;
+    for (idx, &b) in bytes.iter().take(7).enumerate() {
+        word |= (b as u64) << ((idx + 1) * 8);
+    }
+    word as i64
+}
+
+fn validate_func_pack5_ops(
+    func: &BinFunction,
+    reg_pack5: &BTreeMap<u16, (Vec<u8>, usize, bool)>,
+) -> Result<(), String> {
+    let check_reg = |r: u16| -> Result<(), String> {
+        if let Some((bytes, _, _)) = reg_pack5.get(&r) {
+            if bytes.iter().any(|&b| b > PACK5_MAX_VALID) {
+                return Err(String::from("error[CORRUPT_PACK5]: PACK5_SENTINEL_OR_CORRUPT_BYTE"));
+            }
+        }
+        Ok(())
+    };
+    for ins in &func.instructions {
+        if matches!(ins.op_tok, 0x7F30 | 0x7F31 | 0x7F34 | 0x7F35 | 0x7F3F) {
+            for op in &ins.operands {
+                if let BinOperand::Reg(r) = *op {
+                    check_reg(r)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+pub fn is_module_aot_hot_path(module: &BinModule) -> bool {
+    if module.functions.len() != 1 {
+        return false;
+    }
+    let func = &module.functions[0];
+    if !matches!(func.ret_ty_tok, TY_I64 | TY_TRIT) {
+        return false;
+    }
+    if !func.params.iter().all(|&(_, ty, _)| matches!(ty, TY_I64 | TY_TRIT | TY_ARENA)) {
+        return false;
+    }
+    func.instructions
+        .iter()
+        .all(|ins| is_wasm_aot_supported_opcode(ins.op_tok) && is_x86_64_aot_supported_opcode(ins.op_tok))
+}
+
+/// Emits a 65-byte x86-64 CLI decimal integer parser supporting optional leading `'-'` (`0x2D`)
+/// so both positive and negative integer/trit arguments can be passed on the command line.
+fn emit_cli_arg_parser(mc: &mut Vec<u8>, argc_min: u8, disp_argv: u8, target_reg_code: u8) {
+    mc.extend_from_slice(&[0x48, 0x83, 0x7D, 0x08, argc_min]);
+    mc.extend_from_slice(&[0x7C, 0x3A]);
+    mc.extend_from_slice(&[0x48, 0x8B, 0x75, disp_argv]);
+    mc.extend_from_slice(&[0x31, 0xC0]);
+    mc.extend_from_slice(&[0xBF, 0x01, 0x00, 0x00, 0x00]);
+    mc.extend_from_slice(&[0x0F, 0xB6, 0x0E]);
+    mc.extend_from_slice(&[0x80, 0xF9, 0x2D]);
+    mc.extend_from_slice(&[0x75, 0x0A]);
+    mc.extend_from_slice(&[0x48, 0xC7, 0xC7, 0xFF, 0xFF, 0xFF, 0xFF]);
+    mc.extend_from_slice(&[0x48, 0xFF, 0xC6]);
+    mc.extend_from_slice(&[0x0F, 0xB6, 0x0E]);
+    mc.extend_from_slice(&[0x84, 0xC9]);
+    mc.extend_from_slice(&[0x74, 0x0F]);
+    mc.extend_from_slice(&[0x83, 0xE9, 0x30]);
+    mc.extend_from_slice(&[0x48, 0x6B, 0xC0, 0x0A]);
+    mc.extend_from_slice(&[0x48, 0x01, 0xC8]);
+    mc.extend_from_slice(&[0x48, 0xFF, 0xC6]);
+    mc.extend_from_slice(&[0xEB, 0xEA]);
+    mc.extend_from_slice(&[0x48, 0x0F, 0xAF, 0xC7]);
+    mc.extend_from_slice(&[0x49, 0x89, 0xC0 + target_reg_code]);
+}
+
+/// ISA-B strict bounds on x86-64 with rax = buffer length, rcx = off: jumps forward by `skip`
+/// bytes (past the guarded load/store) unless width <= len, off <= len - width (unsigned, so a
+/// negative off fails), and the same against r11 (the current heap length). Clobbers rax.
+/// ISA-B out-of-bounds trap: write OMNI_OOB_ERROR + "\n" to stderr, nothing to stdout, then
+/// exit(OMNI_OOB_EXIT_STATUS). The message bytes sit inline right after the code.
+fn x86_oob_trap() -> Vec<u8> {
+    let msg_len = OMNI_OOB_ERROR.len() as u32 + 1;
+    let mut t = vec![0x48, 0x8D, 0x35, 29, 0x00, 0x00, 0x00]; // lea rsi, [rip+29] (message)
+    t.push(0xBA);
+    t.extend_from_slice(&msg_len.to_le_bytes()); // mov edx, len
+    t.extend_from_slice(&[0xBF, 0x02, 0x00, 0x00, 0x00]); // mov edi, 2 (stderr)
+    t.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]); // mov eax, 1 (write)
+    t.extend_from_slice(&[0x0F, 0x05]); // syscall
+    t.push(0xBF);
+    t.extend_from_slice(&(OMNI_OOB_EXIT_STATUS as u32).to_le_bytes()); // mov edi, status
+    t.extend_from_slice(&[0xB8, 0x3C, 0x00, 0x00, 0x00]); // mov eax, 60 (exit)
+    t.extend_from_slice(&[0x0F, 0x05]); // syscall
+    t.extend_from_slice(OMNI_OOB_ERROR.as_bytes());
+    t.push(b'\n');
+    t
+}
+
+/// Guarded heap access: bounds check, `access`, then a jmp over the trap that every failed
+/// check lands on.
+fn emit_x86_guarded_heap_access(code: &mut Vec<u8>, width: u8, access: &[u8]) {
+    let trap = x86_oob_trap();
+    emit_x86_heap_bounds_check(code, width, access.len() as u8 + 2);
+    code.extend_from_slice(access);
+    code.extend_from_slice(&[0xEB, trap.len() as u8]);
+    code.extend_from_slice(&trap);
+}
+
+fn emit_x86_heap_bounds_check(code: &mut Vec<u8>, width: u8, skip: u8) {
+    // rel8 = bytes left in this sequence after each jump + skip: 19, 14, 5, 0.
+    code.extend_from_slice(&[0x48, 0x83, 0xE8, width, 0x72, 19 + skip]); // sub rax, w; jb skip
+    code.extend_from_slice(&[0x48, 0x39, 0xC1, 0x77, 14 + skip]); // cmp rcx, rax; ja skip
+    code.extend_from_slice(&[0x4C, 0x89, 0xD8]); // mov rax, r11
+    code.extend_from_slice(&[0x48, 0x83, 0xE8, width, 0x72, 5 + skip]); // sub rax, w; jb skip
+    code.extend_from_slice(&[0x48, 0x39, 0xC1, 0x77, skip]); // cmp rcx, rax; ja skip
+}
+
+pub fn compile_pure_u16_to_x86_64_elf(stream: &[u16], arg0: i64, arg1: i64) -> Result<Vec<u8>, String> {
+    compile_pure_u16_to_x86_64_elf_with_args(stream, arg0, arg1, 90)
+}
+
+pub fn compile_pure_u16_to_x86_64_elf_with_args(
+    stream: &[u16],
+    arg0: i64,
+    arg1: i64,
+    arg2: i64,
+) -> Result<Vec<u8>, String> {
+    let module = decode_omni_token_stream(stream)?;
+    let func = module.functions.first().ok_or("No function in module")?;
+    let rep = verify_binary_function(func);
+    if !rep.passed {
+        return Err(format!("Cannot AOT-compile unverified binary stream: {:?}", rep.errors));
+    }
+
+    for ins in &func.instructions {
+        if !is_x86_64_aot_supported_opcode(ins.op_tok) {
+            let lbl = decode_opcode_token(ins.op_tok).map(|s| s.debug_label).unwrap_or("OP_UNKNOWN");
+            return Err(format!(
+                "Opcode 0x{:04X} ({}) requires high-level VM runtime state and is not lowered by standalone x86-64 AOT",
+                ins.op_tok, lbl
+            ));
+        }
+    }
+
+    let mut code: Vec<u8> = Vec::with_capacity(2048);
+    let mut label_offsets: Vec<(u16, usize)> = Vec::new();
+    let mut relocs: Vec<RelocPatch> = Vec::new();
+
+    code.extend_from_slice(&[
+        0x55,
+        0x48, 0x89, 0xE5,
+        0x48, 0x81, 0xEC, 0x00, 0x00, 0x03, 0x00,
+    ]);
+
+    if func.ret_ty_tok == TY_BYTES {
+        code.extend_from_slice(&[0x49, 0xC7, 0xC4, 0x00, 0x00, 0x00, 0x00]);
+        code.extend_from_slice(&[0x49, 0xBD]);
+        code.extend_from_slice(&(arg0 as u64).to_le_bytes());
+        code.extend_from_slice(&[0x49, 0xBE]);
+        code.extend_from_slice(&(arg1 as u64).to_le_bytes());
+        code.extend_from_slice(&[0x49, 0xBF]);
+        code.extend_from_slice(&(arg2 as u64).to_le_bytes());
+
+        code.extend_from_slice(&[
+            0x48, 0x83, 0x7D, 0x08, 0x02,
+            0x7C, 0x2E,
+            0x48, 0x8B, 0x7D, 0x18,
+            0x31, 0xF6,
+            0x31, 0xD2,
+            0xB8, 0x02, 0x00, 0x00, 0x00,
+            0x0F, 0x05,
+            0x48, 0x85, 0xC0,
+            0x78, 0x1A,
+            0x48, 0x89, 0xC7,
+            0x48, 0x8D, 0xB5, 0x00, 0x20, 0xFD, 0xFF,
+            0xBA, 0x00, 0xE0, 0x00, 0x00,
+            0x31, 0xC0,
+            0x0F, 0x05,
+            0xB8, 0x03, 0x00, 0x00, 0x00,
+            0x0F, 0x05,
+            0x45, 0x31, 0xDB,
+        ]);
+        emit_cli_arg_parser(&mut code, 3, 0x20, 5);
+        emit_cli_arg_parser(&mut code, 4, 0x28, 6);
+        emit_cli_arg_parser(&mut code, 5, 0x30, 7);
+    } else {
+        code.extend_from_slice(&[0x49, 0xBC]);
+        code.extend_from_slice(&(arg0 as u64).to_le_bytes());
+        code.extend_from_slice(&[0x49, 0xBD]);
+        code.extend_from_slice(&(arg1 as u64).to_le_bytes());
+        code.extend_from_slice(&[0x49, 0xBE]);
+        code.extend_from_slice(&(arg2 as u64).to_le_bytes());
+        code.extend_from_slice(&[0x49, 0xC7, 0xC7, 0x00, 0x00, 0x00, 0x00]);
+        emit_cli_arg_parser(&mut code, 2, 0x18, 4);
+        emit_cli_arg_parser(&mut code, 3, 0x20, 5);
+        emit_cli_arg_parser(&mut code, 4, 0x28, 6);
+        emit_cli_arg_parser(&mut code, 5, 0x30, 7);
+    }
+
+    let emit_load_op = |c: &mut Vec<u8>, op: &BinOperand, into_rcx: bool| {
+        match *op {
+            BinOperand::Param(0x7EC0) => {
+                c.extend_from_slice(&[0x4C, 0x89, if into_rcx { 0xE1 } else { 0xE0 }]);
+            }
+            BinOperand::Param(0x7EC1) => {
+                c.extend_from_slice(&[0x4C, 0x89, if into_rcx { 0xE9 } else { 0xE8 }]);
+            }
+            BinOperand::Param(0x7EC2) => {
+                c.extend_from_slice(&[0x4C, 0x89, if into_rcx { 0xF1 } else { 0xF0 }]);
+            }
+            BinOperand::Param(0x7EC3) => {
+                c.extend_from_slice(&[0x4C, 0x89, if into_rcx { 0xF9 } else { 0xF8 }]);
+            }
+            BinOperand::Reg(r_tok) => {
+                let disp: i32 = -8 * (((r_tok - REG_BASE) as i32) + 1);
+                c.extend_from_slice(&[0x48, 0x8B, if into_rcx { 0x8D } else { 0x85 }]);
+                c.extend_from_slice(&disp.to_le_bytes());
+            }
+            BinOperand::ImmInt(v) => {
+                c.extend_from_slice(&[0x48, if into_rcx { 0xB9 } else { 0xB8 }]);
+                c.extend_from_slice(&(v as u64).to_le_bytes());
+            }
+            BinOperand::ImmTrit(t) => {
+                c.extend_from_slice(&[0x48, if into_rcx { 0xB9 } else { 0xB8 }]);
+                c.extend_from_slice(&((t as i64) as u64).to_le_bytes());
+            }
+            _ => {}
+        }
+    };
+
+    let emit_store_rax = |c: &mut Vec<u8>, d_tok: u16| {
+        let disp: i32 = -8 * (((d_tok - REG_BASE) as i32) + 1);
+        c.extend_from_slice(&[0x48, 0x89, 0x85]);
+        c.extend_from_slice(&disp.to_le_bytes());
+    };
+
+    let reg_pack5 = collect_func_pack5_map(func);
+    validate_func_pack5_ops(func, &reg_pack5)?;
+    // Registers that hold an ISET-heap buffer (defined by ANEW or ISET). A 2-op IGET on
+    // one of these reads the heap byte; a 2-op IGET on a param still reads the u16 token
+    // region (the Stage-1 image uses only the param form, so its bytes do not change).
+    let x86_buffer_regs: std::collections::BTreeSet<u16> = func
+        .instructions
+        .iter()
+        .filter(|ins| matches!(ins.op_tok, 0x7F0D | 0x7F0F))
+        .filter_map(|ins| ins.dest_reg)
+        .collect();
+    // The pack5 map is flow-insensitive (last definition in stream order wins), so it is only
+    // trusted for IGET on TritVec / TPACK5 registers, never on a runtime ANEW/ISET buffer.
+    let x86_fold_iget = |r: u16| -> bool {
+        reg_pack5.get(&r).map(|(_, _, is_tv)| *is_tv || !x86_buffer_regs.contains(&r)).unwrap_or(false)
+    };
+    let emit_extract_pack5_trit_x86 = |c: &mut Vec<u8>, op: &BinOperand, trit_idx: usize, into_rcx: bool| {
+        let mut direct_byte = false;
+        if let BinOperand::Reg(r) = *op {
+            if let Some((bytes, _, _)) = reg_pack5.get(&r) {
+                let b_val = bytes.get(trit_idx / 5).copied().unwrap_or(121) as i64;
+                emit_load_op(c, &BinOperand::ImmInt(b_val), false);
+                direct_byte = true;
+            }
+        }
+        if !direct_byte {
+            emit_load_op(c, op, false);
+            let shift: u8 = (((trit_idx / 5) + 1) * 8) as u8;
+            c.extend_from_slice(&[0x48, 0xC1, 0xE8, shift]); // shr rax, shift
+            c.extend_from_slice(&[0x0F, 0xB6, 0xC0]);       // movzx eax, al
+        }
+        c.extend_from_slice(&[0x31, 0xD2]);             // xor edx, edx
+        let pow3: u8 = [1u8, 3, 9, 27, 81][trit_idx % 5];
+        if pow3 > 1 {
+            c.extend_from_slice(&[0xBE, pow3, 0, 0, 0]); // mov esi, pow3
+            c.extend_from_slice(&[0x48, 0xF7, 0xF6]);    // div rsi
+            c.extend_from_slice(&[0x31, 0xD2]);          // xor edx, edx
+        }
+        c.extend_from_slice(&[0xBE, 3, 0, 0, 0]);       // mov esi, 3
+        c.extend_from_slice(&[0x48, 0xF7, 0xF6]);       // div rsi (rdx = byte / 3^k % 3)
+        c.extend_from_slice(&[0x48, 0x8D, 0x42, 0xFF]); // lea rax, [rdx - 1]
+        if into_rcx {
+            c.extend_from_slice(&[0x48, 0x89, 0xC1]);   // mov rcx, rax
+        }
+    };
+
+    for ins in &func.instructions {
+        match ins.op_tok {
+            0x7F00 | 0x7F05 => {}
+            0x7F01 | 0x7F02 | 0x7F03 | 0x7F04 | 0x7F06 | 0x7F09 | 0x7F57 | 0x7F58 | 0x7F59 => {
+                emit_load_op(&mut code, &ins.operands[0], false);
+                if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+            }
+            0x7F0D => {
+                code.extend_from_slice(&[0x45, 0x31, 0xDB]);
+                if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+            }
+            0x7F0E => {
+                if let (Some(BinOperand::Reg(r_arr)), Some(idx_op)) =
+                    (ins.operands.first(), ins.operands.get(1))
+                {
+                    if let Some((bytes, n_len, is_tv)) = reg_pack5.get(r_arr).filter(|_| x86_fold_iget(*r_arr)) {
+                        if let BinOperand::ImmInt(idx) = idx_op {
+                            if *idx >= 0 {
+                                if *is_tv {
+                                    emit_extract_pack5_trit_x86(&mut code, &ins.operands[0], *idx as usize, false);
+                                } else {
+                                    let b_val = bytes.get(*idx as usize).copied().unwrap_or(0) as i64;
+                                    emit_load_op(&mut code, &BinOperand::ImmInt(b_val), false);
+                                }
+                                if let Some(d) = ins.dest_reg {
+                                    emit_store_rax(&mut code, d);
+                                }
+                                continue;
+                            }
+                        } else {
+                            code.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d (acc = 0)
+                            for k in 0..*n_len {
+                                if *is_tv {
+                                    emit_extract_pack5_trit_x86(&mut code, &ins.operands[0], k, true);
+                                } else {
+                                    let b_val = bytes.get(k).copied().unwrap_or(0) as i64;
+                                    emit_load_op(&mut code, &BinOperand::ImmInt(b_val), true);
+                                }
+                                emit_load_op(&mut code, idx_op, false); // rax = dynamic index
+                                code.extend_from_slice(&[0x48, 0x3D]);  // cmp rax, imm32(k)
+                                code.extend_from_slice(&(k as i32).to_le_bytes());
+                                code.extend_from_slice(&[0x4C, 0x0F, 0x44, 0xC1]); // cmove r8, rcx
+                            }
+                            code.extend_from_slice(&[0x4C, 0x89, 0xC0]); // mov rax, r8
+                            if let Some(d) = ins.dest_reg {
+                                emit_store_rax(&mut code, d);
+                            }
+                            continue;
+                        }
+                    }
+                }
+                if ins.operands.len() == 3 {
+                    // ISA-B 3-op IGET buf, mode, off: zero-extended LE load from the ISET heap.
+                    let width: u8 = match ins.operands[1] {
+                        BinOperand::ImmInt(-1) => 1,
+                        BinOperand::ImmInt(-2) => 2,
+                        BinOperand::ImmInt(-4) => 4,
+                        BinOperand::ImmInt(-8) => 8,
+                        _ => return Err(String::from("error[BAD_TYPE]: 3-op IGET mode must be -1, -2, -4, or -8")),
+                    };
+                    let load: &[u8] = match width {
+                        1 => &[0x0F, 0xB6, 0x84, 0x0D, 0x00, 0x00, 0xFE, 0xFF], // movzx eax, byte [rbp+rcx-0x20000]
+                        2 => &[0x0F, 0xB7, 0x84, 0x0D, 0x00, 0x00, 0xFE, 0xFF], // movzx eax, word [rbp+rcx-0x20000]
+                        4 => &[0x8B, 0x84, 0x0D, 0x00, 0x00, 0xFE, 0xFF],       // mov eax, dword [...]
+                        _ => &[0x48, 0x8B, 0x84, 0x0D, 0x00, 0x00, 0xFE, 0xFF], // mov rax, qword [...]
+                    };
+                    emit_load_op(&mut code, &ins.operands[0], false); // rax = buffer len
+                    emit_load_op(&mut code, &ins.operands[2], true); // rcx = off
+                    emit_x86_guarded_heap_access(&mut code, width, load); // OOB: canonical trap
+                    if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                    continue;
+                }
+                if let (2, Some(BinOperand::Reg(r_arr))) = (ins.operands.len(), ins.operands.first()) {
+                    if x86_buffer_regs.contains(r_arr) {
+                        // ISET-heap byte readback: 0 unless idx < buffer len (the register's
+                        // length snapshot) and idx < r11 (current heap length), both unsigned.
+                        emit_load_op(&mut code, &ins.operands[0], false); // rax = len
+                        emit_load_op(&mut code, &ins.operands[1], true); // rcx = idx
+                        code.extend_from_slice(&[0x48, 0x39, 0xC1, 0x73, 0x0F]); // cmp rcx, rax; jae oob
+                        code.extend_from_slice(&[0x4C, 0x39, 0xD9, 0x73, 0x0A]); // cmp rcx, r11; jae oob
+                        code.extend_from_slice(&[0x0F, 0xB6, 0x84, 0x0D, 0x00, 0x00, 0xFE, 0xFF]); // movzx eax, byte [rbp+rcx-0x20000]
+                        code.extend_from_slice(&[0xEB, 0x02, 0x31, 0xC0]); // jmp done; oob: xor eax, eax
+                        if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                        continue;
+                    }
+                }
+                emit_load_op(&mut code, &ins.operands[1], false);
+                code.extend_from_slice(&[0x0F, 0xB7, 0x84, 0x45, 0x00, 0x20, 0xFD, 0xFF]);
+                if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+            }
+            0x7F0F => {
+                if ins.operands.len() == 3 && ins.operands[1] == BinOperand::ImmInt(-4) {
+                    emit_load_op(&mut code, &ins.operands[2], false);
+                    code.extend_from_slice(&[0x42, 0x89, 0x84, 0x1D, 0x00, 0x00, 0xFE, 0xFF, 0x49, 0x83, 0xC3, 0x04]);
+                } else if ins.operands.len() == 3 && ins.operands[1] == BinOperand::ImmInt(-8) {
+                    emit_load_op(&mut code, &ins.operands[2], false);
+                    code.extend_from_slice(&[0x4A, 0x89, 0x84, 0x1D, 0x00, 0x00, 0xFE, 0xFF, 0x49, 0x83, 0xC3, 0x08]);
+                } else if ins.operands.len() == 4 && ins.operands[1] == BinOperand::ImmInt(-9) {
+                    emit_load_op(&mut code, &ins.operands[2], true);
+                    emit_load_op(&mut code, &ins.operands[3], false);
+                    code.extend_from_slice(&[0x48, 0x89, 0x84, 0x0D, 0x00, 0x00, 0xFE, 0xFF]);
+                } else if ins.operands.len() == 4
+                    && (ins.operands[1] == BinOperand::ImmInt(-2) || ins.operands[1] == BinOperand::ImmInt(-4))
+                {
+                    // ISA-B 4-op ISET buf, mode, off, val: LE patch of 2/4 bytes. Out of bounds
+                    // (not 0 <= off && off + width <= len, and <= r11) hits the canonical trap.
+                    let width: u8 = if ins.operands[1] == BinOperand::ImmInt(-2) { 2 } else { 4 };
+                    let store: &[u8] = if width == 2 {
+                        &[0x66, 0x89, 0x94, 0x0D, 0x00, 0x00, 0xFE, 0xFF] // mov word [rbp+rcx-0x20000], dx
+                    } else {
+                        &[0x89, 0x94, 0x0D, 0x00, 0x00, 0xFE, 0xFF] // mov dword [rbp+rcx-0x20000], edx
+                    };
+                    emit_load_op(&mut code, &ins.operands[3], false);
+                    code.extend_from_slice(&[0x48, 0x89, 0xC2]); // mov rdx, rax (val)
+                    emit_load_op(&mut code, &ins.operands[0], false); // rax = buffer len
+                    emit_load_op(&mut code, &ins.operands[2], true); // rcx = off
+                    emit_x86_guarded_heap_access(&mut code, width, store); // OOB: canonical trap
+                } else {
+                    for op_b in &ins.operands[1..] {
+                        emit_load_op(&mut code, op_b, false);
+                        code.extend_from_slice(&[0x42, 0x88, 0x84, 0x1D, 0x00, 0x00, 0xFE, 0xFF, 0x49, 0xFF, 0xC3]);
+                    }
+                }
+                if let Some(d) = ins.dest_reg {
+                    code.extend_from_slice(&[0x4C, 0x89, 0xD8]);
+                    emit_store_rax(&mut code, d);
+                }
+            }
+            0x7F50 => {
+                code.extend_from_slice(&[0x4C, 0x89, 0xD8]);
+                if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+            }
+            0x7F30 | 0x7F31 => {
+                if let Some(d) = ins.dest_reg {
+                    let word = reg_pack5
+                        .get(&d)
+                        .map(|(b, n, _)| pack5_word_from_bytes(b, *n))
+                        .unwrap_or(0);
+                    emit_load_op(&mut code, &BinOperand::ImmInt(word), false);
+                    emit_store_rax(&mut code, d);
+                }
+            }
+            0x7F34 => {
+                let n_trits = match (ins.operands.first(), ins.operands.get(1)) {
+                    (Some(BinOperand::Reg(ra)), Some(BinOperand::Reg(rb))) => {
+                        let na = reg_pack5.get(ra).map(|(_, n, _)| *n).unwrap_or(0);
+                        let nb = reg_pack5.get(rb).map(|(_, n, _)| *n).unwrap_or(0);
+                        na.min(nb)
+                    }
+                    _ => 0,
+                };
+                code.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d
+                for idx in 0..n_trits {
+                    emit_extract_pack5_trit_x86(&mut code, &ins.operands[0], idx, true);
+                    emit_extract_pack5_trit_x86(&mut code, &ins.operands[1], idx, false);
+                    code.extend_from_slice(&[0x48, 0x0F, 0xAF, 0xC1]); // imul rax, rcx
+                    code.extend_from_slice(&[0x49, 0x01, 0xC0]);       // add r8, rax
+                }
+                code.extend_from_slice(&[0x4C, 0x89, 0xC0]); // mov rax, r8
+                if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+            }
+            0x7F35 | 0x7F3F => {
+                let pack5_len = match ins.operands.first() {
+                    Some(BinOperand::Reg(r)) => reg_pack5.get(r).map(|(_, n, _)| *n),
+                    _ => None,
+                };
+                if let Some(n_trits) = pack5_len {
+                    code.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d
+                    for idx in 0..n_trits {
+                        emit_extract_pack5_trit_x86(&mut code, &ins.operands[0], idx, false);
+                        code.extend_from_slice(&[0x49, 0x01, 0xC0]); // add r8, rax
+                    }
+                    code.extend_from_slice(&[0x4C, 0x89, 0xC0]); // mov rax, r8
+                } else {
+                    emit_load_op(&mut code, &ins.operands[0], false);
+                }
+                code.extend_from_slice(&[
+                    0x48, 0x83, 0xF8, 0x00, // cmp rax, 0
+                    0x0F, 0x9F, 0xC0,       // setg al
+                    0x0F, 0x9C, 0xC2,       // setl dl
+                    0x0F, 0xB6, 0xC0,       // movzx eax, al
+                    0x0F, 0xB6, 0xD2,       // movzx edx, dl
+                    0x48, 0x29, 0xD0,       // sub rax, rdx
+                ]);
+                if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+            }
+            0x7F10 | 0x7F11 | 0x7F12 | 0x7F1E | 0x7F1F | 0x7F20 => {
+                emit_load_op(&mut code, &ins.operands[0], false);
+                emit_load_op(&mut code, &ins.operands[1], true);
+                match ins.op_tok {
+                    0x7F10 => code.extend_from_slice(&[0x48, 0x01, 0xC8]),
+                    0x7F11 => code.extend_from_slice(&[0x48, 0x29, 0xC8]),
+                    0x7F12 => code.extend_from_slice(&[0x48, 0x0F, 0xAF, 0xC1]),
+                    0x7F1E => code.extend_from_slice(&[0x48, 0x21, 0xC8]),
+                    0x7F1F => code.extend_from_slice(&[0x48, 0x09, 0xC8]),
+                    _      => code.extend_from_slice(&[0x48, 0x31, 0xC8]),
+                }
+                if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+            }
+            0x7F13 | 0x7F14 => {
+                emit_load_op(&mut code, &ins.operands[0], false);
+                emit_load_op(&mut code, &ins.operands[1], true);
+                code.extend_from_slice(&[0x49, 0x89, 0xC0, 0x48, 0x85, 0xC9, 0x74, 0x1E, 0x48, 0x83, 0xF9, 0xFF, 0x75, 0x11, 0x49, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x4D, 0x39, 0xC8, 0x75, 0x02, 0xEB, 0x0A, 0x48, 0x99, 0x48, 0xF7, 0xF9, 0xEB, 0x03, 0x48, 0x31, 0xC0]);
+                if ins.op_tok == 0x7F14 {
+                    code.extend_from_slice(&[0x48, 0x89, 0xD0]);
+                }
+                if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+            }
+            0x7F15 | 0x7F28 => {
+                emit_load_op(&mut code, &ins.operands[0], false);
+                code.extend_from_slice(&[0x48, 0xF7, 0xD8]);
+                if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+            }
+            0x7F16 => {
+                emit_load_op(&mut code, &ins.operands[0], false);
+                code.extend_from_slice(&[0x48, 0x89, 0xC2, 0x48, 0xF7, 0xD8, 0x48, 0x0F, 0x48, 0xC2]); // fixed IABS: cmovs
+                if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+            }
+            0x7F21 => {
+                emit_load_op(&mut code, &ins.operands[0], false);
+                code.extend_from_slice(&[0x48, 0xF7, 0xD0]);
+                if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+            }
+            0x7F22 | 0x7F23 => {
+                emit_load_op(&mut code, &ins.operands[0], false);
+                emit_load_op(&mut code, &ins.operands[1], true);
+                code.extend_from_slice(&[0x48, 0xD3, if ins.op_tok == 0x7F22 { 0xE0 } else { 0xF8 }]);
+                if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+            }
+            0x7F24 | 0x7F25 | 0x7F26 | 0x7F27 => {
+                emit_load_op(&mut code, &ins.operands[0], false);
+                emit_load_op(&mut code, &ins.operands[1], true);
+                let setcc: u8 = match ins.op_tok {
+                    0x7F24 => 0x94,
+                    0x7F25 => 0x95,
+                    0x7F26 => 0x9C,
+                    _      => 0x9F,
+                };
+                code.extend_from_slice(&[
+                    0x48, 0x39, 0xC8,
+                    0x0F, setcc, 0xC0,
+                    0x0F, 0xB6, 0xC0,
+                    0x48, 0x8D, 0x44, 0x00, 0xFF,
+                ]);
+                if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+            }
+            0x7F29 | 0x7F17 => {
+                emit_load_op(&mut code, &ins.operands[0], false);
+                emit_load_op(&mut code, &ins.operands[1], true);
+                code.extend_from_slice(&[0x48, 0x39, 0xC8, 0x48, 0x0F, 0x4F, 0xC1]);
+                if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+            }
+            0x7F2A | 0x7F18 => {
+                emit_load_op(&mut code, &ins.operands[0], false);
+                emit_load_op(&mut code, &ins.operands[1], true);
+                code.extend_from_slice(&[0x48, 0x39, 0xC8, 0x48, 0x0F, 0x4C, 0xC1]);
+                if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+            }
+            0x7F2B => {
+                emit_load_op(&mut code, &ins.operands[0], false);
+                emit_load_op(&mut code, &ins.operands[1], true);
+                code.extend_from_slice(&[0x48, 0x0F, 0xAF, 0xC1, 0x48, 0xF7, 0xD8]);
+                if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+            }
+            0x7F2C => {
+                emit_load_op(&mut code, &ins.operands[0], false);
+                emit_load_op(&mut code, &ins.operands[1], true);
+                code.extend_from_slice(&[0x48, 0x01, 0xC8]);
+                emit_load_op(&mut code, &ins.operands[2], true);
+                code.extend_from_slice(&[
+                    0x48, 0x01, 0xC8,
+                    0x48, 0x83, 0xF8, 0x00,
+                    0x0F, 0x9F, 0xC0,
+                    0x0F, 0x9C, 0xC2,
+                    0x0F, 0xB6, 0xC0,
+                    0x0F, 0xB6, 0xD2,
+                    0x48, 0x29, 0xD0,
+                ]);
+                if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+            }
+            0x7F2D => {
+                emit_load_op(&mut code, &ins.operands[0], false);
+                emit_load_op(&mut code, &ins.operands[1], true);
+                code.extend_from_slice(&[
+                    0x48, 0x39, 0xC8,
+                    0x0F, 0x9F, 0xC2,
+                    0x0F, 0x9C, 0xC1,
+                    0x0F, 0xB6, 0xD2,
+                    0x0F, 0xB6, 0xC9,
+                    0x29, 0xCA,
+                    0x48, 0x63, 0xC2,
+                ]);
+                if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+            }
+            0x7F40 => {
+                if let Some(lbl) = ins.operands.first().and_then(extract_label_id) {
+                    label_offsets.push((lbl, code.len()));
+                }
+            }
+            0x7F41 => {
+                if let Some(lbl) = ins.operands.first().and_then(extract_label_id) {
+                    code.push(0xE9);
+                    relocs.push(RelocPatch { patch_offset: code.len(), target_label: lbl });
+                    code.extend_from_slice(&[0, 0, 0, 0]);
+                }
+            }
+            0x7F42 => {
+                if let (Some(l_neg), Some(l_zero), Some(l_pos)) = (
+                    ins.operands.get(1).and_then(extract_label_id),
+                    ins.operands.get(2).and_then(extract_label_id),
+                    ins.operands.get(3).and_then(extract_label_id),
+                ) {
+                    emit_load_op(&mut code, &ins.operands[0], false);
+                    code.extend_from_slice(&[0x48, 0x83, 0xF8, 0x00]);
+                    code.extend_from_slice(&[0x0F, 0x8C]);
+                    relocs.push(RelocPatch { patch_offset: code.len(), target_label: l_neg });
+                    code.extend_from_slice(&[0, 0, 0, 0]);
+                    code.extend_from_slice(&[0x0F, 0x84]);
+                    relocs.push(RelocPatch { patch_offset: code.len(), target_label: l_zero });
+                    code.extend_from_slice(&[0, 0, 0, 0]);
+                    code.push(0xE9);
+                    relocs.push(RelocPatch { patch_offset: code.len(), target_label: l_pos });
+                    code.extend_from_slice(&[0, 0, 0, 0]);
+                }
+            }
+            0x7F43 | 0x7F44 => {
+                if let Some(lbl) = ins.operands.get(1).and_then(extract_label_id) {
+                    emit_load_op(&mut code, &ins.operands[0], false);
+                    code.extend_from_slice(&[0x48, 0x83, 0xF8, if ins.op_tok == 0x7F43 { 0x01 } else { 0xFF }]);
+                    code.extend_from_slice(&[0x0F, 0x84]);
+                    relocs.push(RelocPatch { patch_offset: code.len(), target_label: lbl });
+                    code.extend_from_slice(&[0, 0, 0, 0]);
+                }
+            }
+            0x7F45 => {
+                emit_load_op(&mut code, &ins.operands[0], false);
+                emit_load_op(&mut code, &ins.operands[1], true);
+                code.extend_from_slice(&[0x49, 0x89, 0xC0, 0x48, 0x89, 0xCA]);
+                emit_load_op(&mut code, &ins.operands[2], true);
+                code.extend_from_slice(&[0x49, 0x83, 0xF8, 0x00, 0x48, 0x0F, 0x44, 0xD1]);
+                emit_load_op(&mut code, &ins.operands[3], true);
+                code.extend_from_slice(&[0x49, 0x83, 0xF8, 0x00, 0x48, 0x0F, 0x4F, 0xD1, 0x48, 0x89, 0xD0]);
+                if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+            }
+            0x7F4A => {
+                if func.ret_ty_tok == TY_BYTES {
+                    if ins.operands.len() == 3 {
+                        // M2-06 (D-1): 3-op RET buf, off, len -> slice [off..off+len] of ISET heap
+                        // with strict bounds against both buf_len (r8) and heap len (r11).
+                        emit_load_op(&mut code, &ins.operands[0], false); // rax = buf_len
+                        code.extend_from_slice(&[0x49, 0x89, 0xC0]);      // mov r8, rax
+                        emit_load_op(&mut code, &ins.operands[1], true);  // rcx = off
+                        emit_load_op(&mut code, &ins.operands[2], false); // rax = len
+                        code.extend_from_slice(&[0x48, 0x89, 0xC2]);      // mov rdx, rax
+                        code.extend_from_slice(&[
+                            0x48, 0x85, 0xC9, 0x78, 0x34,       // test rcx, rcx; js +52 (oob)
+                            0x48, 0x85, 0xD2, 0x78, 0x2F,       // test rdx, rdx; js +47 (oob)
+                            0x48, 0x89, 0xC8,                   // mov rax, rcx
+                            0x48, 0x01, 0xD0,                   // add rax, rdx
+                            0x72, 0x27,                         // jc +39 (oob)
+                            0x4C, 0x39, 0xC0, 0x77, 0x22,       // cmp rax, r8; ja +34 (oob)
+                            0x4C, 0x39, 0xD8, 0x77, 0x1D,       // cmp rax, r11; ja +29 (oob)
+                            0x48, 0x8D, 0xB4, 0x0D, 0x00, 0x00, 0xFE, 0xFF, // lea rsi, [rbp+rcx-0x20000]
+                            0xBF, 0x01, 0x00, 0x00, 0x00,       // mov edi, 1
+                            0xB8, 0x01, 0x00, 0x00, 0x00,       // mov eax, 1 (sys_write)
+                            0x0F, 0x05,                         // syscall
+                            0x31, 0xFF,                         // xor edi, edi
+                            0xB8, 0x3C, 0x00, 0x00, 0x00,       // mov eax, 60 (sys_exit)
+                            0x0F, 0x05,                         // syscall
+                        ]);
+                        code.extend_from_slice(&x86_oob_trap());
+                    } else {
+                        code.extend_from_slice(&[
+                            0xBF, 0x01, 0x00, 0x00, 0x00,
+                            0x48, 0x8D, 0xB5, 0x00, 0x00, 0xFE, 0xFF,
+                            0x4C, 0x89, 0xDA,
+                            0xB8, 0x01, 0x00, 0x00, 0x00,
+                            0x0F, 0x05,
+                            0x31, 0xFF,
+                            0xB8, 0x3C, 0x00, 0x00, 0x00,
+                            0x0F, 0x05,
+                        ]);
+                    }
+                } else if ins.operands.len() == 3 {
+                    return Err(String::from("error[BAD_TYPE]: 3-op RET requires Bytes return type"));
+                } else {
+                    emit_load_op(&mut code, &ins.operands[0], false);
+                    // 64-bit result channel: write raw little-endian i64 to stdout, then exit(0)
+                    code.extend_from_slice(&[
+                        0x48, 0x83, 0xEC, 0x08,             // sub rsp, 8
+                        0x48, 0x89, 0x04, 0x24,             // mov [rsp], rax
+                        0xB8, 0x01, 0x00, 0x00, 0x00,       // mov eax, 1 (write)
+                        0xBF, 0x01, 0x00, 0x00, 0x00,       // mov edi, 1 (stdout)
+                        0x48, 0x89, 0xE6,                   // mov rsi, rsp
+                        0xBA, 0x08, 0x00, 0x00, 0x00,       // mov edx, 8
+                        0x0F, 0x05,                         // syscall
+                        0x48, 0x83, 0xC4, 0x08,             // add rsp, 8
+                        0x31, 0xFF,                         // xor edi, edi
+                        0xB8, 0x3C, 0x00, 0x00, 0x00,       // mov eax, 60 (exit)
+                        0x0F, 0x05,                         // syscall
+                    ]);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for r in &relocs {
+        let target_off = label_offsets
+            .iter()
+            .find(|&&(lbl, _)| lbl == r.target_label)
+            .map(|&(_, off)| off)
+            .ok_or_else(|| format!("Unresolved label 0x{:04X}", r.target_label))?;
+        let rel32: i32 = (target_off as i32) - ((r.patch_offset + 4) as i32);
+        code[r.patch_offset..r.patch_offset + 4].copy_from_slice(&rel32.to_le_bytes());
+    }
+
+    let base_vaddr: u64 = 0x400000;
+    let entry_vaddr: u64 = base_vaddr + 120;
+    let total_size: u64 = 120 + (code.len() as u64);
+
+    let mut elf = vec![0u8; 120];
+    elf[0..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
+    elf[4] = 2;
+    elf[5] = 1;
+    elf[6] = 1;
+    elf[16..18].copy_from_slice(&2u16.to_le_bytes());
+    elf[18..20].copy_from_slice(&0x3Eu16.to_le_bytes());
+    elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+    elf[24..32].copy_from_slice(&entry_vaddr.to_le_bytes());
+    elf[32..40].copy_from_slice(&64u64.to_le_bytes());
+    elf[52..54].copy_from_slice(&64u16.to_le_bytes());
+    elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+    elf[56..58].copy_from_slice(&1u16.to_le_bytes());
+
+    elf[64..68].copy_from_slice(&1u32.to_le_bytes());
+    elf[68..72].copy_from_slice(&5u32.to_le_bytes());
+    elf[80..88].copy_from_slice(&base_vaddr.to_le_bytes());
+    elf[88..96].copy_from_slice(&base_vaddr.to_le_bytes());
+    elf[96..104].copy_from_slice(&total_size.to_le_bytes());
+    elf[104..112].copy_from_slice(&total_size.to_le_bytes());
+    elf[112..120].copy_from_slice(&0x1000u64.to_le_bytes());
+
+    elf.extend_from_slice(&code);
+    Ok(elf)
+}
+
+/// M2-09 (D-4): Reference multi-function x86-64 ELF64 compiler.
+pub fn compile_pure_u16_to_x86_64_elf_multi(
+    stream: &[u16],
+    arg0: i64,
+    arg1: i64,
+    arg2: i64,
+) -> Result<Vec<u8>, String> {
+    let module = decode_omni_token_stream(stream)?;
+    verify_module_for_multi_aot(&module)?;
+    for func in &module.functions {
+        let rep = verify_binary_function(func);
+        if !rep.passed {
+            return Err(format!(
+                "Cannot multi-AOT-compile unverified fn#{}: {:?}",
+                func.fn_idx, rep.errors
+            ));
+        }
+        for ins in &func.instructions {
+            if !is_x86_64_aot_supported_opcode(ins.op_tok) && ins.op_tok != 0x7F48 {
+                let lbl = decode_opcode_token(ins.op_tok).map(|s| s.debug_label).unwrap_or("OP_UNKNOWN");
+                return Err(format!(
+                    "Opcode 0x{:04X} ({}) in fn#{} is not lowered by multi-function x86-64 AOT",
+                    ins.op_tok, lbl, func.fn_idx
+                ));
+            }
+        }
+    }
+
+    let n_fns = module.functions.len();
+    let entry_pos = module.functions.iter().position(|f| f.fn_idx == 0).unwrap_or(n_fns - 1);
+    let entry_fn = &module.functions[entry_pos];
+    let entry_is_bytes = entry_fn.ret_ty_tok == TY_BYTES;
+
+    let mut code: Vec<u8> = Vec::with_capacity(8192);
+    let mut call_relocs: Vec<(usize, u16)> = Vec::new();
+    let mut trap_relocs: Vec<(usize, u8)> = Vec::new();
+
+    code.extend_from_slice(&[0x55, 0x48, 0x89, 0xE5, 0x48, 0x81, 0xEC, 0x10, 0x00, 0x12, 0x00]);
+    code.extend_from_slice(&[0x48, 0x89, 0xE3]);
+    code.extend_from_slice(&[0x48, 0xC7, 0x83, 0x00, 0x00, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00]);
+
+    if entry_is_bytes {
+        code.extend_from_slice(&[0x49, 0xC7, 0xC4, 0x00, 0x00, 0x00, 0x00]);
+        code.extend_from_slice(&[0x49, 0xBD]);
+        code.extend_from_slice(&(arg0 as u64).to_le_bytes());
+        code.extend_from_slice(&[0x49, 0xBE]);
+        code.extend_from_slice(&(arg1 as u64).to_le_bytes());
+        code.extend_from_slice(&[0x49, 0xBF]);
+        code.extend_from_slice(&(arg2 as u64).to_le_bytes());
+        emit_cli_arg_parser(&mut code, 3, 0x20, 5);
+        emit_cli_arg_parser(&mut code, 4, 0x28, 6);
+        emit_cli_arg_parser(&mut code, 5, 0x30, 7);
+
+        code.extend_from_slice(&[0x48, 0x83, 0x7D, 0x08, 0x02, 0x7C]);
+        let j_no_arg = code.len();
+        code.push(0);
+        code.extend_from_slice(&[
+            0x48, 0x8B, 0x7D, 0x18,
+            0x31, 0xF6, 0x31, 0xD2,
+            0xB8, 0x02, 0x00, 0x00, 0x00,
+            0x0F, 0x05,
+            0x48, 0x85, 0xC0, 0x78,
+        ]);
+        let j_open_err = code.len();
+        code.push(0);
+        code.extend_from_slice(&[
+            0x48, 0x89, 0xC7,
+            0x48, 0x8D, 0xB3, 0x00, 0x00, 0x10, 0x00,
+            0xBA, 0x00, 0x00, 0x02, 0x00,
+            0x31, 0xC0, 0x0F, 0x05,
+            0x48, 0x85, 0xC0, 0x7C,
+        ]);
+        let j_read_err = code.len();
+        code.push(0);
+        code.extend_from_slice(&[0xA8, 0x01, 0x0F, 0x85]);
+        trap_relocs.push((code.len(), 0));
+        code.extend_from_slice(&[0, 0, 0, 0]);
+        code.extend_from_slice(&[
+            0x48, 0xD1, 0xE8,
+            0x48, 0x89, 0x83, 0x00, 0x00, 0x12, 0x00,
+            0x31, 0xC0,
+            0x48, 0x8D, 0x75, 0xF8,
+            0xBA, 0x01, 0x00, 0x00, 0x00,
+            0x0F, 0x05,
+            0x48, 0x85, 0xC0, 0x0F, 0x8F,
+        ]);
+        trap_relocs.push((code.len(), 0));
+        code.extend_from_slice(&[0, 0, 0, 0]);
+        let do_close_off = code.len();
+        code.extend_from_slice(&[0xB8, 0x03, 0x00, 0x00, 0x00, 0x0F, 0x05]);
+        let after_read_off = code.len();
+        code[j_read_err] = (do_close_off - (j_read_err + 1)) as u8;
+        code[j_open_err] = (after_read_off - (j_open_err + 1)) as u8;
+        code[j_no_arg] = (after_read_off - (j_no_arg + 1)) as u8;
+    } else {
+        code.extend_from_slice(&[0x49, 0xBC]);
+        code.extend_from_slice(&(arg0 as u64).to_le_bytes());
+        code.extend_from_slice(&[0x49, 0xBD]);
+        code.extend_from_slice(&(arg1 as u64).to_le_bytes());
+        code.extend_from_slice(&[0x49, 0xBE]);
+        code.extend_from_slice(&(arg2 as u64).to_le_bytes());
+        code.extend_from_slice(&[0x49, 0xC7, 0xC7, 0x00, 0x00, 0x00, 0x00]);
+        emit_cli_arg_parser(&mut code, 2, 0x18, 4);
+        emit_cli_arg_parser(&mut code, 3, 0x20, 5);
+        emit_cli_arg_parser(&mut code, 4, 0x28, 6);
+        emit_cli_arg_parser(&mut code, 5, 0x30, 7);
+    }
+
+    code.extend_from_slice(&[0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x45, 0x31, 0xDB, 0xE8]);
+    call_relocs.push((code.len(), entry_fn.fn_idx));
+    code.extend_from_slice(&[0, 0, 0, 0]);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x20]);
+
+    if entry_is_bytes {
+        code.extend_from_slice(&[
+            0x48, 0x8D, 0x34, 0x03,
+            0xBF, 0x01, 0x00, 0x00, 0x00,
+            0xB8, 0x01, 0x00, 0x00, 0x00,
+            0x0F, 0x05,
+            0x31, 0xFF,
+            0xB8, 0x3C, 0x00, 0x00, 0x00,
+            0x0F, 0x05,
+        ]);
+    } else {
+        code.extend_from_slice(&[
+            0x48, 0x83, 0xEC, 0x08,
+            0x48, 0x89, 0x04, 0x24,
+            0xB8, 0x01, 0x00, 0x00, 0x00,
+            0xBF, 0x01, 0x00, 0x00, 0x00,
+            0x48, 0x89, 0xE6,
+            0xBA, 0x08, 0x00, 0x00, 0x00,
+            0x0F, 0x05,
+            0x48, 0x83, 0xC4, 0x08,
+            0x31, 0xFF,
+            0xB8, 0x3C, 0x00, 0x00, 0x00,
+            0x0F, 0x05,
+        ]);
+    }
+
+    let t_trunc_off = code.len();
+    code.extend_from_slice(&[0xBF, 2, 0, 0, 0, 0xB8, 60, 0, 0, 0, 0x0F, 0x05]);
+    let t_oob_off = code.len();
+    code.extend_from_slice(&[0xBF, 1, 0, 0, 0, 0xB8, 60, 0, 0, 0, 0x0F, 0x05]);
+    let t_cap_off = code.len();
+    code.extend_from_slice(&[0xBF, 3, 0, 0, 0, 0xB8, 60, 0, 0, 0, 0x0F, 0x05]);
+
+    let emit_load_op = |c: &mut Vec<u8>, op: &BinOperand, into_rcx: bool| {
+        match *op {
+            BinOperand::Param(p_tok) => {
+                let disp: i32 = 16 + 8 * ((p_tok - PAR_BASE) as i32);
+                c.extend_from_slice(&[0x48, 0x8B, if into_rcx { 0x8D } else { 0x85 }]);
+                c.extend_from_slice(&disp.to_le_bytes());
+            }
+            BinOperand::Reg(r_tok) => {
+                let disp: i32 = -8 * (((r_tok - REG_BASE) as i32) + 1);
+                c.extend_from_slice(&[0x48, 0x8B, if into_rcx { 0x8D } else { 0x85 }]);
+                c.extend_from_slice(&disp.to_le_bytes());
+            }
+            BinOperand::ImmInt(v) => {
+                c.extend_from_slice(&[0x48, if into_rcx { 0xB9 } else { 0xB8 }]);
+                c.extend_from_slice(&(v as u64).to_le_bytes());
+            }
+            BinOperand::ImmTrit(t) => {
+                c.extend_from_slice(&[0x48, if into_rcx { 0xB9 } else { 0xB8 }]);
+                c.extend_from_slice(&((t as i64) as u64).to_le_bytes());
+            }
+            _ => {}
+        }
+    };
+    let emit_store_rax = |c: &mut Vec<u8>, d_tok: u16| {
+        let disp: i32 = -8 * (((d_tok - REG_BASE) as i32) + 1);
+        c.extend_from_slice(&[0x48, 0x89, 0x85]);
+        c.extend_from_slice(&disp.to_le_bytes());
+    };
+
+    let mut fn_offsets: BTreeMap<u16, usize> = BTreeMap::new();
+    for func in &module.functions {
+        fn_offsets.insert(func.fn_idx, code.len());
+        let max_reg: usize = func
+            .instructions
+            .iter()
+            .filter_map(|i| i.dest_reg.map(|d| (d - REG_BASE) as usize))
+            .max()
+            .unwrap_or(0);
+        let frame_bytes: u32 = (((8 * (max_reg + 1)) + 15) & !15) as u32;
+        code.extend_from_slice(&[0x55, 0x48, 0x89, 0xE5, 0x48, 0x81, 0xEC]);
+        code.extend_from_slice(&frame_bytes.to_le_bytes());
+
+        let mut label_offsets: Vec<(u16, usize)> = Vec::new();
+        let mut relocs: Vec<RelocPatch> = Vec::new();
+
+        for ins in &func.instructions {
+            match ins.op_tok {
+                0x7F00 | 0x7F05 => {}
+                0x7F01 | 0x7F02 | 0x7F03 | 0x7F04 | 0x7F06 | 0x7F09 | 0x7F57 | 0x7F58 | 0x7F59 => {
+                    emit_load_op(&mut code, &ins.operands[0], false);
+                    if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                }
+                0x7F0D => {
+                    code.extend_from_slice(&[0x45, 0x31, 0xDB]);
+                    if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                }
+                0x7F50 => {
+                    let is_arr_param = match ins.operands.first() {
+                        Some(BinOperand::Param(p_tok)) => func
+                            .params
+                            .get((*p_tok - PAR_BASE) as usize)
+                            .map(|&(_, ty, _)| ty == TY_ARRAY)
+                            .unwrap_or(false),
+                        _ => false,
+                    };
+                    if is_arr_param {
+                        code.extend_from_slice(&[0x48, 0x8B, 0x83, 0x00, 0x00, 0x12, 0x00]);
+                    } else {
+                        code.extend_from_slice(&[0x4C, 0x89, 0xD8]);
+                    }
+                    if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                }
+                0x7F0E => {
+                    if ins.operands.len() == 3 {
+                        let width: u8 = match ins.operands[1] {
+                            BinOperand::ImmInt(-1) => 1,
+                            BinOperand::ImmInt(-2) => 2,
+                            BinOperand::ImmInt(-4) => 4,
+                            BinOperand::ImmInt(-8) => 8,
+                            _ => return Err(String::from("error[BAD_TYPE]: 3-op IGET mode must be -1, -2, -4, or -8")),
+                        };
+                        emit_load_op(&mut code, &ins.operands[2], true);
+                        code.extend_from_slice(&[0x48, 0x85, 0xC9, 0x0F, 0x88]);
+                        trap_relocs.push((code.len(), 1));
+                        code.extend_from_slice(&[0, 0, 0, 0]);
+                        code.extend_from_slice(&[0x48, 0x8D, 0x41, width]);
+                        code.extend_from_slice(&[0x48, 0x39, 0xC8, 0x0F, 0x82]);
+                        trap_relocs.push((code.len(), 1));
+                        code.extend_from_slice(&[0, 0, 0, 0]);
+                        code.extend_from_slice(&[0x4C, 0x39, 0xD8, 0x0F, 0x87]);
+                        trap_relocs.push((code.len(), 1));
+                        code.extend_from_slice(&[0, 0, 0, 0]);
+                        match width {
+                            1 => code.extend_from_slice(&[0x0F, 0xB6, 0x04, 0x0B]),
+                            2 => code.extend_from_slice(&[0x0F, 0xB7, 0x04, 0x0B]),
+                            4 => code.extend_from_slice(&[0x8B, 0x04, 0x0B]),
+                            _ => code.extend_from_slice(&[0x48, 0x8B, 0x04, 0x0B]),
+                        }
+                        if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                    } else {
+                        emit_load_op(&mut code, &ins.operands[1], false);
+                        code.extend_from_slice(&[
+                            0x48, 0x3B, 0x83, 0x00, 0x00, 0x12, 0x00,
+                            0x73, 0x0A,
+                            0x0F, 0xB7, 0x84, 0x43, 0x00, 0x00, 0x10, 0x00,
+                            0xEB, 0x02,
+                            0x31, 0xC0,
+                        ]);
+                        if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                    }
+                }
+                0x7F0F => {
+                    let emit_cap_guard = |c: &mut Vec<u8>, tr: &mut Vec<(usize, u8)>, k: u32| {
+                        c.extend_from_slice(&[0x49, 0x8D, 0x83]);
+                        c.extend_from_slice(&k.to_le_bytes());
+                        c.extend_from_slice(&[0x48, 0x3D, 0x00, 0x00, 0x10, 0x00, 0x0F, 0x87]);
+                        tr.push((c.len(), 2));
+                        c.extend_from_slice(&[0, 0, 0, 0]);
+                    };
+                    if ins.operands.len() == 3 && ins.operands[1] == BinOperand::ImmInt(-4) {
+                        emit_cap_guard(&mut code, &mut trap_relocs, 4);
+                        emit_load_op(&mut code, &ins.operands[2], false);
+                        code.extend_from_slice(&[0x42, 0x89, 0x04, 0x1B, 0x49, 0x83, 0xC3, 0x04]);
+                    } else if ins.operands.len() == 3 && ins.operands[1] == BinOperand::ImmInt(-8) {
+                        emit_cap_guard(&mut code, &mut trap_relocs, 8);
+                        emit_load_op(&mut code, &ins.operands[2], false);
+                        code.extend_from_slice(&[0x4A, 0x89, 0x04, 0x1B, 0x49, 0x83, 0xC3, 0x08]);
+                    } else if ins.operands.len() == 4 && ins.operands[1] == BinOperand::ImmInt(-9) {
+                        emit_load_op(&mut code, &ins.operands[2], true);
+                        emit_load_op(&mut code, &ins.operands[3], false);
+                        code.extend_from_slice(&[
+                            0x48, 0x85, 0xC9, 0x78, 0x0D,
+                            0x48, 0x8D, 0x71, 0x08,
+                            0x4C, 0x39, 0xDE, 0x77, 0x04,
+                            0x48, 0x89, 0x04, 0x0B,
+                        ]);
+                    } else if ins.operands.len() == 4
+                        && (ins.operands[1] == BinOperand::ImmInt(-2) || ins.operands[1] == BinOperand::ImmInt(-4))
+                    {
+                        let width: u8 = if ins.operands[1] == BinOperand::ImmInt(-2) { 2 } else { 4 };
+                        emit_load_op(&mut code, &ins.operands[3], false);
+                        code.extend_from_slice(&[0x48, 0x89, 0xC2]);
+                        emit_load_op(&mut code, &ins.operands[2], true);
+                        code.extend_from_slice(&[0x48, 0x85, 0xC9, 0x0F, 0x88]);
+                        trap_relocs.push((code.len(), 1));
+                        code.extend_from_slice(&[0, 0, 0, 0]);
+                        code.extend_from_slice(&[0x48, 0x8D, 0x41, width]);
+                        code.extend_from_slice(&[0x48, 0x39, 0xC8, 0x0F, 0x82]);
+                        trap_relocs.push((code.len(), 1));
+                        code.extend_from_slice(&[0, 0, 0, 0]);
+                        code.extend_from_slice(&[0x4C, 0x39, 0xD8, 0x0F, 0x87]);
+                        trap_relocs.push((code.len(), 1));
+                        code.extend_from_slice(&[0, 0, 0, 0]);
+                        if width == 2 {
+                            code.extend_from_slice(&[0x66, 0x89, 0x14, 0x0B]);
+                        } else {
+                            code.extend_from_slice(&[0x89, 0x14, 0x0B]);
+                        }
+                    } else {
+                        let k = ins.operands.len().saturating_sub(1) as u32;
+                        emit_cap_guard(&mut code, &mut trap_relocs, k);
+                        for op_b in &ins.operands[1..] {
+                            emit_load_op(&mut code, op_b, false);
+                            code.extend_from_slice(&[0x42, 0x88, 0x04, 0x1B, 0x49, 0xFF, 0xC3]);
+                        }
+                    }
+                    if let Some(d) = ins.dest_reg {
+                        code.extend_from_slice(&[0x4C, 0x89, 0xD8]);
+                        emit_store_rax(&mut code, d);
+                    }
+                }
+                0x7F10 | 0x7F11 | 0x7F12 | 0x7F1E | 0x7F1F | 0x7F20 => {
+                    emit_load_op(&mut code, &ins.operands[0], false);
+                    emit_load_op(&mut code, &ins.operands[1], true);
+                    match ins.op_tok {
+                        0x7F10 => code.extend_from_slice(&[0x48, 0x01, 0xC8]),
+                        0x7F11 => code.extend_from_slice(&[0x48, 0x29, 0xC8]),
+                        0x7F12 => code.extend_from_slice(&[0x48, 0x0F, 0xAF, 0xC1]),
+                        0x7F1E => code.extend_from_slice(&[0x48, 0x21, 0xC8]),
+                        0x7F1F => code.extend_from_slice(&[0x48, 0x09, 0xC8]),
+                        _      => code.extend_from_slice(&[0x48, 0x31, 0xC8]),
+                    }
+                    if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                }
+                0x7F13 | 0x7F14 => {
+                    emit_load_op(&mut code, &ins.operands[0], false);
+                    emit_load_op(&mut code, &ins.operands[1], true);
+                    code.extend_from_slice(&[
+                        0x49, 0x89, 0xC0, 0x48, 0x85, 0xC9, 0x74, 0x1E, 0x48, 0x83, 0xF9, 0xFF,
+                        0x75, 0x11, 0x49, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80,
+                        0x4D, 0x39, 0xC8, 0x75, 0x02, 0xEB, 0x0A, 0x48, 0x99, 0x48, 0xF7, 0xF9,
+                        0xEB, 0x03, 0x48, 0x31, 0xC0,
+                    ]);
+                    if ins.op_tok == 0x7F14 {
+                        code.extend_from_slice(&[0x48, 0x89, 0xD0]);
+                    }
+                    if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                }
+                0x7F15 | 0x7F28 => {
+                    emit_load_op(&mut code, &ins.operands[0], false);
+                    code.extend_from_slice(&[0x48, 0xF7, 0xD8]);
+                    if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                }
+                0x7F16 => {
+                    emit_load_op(&mut code, &ins.operands[0], false);
+                    code.extend_from_slice(&[0x48, 0x89, 0xC2, 0x48, 0xF7, 0xD8, 0x48, 0x0F, 0x48, 0xC2]);
+                    if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                }
+                0x7F21 => {
+                    emit_load_op(&mut code, &ins.operands[0], false);
+                    code.extend_from_slice(&[0x48, 0xF7, 0xD0]);
+                    if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                }
+                0x7F22 | 0x7F23 => {
+                    emit_load_op(&mut code, &ins.operands[0], false);
+                    emit_load_op(&mut code, &ins.operands[1], true);
+                    code.extend_from_slice(&[0x48, 0xD3, if ins.op_tok == 0x7F22 { 0xE0 } else { 0xF8 }]);
+                    if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                }
+                0x7F24 | 0x7F25 | 0x7F26 | 0x7F27 => {
+                    emit_load_op(&mut code, &ins.operands[0], false);
+                    emit_load_op(&mut code, &ins.operands[1], true);
+                    let setcc: u8 = match ins.op_tok {
+                        0x7F24 => 0x94,
+                        0x7F25 => 0x95,
+                        0x7F26 => 0x9C,
+                        _      => 0x9F,
+                    };
+                    code.extend_from_slice(&[
+                        0x48, 0x39, 0xC8, 0x0F, setcc, 0xC0, 0x0F, 0xB6, 0xC0, 0x48, 0x8D, 0x44, 0x00, 0xFF,
+                    ]);
+                    if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                }
+                0x7F29 | 0x7F17 => {
+                    emit_load_op(&mut code, &ins.operands[0], false);
+                    emit_load_op(&mut code, &ins.operands[1], true);
+                    code.extend_from_slice(&[0x48, 0x39, 0xC8, 0x48, 0x0F, 0x4F, 0xC1]);
+                    if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                }
+                0x7F2A | 0x7F18 => {
+                    emit_load_op(&mut code, &ins.operands[0], false);
+                    emit_load_op(&mut code, &ins.operands[1], true);
+                    code.extend_from_slice(&[0x48, 0x39, 0xC8, 0x48, 0x0F, 0x4C, 0xC1]);
+                    if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                }
+                0x7F2B => {
+                    emit_load_op(&mut code, &ins.operands[0], false);
+                    emit_load_op(&mut code, &ins.operands[1], true);
+                    code.extend_from_slice(&[0x48, 0x0F, 0xAF, 0xC1, 0x48, 0xF7, 0xD8]);
+                    if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                }
+                0x7F2C => {
+                    emit_load_op(&mut code, &ins.operands[0], false);
+                    emit_load_op(&mut code, &ins.operands[1], true);
+                    code.extend_from_slice(&[0x48, 0x01, 0xC8]);
+                    emit_load_op(&mut code, &ins.operands[2], true);
+                    code.extend_from_slice(&[
+                        0x48, 0x01, 0xC8, 0x48, 0x83, 0xF8, 0x00, 0x0F, 0x9F, 0xC0,
+                        0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC0, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD0,
+                    ]);
+                    if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                }
+                0x7F2D => {
+                    emit_load_op(&mut code, &ins.operands[0], false);
+                    emit_load_op(&mut code, &ins.operands[1], true);
+                    code.extend_from_slice(&[
+                        0x48, 0x39, 0xC8, 0x0F, 0x9F, 0xC2, 0x0F, 0x9C, 0xC1,
+                        0x0F, 0xB6, 0xD2, 0x0F, 0xB6, 0xC9, 0x29, 0xCA, 0x48, 0x63, 0xC2,
+                    ]);
+                    if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                }
+                0x7F35 | 0x7F3F => {
+                    emit_load_op(&mut code, &ins.operands[0], false);
+                    code.extend_from_slice(&[
+                        0x48, 0x83, 0xF8, 0x00, 0x0F, 0x9F, 0xC0, 0x0F, 0x9C, 0xC2,
+                        0x0F, 0xB6, 0xC0, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD0,
+                    ]);
+                    if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                }
+                0x7F40 => {
+                    if let Some(lbl) = ins.operands.first().and_then(extract_label_id) {
+                        label_offsets.push((lbl, code.len()));
+                    }
+                }
+                0x7F41 => {
+                    if let Some(lbl) = ins.operands.first().and_then(extract_label_id) {
+                        code.push(0xE9);
+                        relocs.push(RelocPatch { patch_offset: code.len(), target_label: lbl });
+                        code.extend_from_slice(&[0, 0, 0, 0]);
+                    }
+                }
+                0x7F42 => {
+                    if let (Some(l_neg), Some(l_zero), Some(l_pos)) = (
+                        ins.operands.get(1).and_then(extract_label_id),
+                        ins.operands.get(2).and_then(extract_label_id),
+                        ins.operands.get(3).and_then(extract_label_id),
+                    ) {
+                        emit_load_op(&mut code, &ins.operands[0], false);
+                        code.extend_from_slice(&[0x48, 0x83, 0xF8, 0x00, 0x0F, 0x8C]);
+                        relocs.push(RelocPatch { patch_offset: code.len(), target_label: l_neg });
+                        code.extend_from_slice(&[0, 0, 0, 0, 0x0F, 0x84]);
+                        relocs.push(RelocPatch { patch_offset: code.len(), target_label: l_zero });
+                        code.extend_from_slice(&[0, 0, 0, 0, 0xE9]);
+                        relocs.push(RelocPatch { patch_offset: code.len(), target_label: l_pos });
+                        code.extend_from_slice(&[0, 0, 0, 0]);
+                    }
+                }
+                0x7F43 | 0x7F44 => {
+                    if let Some(lbl) = ins.operands.get(1).and_then(extract_label_id) {
+                        emit_load_op(&mut code, &ins.operands[0], false);
+                        code.extend_from_slice(&[0x48, 0x83, 0xF8, if ins.op_tok == 0x7F43 { 0x01 } else { 0xFF }, 0x0F, 0x84]);
+                        relocs.push(RelocPatch { patch_offset: code.len(), target_label: lbl });
+                        code.extend_from_slice(&[0, 0, 0, 0]);
+                    }
+                }
+                0x7F45 => {
+                    emit_load_op(&mut code, &ins.operands[0], false);
+                    emit_load_op(&mut code, &ins.operands[1], true);
+                    code.extend_from_slice(&[0x49, 0x89, 0xC0, 0x48, 0x89, 0xCA]);
+                    emit_load_op(&mut code, &ins.operands[2], true);
+                    code.extend_from_slice(&[0x49, 0x83, 0xF8, 0x00, 0x48, 0x0F, 0x44, 0xD1]);
+                    emit_load_op(&mut code, &ins.operands[3], true);
+                    code.extend_from_slice(&[0x49, 0x83, 0xF8, 0x00, 0x48, 0x0F, 0x4F, 0xD1, 0x48, 0x89, 0xD0]);
+                    if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                }
+                0x7F48 => {
+                    if let Some(BinOperand::FnRef(callee_idx)) = ins.operands.first() {
+                        let args = &ins.operands[1..];
+                        for arg in args.iter().rev() {
+                            emit_load_op(&mut code, arg, false);
+                            code.push(0x50);
+                        }
+                        code.push(0xE8);
+                        call_relocs.push((code.len(), *callee_idx));
+                        code.extend_from_slice(&[0, 0, 0, 0]);
+                        let cleanup: u32 = (args.len() * 8) as u32;
+                        code.extend_from_slice(&[0x48, 0x81, 0xC4]);
+                        code.extend_from_slice(&cleanup.to_le_bytes());
+                        if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                    }
+                }
+                0x7F4A => {
+                    if func.ret_ty_tok == TY_BYTES {
+                        if ins.operands.len() == 3 {
+                            emit_load_op(&mut code, &ins.operands[1], false);
+                            emit_load_op(&mut code, &ins.operands[2], true);
+                            code.extend_from_slice(&[0x48, 0x85, 0xC0, 0x0F, 0x88]);
+                            trap_relocs.push((code.len(), 1));
+                            code.extend_from_slice(&[0, 0, 0, 0]);
+                            code.extend_from_slice(&[0x48, 0x85, 0xC9, 0x0F, 0x88]);
+                            trap_relocs.push((code.len(), 1));
+                            code.extend_from_slice(&[0, 0, 0, 0]);
+                            code.extend_from_slice(&[0x48, 0x8D, 0x34, 0x08]);
+                            code.extend_from_slice(&[0x48, 0x39, 0xC6, 0x0F, 0x82]);
+                            trap_relocs.push((code.len(), 1));
+                            code.extend_from_slice(&[0, 0, 0, 0]);
+                            code.extend_from_slice(&[0x4C, 0x39, 0xDE, 0x0F, 0x87]);
+                            trap_relocs.push((code.len(), 1));
+                            code.extend_from_slice(&[0, 0, 0, 0]);
+                            code.extend_from_slice(&[0x48, 0x89, 0xCA, 0xC9, 0xC3]);
+                        } else {
+                            code.extend_from_slice(&[0x31, 0xC0, 0x4C, 0x89, 0xDA, 0xC9, 0xC3]);
+                        }
+                    } else if ins.operands.len() == 3 {
+                        return Err(String::from("error[BAD_TYPE]: 3-op RET requires Bytes return type"));
+                    } else {
+                        emit_load_op(&mut code, &ins.operands[0], false);
+                        code.extend_from_slice(&[0xC9, 0xC3]);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        for r in &relocs {
+            let target_off = label_offsets
+                .iter()
+                .find(|&&(lbl, _)| lbl == r.target_label)
+                .map(|&(_, off)| off)
+                .ok_or_else(|| format!("Unresolved label 0x{:04X} in fn#{}", r.target_label, func.fn_idx))?;
+            let rel32: i32 = (target_off as i32) - ((r.patch_offset + 4) as i32);
+            code[r.patch_offset..r.patch_offset + 4].copy_from_slice(&rel32.to_le_bytes());
+        }
+    }
+
+    for &(patch_off, callee_idx) in &call_relocs {
+        let target_off = *fn_offsets
+            .get(&callee_idx)
+            .ok_or_else(|| format!("Unresolved CALL target fn#{}", callee_idx))?;
+        let rel32: i32 = (target_off as i32) - ((patch_off + 4) as i32);
+        code[patch_off..patch_off + 4].copy_from_slice(&rel32.to_le_bytes());
+    }
+
+    let trap_offs = [t_trunc_off, t_oob_off, t_cap_off];
+    for &(patch_off, trap_kind) in &trap_relocs {
+        let target_off = trap_offs[trap_kind as usize];
+        let rel32: i32 = (target_off as i32) - ((patch_off + 4) as i32);
+        code[patch_off..patch_off + 4].copy_from_slice(&rel32.to_le_bytes());
+    }
+
+    let base_vaddr: u64 = 0x400000;
+    let entry_vaddr: u64 = base_vaddr + 120;
+    let total_size: u64 = 120 + (code.len() as u64);
+
+    let mut elf = vec![0u8; 120];
+    elf[0..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
+    elf[4] = 2;
+    elf[5] = 1;
+    elf[6] = 1;
+    elf[16..18].copy_from_slice(&2u16.to_le_bytes());
+    elf[18..20].copy_from_slice(&0x3Eu16.to_le_bytes());
+    elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+    elf[24..32].copy_from_slice(&entry_vaddr.to_le_bytes());
+    elf[32..40].copy_from_slice(&64u64.to_le_bytes());
+    elf[52..54].copy_from_slice(&64u16.to_le_bytes());
+    elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+    elf[56..58].copy_from_slice(&1u16.to_le_bytes());
+    elf[64..68].copy_from_slice(&1u32.to_le_bytes());
+    elf[68..72].copy_from_slice(&5u32.to_le_bytes());
+    elf[80..88].copy_from_slice(&base_vaddr.to_le_bytes());
+    elf[88..96].copy_from_slice(&base_vaddr.to_le_bytes());
+    elf[96..104].copy_from_slice(&total_size.to_le_bytes());
+    elf[104..112].copy_from_slice(&total_size.to_le_bytes());
+    elf[112..120].copy_from_slice(&0x1000u64.to_le_bytes());
+
+    elf.extend_from_slice(&code);
+    Ok(elf)
+}
+
+fn encode_uleb128(mut val: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let mut byte = (val & 0x7F) as u8;
+        val >>= 7;
+        if val != 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if val == 0 {
+            break;
+        }
+    }
+    out
+}
+
+fn encode_sleb128(mut val: i64) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let mut byte = (val & 0x7F) as u8;
+        val >>= 7;
+        let done = (val == 0 && (byte & 0x40) == 0) || (val == -1 && (byte & 0x40) != 0);
+        if !done {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if done {
+            break;
+        }
+    }
+    out
+}
+
+/// Linear memory reserved for ISET/IGET byte buffers in Wasm AOT (2 pages = 128 KiB).
+pub const WASM_ISET_MEMORY_PAGES: u32 = 2;
+pub const WASM_ISET_MEMORY_BYTES: i64 = (WASM_ISET_MEMORY_PAGES as i64) * 65536;
+
+/// Wasm buffer values are `(base << 32) | len` into the ISET linear memory, allocated by a
+/// bump pointer (`top`). An append to a buffer that is not the most recent allocation copies it
+/// to `top` first, so earlier values keep their bytes (VM value semantics for appends).
+#[derive(Clone, Copy)]
+struct WasmBufLocals {
+    top: usize,
+    bbase: usize,
+    blen: usize,
+    bidx: usize,
+    s0: usize,
+}
+
+fn wasm_lget(b: &mut Vec<u8>, l: usize) {
+    b.push(0x20);
+    b.extend(encode_uleb128(l));
+}
+
+fn wasm_lset(b: &mut Vec<u8>, l: usize) {
+    b.push(0x21);
+    b.extend(encode_uleb128(l));
+}
+
+fn wasm_i64c(b: &mut Vec<u8>, v: i64) {
+    b.push(0x42);
+    b.extend(encode_sleb128(v));
+}
+
+/// Stack: [v] -> []. bbase = v >> 32, blen = v & 0xFFFF_FFFF.
+fn wasm_buf_split(b: &mut Vec<u8>, l: &WasmBufLocals) {
+    wasm_lset(b, l.s0);
+    wasm_lget(b, l.s0);
+    wasm_i64c(b, 32);
+    b.push(0x87); // i64.shr_s (base < 2^31)
+    wasm_lset(b, l.bbase);
+    wasm_lget(b, l.s0);
+    wasm_i64c(b, 0xFFFF_FFFF);
+    b.push(0x83); // i64.and
+    wasm_lset(b, l.blen);
+}
+
+/// Stack: [] -> [(bbase << 32) | blen].
+fn wasm_buf_join(b: &mut Vec<u8>, l: &WasmBufLocals) {
+    wasm_lget(b, l.bbase);
+    wasm_i64c(b, 32);
+    b.push(0x86); // i64.shl
+    wasm_lget(b, l.blen);
+    b.push(0x84); // i64.or
+}
+
+/// After `wasm_buf_split`: if the buffer does not end at `top`, copy it to `top` (when it fits)
+/// so appends never overwrite bytes another value still refers to.
+fn wasm_buf_make_appendable(b: &mut Vec<u8>, l: &WasmBufLocals, mem_bytes: i64) {
+    wasm_lget(b, l.bbase);
+    wasm_lget(b, l.blen);
+    b.push(0x7C);
+    wasm_lget(b, l.top);
+    b.push(0x52); // i64.ne
+    b.extend_from_slice(&[0x04, 0x40]); // if
+    wasm_lget(b, l.top);
+    wasm_lget(b, l.blen);
+    b.push(0x7C);
+    wasm_i64c(b, mem_bytes);
+    b.extend_from_slice(&[0x55, 0x50]); // !(top + blen > MEM)
+    b.extend_from_slice(&[0x04, 0x40]); // if
+    wasm_i64c(b, 0);
+    wasm_lset(b, l.bidx);
+    b.extend_from_slice(&[0x03, 0x40]); // loop
+    wasm_lget(b, l.bidx);
+    wasm_lget(b, l.blen);
+    b.push(0x53); // i64.lt_s
+    b.extend_from_slice(&[0x04, 0x40]); // if
+    wasm_lget(b, l.top);
+    wasm_lget(b, l.bidx);
+    b.push(0x7C);
+    b.push(0xA7);
+    wasm_lget(b, l.bbase);
+    wasm_lget(b, l.bidx);
+    b.push(0x7C);
+    b.push(0xA7);
+    b.extend_from_slice(&[0x2D, 0x00, 0x00]); // i32.load8_u
+    b.extend_from_slice(&[0x3A, 0x00, 0x00]); // i32.store8
+    wasm_lget(b, l.bidx);
+    wasm_i64c(b, 1);
+    b.push(0x7C);
+    wasm_lset(b, l.bidx);
+    b.extend_from_slice(&[0x0C, 0x01]); // br 1 (loop)
+    b.push(0x0B); // end if
+    b.push(0x0B); // end loop
+    wasm_lget(b, l.top);
+    wasm_lset(b, l.bbase);
+    wasm_lget(b, l.top);
+    wasm_lget(b, l.blen);
+    b.push(0x7C);
+    wasm_lset(b, l.top);
+    b.push(0x0B); // end if fits
+    b.push(0x0B); // end if not at top
+}
+
+/// Pushes i32 cond: buffer ends at `top` and `top + width <= MEM`.
+fn wasm_buf_can_append(b: &mut Vec<u8>, l: &WasmBufLocals, width: i64, mem_bytes: i64) {
+    wasm_lget(b, l.bbase);
+    wasm_lget(b, l.blen);
+    b.push(0x7C);
+    wasm_lget(b, l.top);
+    b.push(0x51); // i64.eq
+    wasm_lget(b, l.top);
+    wasm_i64c(b, width);
+    b.push(0x7C);
+    wasm_i64c(b, mem_bytes);
+    b.extend_from_slice(&[0x55, 0x50]);
+    b.push(0x71); // i32.and
+}
+
+/// Inside an append `if`: blen += width; top += width.
+fn wasm_buf_bump(b: &mut Vec<u8>, l: &WasmBufLocals, width: i64) {
+    wasm_lget(b, l.blen);
+    wasm_i64c(b, width);
+    b.push(0x7C);
+    wasm_lset(b, l.blen);
+    wasm_lget(b, l.top);
+    wasm_i64c(b, width);
+    b.push(0x7C);
+    wasm_lset(b, l.top);
+}
+
+/// Pushes i32 cond: 0 <= off && off + width <= blen (off in `off_l`). Tested as
+/// off <= blen - width, so a huge off cannot overflow into an in-bounds sum.
+/// ISA-B strict bounds: traps (`unreachable`) unless 0 <= off && off + width <= blen. The
+/// evaluator reports the trap as error[OUT_OF_BOUNDS].
+fn wasm_trap_unless_in_bounds(b: &mut Vec<u8>, l: &WasmBufLocals, off_l: usize, width: i64) {
+    wasm_buf_in_bounds(b, l, off_l, width);
+    b.extend_from_slice(&[0x45, 0x04, 0x40, 0x00, 0x0B]); // i32.eqz; if; unreachable; end
+}
+
+fn wasm_buf_in_bounds(b: &mut Vec<u8>, l: &WasmBufLocals, off_l: usize, width: i64) {
+    wasm_lget(b, off_l);
+    wasm_i64c(b, 0);
+    b.extend_from_slice(&[0x53, 0x50]); // off >= 0
+    wasm_lget(b, off_l);
+    wasm_lget(b, l.blen);
+    wasm_i64c(b, width);
+    b.push(0x7D); // blen - width
+    b.extend_from_slice(&[0x55, 0x50]); // !(off > blen - width)
+    b.push(0x71);
+}
+
+pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
+    let module = decode_omni_token_stream(stream)?;
+    let func = module.functions.first().ok_or("No function in module")?;
+    let rep = verify_binary_function(func);
+    if !rep.passed {
+        return Err(format!("Cannot Wasm-compile unverified binary stream: {:?}", rep.errors));
+    }
+    let empty_map: HashMap<u16, usize> = HashMap::new();
+    let body = compile_wasm_single_func_body(func, &empty_map, false)?;
+
+    let mut type_sec = vec![0x01, 0x60];
+    type_sec.extend(encode_uleb128(func.params.len()));
+    type_sec.resize(type_sec.len() + func.params.len(), 0x7E);
+    type_sec.extend_from_slice(&[0x01, 0x7E]);
+
+    let func_sec = vec![0x01, 0x00];
+    let exp_sec = vec![0x01, 0x07, b'o', b'm', b'n', b'i', b'_', b'f', b'n', 0x00, 0x00];
+    let mut code_sec = vec![0x01];
+    code_sec.extend(encode_uleb128(body.len()));
+    code_sec.extend(body);
+
+    let mem_sec = vec![0x01, 0x00, WASM_ISET_MEMORY_PAGES as u8];
+    let mut wasm = vec![0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00];
+    for (sec_id, payload) in [
+        (1u8, type_sec),
+        (3u8, func_sec),
+        (5u8, mem_sec),
+        (7u8, exp_sec),
+        (10u8, code_sec),
+    ] {
+        wasm.push(sec_id);
+        wasm.extend(encode_uleb128(payload.len()));
+        wasm.extend(payload);
+    }
+    Ok(wasm)
+}
+
+/// M2-10: Multi-function WebAssembly v1 AOT compiler supporting `CALL (0x7F48)`,
+/// shared bump-allocated linear memory (via mutable `global 0`), and `omni_fn` entry dispatch.
+pub fn compile_pure_u16_to_wasm_multi(stream: &[u16]) -> Result<Vec<u8>, String> {
+    let module = decode_omni_token_stream(stream)?;
+    if module.functions.is_empty() {
+        return Err(String::from("No function in module"));
+    }
+    verify_module_for_multi_aot(&module)?;
+    let is_multi = true;
+
+    let mut fn_id_to_wasm_idx: HashMap<u16, usize> = HashMap::new();
+    for (idx, f) in module.functions.iter().enumerate() {
+        fn_id_to_wasm_idx.insert(f.fn_idx, idx);
+    }
+    let entry_wasm_idx = fn_id_to_wasm_idx.get(&0).copied().unwrap_or(0);
+
+    let mut type_sec: Vec<u8> = Vec::new();
+    type_sec.extend(encode_uleb128(module.functions.len()));
+    let mut func_sec: Vec<u8> = Vec::new();
+    func_sec.extend(encode_uleb128(module.functions.len()));
+    let mut code_sec: Vec<u8> = Vec::new();
+    code_sec.extend(encode_uleb128(module.functions.len()));
+
+    for (f_idx, func) in module.functions.iter().enumerate() {
+        let rep = verify_binary_function(func);
+        if !rep.passed {
+            return Err(format!("Cannot Wasm-compile unverified function {}: {:?}", func.fn_idx, rep.errors));
+        }
+        let body = compile_wasm_single_func_body(func, &fn_id_to_wasm_idx, is_multi)?;
+        type_sec.push(0x60);
+        type_sec.extend(encode_uleb128(func.params.len()));
+        type_sec.resize(type_sec.len() + func.params.len(), 0x7E);
+        type_sec.extend_from_slice(&[0x01, 0x7E]);
+        func_sec.extend(encode_uleb128(f_idx));
+        code_sec.extend(encode_uleb128(body.len()));
+        code_sec.extend(body);
+    }
+
+    let mut exp_sec = vec![0x01, 0x07, b'o', b'm', b'n', b'i', b'_', b'f', b'n', 0x00];
+    exp_sec.extend(encode_uleb128(entry_wasm_idx));
+
+    let mem_pages = (WASM_ISET_MEMORY_PAGES as usize).max(32);
+    let mut mem_sec = vec![0x01, 0x00];
+    mem_sec.extend(encode_uleb128(mem_pages));
+
+    let mut wasm = vec![0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00];
+    let sections: Vec<(u8, Vec<u8>)> = vec![
+        (1u8, type_sec),
+        (3u8, func_sec),
+        (5u8, mem_sec),
+        (6u8, vec![0x01, 0x7E, 0x01, 0x42, 0x00, 0x0B]),
+        (7u8, exp_sec),
+        (10u8, code_sec),
+    ];
+    for (sec_id, payload) in sections {
+        wasm.push(sec_id);
+        wasm.extend(encode_uleb128(payload.len()));
+        wasm.extend(payload);
+    }
+    Ok(wasm)
+}
+
+fn compile_wasm_single_func_body(
+    func: &BinFunction,
+    fn_id_to_wasm_idx: &HashMap<u16, usize>,
+    is_multi: bool,
+) -> Result<Vec<u8>, String> {
+    for ins in &func.instructions {
+        if !is_wasm_aot_supported_opcode(ins.op_tok) && !(is_multi && ins.op_tok == 0x7F48) {
+            let lbl = decode_opcode_token(ins.op_tok).map(|s| s.debug_label).unwrap_or("OP_UNKNOWN");
+            return Err(format!(
+                "Opcode 0x{:04X} ({}) requires high-level VM runtime state and is not lowered by standalone WebAssembly AOT",
+                ins.op_tok, lbl
+            ));
+        }
+        if ins.op_tok == 0x7F0E
+            && ins.operands.len() == 3
+            && !matches!(ins.operands[1], BinOperand::ImmInt(-1) | BinOperand::ImmInt(-2) | BinOperand::ImmInt(-4) | BinOperand::ImmInt(-8))
+        {
+            return Err(String::from("error[BAD_TYPE]: 3-op IGET mode must be -1, -2, -4, or -8"));
+        }
+    }
+
+    let num_params = func.params.len();
+    let max_reg_used = func
+        .instructions
+        .iter()
+        .filter_map(|ins| ins.dest_reg)
+        .map(|r| (r - REG_BASE) as usize + 1)
+        .max()
+        .unwrap_or(0);
+    let num_locals = max_reg_used + 7;
+    let scratch0 = num_params + max_reg_used;
+    let scratch1 = num_params + max_reg_used + 1;
+    let pc_local = num_params + max_reg_used + 3;
+    let bl = WasmBufLocals {
+        top: num_params + max_reg_used + 2,
+        bbase: num_params + max_reg_used + 4,
+        blen: num_params + max_reg_used + 5,
+        bidx: num_params + max_reg_used + 6,
+        s0: scratch0,
+    };
+    let wasm_buffer_regs: std::collections::BTreeSet<u16> = func
+        .instructions
+        .iter()
+        .filter(|ins| matches!(ins.op_tok, 0x7F0D | 0x7F0F | 0x7F48))
+        .filter_map(|ins| ins.dest_reg)
+        .collect();
+
+    let has_control_flow = func
+        .instructions
+        .iter()
+        .any(|ins| (0x7F40..=0x7F44).contains(&ins.op_tok));
+
+    let mut label_pcs: Vec<(u16, i64)> = Vec::new();
+    for (idx, ins) in func.instructions.iter().enumerate() {
+        if ins.op_tok == 0x7F40 {
+            if let Some(lbl) = ins.operands.first().and_then(extract_label_id) {
+                label_pcs.push((lbl, idx as i64));
+            }
+        }
+    }
+    let lookup_lbl_pc = |lbl: u16| -> Result<i64, String> {
+        label_pcs
+            .iter()
+            .find(|&&(l, _)| l == lbl)
+            .map(|&(_, pc)| pc)
+            .ok_or_else(|| format!("Unresolved Wasm label 0x{:04X}", lbl))
+    };
+
+    let mut body: Vec<u8> = Vec::with_capacity(512);
+    body.extend(encode_uleb128(1));
+    body.extend(encode_uleb128(num_locals));
+    body.push(0x7E);
+    if is_multi {
+        body.extend_from_slice(&[0x23, 0x00]); // global.get 0
+        wasm_lset(&mut body, bl.top);
+    }
+
+    let emit_wasm_op = |b: &mut Vec<u8>, op: &BinOperand| {
+        match *op {
+            BinOperand::Param(p_tok) => {
+                b.push(0x20);
+                b.extend(encode_uleb128((p_tok - PAR_BASE) as usize));
+            }
+            BinOperand::Reg(r_tok) => {
+                b.push(0x20);
+                b.extend(encode_uleb128(num_params + (r_tok - REG_BASE) as usize));
+            }
+            BinOperand::ImmInt(v) => {
+                b.push(0x42);
+                b.extend(encode_sleb128(v));
+            }
+            BinOperand::ImmTrit(t) => {
+                b.push(0x42);
+                b.extend(encode_sleb128(t as i64));
+            }
+            _ => {
+                b.extend_from_slice(&[0x42, 0x00]);
+            }
+        }
+    };
+
+    let emit_wasm_set_dest = |b: &mut Vec<u8>, dest: Option<u16>| {
+        if let Some(d_tok) = dest {
+            b.push(0x21);
+            b.extend(encode_uleb128(num_params + (d_tok - REG_BASE) as usize));
+        }
+    };
+
+    let reg_pack5 = collect_func_pack5_map(func);
+    validate_func_pack5_ops(func, &reg_pack5)?;
+    let emit_extract_pack5_trit_wasm = |b: &mut Vec<u8>, op: &BinOperand, trit_idx: usize| {
+        let mut direct_byte = false;
+        if let BinOperand::Reg(r) = *op {
+            if let Some((bytes, _, _)) = reg_pack5.get(&r) {
+                let b_val = bytes.get(trit_idx / 5).copied().unwrap_or(121) as i64;
+                b.push(0x42);
+                b.extend(encode_sleb128(b_val));
+                direct_byte = true;
+            }
+        }
+        if !direct_byte {
+            emit_wasm_op(b, op);
+            let shift: i64 = (((trit_idx / 5) + 1) * 8) as i64;
+            b.push(0x42);
+            b.extend(encode_sleb128(shift));
+            b.push(0x87); // i64.shr_s
+            b.push(0x42);
+            b.extend(encode_sleb128(255));
+            b.push(0x83); // i64.and
+        }
+        let pow3: i64 = [1i64, 3, 9, 27, 81][trit_idx % 5];
+        if pow3 > 1 {
+            b.push(0x42);
+            b.extend(encode_sleb128(pow3));
+            b.push(0x7F); // i64.div_s
+        }
+        b.extend_from_slice(&[0x42, 0x03, 0x81, 0x42, 0x01, 0x7D]); // % 3 - 1
+    };
+
+    let emit_straight_ins = |b: &mut Vec<u8>, ins: &BinInstruction| {
+        match ins.op_tok {
+            0x7F00 | 0x7F05 => {}
+            0x7F01 | 0x7F02 | 0x7F03 | 0x7F04 | 0x7F06 | 0x7F09 | 0x7F57 | 0x7F58 | 0x7F59 => {
+                emit_wasm_op(b, &ins.operands[0]);
+                emit_wasm_set_dest(b, ins.dest_reg);
+            }
+            0x7F30 | 0x7F31 => {
+                let word = ins
+                    .dest_reg
+                    .and_then(|d| reg_pack5.get(&d).map(|(bytes, n, _)| pack5_word_from_bytes(bytes, *n)))
+                    .unwrap_or(0);
+                b.push(0x42);
+                b.extend(encode_sleb128(word));
+                emit_wasm_set_dest(b, ins.dest_reg);
+            }
+            0x7F34 => {
+                let n_trits = match (ins.operands.first(), ins.operands.get(1)) {
+                    (Some(BinOperand::Reg(ra)), Some(BinOperand::Reg(rb))) => {
+                        let na = reg_pack5.get(ra).map(|(_, n, _)| *n).unwrap_or(0);
+                        let nb = reg_pack5.get(rb).map(|(_, n, _)| *n).unwrap_or(0);
+                        na.min(nb)
+                    }
+                    _ => 0,
+                };
+                b.extend_from_slice(&[0x42, 0x00]); // acc = 0
+                for idx in 0..n_trits {
+                    emit_extract_pack5_trit_wasm(b, &ins.operands[0], idx);
+                    emit_extract_pack5_trit_wasm(b, &ins.operands[1], idx);
+                    b.extend_from_slice(&[0x7E, 0x7C]); // i64.mul, i64.add
+                }
+                emit_wasm_set_dest(b, ins.dest_reg);
+            }
+            0x7F35 | 0x7F3F => {
+                let pack5_len = match ins.operands.first() {
+                    Some(BinOperand::Reg(r)) => reg_pack5.get(r).map(|(_, n, _)| *n),
+                    _ => None,
+                };
+                if let Some(n_trits) = pack5_len {
+                    b.extend_from_slice(&[0x42, 0x00]); // sum = 0
+                    for idx in 0..n_trits {
+                        emit_extract_pack5_trit_wasm(b, &ins.operands[0], idx);
+                        b.push(0x7C); // i64.add
+                    }
+                } else {
+                    emit_wasm_op(b, &ins.operands[0]);
+                }
+                b.push(0x22); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x55, 0xAD]);
+                b.push(0x20); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x53, 0xAD, 0x7D]);
+                emit_wasm_set_dest(b, ins.dest_reg);
+            }
+            0x7F0D => {
+                // New empty buffer at the bump pointer: (top << 32) | 0.
+                if ins.dest_reg.is_some() {
+                    wasm_lget(b, bl.top);
+                    wasm_i64c(b, 32);
+                    b.push(0x86);
+                    emit_wasm_set_dest(b, ins.dest_reg);
+                }
+            }
+            0x7F0E if ins.operands.len() == 3 => {
+                // ISA-B 3-op IGET buf, mode, off: zero-extended LE load from the buffer's own
+                // region; 0 unless 0 <= off && off + width <= len. Never uses the pack5 map.
+                let width: i64 = match ins.operands[1] {
+                    BinOperand::ImmInt(-1) => 1,
+                    BinOperand::ImmInt(-2) => 2,
+                    BinOperand::ImmInt(-4) => 4,
+                    BinOperand::ImmInt(-8) => 8,
+                    _ => 0,
+                };
+                emit_wasm_op(b, &ins.operands[0]);
+                wasm_buf_split(b, &bl);
+                emit_wasm_op(b, &ins.operands[2]);
+                wasm_lset(b, scratch0);
+                wasm_trap_unless_in_bounds(b, &bl, scratch0, width.max(1));
+                wasm_lget(b, bl.bbase);
+                wasm_lget(b, scratch0);
+                b.push(0x7C);
+                b.push(0xA7);
+                match width {
+                    1 => b.extend_from_slice(&[0x2D, 0x00, 0x00, 0xAD]), // i32.load8_u; i64.extend_i32_u
+                    2 => b.extend_from_slice(&[0x2F, 0x01, 0x00, 0xAD]), // i32.load16_u; i64.extend_i32_u
+                    4 => b.extend_from_slice(&[0x28, 0x02, 0x00, 0xAD]), // i32.load; i64.extend_i32_u
+                    _ => b.extend_from_slice(&[0x29, 0x03, 0x00]),       // i64.load
+                }
+                emit_wasm_set_dest(b, ins.dest_reg);
+            }
+            0x7F0E => {
+                let mut handled = false;
+                if let (Some(BinOperand::Reg(r_arr)), Some(idx_op)) =
+                    (ins.operands.first(), ins.operands.get(1))
+                {
+                    // The pack5 map is flow-insensitive (last definition in stream order wins),
+                    // so it is only trusted for TritVec / TPACK5 registers, never for a runtime
+                    // ANEW/ISET buffer (that was the pack5_flow mis-fold).
+                    let fold = reg_pack5
+                        .get(r_arr)
+                        .filter(|(_, _, is_tv)| *is_tv || !wasm_buffer_regs.contains(r_arr));
+                    if let Some((bytes, n_len, is_tv)) = fold {
+                        if let BinOperand::ImmInt(idx) = idx_op {
+                            if *idx >= 0 {
+                                if *is_tv {
+                                    emit_extract_pack5_trit_wasm(b, &ins.operands[0], *idx as usize);
+                                } else {
+                                    let b_val = bytes.get(*idx as usize).copied().unwrap_or(0) as i64;
+                                    b.push(0x42);
+                                    b.extend(encode_sleb128(b_val));
+                                }
+                                emit_wasm_set_dest(b, ins.dest_reg);
+                                handled = true;
+                            }
+                        } else {
+                            // Dynamic index IGET on @PACK5 TritVec or Bytes in Wasm AOT:
+                            b.extend_from_slice(&[0x42, 0x00]); // acc = 0
+                            for k in 0..*n_len {
+                                if *is_tv {
+                                    emit_extract_pack5_trit_wasm(b, &ins.operands[0], k);
+                                } else {
+                                    let b_val = bytes.get(k).copied().unwrap_or(0) as i64;
+                                    b.push(0x42);
+                                    b.extend(encode_sleb128(b_val));
+                                }
+                                emit_wasm_op(b, idx_op);
+                                b.push(0x42);
+                                b.extend(encode_sleb128(k as i64));
+                                b.extend_from_slice(&[0x51, 0xAD, 0x7E, 0x7C]); // i64.eq, i64.extend_i32_u, i64.mul, i64.add
+                            }
+                            emit_wasm_set_dest(b, ins.dest_reg);
+                            handled = true;
+                        }
+                    }
+                }
+                if !handled {
+                    if ins.operands.len() == 2
+                        && (matches!(ins.operands[0], BinOperand::Reg(_))
+                            || (is_multi && matches!(ins.operands[0], BinOperand::Param(_))))
+                    {
+                        // Runtime byte load from this buffer's own region. OOB yields 0.
+                        emit_wasm_op(b, &ins.operands[0]);
+                        wasm_buf_split(b, &bl);
+                        emit_wasm_op(b, &ins.operands[1]);
+                        wasm_lset(b, scratch0);
+                        wasm_buf_in_bounds(b, &bl, scratch0, 1);
+                        wasm_lset(b, scratch1);
+                        // addr = (base + idx) * in_bounds (0 when OOB, so a dummy load is safe)
+                        wasm_lget(b, bl.bbase);
+                        wasm_lget(b, scratch0);
+                        b.push(0x7C);
+                        wasm_lget(b, scratch1);
+                        b.push(0x7E);
+                        b.push(0xA7); // i32.wrap_i64
+                        b.extend_from_slice(&[0x2D, 0x00, 0x00]); // i32.load8_u
+                        b.push(0xAD); // i64.extend_i32_u
+                        b.extend_from_slice(&[0x42, 0x00]);
+                        wasm_lget(b, scratch1);
+                        b.push(0x1B); // select
+                        emit_wasm_set_dest(b, ins.dest_reg);
+                    } else {
+                        b.extend_from_slice(&[0x42, 0x00]);
+                        emit_wasm_set_dest(b, ins.dest_reg);
+                    }
+                }
+            }
+            0x7F0F => {
+                let ops = &ins.operands;
+                // Source buffer value; a non-register source is a fresh empty buffer at `top`.
+                let emit_src = |b: &mut Vec<u8>| {
+                    if matches!(ops.first(), Some(BinOperand::Reg(_)))
+                        || (is_multi && matches!(ops.first(), Some(BinOperand::Param(_))))
+                    {
+                        emit_wasm_op(b, &ops[0]);
+                    } else {
+                        wasm_lget(b, bl.top);
+                        wasm_i64c(b, 32);
+                        b.push(0x86);
+                    }
+                };
+                let patch_width: i64 = match (ops.len(), ops.get(1)) {
+                    (4, Some(BinOperand::ImmInt(-9))) => 8,
+                    (4, Some(BinOperand::ImmInt(-4))) => 4,
+                    (4, Some(BinOperand::ImmInt(-2))) => 2,
+                    _ => 0,
+                };
+                if patch_width > 0 {
+                    // Patch in place, length unchanged. -9 (8 bytes): silent no-op unless
+                    // 0 <= off && off + 8 <= len. ISA-B -4/-2 (4/2 bytes): out of bounds traps.
+                    emit_src(b);
+                    wasm_buf_split(b, &bl);
+                    emit_wasm_op(b, &ops[2]);
+                    wasm_lset(b, scratch0);
+                    emit_wasm_op(b, &ops[3]);
+                    wasm_lset(b, scratch1);
+                    if patch_width == 8 {
+                        wasm_buf_in_bounds(b, &bl, scratch0, patch_width);
+                    } else {
+                        wasm_trap_unless_in_bounds(b, &bl, scratch0, patch_width);
+                        wasm_buf_in_bounds(b, &bl, scratch0, patch_width); // now always true
+                    }
+                    b.extend_from_slice(&[0x04, 0x40]);
+                    wasm_lget(b, bl.bbase);
+                    wasm_lget(b, scratch0);
+                    b.push(0x7C);
+                    b.push(0xA7);
+                    wasm_lget(b, scratch1);
+                    match patch_width {
+                        8 => b.extend_from_slice(&[0x37, 0x00, 0x00]), // i64.store
+                        4 => b.extend_from_slice(&[0xA7, 0x36, 0x00, 0x00]), // i32.store
+                        _ => b.extend_from_slice(&[0xA7, 0x3B, 0x00, 0x00]), // i32.store16
+                    }
+                    b.push(0x0B);
+                } else {
+                    let mem_bytes: i64 = if is_multi { 32 * 65536 } else { WASM_ISET_MEMORY_BYTES };
+                    emit_src(b);
+                    wasm_buf_split(b, &bl);
+                    wasm_buf_make_appendable(b, &bl, mem_bytes);
+                    let chunks: Vec<(i64, &BinOperand)> = if ops.len() == 3 && ops[1] == BinOperand::ImmInt(-4) {
+                        vec![(4, &ops[2])]
+                    } else if ops.len() == 3 && ops[1] == BinOperand::ImmInt(-8) {
+                        vec![(8, &ops[2])]
+                    } else {
+                        ops.iter().skip(1).map(|o| (1i64, o)).collect()
+                    };
+                    for (width, op_v) in chunks {
+                        wasm_buf_can_append(b, &bl, width, mem_bytes);
+                        b.extend_from_slice(&[0x04, 0x40]); // if
+                        wasm_lget(b, bl.top);
+                        b.push(0xA7);
+                        emit_wasm_op(b, op_v);
+                        match width {
+                            1 => {
+                                b.push(0xA7);
+                                b.extend_from_slice(&[0x3A, 0x00, 0x00]); // i32.store8
+                            }
+                            4 => {
+                                b.push(0xA7);
+                                b.extend_from_slice(&[0x36, 0x00, 0x00]); // i32.store
+                            }
+                            _ => b.extend_from_slice(&[0x37, 0x00, 0x00]), // i64.store
+                        }
+                        wasm_buf_bump(b, &bl, width);
+                        b.push(0x0B);
+                    }
+                }
+                if ins.dest_reg.is_some() {
+                    wasm_buf_join(b, &bl);
+                    emit_wasm_set_dest(b, ins.dest_reg);
+                }
+            }
+            0x7F50 => {
+                if ins.dest_reg.is_some() {
+                    let const_len = match ins.operands.first() {
+                        Some(BinOperand::Reg(r)) if !wasm_buffer_regs.contains(r) => {
+                            reg_pack5.get(r).map(|(bytes, _, _)| bytes.len() as i64)
+                        }
+                        _ => None,
+                    };
+                    if let Some(n) = const_len {
+                        wasm_i64c(b, n);
+                    } else if let Some(op0) = ins.operands.first() {
+                        emit_wasm_op(b, op0);
+                        wasm_i64c(b, 0xFFFF_FFFF);
+                        b.push(0x83);
+                    } else {
+                        wasm_i64c(b, 0);
+                    }
+                    emit_wasm_set_dest(b, ins.dest_reg);
+                }
+            }
+            0x7F10 | 0x7F11 | 0x7F12 | 0x7F1E | 0x7F1F | 0x7F20 | 0x7F22 | 0x7F23 => {
+                emit_wasm_op(b, &ins.operands[0]);
+                emit_wasm_op(b, &ins.operands[1]);
+                let wasm_op = match ins.op_tok {
+                    0x7F10 => 0x7C,
+                    0x7F11 => 0x7D,
+                    0x7F12 => 0x7E,
+                    0x7F1E => 0x83,
+                    0x7F1F => 0x84,
+                    0x7F20 => 0x85,
+                    0x7F22 => 0x86,
+                    _      => 0x87,
+                };
+                b.push(wasm_op);
+                emit_wasm_set_dest(b, ins.dest_reg);
+            }
+            0x7F13 | 0x7F14 => {
+                emit_wasm_op(b, &ins.operands[0]);
+                b.push(0x21); b.extend(encode_uleb128(scratch0));
+                emit_wasm_op(b, &ins.operands[1]);
+                b.push(0x21); b.extend(encode_uleb128(scratch1));
+                if ins.op_tok == 0x7F13 {
+                    b.extend_from_slice(&[0x42, 0x00]);
+                }
+                b.push(0x20); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x01]);
+                b.push(0x20); b.extend(encode_uleb128(scratch1));
+                b.push(0x20); b.extend(encode_uleb128(scratch1));
+                b.push(0x50);
+                b.push(0x20); b.extend(encode_uleb128(scratch0));
+                b.push(0x42); b.extend(encode_sleb128(i64::MIN));
+                b.push(0x51);
+                b.push(0x20); b.extend(encode_uleb128(scratch1));
+                b.extend_from_slice(&[0x42, 0x7F, 0x51]);
+                b.extend_from_slice(&[0x71, 0x72, 0x1B]);
+                if ins.op_tok == 0x7F13 {
+                    b.push(0x7F);
+                    b.push(0x20); b.extend(encode_uleb128(scratch1));
+                    b.extend_from_slice(&[0x50, 0x1B]);
+                } else {
+                    b.push(0x81);
+                }
+                emit_wasm_set_dest(b, ins.dest_reg);
+            }
+            0x7F15 | 0x7F28 => {
+                b.extend_from_slice(&[0x42, 0x00]);
+                emit_wasm_op(b, &ins.operands[0]);
+                b.push(0x7D);
+                emit_wasm_set_dest(b, ins.dest_reg);
+            }
+            0x7F16 => {
+                b.extend_from_slice(&[0x42, 0x00]);
+                emit_wasm_op(b, &ins.operands[0]);
+                b.push(0x7D);
+                emit_wasm_op(b, &ins.operands[0]);
+                emit_wasm_op(b, &ins.operands[0]);
+                b.extend_from_slice(&[0x42, 0x00, 0x53, 0x1B]);
+                emit_wasm_set_dest(b, ins.dest_reg);
+            }
+            0x7F21 => {
+                emit_wasm_op(b, &ins.operands[0]);
+                b.extend_from_slice(&[0x42, 0x7F, 0x85]);
+                emit_wasm_set_dest(b, ins.dest_reg);
+            }
+            0x7F17 | 0x7F29 | 0x7F18 | 0x7F2A => {
+                emit_wasm_op(b, &ins.operands[0]);
+                emit_wasm_op(b, &ins.operands[1]);
+                emit_wasm_op(b, &ins.operands[0]);
+                emit_wasm_op(b, &ins.operands[1]);
+                b.push(if matches!(ins.op_tok, 0x7F17 | 0x7F29) { 0x53 } else { 0x55 });
+                b.push(0x1B);
+                emit_wasm_set_dest(b, ins.dest_reg);
+            }
+            0x7F2B => {
+                b.extend_from_slice(&[0x42, 0x00]);
+                emit_wasm_op(b, &ins.operands[0]);
+                emit_wasm_op(b, &ins.operands[1]);
+                b.extend_from_slice(&[0x7E, 0x7D]);
+                emit_wasm_set_dest(b, ins.dest_reg);
+            }
+            0x7F24 | 0x7F25 | 0x7F26 | 0x7F27 => {
+                emit_wasm_op(b, &ins.operands[0]);
+                emit_wasm_op(b, &ins.operands[1]);
+                let cmp_op = match ins.op_tok {
+                    0x7F24 => 0x51,
+                    0x7F25 => 0x52,
+                    0x7F26 => 0x53,
+                    _      => 0x55,
+                };
+                b.extend_from_slice(&[cmp_op, 0xAD, 0x42, 0x02, 0x7E, 0x42, 0x01, 0x7D]);
+                emit_wasm_set_dest(b, ins.dest_reg);
+            }
+            0x7F2C => {
+                emit_wasm_op(b, &ins.operands[0]);
+                emit_wasm_op(b, &ins.operands[1]);
+                b.push(0x7C);
+                emit_wasm_op(b, &ins.operands[2]);
+                b.push(0x7C);
+                b.push(0x22); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x55, 0xAD]);
+                b.push(0x20); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x53, 0xAD, 0x7D]);
+                emit_wasm_set_dest(b, ins.dest_reg);
+            }
+            0x7F2D => {
+                emit_wasm_op(b, &ins.operands[0]);
+                emit_wasm_op(b, &ins.operands[1]);
+                b.extend_from_slice(&[0x55, 0xAD]);
+                emit_wasm_op(b, &ins.operands[0]);
+                emit_wasm_op(b, &ins.operands[1]);
+                b.extend_from_slice(&[0x53, 0xAD, 0x7D]);
+                emit_wasm_set_dest(b, ins.dest_reg);
+            }
+            0x7F45 => {
+                emit_wasm_op(b, &ins.operands[1]);
+                emit_wasm_op(b, &ins.operands[2]);
+                emit_wasm_op(b, &ins.operands[0]);
+                b.extend_from_slice(&[0x42, 0x00, 0x53, 0x1B]);
+                b.push(0x21); b.extend(encode_uleb128(scratch1));
+                emit_wasm_op(b, &ins.operands[3]);
+                b.push(0x20); b.extend(encode_uleb128(scratch1));
+                emit_wasm_op(b, &ins.operands[0]);
+                b.extend_from_slice(&[0x42, 0x00, 0x55, 0x1B]);
+                emit_wasm_set_dest(b, ins.dest_reg);
+            }
+            0x7F4A => {
+                if ins.operands.len() == 3 {
+                    // M2-06 (D-1): 3-op RET buf, off, len -> strict bounds check + slice descriptor.
+                    emit_wasm_op(b, &ins.operands[0]);
+                    wasm_buf_split(b, &bl);
+                    emit_wasm_op(b, &ins.operands[1]);
+                    wasm_lset(b, scratch0); // off
+                    emit_wasm_op(b, &ins.operands[2]);
+                    wasm_lset(b, scratch1); // len
+                    wasm_lget(b, scratch0);
+                    wasm_i64c(b, 0);
+                    b.extend_from_slice(&[0x53, 0x50]); // !(off < 0)
+                    wasm_lget(b, scratch1);
+                    wasm_i64c(b, 0);
+                    b.extend_from_slice(&[0x53, 0x50]); // !(len < 0)
+                    b.push(0x71); // i32.and
+                    wasm_lget(b, scratch1);
+                    wasm_lget(b, bl.blen);
+                    b.extend_from_slice(&[0x55, 0x50]); // !(len > blen)
+                    b.push(0x71); // i32.and
+                    wasm_lget(b, scratch0);
+                    wasm_lget(b, bl.blen);
+                    wasm_lget(b, scratch1);
+                    b.push(0x7D); // blen - len
+                    b.extend_from_slice(&[0x55, 0x50]); // !(off > blen - len)
+                    b.push(0x71); // i32.and
+                    b.extend_from_slice(&[0x45, 0x04, 0x40, 0x00, 0x0B]);
+                    if is_multi {
+                        wasm_lget(b, bl.top);
+                        b.extend_from_slice(&[0x24, 0x00]); // global.set 0
+                    }
+                    wasm_lget(b, bl.bbase);
+                    wasm_lget(b, scratch0);
+                    b.push(0x7C);
+                    wasm_i64c(b, 32);
+                    b.push(0x86);
+                    wasm_lget(b, scratch1);
+                    b.push(0x84);
+                    b.push(0x0F);
+                } else {
+                    if is_multi {
+                        wasm_lget(b, bl.top);
+                        b.extend_from_slice(&[0x24, 0x00]); // global.set 0
+                    }
+                    emit_wasm_op(b, &ins.operands[0]);
+                    b.push(0x0F);
+                }
+            }
+            0x7F48 => {
+                if let Some(BinOperand::FnRef(callee_fn_id)) = ins.operands.first() {
+                    if is_multi {
+                        wasm_lget(b, bl.top);
+                        b.extend_from_slice(&[0x24, 0x00]); // global.set 0
+                    }
+                    for arg in &ins.operands[1..] {
+                        emit_wasm_op(b, arg);
+                    }
+                    let callee_widx = fn_id_to_wasm_idx.get(callee_fn_id).copied().unwrap_or(0);
+                    b.push(0x10);
+                    b.extend(encode_uleb128(callee_widx));
+                    if let Some(dest) = ins.dest_reg {
+                        b.push(0x21);
+                        b.extend(encode_uleb128(num_params + (dest - REG_BASE) as usize));
+                    } else {
+                        b.push(0x1A); // drop
+                    }
+                    if is_multi {
+                        b.extend_from_slice(&[0x23, 0x00]); // global.get 0
+                        wasm_lset(b, bl.top);
+                    }
+                }
+            }
+            _ => {}
+        }
+    };
+
+    if !has_control_flow {
+        for ins in &func.instructions {
+            emit_straight_ins(&mut body, ins);
+        }
+    } else {
+        body.extend_from_slice(&[0x03, 0x40]); // loop (empty blocktype)
+        for (ins_idx, ins) in func.instructions.iter().enumerate() {
+            body.push(0x20);
+            body.extend(encode_uleb128(pc_local));
+            body.push(0x42);
+            body.extend(encode_sleb128(ins_idx as i64));
+            body.extend_from_slice(&[0x51, 0x04, 0x40]); // i64.eq, if (empty blocktype)
+
+            match ins.op_tok {
+                0x7F40 => {
+                    body.push(0x42);
+                    body.extend(encode_sleb128((ins_idx + 1) as i64));
+                    body.push(0x21);
+                    body.extend(encode_uleb128(pc_local));
+                    body.extend_from_slice(&[0x0C, 0x01]);
+                }
+                0x7F41 => {
+                    let lbl = ins.operands.first().and_then(extract_label_id).ok_or("Missing JMP label")?;
+                    let target_pc = lookup_lbl_pc(lbl)?;
+                    body.push(0x42);
+                    body.extend(encode_sleb128(target_pc));
+                    body.push(0x21);
+                    body.extend(encode_uleb128(pc_local));
+                    body.extend_from_slice(&[0x0C, 0x01]);
+                }
+                0x7F43 | 0x7F44 => {
+                    let lbl = ins.operands.get(1).and_then(extract_label_id).ok_or("Missing BR label")?;
+                    let target_pc = lookup_lbl_pc(lbl)?;
+                    body.push(0x42);
+                    body.extend(encode_sleb128(target_pc));
+                    body.push(0x42);
+                    body.extend(encode_sleb128((ins_idx + 1) as i64));
+                    emit_wasm_op(&mut body, &ins.operands[0]);
+                    body.push(0x42);
+                    body.extend(encode_sleb128(if ins.op_tok == 0x7F43 { 1 } else { -1 }));
+                    body.extend_from_slice(&[0x51, 0x1B]);
+                    body.push(0x21);
+                    body.extend(encode_uleb128(pc_local));
+                    body.extend_from_slice(&[0x0C, 0x01]);
+                }
+                0x7F42 => {
+                    let l_neg = ins.operands.get(1).and_then(extract_label_id).ok_or("Missing BR_TRIT neg")?;
+                    let l_zero = ins.operands.get(2).and_then(extract_label_id).ok_or("Missing BR_TRIT zero")?;
+                    let l_pos = ins.operands.get(3).and_then(extract_label_id).ok_or("Missing BR_TRIT pos")?;
+                    let pc_neg = lookup_lbl_pc(l_neg)?;
+                    let pc_zero = lookup_lbl_pc(l_zero)?;
+                    let pc_pos = lookup_lbl_pc(l_pos)?;
+                    body.push(0x42);
+                    body.extend(encode_sleb128(pc_neg));
+                    body.push(0x42);
+                    body.extend(encode_sleb128(pc_zero));
+                    emit_wasm_op(&mut body, &ins.operands[0]);
+                    body.extend_from_slice(&[0x42, 0x00, 0x53, 0x1B]);
+                    body.push(0x21);
+                    body.extend(encode_uleb128(scratch1));
+                    body.push(0x42);
+                    body.extend(encode_sleb128(pc_pos));
+                    body.push(0x20);
+                    body.extend(encode_uleb128(scratch1));
+                    emit_wasm_op(&mut body, &ins.operands[0]);
+                    body.extend_from_slice(&[0x42, 0x00, 0x55, 0x1B]);
+                    body.push(0x21);
+                    body.extend(encode_uleb128(pc_local));
+                    body.extend_from_slice(&[0x0C, 0x01]);
+                }
+                0x7F4A => {
+                    emit_straight_ins(&mut body, ins);
+                }
+                _ => {
+                    emit_straight_ins(&mut body, ins);
+                    body.push(0x42);
+                    body.extend(encode_sleb128((ins_idx + 1) as i64));
+                    body.push(0x21);
+                    body.extend(encode_uleb128(pc_local));
+                    body.extend_from_slice(&[0x0C, 0x01]);
+                }
+            }
+            body.push(0x0B); // end if
+        }
+        body.push(0x0B); // end loop
+        body.extend_from_slice(&[0x42, 0x00]); // fallback i64.const 0
+    }
+    body.push(0x0B);
+    Ok(body)
+}
+
+fn decode_uleb128(bytes: &[u8], pos: &mut usize) -> Result<usize, String> {
+    let mut result: usize = 0;
+    let mut shift: u32 = 0;
+    loop {
+        if *pos >= bytes.len() {
+            return Err(String::from("Unexpected EOF in Wasm ULEB128"));
+        }
+        let byte = bytes[*pos];
+        *pos += 1;
+        result |= ((byte & 0x7F) as usize) << shift;
+        if (byte & 0x80) == 0 {
+            break;
+        }
+        shift += 7;
+        if shift >= 64 {
+            return Err(String::from("Wasm ULEB128 overflow"));
+        }
+    }
+    Ok(result)
+}
+
+fn decode_sleb128(bytes: &[u8], pos: &mut usize) -> Result<i64, String> {
+    let mut result: i64 = 0;
+    let mut shift: u32 = 0;
+    let mut byte: u8;
+    loop {
+        if *pos >= bytes.len() {
+            return Err(String::from("Unexpected EOF in Wasm SLEB128"));
+        }
+        byte = bytes[*pos];
+        *pos += 1;
+        result |= ((byte & 0x7F) as i64) << shift;
+        shift += 7;
+        if (byte & 0x80) == 0 {
+            break;
+        }
+        if shift >= 64 {
+            break;
+        }
+    }
+    if shift < 64 && (byte & 0x40) != 0 {
+        result |= !0i64 << shift;
+    }
+    Ok(result)
+}
+
+fn skip_wasm_to_matching_end(body: &[u8], mut pos: usize) -> Result<usize, String> {
+    let mut depth = 1usize;
+    while pos < body.len() {
+        let op = body[pos];
+        pos += 1;
+        match op {
+            0x02 | 0x03 | 0x04 => {
+                if pos >= body.len() {
+                    return Err(String::from("Truncated Wasm block header during skip"));
+                }
+                pos += 1;
+                depth += 1;
+            }
+            0x0B => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(pos);
+                }
+            }
+            0x0C | 0x10 | 0x20 | 0x21 | 0x22 | 0x23 | 0x24 => {
+                let _ = decode_uleb128(body, &mut pos)?;
+            }
+            0x42 => {
+                let _ = decode_sleb128(body, &mut pos)?;
+            }
+            0x28..=0x3E => {
+                // load/store memarg: align, offset
+                let _ = decode_uleb128(body, &mut pos)?;
+                let _ = decode_uleb128(body, &mut pos)?;
+            }
+            _ => {}
+        }
+    }
+    Err(String::from("Unclosed Wasm block while skipping to end"))
+}
+
+pub const DEFAULT_WASM_STEP_LIMIT: u64 = 50_000_000;
+pub const DEFAULT_WASM_MEMORY_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
+/// Self-contained 64-bit WebAssembly v1 binary validator and stack-machine evaluator for
+/// differential verification of `compile_pure_u16_to_wasm` against `OmniBinaryVm` and x86-64 ELF.
+pub fn execute_wasm_module_i64(wasm: &[u8], args: &[i64]) -> Result<i64, String> {
+    execute_wasm_module_i64_with_budgets(
+        wasm,
+        args,
+        DEFAULT_WASM_STEP_LIMIT,
+        DEFAULT_WASM_MEMORY_BUDGET_BYTES,
+    )
+}
+
+/// Executes a 64-bit WebAssembly v1 binary under explicit `step_limit` and `memory_budget_bytes` caps.
+pub fn execute_wasm_module_i64_with_budgets(
+    wasm: &[u8],
+    args: &[i64],
+    step_limit: u64,
+    memory_budget_bytes: usize,
+) -> Result<i64, String> {
+    if wasm.len() < 8 || &wasm[0..8] != &[0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00] {
+        return Err(String::from("Invalid WebAssembly '\0asm' v1 header"));
+    }
+    let mut pos = 8usize;
+    let mut type_param_counts: Vec<usize> = Vec::new();
+    let mut func_type_indices: Vec<usize> = Vec::new();
+    let mut fn_bodies: Vec<&[u8]> = Vec::new();
+    let mut entry_func_idx: usize = 0;
+    let mut globals: Vec<i64> = Vec::new();
+    let mut memory: Vec<u8> = Vec::new();
+
+    while pos < wasm.len() {
+        let sec_id = wasm[pos];
+        pos += 1;
+        let sec_len = decode_uleb128(wasm, &mut pos)?;
+        if pos + sec_len > wasm.len() {
+            return Err(String::from("Truncated Wasm section"));
+        }
+        let sec_end = pos + sec_len;
+        if sec_id == 1 {
+            let mut p = pos;
+            let type_cnt = decode_uleb128(wasm, &mut p)?;
+            if type_cnt == 0 {
+                return Err(String::from("Invalid Wasm Type section"));
+            }
+            for _ in 0..type_cnt {
+                if p >= sec_end || wasm[p] != 0x60 {
+                    return Err(String::from("Invalid Wasm Type section"));
+                }
+                p += 1;
+                let np = decode_uleb128(wasm, &mut p)?;
+                p = p.saturating_add(np);
+                let nr = decode_uleb128(wasm, &mut p)?;
+                p = p.saturating_add(nr);
+                if p > sec_end {
+                    return Err(String::from("Truncated Wasm Type entry"));
+                }
+                type_param_counts.push(np);
+            }
+        } else if sec_id == 3 {
+            let mut p = pos;
+            let fn_cnt = decode_uleb128(wasm, &mut p)?;
+            for _ in 0..fn_cnt {
+                let tidx = decode_uleb128(wasm, &mut p)?;
+                func_type_indices.push(tidx);
+            }
+        } else if sec_id == 5 {
+            let mut p = pos;
+            let mem_cnt = decode_uleb128(wasm, &mut p)?;
+            if mem_cnt > 0 {
+                if p >= sec_end {
+                    return Err(String::from("Truncated Wasm Memory section"));
+                }
+                let flags = wasm[p];
+                p += 1;
+                let min_pages = decode_uleb128(wasm, &mut p)?;
+                if flags & 1 != 0 {
+                    let _max = decode_uleb128(wasm, &mut p)?;
+                }
+                let bytes = min_pages.saturating_mul(65536);
+                memory.resize(bytes, 0);
+            }
+        } else if sec_id == 6 {
+            let mut p = pos;
+            let g_cnt = decode_uleb128(wasm, &mut p)?;
+            for _ in 0..g_cnt {
+                if p + 2 > sec_end {
+                    return Err(String::from("Truncated Wasm Global section"));
+                }
+                p += 2;
+                let mut init_val = 0i64;
+                if p < sec_end && wasm[p] == 0x42 {
+                    p += 1;
+                    init_val = decode_sleb128(wasm, &mut p)?;
+                }
+                if p < sec_end && wasm[p] == 0x0B {
+                    p += 1;
+                }
+                globals.push(init_val);
+            }
+        } else if sec_id == 7 {
+            let mut p = pos;
+            let exp_cnt = decode_uleb128(wasm, &mut p)?;
+            for _ in 0..exp_cnt {
+                let name_len = decode_uleb128(wasm, &mut p)?;
+                if p + name_len + 1 > sec_end {
+                    return Err(String::from("Truncated Wasm Export section"));
+                }
+                let name = &wasm[p..p + name_len];
+                p += name_len;
+                let kind = wasm[p];
+                p += 1;
+                let idx = decode_uleb128(wasm, &mut p)?;
+                if kind == 0x00 && name == b"omni_fn" {
+                    entry_func_idx = idx;
+                }
+            }
+        } else if sec_id == 10 {
+            let mut p = pos;
+            let fn_cnt = decode_uleb128(wasm, &mut p)?;
+            if fn_cnt == 0 {
+                return Err(String::from("Empty Wasm Code section"));
+            }
+            for _ in 0..fn_cnt {
+                let body_len = decode_uleb128(wasm, &mut p)?;
+                if p + body_len > sec_end {
+                    return Err(String::from("Truncated Wasm function body"));
+                }
+                fn_bodies.push(&wasm[p..p + body_len]);
+                p += body_len;
+            }
+        }
+        pos = sec_end;
+    }
+
+    if fn_bodies.is_empty() || entry_func_idx >= fn_bodies.len() {
+        return Err(String::from("Missing Wasm Code section"));
+    }
+
+    let mut fn_code_starts: Vec<usize> = Vec::with_capacity(fn_bodies.len());
+    let mut fn_total_locals: Vec<usize> = Vec::with_capacity(fn_bodies.len());
+    let mut fn_num_params: Vec<usize> = Vec::with_capacity(fn_bodies.len());
+    for (idx, body) in fn_bodies.iter().enumerate() {
+        let tidx = func_type_indices.get(idx).copied().unwrap_or(idx);
+        let np = type_param_counts.get(tidx).copied().unwrap_or(0);
+        let mut bp = 0usize;
+        let decl_cnt = decode_uleb128(body, &mut bp)?;
+        let mut tot = np;
+        for _ in 0..decl_cnt {
+            let cnt = decode_uleb128(body, &mut bp)?;
+            if bp >= body.len() {
+                return Err(String::from("Truncated Wasm local decl"));
+            }
+            bp += 1;
+            tot += cnt;
+        }
+        fn_code_starts.push(bp);
+        fn_total_locals.push(tot);
+        fn_num_params.push(np);
+    }
+
+    let mut cur_fn = entry_func_idx;
+    let mut body = fn_bodies[cur_fn];
+    let mut bpos = fn_code_starts[cur_fn];
+    let total_locals = fn_total_locals[cur_fn];
+
+    let frame_bytes = wasm
+        .len()
+        .saturating_add(total_locals.max(args.len()).saturating_mul(8))
+        .saturating_add(memory.len());
+    if frame_bytes > memory_budget_bytes {
+        return Err(format!(
+            "error[BUDGET_EXCEEDED]: Wasm AOT memory budget exceeded ({} > {} bytes)",
+            frame_bytes, memory_budget_bytes
+        ));
+    }
+
+    let mut locals = vec![0i64; total_locals.max(args.len())];
+    for (i, &v) in args.iter().enumerate() {
+        if i < locals.len() {
+            locals[i] = v;
+        }
+    }
+    let mut stack: Vec<i64> = Vec::with_capacity(32);
+    let mut ctrl_stack: Vec<(u8, usize)> = Vec::with_capacity(8);
+    let mut call_stack: Vec<(usize, usize, Vec<i64>, Vec<(u8, usize)>)> = Vec::with_capacity(8);
+    let mut steps_executed: u64 = 0;
+
+    while bpos < body.len() {
+        steps_executed = steps_executed.saturating_add(1);
+        if steps_executed > step_limit {
+            return Err(format!(
+                "error[BUDGET_EXCEEDED]: Wasm AOT step budget exceeded ({} > {})",
+                steps_executed, step_limit
+            ));
+        }
+        let runtime_bytes = frame_bytes.saturating_add(stack.len().saturating_add(ctrl_stack.len()).saturating_mul(8));
+        if runtime_bytes > memory_budget_bytes {
+            return Err(format!(
+                "error[BUDGET_EXCEEDED]: Wasm AOT memory budget exceeded ({} > {} bytes)",
+                runtime_bytes, memory_budget_bytes
+            ));
+        }
+        let op = body[bpos];
+        bpos += 1;
+        match op {
+            0x02 | 0x03 => {
+                if bpos >= body.len() {
+                    return Err(String::from("Truncated Wasm block/loop header"));
+                }
+                bpos += 1;
+                ctrl_stack.push((op, bpos));
+            }
+            0x04 => {
+                if bpos >= body.len() {
+                    return Err(String::from("Truncated Wasm if header"));
+                }
+                bpos += 1;
+                let cond = stack.pop().ok_or("Wasm stack underflow on if")?;
+                if cond != 0 {
+                    ctrl_stack.push((0x04, bpos));
+                } else {
+                    bpos = skip_wasm_to_matching_end(body, bpos)?;
+                }
+            }
+            0x0C => {
+                let depth = decode_uleb128(body, &mut bpos)?;
+                if depth >= ctrl_stack.len() {
+                    return Err(String::from("Wasm br depth out of bounds"));
+                }
+                for _ in 0..depth {
+                    ctrl_stack.pop();
+                }
+                let &(target_op, target_pos) = ctrl_stack.last().unwrap();
+                if target_op == 0x03 {
+                    bpos = target_pos;
+                } else {
+                    ctrl_stack.pop();
+                    bpos = skip_wasm_to_matching_end(body, target_pos)?;
+                }
+            }
+            0x20 => {
+                let idx = decode_uleb128(body, &mut bpos)?;
+                stack.push(*locals.get(idx).ok_or("Wasm local.get out of bounds")?);
+            }
+            0x21 => {
+                let idx = decode_uleb128(body, &mut bpos)?;
+                let v = stack.pop().ok_or("Wasm stack underflow on local.set")?;
+                if idx >= locals.len() {
+                    return Err(String::from("Wasm local.set out of bounds"));
+                }
+                locals[idx] = v;
+            }
+            0x22 => {
+                let idx = decode_uleb128(body, &mut bpos)?;
+                let v = *stack.last().ok_or("Wasm stack underflow on local.tee")?;
+                if idx >= locals.len() {
+                    return Err(String::from("Wasm local.tee out of bounds"));
+                }
+                locals[idx] = v;
+            }
+            0x42 => {
+                let v = decode_sleb128(body, &mut bpos)?;
+                stack.push(v);
+            }
+            0x45 | 0x50 => {
+                // i32.eqz / i64.eqz (the evaluator keeps every value as i64)
+                let a = stack.pop().ok_or("Wasm stack underflow on i64.eqz")?;
+                stack.push(if a == 0 { 1 } else { 0 });
+            }
+            0x51 | 0x52 | 0x53 | 0x55 => {
+                let b = stack.pop().ok_or("Wasm stack underflow on cmp b")?;
+                let a = stack.pop().ok_or("Wasm stack underflow on cmp a")?;
+                let r = match op {
+                    0x51 => a == b,
+                    0x52 => a != b,
+                    0x53 => a < b,
+                    _    => a > b,
+                };
+                stack.push(if r { 1 } else { 0 });
+            }
+            0x71 => {
+                let b = stack.pop().ok_or("Wasm stack underflow on i32.and")?;
+                let a = stack.pop().ok_or("Wasm stack underflow on i32.and")?;
+                stack.push((a & b) & 1);
+            }
+            0x72 => {
+                let b = stack.pop().ok_or("Wasm stack underflow on i32.or")?;
+                let a = stack.pop().ok_or("Wasm stack underflow on i32.or")?;
+                stack.push((a | b) & 1);
+            }
+            0x7C | 0x7D | 0x7E | 0x83 | 0x84 | 0x85 | 0x86 | 0x87 => {
+                let b = stack.pop().ok_or("Wasm stack underflow on binop b")?;
+                let a = stack.pop().ok_or("Wasm stack underflow on binop a")?;
+                let r = match op {
+                    0x7C => a.wrapping_add(b),
+                    0x7D => a.wrapping_sub(b),
+                    0x7E => a.wrapping_mul(b),
+                    0x83 => a & b,
+                    0x84 => a | b,
+                    0x85 => a ^ b,
+                    0x86 => a.wrapping_shl((b & 63) as u32),
+                    _    => a.wrapping_shr((b & 63) as u32),
+                };
+                stack.push(r);
+            }
+            0x7F => {
+                let b = stack.pop().ok_or("Wasm stack underflow on i64.div_s b")?;
+                let a = stack.pop().ok_or("Wasm stack underflow on i64.div_s a")?;
+                if b == 0 || (a == i64::MIN && b == -1) {
+                    return Err(String::from("Wasm hardware trap on unguarded i64.div_s"));
+                }
+                stack.push(a.wrapping_div(b));
+            }
+            0x81 => {
+                let b = stack.pop().ok_or("Wasm stack underflow on i64.rem_s b")?;
+                let a = stack.pop().ok_or("Wasm stack underflow on i64.rem_s a")?;
+                if b == 0 {
+                    return Err(String::from("Wasm hardware trap on unguarded i64.rem_s"));
+                }
+                stack.push(if a == i64::MIN && b == -1 { 0 } else { a.wrapping_rem(b) });
+            }
+            0xA7 => {
+                let a = stack.pop().ok_or("Wasm stack underflow on i32.wrap_i64")?;
+                stack.push((a as i32) as i64);
+            }
+            0xAD => {
+                let a = stack.pop().ok_or("Wasm stack underflow on i64.extend_i32_u")?;
+                stack.push((a as u32) as i64);
+            }
+            0x2D | 0x2F | 0x28 | 0x29 | 0x36 | 0x37 | 0x3A | 0x3B => {
+                let _align = decode_uleb128(body, &mut bpos)?;
+                let offset = decode_uleb128(body, &mut bpos)?;
+                let is_store = matches!(op, 0x36 | 0x37 | 0x3A | 0x3B);
+                let val = if is_store {
+                    stack.pop().ok_or("Wasm stack underflow on store value")?
+                } else {
+                    0
+                };
+                let addr_i = stack.pop().ok_or("Wasm stack underflow on mem addr")?;
+                let addr = (addr_i as u32 as u64).saturating_add(offset as u64) as usize;
+                let width: usize = match op {
+                    0x2D | 0x3A => 1,
+                    0x2F | 0x3B => 2,
+                    0x28 | 0x36 => 4,
+                    _ => 8,
+                };
+                if is_store {
+                    if addr.saturating_add(width) > memory.len() {
+                        return Err(format!(
+                            "Wasm store out of bounds (addr={addr}, width={width}, mem={})",
+                            memory.len()
+                        ));
+                    }
+                    match op {
+                        0x3A => memory[addr] = val as u8,
+                        0x3B => memory[addr..addr + 2].copy_from_slice(&(val as u16).to_le_bytes()),
+                        0x36 => memory[addr..addr + 4].copy_from_slice(&(val as u32).to_le_bytes()),
+                        _ => memory[addr..addr + 8].copy_from_slice(&(val as u64).to_le_bytes()),
+                    }
+                } else if addr.saturating_add(width) > memory.len() {
+                    stack.push(0);
+                } else {
+                    let loaded = match op {
+                        0x2D => memory[addr] as i64,
+                        0x2F => u16::from_le_bytes([memory[addr], memory[addr + 1]]) as i64,
+                        0x28 => i32::from_le_bytes(memory[addr..addr + 4].try_into().unwrap()) as i64,
+                        _ => i64::from_le_bytes(memory[addr..addr + 8].try_into().unwrap()),
+                    };
+                    stack.push(loaded);
+                }
+            }
+            0x10 => {
+                let callee = decode_uleb128(body, &mut bpos)?;
+                if callee >= fn_bodies.len() {
+                    return Err(format!("Wasm call target {} out of range", callee));
+                }
+                if call_stack.len() >= 64 {
+                    return Err(String::from("error[BUDGET_EXCEEDED]: Wasm AOT call depth exceeded (64)"));
+                }
+                let np = fn_num_params[callee];
+                if stack.len() < np {
+                    return Err(String::from("Wasm stack underflow on call"));
+                }
+                let mut callee_locals = vec![0i64; fn_total_locals[callee].max(np)];
+                for i in (0..np).rev() {
+                    callee_locals[i] = stack.pop().unwrap();
+                }
+                call_stack.push((cur_fn, bpos, locals, ctrl_stack));
+                cur_fn = callee;
+                body = fn_bodies[cur_fn];
+                bpos = fn_code_starts[cur_fn];
+                locals = callee_locals;
+                ctrl_stack = Vec::with_capacity(8);
+            }
+            0x1A => {
+                let _ = stack.pop().ok_or("Wasm stack underflow on drop")?;
+            }
+            0x23 => {
+                let gidx = decode_uleb128(body, &mut bpos)?;
+                let v = *globals.get(gidx).ok_or("Wasm global.get out of bounds")?;
+                stack.push(v);
+            }
+            0x24 => {
+                let gidx = decode_uleb128(body, &mut bpos)?;
+                let v = stack.pop().ok_or("Wasm stack underflow on global.set")?;
+                let slot = globals.get_mut(gidx).ok_or("Wasm global.set out of bounds")?;
+                *slot = v;
+            }
+            0x1B => {
+                let c = stack.pop().ok_or("Wasm stack underflow on select c")?;
+                let v2 = stack.pop().ok_or("Wasm stack underflow on select v2")?;
+                let v1 = stack.pop().ok_or("Wasm stack underflow on select v1")?;
+                stack.push(if c != 0 { v1 } else { v2 });
+            }
+            0x0F => {
+                let rv = stack.pop().ok_or_else(|| String::from("Wasm stack empty on return"))?;
+                if let Some((prev_fn, prev_bpos, prev_locals, prev_ctrl)) = call_stack.pop() {
+                    cur_fn = prev_fn;
+                    body = fn_bodies[cur_fn];
+                    bpos = prev_bpos;
+                    locals = prev_locals;
+                    ctrl_stack = prev_ctrl;
+                    stack.push(rv);
+                } else {
+                    return Ok(rv);
+                }
+            }
+            0x0B => {
+                if ctrl_stack.pop().is_none() {
+                    if let Some((prev_fn, prev_bpos, prev_locals, prev_ctrl)) = call_stack.pop() {
+                        cur_fn = prev_fn;
+                        body = fn_bodies[cur_fn];
+                        bpos = prev_bpos;
+                        locals = prev_locals;
+                        ctrl_stack = prev_ctrl;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            0x00 => {
+                // `unreachable` is only emitted for ISA-B strict-bounds failures.
+                return Err(String::from(OMNI_OOB_ERROR));
+            }
+            other => {
+                return Err(format!("Unsupported Wasm opcode 0x{:02X} in evaluator", other));
+            }
+        }
+    }
+    stack.pop().ok_or_else(|| String::from("Wasm execution finished with empty stack"))
+}
+
+// ==============================================================================
+// 13. STEP 7 (PURE RUST): LOOP-BASED STAGE-1 PURE-`u16` COMPILER LOWERING `.omni_bc` -> ELF64
+// ==============================================================================
+
+fn alloc_ssa_ins(
+    ins: &mut Vec<Vec<u16>>,
+    next_reg: &mut u16,
+    tc_safe: u16,
+    op: u16,
+    ty: u16,
+    ops: Vec<u16>,
+) -> u16 {
+    let r = *next_reg;
+    *next_reg += 1;
+    let mut pkt = vec![r, op, ty, tc_safe];
+    pkt.extend(ops);
+    pkt.push(TOK_INS_END);
+    ins.push(pkt);
+    r
+}
+
+fn set_ssa_reg(
+    ins: &mut Vec<Vec<u16>>,
+    tc_safe: u16,
+    r: u16,
+    op: u16,
+    ty: u16,
+    ops: Vec<u16>,
+) {
+    let mut pkt = vec![r, op, ty, tc_safe];
+    pkt.extend(ops);
+    pkt.push(TOK_INS_END);
+    ins.push(pkt);
+}
+
+fn emit_lbl_ins(ins: &mut Vec<Vec<u16>>, lbl_id: u16) {
+    ins.push(vec![0x7F40, TOK_IMM_I16, lbl_id, TOK_INS_END]);
+}
+
+fn emit_jmp_ins(ins: &mut Vec<Vec<u16>>, lbl_id: u16) {
+    ins.push(vec![0x7F41, TOK_IMM_I16, lbl_id, TOK_INS_END]);
+}
+
+fn emit_br_pos_ins(ins: &mut Vec<Vec<u16>>, cond_reg: u16, lbl_id: u16) {
+    ins.push(vec![0x7F43, cond_reg, TOK_IMM_I16, lbl_id, TOK_INS_END]);
+}
+
+fn alloc_lbl(next_lbl: &mut u16) -> u16 {
+    let l = *next_lbl;
+    *next_lbl += 1;
+    l
+}
+
+fn emit_iset_bytes_in_place(
+    ins: &mut Vec<Vec<u16>>,
+    tc_safe: u16,
+    r_buf: u16,
+    bytes: &[u8],
+) {
+    for chunk in bytes.chunks(24) {
+        let mut ops = vec![r_buf];
+        for &b in chunk {
+            ops.push(TOK_IMM_I16);
+            ops.push(b as u16);
+        }
+        set_ssa_reg(ins, tc_safe, r_buf, 0x7F0F, TY_BYTES, ops);
+    }
+}
+
+pub fn build_step7_stage1_compiler_stream() -> Vec<u16> {
+    let tc_safe = pack_tc(false, CAP_ID_PURE);
+    let mut ins: Vec<Vec<u16>> = Vec::new();
+    let mut next_reg: u16 = REG_BASE;
+    let mut next_lbl: u16 = 0;
+
+    let r_buf      = alloc_ssa_ins(&mut ins, &mut next_reg, tc_safe, 0x7F0D, TY_BYTES, vec![TOK_IMM_I16, 0]);
+    let r_pos      = alloc_ssa_ins(&mut ins, &mut next_reg, tc_safe, 0x7F06, TY_I64,   vec![TOK_IMM_I16, 1]);
+    let r_cur      = alloc_ssa_ins(&mut ins, &mut next_reg, tc_safe, 0x7F06, TY_I64,   vec![TOK_IMM_I16, 0]);
+    let r_tok0     = alloc_ssa_ins(&mut ins, &mut next_reg, tc_safe, 0x7F06, TY_I64,   vec![TOK_IMM_I16, 0]);
+    let r_op       = alloc_ssa_ins(&mut ins, &mut next_reg, tc_safe, 0x7F06, TY_I64,   vec![TOK_IMM_I16, 0]);
+    let r_disp_dst = alloc_ssa_ins(&mut ins, &mut next_reg, tc_safe, 0x7F06, TY_I64,   vec![TOK_IMM_I16, 0]);
+    let r_otok     = alloc_ssa_ins(&mut ins, &mut next_reg, tc_safe, 0x7F06, TY_I64,   vec![TOK_IMM_I16, 0]);
+    let r_tmp      = alloc_ssa_ins(&mut ins, &mut next_reg, tc_safe, 0x7F06, TY_I64,   vec![TOK_IMM_I16, 0]);
+    let r_tmp2     = alloc_ssa_ins(&mut ins, &mut next_reg, tc_safe, 0x7F06, TY_I64,   vec![TOK_IMM_I16, 0]);
+    let r_tmp3     = alloc_ssa_ins(&mut ins, &mut next_reg, tc_safe, 0x7F06, TY_I64,   vec![TOK_IMM_I16, 0]);
+    let r_cond     = alloc_ssa_ins(&mut ins, &mut next_reg, tc_safe, 0x7F09, TY_TRIT,  vec![TOK_TRIT_NEG]);
+    let r_pass     = alloc_ssa_ins(&mut ins, &mut next_reg, tc_safe, 0x7F06, TY_I64,   vec![TOK_IMM_I16, 0]);
+    let r_lid      = alloc_ssa_ins(&mut ins, &mut next_reg, tc_safe, 0x7F06, TY_I64,   vec![TOK_IMM_I16, 0]);
+    let r_loff     = alloc_ssa_ins(&mut ins, &mut next_reg, tc_safe, 0x7F06, TY_I64,   vec![TOK_IMM_I16, 0]);
+    let r_retty    = alloc_ssa_ins(&mut ins, &mut next_reg, tc_safe, 0x7F06, TY_I64,   vec![TOK_IMM_I16, 0]);
+
+    const MAX_LABELS: usize = 83;
+    let mut r_lbl = [0u16; MAX_LABELS];
+    for k in 0..MAX_LABELS {
+        r_lbl[k] = alloc_ssa_ins(&mut ins, &mut next_reg, tc_safe, 0x7F06, TY_I64, vec![TOK_IMM_I16, 0]);
+    }
+
+    let lbl_pass_entry  = alloc_lbl(&mut next_lbl);
+    let lbl_find_fn     = alloc_lbl(&mut next_lbl);
+    let lbl_fn_found    = alloc_lbl(&mut next_lbl);
+    let lbl_ty_bytes_pr = alloc_lbl(&mut next_lbl);
+    let lbl_pro_done    = alloc_lbl(&mut next_lbl);
+    let lbl_ins_loop    = alloc_lbl(&mut next_lbl);
+
+    emit_lbl_ins(&mut ins, lbl_pass_entry);
+    set_ssa_reg(&mut ins, tc_safe, r_buf, 0x7F0D, TY_BYTES, vec![TOK_IMM_I16, 0]);
+    set_ssa_reg(&mut ins, tc_safe, r_pos, 0x7F06, TY_I64,   vec![TOK_IMM_I16, 1]);
+
+    // Locate TOK_FN_DEF and extract ret_ty_tok before emitting the prologue
+    emit_lbl_ins(&mut ins, lbl_find_fn);
+    set_ssa_reg(&mut ins, tc_safe, r_tok0, 0x7F0E, TY_I64,  vec![0x7EC0, r_pos]);
+    set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_tok0, TOK_IMM_I16, TOK_FN_DEF]);
+    emit_br_pos_ins(&mut ins, r_cond, lbl_fn_found);
+    set_ssa_reg(&mut ins, tc_safe, r_pos,  0x7F10, TY_I64,  vec![r_pos, TOK_IMM_I16, 1]);
+    emit_jmp_ins(&mut ins, lbl_find_fn);
+
+    emit_lbl_ins(&mut ins, lbl_fn_found);
+    set_ssa_reg(&mut ins, tc_safe, r_tmp,   0x7F10, TY_I64, vec![r_pos, TOK_IMM_I16, 2]);
+    set_ssa_reg(&mut ins, tc_safe, r_tmp,   0x7F0E, TY_I64, vec![0x7EC0, r_tmp]);
+    set_ssa_reg(&mut ins, tc_safe, r_tmp,   0x7F12, TY_I64, vec![r_tmp, TOK_IMM_I16, 3]);
+    set_ssa_reg(&mut ins, tc_safe, r_tmp2,  0x7F10, TY_I64, vec![r_pos, TOK_IMM_I16, 3]);
+    set_ssa_reg(&mut ins, tc_safe, r_tmp2,  0x7F10, TY_I64, vec![r_tmp2, r_tmp]);
+    set_ssa_reg(&mut ins, tc_safe, r_retty, 0x7F0E, TY_I64, vec![0x7EC0, r_tmp2]);
+    set_ssa_reg(&mut ins, tc_safe, r_pos,   0x7F10, TY_I64, vec![r_tmp2, TOK_IMM_I16, 3]);
+
+    let mut elf_hdr = [0u8; 120];
+    elf_hdr[0..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
+    elf_hdr[4] = 2; elf_hdr[5] = 1; elf_hdr[6] = 1;
+    elf_hdr[16] = 2; elf_hdr[18] = 0x3E; elf_hdr[20] = 1;
+    elf_hdr[24] = 0x78; elf_hdr[25] = 0x00; elf_hdr[26] = 0x40;
+    elf_hdr[32] = 64; elf_hdr[52] = 64; elf_hdr[54] = 56; elf_hdr[56] = 1;
+    elf_hdr[64] = 1; elf_hdr[68] = 5;
+    elf_hdr[82] = 0x40; elf_hdr[90] = 0x40;
+    elf_hdr[113] = 0x10;
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &elf_hdr);
+
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x55, 0x48, 0x89, 0xE5, 0x48, 0x81, 0xEC, 0x00, 0x00, 0x03, 0x00]);
+
+    set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_retty, TOK_IMM_I16, TY_BYTES]);
+    emit_br_pos_ins(&mut ins, r_cond, lbl_ty_bytes_pr);
+
+    // Non-TY_BYTES prologue
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x49, 0xBC]);
+    set_ssa_reg(&mut ins, tc_safe, r_buf, 0x7F0F, TY_BYTES, vec![r_buf, TOK_IMM_I16, (-8i16) as u16, 0x7EC1]);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x49, 0xBD]);
+    set_ssa_reg(&mut ins, tc_safe, r_buf, 0x7F0F, TY_BYTES, vec![r_buf, TOK_IMM_I16, (-8i16) as u16, 0x7EC2]);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x49, 0xBE]);
+    set_ssa_reg(&mut ins, tc_safe, r_buf, 0x7F0F, TY_BYTES, vec![r_buf, TOK_IMM_I16, (-8i16) as u16, 0x7EC3]);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x49, 0xC7, 0xC7, 0x00, 0x00, 0x00, 0x00]);
+    for (argc_min, disp_argv, reg_code) in [(2u8, 0x18u8, 4u8), (3, 0x20, 5), (4, 0x28, 6), (5, 0x30, 7)] {
+        let mut cli_mc = Vec::new();
+        emit_cli_arg_parser(&mut cli_mc, argc_min, disp_argv, reg_code);
+        emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &cli_mc);
+    }
+    emit_jmp_ins(&mut ins, lbl_pro_done);
+
+    // TY_BYTES prologue
+    emit_lbl_ins(&mut ins, lbl_ty_bytes_pr);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x49, 0xC7, 0xC4, 0x00, 0x00, 0x00, 0x00]);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x49, 0xBD]);
+    set_ssa_reg(&mut ins, tc_safe, r_buf, 0x7F0F, TY_BYTES, vec![r_buf, TOK_IMM_I16, (-8i16) as u16, 0x7EC1]);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x49, 0xBE]);
+    set_ssa_reg(&mut ins, tc_safe, r_buf, 0x7F0F, TY_BYTES, vec![r_buf, TOK_IMM_I16, (-8i16) as u16, 0x7EC2]);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x49, 0xBF]);
+    set_ssa_reg(&mut ins, tc_safe, r_buf, 0x7F0F, TY_BYTES, vec![r_buf, TOK_IMM_I16, (-8i16) as u16, 0x7EC3]);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[
+        0x48, 0x83, 0x7D, 0x08, 0x02,
+        0x7C, 0x2E,
+        0x48, 0x8B, 0x7D, 0x18,
+        0x31, 0xF6,
+        0x31, 0xD2,
+        0xB8, 0x02, 0x00, 0x00, 0x00,
+        0x0F, 0x05,
+        0x48, 0x85, 0xC0,
+        0x78, 0x1A,
+        0x48, 0x89, 0xC7,
+        0x48, 0x8D, 0xB5, 0x00, 0x20, 0xFD, 0xFF,
+        0xBA, 0x00, 0xE0, 0x00, 0x00,
+        0x31, 0xC0,
+        0x0F, 0x05,
+        0xB8, 0x03, 0x00, 0x00, 0x00,
+        0x0F, 0x05,
+        0x45, 0x31, 0xDB,
+    ]);
+    for (argc_min, disp_argv, reg_code) in [(3u8, 0x20u8, 5u8), (4, 0x28, 6), (5, 0x30, 7)] {
+        let mut cli_mc = Vec::new();
+        emit_cli_arg_parser(&mut cli_mc, argc_min, disp_argv, reg_code);
+        emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &cli_mc);
+    }
+
+    emit_lbl_ins(&mut ins, lbl_pro_done);
+
+    let emit_decode_operand = |ins_v: &mut Vec<Vec<u16>>, next_l: &mut u16, into_rcx: bool| {
+        let l_imm  = alloc_lbl(next_l);
+        let l_par  = alloc_lbl(next_l);
+        let l_done = alloc_lbl(next_l);
+        let reg_ld: [u8; 3] = [0x48, 0x8B, if into_rcx { 0x8D } else { 0x85 }];
+        let imm_ld: [u8; 2] = [0x48, if into_rcx { 0xB9 } else { 0xB8 }];
+        let par_b: u16      = if into_rcx { 0xE1 } else { 0xE0 };
+
+        set_ssa_reg(ins_v, tc_safe, r_otok, 0x7F0E, TY_I64,  vec![0x7EC0, r_cur]);
+        set_ssa_reg(ins_v, tc_safe, r_cond, 0x7F27, TY_TRIT, vec![r_otok, TOK_IMM_I16, TOK_INS_END]);
+        emit_br_pos_ins(ins_v, r_cond, l_imm);
+        set_ssa_reg(ins_v, tc_safe, r_cond, 0x7F27, TY_TRIT, vec![r_otok, TOK_IMM_I16, REG_MAX]);
+        emit_br_pos_ins(ins_v, r_cond, l_par);
+
+        set_ssa_reg(ins_v, tc_safe, r_tmp, 0x7F11, TY_I64,   vec![TOK_IMM_I16, 0x7DFF, r_otok]);
+        set_ssa_reg(ins_v, tc_safe, r_tmp, 0x7F12, TY_I64,   vec![r_tmp, TOK_IMM_I16, 8]);
+        emit_iset_bytes_in_place(ins_v, tc_safe, r_buf, &reg_ld);
+        set_ssa_reg(ins_v, tc_safe, r_buf, 0x7F0F, TY_BYTES, vec![r_buf, TOK_IMM_I16, (-4i16) as u16, r_tmp]);
+        set_ssa_reg(ins_v, tc_safe, r_cur, 0x7F10, TY_I64,   vec![r_cur, TOK_IMM_I16, 1]);
+        emit_jmp_ins(ins_v, l_done);
+
+        emit_lbl_ins(ins_v, l_imm);
+        set_ssa_reg(ins_v, tc_safe, r_cond, 0x7F2D, TY_TRIT, vec![r_otok, TOK_IMM_I16, TOK_IMM_I32]);
+        set_ssa_reg(ins_v, tc_safe, r_tmp,  0x7F10, TY_I64,  vec![r_cur, TOK_IMM_I16, 1]);
+        set_ssa_reg(ins_v, tc_safe, r_tmp,  0x7F0E, TY_I64,  vec![0x7EC0, r_tmp]);
+        set_ssa_reg(ins_v, tc_safe, r_tmp2, 0x7F22, TY_I64,  vec![r_tmp, TOK_IMM_I16, 48]);
+        set_ssa_reg(ins_v, tc_safe, r_tmp2, 0x7F23, TY_I64,  vec![r_tmp2, TOK_IMM_I16, 48]);
+        set_ssa_reg(ins_v, tc_safe, r_tmp3, 0x7F10, TY_I64,  vec![r_cur, TOK_IMM_I16, 2]);
+        set_ssa_reg(ins_v, tc_safe, r_tmp3, 0x7F0E, TY_I64,  vec![0x7EC0, r_tmp3]);
+        set_ssa_reg(ins_v, tc_safe, r_tmp,  0x7F22, TY_I64,  vec![r_tmp, TOK_IMM_I16, 16]);
+        set_ssa_reg(ins_v, tc_safe, r_tmp3, 0x7F1F, TY_I64,  vec![r_tmp, r_tmp3]);
+        set_ssa_reg(ins_v, tc_safe, r_tmp3, 0x7F22, TY_I64,  vec![r_tmp3, TOK_IMM_I16, 32]);
+        set_ssa_reg(ins_v, tc_safe, r_tmp3, 0x7F23, TY_I64,  vec![r_tmp3, TOK_IMM_I16, 32]);
+        set_ssa_reg(ins_v, tc_safe, r_tmp,  0x7F11, TY_I64,  vec![r_otok, TOK_IMM_I16, TOK_TRIT_ZERO]);
+        set_ssa_reg(ins_v, tc_safe, r_tmp,  0x7F45, TY_I64,  vec![r_cond, r_tmp2, r_tmp3, r_tmp]);
+        emit_iset_bytes_in_place(ins_v, tc_safe, r_buf, &imm_ld);
+        set_ssa_reg(ins_v, tc_safe, r_buf,  0x7F0F, TY_BYTES, vec![r_buf, TOK_IMM_I16, (-8i16) as u16, r_tmp]);
+        set_ssa_reg(ins_v, tc_safe, r_tmp2, 0x7F45, TY_I64,  vec![r_cond, TOK_IMM_I16, 2, TOK_IMM_I16, 3, TOK_IMM_I16, 1]);
+        set_ssa_reg(ins_v, tc_safe, r_cur,  0x7F10, TY_I64,  vec![r_cur, r_tmp2]);
+        emit_jmp_ins(ins_v, l_done);
+
+        emit_lbl_ins(ins_v, l_par);
+        set_ssa_reg(ins_v, tc_safe, r_tmp, 0x7F11, TY_I64,   vec![r_otok, TOK_IMM_I16, PAR_BASE]);
+        set_ssa_reg(ins_v, tc_safe, r_tmp, 0x7F12, TY_I64,   vec![r_tmp, TOK_IMM_I16, 8]);
+        set_ssa_reg(ins_v, tc_safe, r_tmp, 0x7F10, TY_I64,   vec![r_tmp, TOK_IMM_I16, par_b]);
+        set_ssa_reg(ins_v, tc_safe, r_buf, 0x7F0F, TY_BYTES, vec![r_buf, TOK_IMM_I16, 0x4C, TOK_IMM_I16, 0x89, r_tmp]);
+        set_ssa_reg(ins_v, tc_safe, r_cur, 0x7F10, TY_I64,   vec![r_cur, TOK_IMM_I16, 1]);
+
+        emit_lbl_ins(ins_v, l_done);
+    };
+
+    let emit_read_label_id = |ins_v: &mut Vec<Vec<u16>>| {
+        set_ssa_reg(ins_v, tc_safe, r_otok, 0x7F0E, TY_I64,  vec![0x7EC0, r_cur]);
+        set_ssa_reg(ins_v, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_otok, TOK_IMM_I16, TOK_IMM_I16]);
+        set_ssa_reg(ins_v, tc_safe, r_tmp,  0x7F10, TY_I64,  vec![r_cur, TOK_IMM_I16, 1]);
+        set_ssa_reg(ins_v, tc_safe, r_tmp,  0x7F0E, TY_I64,  vec![0x7EC0, r_tmp]);
+        set_ssa_reg(ins_v, tc_safe, r_tmp2, 0x7F11, TY_I64,  vec![r_otok, TOK_IMM_I16, LBL_BASE]);
+        set_ssa_reg(ins_v, tc_safe, r_lid,  0x7F45, TY_I64,  vec![r_cond, r_tmp2, r_tmp2, r_tmp]);
+        set_ssa_reg(ins_v, tc_safe, r_tmp3, 0x7F45, TY_I64,  vec![r_cond, TOK_IMM_I16, 1, TOK_IMM_I16, 1, TOK_IMM_I16, 2]);
+        set_ssa_reg(ins_v, tc_safe, r_cur,  0x7F10, TY_I64,  vec![r_cur, r_tmp3]);
+    };
+
+    let emit_rel32_for_lid = |ins_v: &mut Vec<Vec<u16>>| {
+        set_ssa_reg(ins_v, tc_safe, r_loff, 0x7F06, TY_I64, vec![r_lbl[0]]);
+        for k in 1..MAX_LABELS {
+            set_ssa_reg(ins_v, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_lid, TOK_IMM_I16, k as u16]);
+            set_ssa_reg(ins_v, tc_safe, r_loff, 0x7F45, TY_I64,  vec![r_cond, r_loff, r_loff, r_lbl[k]]);
+        }
+        set_ssa_reg(ins_v, tc_safe, r_tmp, 0x7F50, TY_I64,   vec![r_buf]);
+        set_ssa_reg(ins_v, tc_safe, r_tmp, 0x7F11, TY_I64,   vec![r_tmp, TOK_IMM_I16, 116]);
+        set_ssa_reg(ins_v, tc_safe, r_tmp, 0x7F11, TY_I64,   vec![r_loff, r_tmp]);
+        set_ssa_reg(ins_v, tc_safe, r_buf, 0x7F0F, TY_BYTES, vec![r_buf, TOK_IMM_I16, (-4i16) as u16, r_tmp]);
+    };
+
+    let lbl_nop        = alloc_lbl(&mut next_lbl);
+    let lbl_label      = alloc_lbl(&mut next_lbl);
+    let lbl_jmp        = alloc_lbl(&mut next_lbl);
+    let lbl_br_trit    = alloc_lbl(&mut next_lbl);
+    let lbl_br_pos     = alloc_lbl(&mut next_lbl);
+    let lbl_br_neg     = alloc_lbl(&mut next_lbl);
+    let lbl_ret        = alloc_lbl(&mut next_lbl);
+    let lbl_ret_bytes  = alloc_lbl(&mut next_lbl);
+    let lbl_anew       = alloc_lbl(&mut next_lbl);
+    let lbl_slen       = alloc_lbl(&mut next_lbl);
+    let lbl_iget       = alloc_lbl(&mut next_lbl);
+    let lbl_iset       = alloc_lbl(&mut next_lbl);
+    let lbl_iset_m4    = alloc_lbl(&mut next_lbl);
+    let lbl_iset_m8    = alloc_lbl(&mut next_lbl);
+    let lbl_iset_m9    = alloc_lbl(&mut next_lbl);
+    let lbl_iset_bloop = alloc_lbl(&mut next_lbl);
+    let lbl_iset_bdone = alloc_lbl(&mut next_lbl);
+    let lbl_dispatch_1 = alloc_lbl(&mut next_lbl);
+    let lbl_tmaj       = alloc_lbl(&mut next_lbl);
+    let lbl_sel_trit   = alloc_lbl(&mut next_lbl);
+    let lbl_store_dst  = alloc_lbl(&mut next_lbl);
+    let lbl_loop_end   = alloc_lbl(&mut next_lbl);
+    let lbl_pass0_end  = alloc_lbl(&mut next_lbl);
+
+    emit_lbl_ins(&mut ins, lbl_ins_loop);
+    set_ssa_reg(&mut ins, tc_safe, r_tok0, 0x7F0E, TY_I64,  vec![0x7EC0, r_pos]);
+    set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_tok0, TOK_IMM_I16, TOK_MOD_END]);
+    emit_br_pos_ins(&mut ins, r_cond, lbl_loop_end);
+    set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_tok0, TOK_IMM_I16, 0]);
+    emit_br_pos_ins(&mut ins, r_cond, lbl_loop_end);
+    set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_tok0, TOK_IMM_I16, 0x7F00]);
+    emit_br_pos_ins(&mut ins, r_cond, lbl_nop);
+    set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_tok0, TOK_IMM_I16, 0x7F40]);
+    emit_br_pos_ins(&mut ins, r_cond, lbl_label);
+    set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_tok0, TOK_IMM_I16, 0x7F41]);
+    emit_br_pos_ins(&mut ins, r_cond, lbl_jmp);
+    set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_tok0, TOK_IMM_I16, 0x7F42]);
+    emit_br_pos_ins(&mut ins, r_cond, lbl_br_trit);
+    set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_tok0, TOK_IMM_I16, 0x7F43]);
+    emit_br_pos_ins(&mut ins, r_cond, lbl_br_pos);
+    set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_tok0, TOK_IMM_I16, 0x7F44]);
+    emit_br_pos_ins(&mut ins, r_cond, lbl_br_neg);
+    set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_tok0, TOK_IMM_I16, 0x7F4A]);
+    emit_br_pos_ins(&mut ins, r_cond, lbl_ret);
+
+    set_ssa_reg(&mut ins, tc_safe, r_tmp,      0x7F10, TY_I64, vec![r_pos, TOK_IMM_I16, 1]);
+    set_ssa_reg(&mut ins, tc_safe, r_op,       0x7F0E, TY_I64, vec![0x7EC0, r_tmp]);
+    set_ssa_reg(&mut ins, tc_safe, r_tmp,      0x7F11, TY_I64, vec![TOK_IMM_I16, 0x7DFF, r_tok0]);
+    set_ssa_reg(&mut ins, tc_safe, r_disp_dst, 0x7F12, TY_I64, vec![r_tmp, TOK_IMM_I16, 8]);
+    set_ssa_reg(&mut ins, tc_safe, r_cur,      0x7F10, TY_I64, vec![r_pos, TOK_IMM_I16, 4]);
+
+    set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, 0x7F0D]);
+    emit_br_pos_ins(&mut ins, r_cond, lbl_anew);
+    set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, 0x7F50]);
+    emit_br_pos_ins(&mut ins, r_cond, lbl_slen);
+    set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, 0x7F0E]);
+    emit_br_pos_ins(&mut ins, r_cond, lbl_iget);
+    set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, 0x7F0F]);
+    emit_br_pos_ins(&mut ins, r_cond, lbl_iset);
+
+    emit_decode_operand(&mut ins, &mut next_lbl, false);
+
+    set_ssa_reg(&mut ins, tc_safe, r_otok, 0x7F0E, TY_I64,  vec![0x7EC0, r_cur]);
+    set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_otok, TOK_IMM_I16, TOK_INS_END]);
+    emit_br_pos_ins(&mut ins, r_cond, lbl_dispatch_1);
+
+    emit_decode_operand(&mut ins, &mut next_lbl, true);
+    set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, 0x7F2C]);
+    emit_br_pos_ins(&mut ins, r_cond, lbl_tmaj);
+    set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, 0x7F45]);
+    emit_br_pos_ins(&mut ins, r_cond, lbl_sel_trit);
+
+    emit_lbl_ins(&mut ins, lbl_dispatch_1);
+    for copy_op in [0x7F02u16, 0x7F03, 0x7F04, 0x7F06, 0x7F09, 0x7F57, 0x7F58, 0x7F59] {
+        set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, copy_op]);
+        emit_br_pos_ins(&mut ins, r_cond, lbl_store_dst);
+    }
+
+    let lbl_emit_3b   = alloc_lbl(&mut next_lbl);
+    let lbl_imul      = alloc_lbl(&mut next_lbl);
+    let lbl_idiv      = alloc_lbl(&mut next_lbl);
+    let lbl_imod      = alloc_lbl(&mut next_lbl);
+    let lbl_iabs      = alloc_lbl(&mut next_lbl);
+    let lbl_imin_imax = alloc_lbl(&mut next_lbl);
+    let lbl_txor      = alloc_lbl(&mut next_lbl);
+    let lbl_cmp4      = alloc_lbl(&mut next_lbl);
+    let lbl_tcmp      = alloc_lbl(&mut next_lbl);
+
+    let ops_3b: &[(u16, u16, u16)] = &[
+        (0x7F10, 0x01, 0xC8),
+        (0x7F11, 0x29, 0xC8),
+        (0x7F1E, 0x21, 0xC8),
+        (0x7F1F, 0x09, 0xC8),
+        (0x7F20, 0x31, 0xC8),
+        (0x7F15, 0xF7, 0xD8),
+        (0x7F28, 0xF7, 0xD8),
+        (0x7F21, 0xF7, 0xD0),
+        (0x7F22, 0xD3, 0xE0),
+        (0x7F23, 0xD3, 0xF8),
+    ];
+    for &(op_c, _, _) in ops_3b {
+        set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, op_c]);
+        emit_br_pos_ins(&mut ins, r_cond, lbl_emit_3b);
+    }
+    set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, 0x7F12]);
+    emit_br_pos_ins(&mut ins, r_cond, lbl_imul);
+    set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, 0x7F13]);
+    emit_br_pos_ins(&mut ins, r_cond, lbl_idiv);
+    set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, 0x7F14]);
+    emit_br_pos_ins(&mut ins, r_cond, lbl_imod);
+    set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, 0x7F16]);
+    emit_br_pos_ins(&mut ins, r_cond, lbl_iabs);
+    for op_mm in [0x7F17u16, 0x7F29, 0x7F18, 0x7F2A] {
+        set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, op_mm]);
+        emit_br_pos_ins(&mut ins, r_cond, lbl_imin_imax);
+    }
+    set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, 0x7F2B]);
+    emit_br_pos_ins(&mut ins, r_cond, lbl_txor);
+    for op_cm in [0x7F24u16, 0x7F25, 0x7F26, 0x7F27] {
+        set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, op_cm]);
+        emit_br_pos_ins(&mut ins, r_cond, lbl_cmp4);
+    }
+    set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, 0x7F2D]);
+    emit_br_pos_ins(&mut ins, r_cond, lbl_tcmp);
+    emit_jmp_ins(&mut ins, lbl_store_dst);
+
+    emit_lbl_ins(&mut ins, lbl_emit_3b);
+    set_ssa_reg(&mut ins, tc_safe, r_tmp,  0x7F06, TY_I64, vec![TOK_IMM_I16, 0x01]);
+    set_ssa_reg(&mut ins, tc_safe, r_tmp2, 0x7F06, TY_I64, vec![TOK_IMM_I16, 0xC8]);
+    for &(op_c, b1, b2) in &ops_3b[1..] {
+        set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, op_c]);
+        set_ssa_reg(&mut ins, tc_safe, r_tmp,  0x7F45, TY_I64,  vec![r_cond, r_tmp, r_tmp, TOK_IMM_I16, b1]);
+        set_ssa_reg(&mut ins, tc_safe, r_tmp2, 0x7F45, TY_I64,  vec![r_cond, r_tmp2, r_tmp2, TOK_IMM_I16, b2]);
+    }
+    set_ssa_reg(&mut ins, tc_safe, r_buf, 0x7F0F, TY_BYTES, vec![r_buf, TOK_IMM_I16, 0x48, r_tmp, r_tmp2]);
+    emit_jmp_ins(&mut ins, lbl_store_dst);
+
+    emit_lbl_ins(&mut ins, lbl_imul);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x0F, 0xAF, 0xC1]);
+    emit_jmp_ins(&mut ins, lbl_store_dst);
+
+    emit_lbl_ins(&mut ins, lbl_idiv);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x49, 0x89, 0xC0, 0x48, 0x85, 0xC9, 0x74, 0x1E, 0x48, 0x83, 0xF9, 0xFF, 0x75, 0x11, 0x49, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x4D, 0x39, 0xC8, 0x75, 0x02, 0xEB, 0x0A, 0x48, 0x99, 0x48, 0xF7, 0xF9, 0xEB, 0x03, 0x48, 0x31, 0xC0]);
+    emit_jmp_ins(&mut ins, lbl_store_dst);
+
+    emit_lbl_ins(&mut ins, lbl_imod);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x49, 0x89, 0xC0, 0x48, 0x85, 0xC9, 0x74, 0x1E, 0x48, 0x83, 0xF9, 0xFF, 0x75, 0x11, 0x49, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x4D, 0x39, 0xC8, 0x75, 0x02, 0xEB, 0x0A, 0x48, 0x99, 0x48, 0xF7, 0xF9, 0xEB, 0x03, 0x48, 0x31, 0xC0, 0x48, 0x89, 0xD0]);
+    emit_jmp_ins(&mut ins, lbl_store_dst);
+
+    emit_lbl_ins(&mut ins, lbl_iabs);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x89, 0xC2, 0x48, 0xF7, 0xD8, 0x48, 0x0F, 0x48, 0xC2]);
+    emit_jmp_ins(&mut ins, lbl_store_dst);
+
+    emit_lbl_ins(&mut ins, lbl_imin_imax);
+    set_ssa_reg(&mut ins, tc_safe, r_tmp,  0x7F06, TY_I64,  vec![TOK_IMM_I16, 0x4F]);
+    set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, 0x7F18]);
+    set_ssa_reg(&mut ins, tc_safe, r_tmp,  0x7F45, TY_I64,  vec![r_cond, r_tmp, r_tmp, TOK_IMM_I16, 0x4C]);
+    set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, 0x7F2A]);
+    set_ssa_reg(&mut ins, tc_safe, r_tmp,  0x7F45, TY_I64,  vec![r_cond, r_tmp, r_tmp, TOK_IMM_I16, 0x4C]);
+    set_ssa_reg(&mut ins, tc_safe, r_buf,  0x7F0F, TY_BYTES, vec![r_buf, TOK_IMM_I16, 0x48, TOK_IMM_I16, 0x39, TOK_IMM_I16, 0xC8, TOK_IMM_I16, 0x48, TOK_IMM_I16, 0x0F, r_tmp, TOK_IMM_I16, 0xC1]);
+    emit_jmp_ins(&mut ins, lbl_store_dst);
+
+    emit_lbl_ins(&mut ins, lbl_txor);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x0F, 0xAF, 0xC1, 0x48, 0xF7, 0xD8]);
+    emit_jmp_ins(&mut ins, lbl_store_dst);
+
+    emit_lbl_ins(&mut ins, lbl_cmp4);
+    set_ssa_reg(&mut ins, tc_safe, r_tmp, 0x7F06, TY_I64, vec![TOK_IMM_I16, 0x94]);
+    for (op_cm, scc) in [(0x7F25u16, 0x95u16), (0x7F26, 0x9C), (0x7F27, 0x9F)] {
+        set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, op_cm]);
+        set_ssa_reg(&mut ins, tc_safe, r_tmp,  0x7F45, TY_I64,  vec![r_cond, r_tmp, r_tmp, TOK_IMM_I16, scc]);
+    }
+    set_ssa_reg(&mut ins, tc_safe, r_buf, 0x7F0F, TY_BYTES, vec![
+        r_buf,
+        TOK_IMM_I16, 0x48, TOK_IMM_I16, 0x39, TOK_IMM_I16, 0xC8,
+        TOK_IMM_I16, 0x0F, r_tmp, TOK_IMM_I16, 0xC0,
+        TOK_IMM_I16, 0x0F, TOK_IMM_I16, 0xB6, TOK_IMM_I16, 0xC0,
+        TOK_IMM_I16, 0x48, TOK_IMM_I16, 0x8D, TOK_IMM_I16, 0x44, TOK_IMM_I16, 0x00, TOK_IMM_I16, 0xFF,
+    ]);
+    emit_jmp_ins(&mut ins, lbl_store_dst);
+
+    emit_lbl_ins(&mut ins, lbl_tcmp);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x39, 0xC8, 0x0F, 0x9F, 0xC2, 0x0F, 0x9C, 0xC1, 0x0F, 0xB6, 0xD2, 0x0F, 0xB6, 0xC9, 0x29, 0xCA, 0x48, 0x63, 0xC2]);
+    emit_jmp_ins(&mut ins, lbl_store_dst);
+
+    emit_lbl_ins(&mut ins, lbl_tmaj);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x01, 0xC8]);
+    emit_decode_operand(&mut ins, &mut next_lbl, true);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[
+        0x48, 0x01, 0xC8, 0x48, 0x83, 0xF8, 0x00,
+        0x0F, 0x9F, 0xC0, 0x0F, 0x9C, 0xC2,
+        0x0F, 0xB6, 0xC0, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD0,
+    ]);
+    emit_jmp_ins(&mut ins, lbl_store_dst);
+
+    emit_lbl_ins(&mut ins, lbl_sel_trit);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x49, 0x89, 0xC0, 0x48, 0x89, 0xCA]);
+    emit_decode_operand(&mut ins, &mut next_lbl, true);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x49, 0x83, 0xF8, 0x00, 0x48, 0x0F, 0x44, 0xD1]);
+    emit_decode_operand(&mut ins, &mut next_lbl, true);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x49, 0x83, 0xF8, 0x00, 0x48, 0x0F, 0x4F, 0xD1, 0x48, 0x89, 0xD0]);
+    emit_jmp_ins(&mut ins, lbl_store_dst);
+
+    emit_lbl_ins(&mut ins, lbl_anew);
+    set_ssa_reg(&mut ins, tc_safe, r_cur, 0x7F10, TY_I64, vec![r_cur, TOK_IMM_I16, 2]);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x45, 0x31, 0xDB]);
+    emit_jmp_ins(&mut ins, lbl_store_dst);
+
+    emit_lbl_ins(&mut ins, lbl_slen);
+    set_ssa_reg(&mut ins, tc_safe, r_cur, 0x7F10, TY_I64, vec![r_cur, TOK_IMM_I16, 1]);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x4C, 0x89, 0xD8]);
+    emit_jmp_ins(&mut ins, lbl_store_dst);
+
+    emit_lbl_ins(&mut ins, lbl_iget);
+    set_ssa_reg(&mut ins, tc_safe, r_cur, 0x7F10, TY_I64, vec![r_cur, TOK_IMM_I16, 1]);
+    emit_decode_operand(&mut ins, &mut next_lbl, false);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x0F, 0xB7, 0x84, 0x45, 0x00, 0x20, 0xFD, 0xFF]);
+    emit_jmp_ins(&mut ins, lbl_store_dst);
+
+    emit_lbl_ins(&mut ins, lbl_iset);
+    set_ssa_reg(&mut ins, tc_safe, r_cur,  0x7F10, TY_I64,  vec![r_cur, TOK_IMM_I16, 1]);
+    set_ssa_reg(&mut ins, tc_safe, r_otok, 0x7F0E, TY_I64,  vec![0x7EC0, r_cur]);
+    set_ssa_reg(&mut ins, tc_safe, r_tmp,  0x7F10, TY_I64,  vec![r_cur, TOK_IMM_I16, 1]);
+    set_ssa_reg(&mut ins, tc_safe, r_tmp,  0x7F0E, TY_I64,  vec![0x7EC0, r_tmp]);
+    set_ssa_reg(&mut ins, tc_safe, r_tmp,  0x7F22, TY_I64,  vec![r_tmp, TOK_IMM_I16, 48]);
+    set_ssa_reg(&mut ins, tc_safe, r_tmp,  0x7F23, TY_I64,  vec![r_tmp, TOK_IMM_I16, 48]);
+    set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_otok, TOK_IMM_I16, TOK_IMM_I16]);
+    set_ssa_reg(&mut ins, tc_safe, r_tmp2, 0x7F24, TY_TRIT, vec![r_tmp, TOK_IMM_I16, (-4i16) as u16]);
+    set_ssa_reg(&mut ins, tc_safe, r_tmp2, 0x7F29, TY_TRIT, vec![r_cond, r_tmp2]);
+    emit_br_pos_ins(&mut ins, r_tmp2, lbl_iset_m4);
+    set_ssa_reg(&mut ins, tc_safe, r_tmp2, 0x7F24, TY_TRIT, vec![r_tmp, TOK_IMM_I16, (-8i16) as u16]);
+    set_ssa_reg(&mut ins, tc_safe, r_tmp2, 0x7F29, TY_TRIT, vec![r_cond, r_tmp2]);
+    emit_br_pos_ins(&mut ins, r_tmp2, lbl_iset_m8);
+    set_ssa_reg(&mut ins, tc_safe, r_tmp2, 0x7F24, TY_TRIT, vec![r_tmp, TOK_IMM_I16, (-9i16) as u16]);
+    set_ssa_reg(&mut ins, tc_safe, r_tmp2, 0x7F29, TY_TRIT, vec![r_cond, r_tmp2]);
+    emit_br_pos_ins(&mut ins, r_tmp2, lbl_iset_m9);
+
+    emit_lbl_ins(&mut ins, lbl_iset_bloop);
+    set_ssa_reg(&mut ins, tc_safe, r_otok, 0x7F0E, TY_I64,  vec![0x7EC0, r_cur]);
+    set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_otok, TOK_IMM_I16, TOK_INS_END]);
+    emit_br_pos_ins(&mut ins, r_cond, lbl_iset_bdone);
+    emit_decode_operand(&mut ins, &mut next_lbl, false);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x42, 0x88, 0x84, 0x1D, 0x00, 0x00, 0xFE, 0xFF, 0x49, 0xFF, 0xC3]);
+    emit_jmp_ins(&mut ins, lbl_iset_bloop);
+
+    emit_lbl_ins(&mut ins, lbl_iset_m4);
+    set_ssa_reg(&mut ins, tc_safe, r_cur, 0x7F10, TY_I64, vec![r_cur, TOK_IMM_I16, 2]);
+    emit_decode_operand(&mut ins, &mut next_lbl, false);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x42, 0x89, 0x84, 0x1D, 0x00, 0x00, 0xFE, 0xFF, 0x49, 0x83, 0xC3, 0x04]);
+    emit_jmp_ins(&mut ins, lbl_iset_bdone);
+
+    emit_lbl_ins(&mut ins, lbl_iset_m8);
+    set_ssa_reg(&mut ins, tc_safe, r_cur, 0x7F10, TY_I64, vec![r_cur, TOK_IMM_I16, 2]);
+    emit_decode_operand(&mut ins, &mut next_lbl, false);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x4A, 0x89, 0x84, 0x1D, 0x00, 0x00, 0xFE, 0xFF, 0x49, 0x83, 0xC3, 0x08]);
+    emit_jmp_ins(&mut ins, lbl_iset_bdone);
+
+    emit_lbl_ins(&mut ins, lbl_iset_m9);
+    set_ssa_reg(&mut ins, tc_safe, r_cur, 0x7F10, TY_I64, vec![r_cur, TOK_IMM_I16, 2]);
+    emit_decode_operand(&mut ins, &mut next_lbl, true);
+    emit_decode_operand(&mut ins, &mut next_lbl, false);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x89, 0x84, 0x0D, 0x00, 0x00, 0xFE, 0xFF]);
+
+    emit_lbl_ins(&mut ins, lbl_iset_bdone);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x4C, 0x89, 0xD8]);
+    emit_jmp_ins(&mut ins, lbl_store_dst);
+
+    emit_lbl_ins(&mut ins, lbl_nop);
+    set_ssa_reg(&mut ins, tc_safe, r_pos, 0x7F10, TY_I64, vec![r_pos, TOK_IMM_I16, 2]);
+    emit_jmp_ins(&mut ins, lbl_ins_loop);
+
+    emit_lbl_ins(&mut ins, lbl_label);
+    set_ssa_reg(&mut ins, tc_safe, r_cur,  0x7F10, TY_I64, vec![r_pos, TOK_IMM_I16, 1]);
+    emit_read_label_id(&mut ins);
+    set_ssa_reg(&mut ins, tc_safe, r_loff, 0x7F50, TY_I64, vec![r_buf]);
+    set_ssa_reg(&mut ins, tc_safe, r_loff, 0x7F11, TY_I64, vec![r_loff, TOK_IMM_I16, 120]);
+    for k in 0..MAX_LABELS {
+        set_ssa_reg(&mut ins, tc_safe, r_cond,   0x7F24, TY_TRIT, vec![r_lid, TOK_IMM_I16, k as u16]);
+        set_ssa_reg(&mut ins, tc_safe, r_lbl[k], 0x7F45, TY_I64,  vec![r_cond, r_lbl[k], r_lbl[k], r_loff]);
+    }
+    set_ssa_reg(&mut ins, tc_safe, r_pos, 0x7F10, TY_I64, vec![r_cur, TOK_IMM_I16, 1]);
+    emit_jmp_ins(&mut ins, lbl_ins_loop);
+
+    emit_lbl_ins(&mut ins, lbl_jmp);
+    set_ssa_reg(&mut ins, tc_safe, r_cur, 0x7F10, TY_I64, vec![r_pos, TOK_IMM_I16, 1]);
+    emit_read_label_id(&mut ins);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0xE9]);
+    emit_rel32_for_lid(&mut ins);
+    set_ssa_reg(&mut ins, tc_safe, r_pos, 0x7F10, TY_I64, vec![r_cur, TOK_IMM_I16, 1]);
+    emit_jmp_ins(&mut ins, lbl_ins_loop);
+
+    emit_lbl_ins(&mut ins, lbl_br_trit);
+    set_ssa_reg(&mut ins, tc_safe, r_cur, 0x7F10, TY_I64, vec![r_pos, TOK_IMM_I16, 1]);
+    emit_decode_operand(&mut ins, &mut next_lbl, false);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x83, 0xF8, 0x00, 0x0F, 0x8C]);
+    emit_read_label_id(&mut ins);
+    emit_rel32_for_lid(&mut ins);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x0F, 0x84]);
+    emit_read_label_id(&mut ins);
+    emit_rel32_for_lid(&mut ins);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0xE9]);
+    emit_read_label_id(&mut ins);
+    emit_rel32_for_lid(&mut ins);
+    set_ssa_reg(&mut ins, tc_safe, r_pos, 0x7F10, TY_I64, vec![r_cur, TOK_IMM_I16, 1]);
+    emit_jmp_ins(&mut ins, lbl_ins_loop);
+
+    emit_lbl_ins(&mut ins, lbl_br_pos);
+    set_ssa_reg(&mut ins, tc_safe, r_cur, 0x7F10, TY_I64, vec![r_pos, TOK_IMM_I16, 1]);
+    emit_decode_operand(&mut ins, &mut next_lbl, false);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x83, 0xF8, 0x01, 0x0F, 0x84]);
+    emit_read_label_id(&mut ins);
+    emit_rel32_for_lid(&mut ins);
+    set_ssa_reg(&mut ins, tc_safe, r_pos, 0x7F10, TY_I64, vec![r_cur, TOK_IMM_I16, 1]);
+    emit_jmp_ins(&mut ins, lbl_ins_loop);
+
+    emit_lbl_ins(&mut ins, lbl_br_neg);
+    set_ssa_reg(&mut ins, tc_safe, r_cur, 0x7F10, TY_I64, vec![r_pos, TOK_IMM_I16, 1]);
+    emit_decode_operand(&mut ins, &mut next_lbl, false);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x83, 0xF8, 0xFF, 0x0F, 0x84]);
+    emit_read_label_id(&mut ins);
+    emit_rel32_for_lid(&mut ins);
+    set_ssa_reg(&mut ins, tc_safe, r_pos, 0x7F10, TY_I64, vec![r_cur, TOK_IMM_I16, 1]);
+    emit_jmp_ins(&mut ins, lbl_ins_loop);
+
+    emit_lbl_ins(&mut ins, lbl_store_dst);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x89, 0x85]);
+    set_ssa_reg(&mut ins, tc_safe, r_buf, 0x7F0F, TY_BYTES, vec![r_buf, TOK_IMM_I16, (-4i16) as u16, r_disp_dst]);
+    set_ssa_reg(&mut ins, tc_safe, r_pos, 0x7F10, TY_I64,   vec![r_cur, TOK_IMM_I16, 1]);
+    emit_jmp_ins(&mut ins, lbl_ins_loop);
+
+    emit_lbl_ins(&mut ins, lbl_ret);
+    set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_retty, TOK_IMM_I16, TY_BYTES]);
+    emit_br_pos_ins(&mut ins, r_cond, lbl_ret_bytes);
+    set_ssa_reg(&mut ins, tc_safe, r_cur, 0x7F10, TY_I64, vec![r_pos, TOK_IMM_I16, 1]);
+    emit_decode_operand(&mut ins, &mut next_lbl, false);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[
+        0x48, 0x83, 0xEC, 0x08, 0x48, 0x89, 0x04, 0x24,
+        0xB8, 0x01, 0x00, 0x00, 0x00, 0xBF, 0x01, 0x00, 0x00, 0x00,
+        0x48, 0x89, 0xE6, 0xBA, 0x08, 0x00, 0x00, 0x00, 0x0F, 0x05,
+        0x48, 0x83, 0xC4, 0x08, 0x31, 0xFF, 0xB8, 0x3C, 0x00, 0x00, 0x00, 0x0F, 0x05,
+    ]);
+    set_ssa_reg(&mut ins, tc_safe, r_pos, 0x7F10, TY_I64, vec![r_cur, TOK_IMM_I16, 1]);
+    emit_jmp_ins(&mut ins, lbl_ins_loop);
+
+    emit_lbl_ins(&mut ins, lbl_ret_bytes);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[
+        0xBF, 0x01, 0x00, 0x00, 0x00,
+        0x48, 0x8D, 0xB5, 0x00, 0x00, 0xFE, 0xFF,
+        0x4C, 0x89, 0xDA,
+        0xB8, 0x01, 0x00, 0x00, 0x00,
+        0x0F, 0x05,
+        0x31, 0xFF,
+        0xB8, 0x3C, 0x00, 0x00, 0x00,
+        0x0F, 0x05,
+    ]);
+    set_ssa_reg(&mut ins, tc_safe, r_pos, 0x7F10, TY_I64, vec![r_pos, TOK_IMM_I16, 3]);
+    emit_jmp_ins(&mut ins, lbl_ins_loop);
+
+    emit_lbl_ins(&mut ins, lbl_loop_end);
+    set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_pass, TOK_IMM_I16, 0]);
+    emit_br_pos_ins(&mut ins, r_cond, lbl_pass0_end);
+    set_ssa_reg(&mut ins, tc_safe, r_tmp, 0x7F50, TY_I64,   vec![r_buf]);
+    set_ssa_reg(&mut ins, tc_safe, r_buf, 0x7F0F, TY_BYTES, vec![r_buf, TOK_IMM_I16, (-9i16) as u16, TOK_IMM_I16, 96,  r_tmp]);
+    set_ssa_reg(&mut ins, tc_safe, r_buf, 0x7F0F, TY_BYTES, vec![r_buf, TOK_IMM_I16, (-9i16) as u16, TOK_IMM_I16, 104, r_tmp]);
+    ins.push(vec![0x7F4A, r_buf, TOK_INS_END]);
+
+    emit_lbl_ins(&mut ins, lbl_pass0_end);
+    set_ssa_reg(&mut ins, tc_safe, r_pass, 0x7F06, TY_I64, vec![TOK_IMM_I16, 1]);
+    emit_jmp_ins(&mut ins, lbl_pass_entry);
+
+    pack_fn_module(
+        &[],
+        0x0000,
+        &[
+            (0x7EC0, TY_ARRAY, tc_safe),
+            (0x7EC1, TY_I64,   tc_safe),
+            (0x7EC2, TY_I64,   tc_safe),
+            (0x7EC3, TY_I64,   tc_safe),
+        ],
+        TY_BYTES,
+        0x0000,
+        &ins,
+    )
+}
+
+pub fn fnv1a_64_hash(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+pub fn assert_elf_bit_exact(native_elf: &[u8], vm_elf: &[u8], label: &str) {
+    if native_elf != vm_elf {
+        let min_len = native_elf.len().min(vm_elf.len());
+        let first_diff = (0..min_len).find(|&i| native_elf[i] != vm_elf[i]).unwrap_or(min_len);
+        let s_start = first_diff.saturating_sub(8);
+        let s_end = (first_diff + 16).min(min_len);
+        panic!(
+            "Step 7 ELF mismatch on '{}': native_len={} vs vm_len={}, first diff at byte offset {} (0x{:04X}):\n  native[{}..{}]: {:02X?}\n  vm    [{}..{}]: {:02X?}",
+            label,
+            native_elf.len(),
+            vm_elf.len(),
+            first_diff,
+            first_diff,
+            s_start, s_end, &native_elf[s_start..s_end],
+            s_start, s_end, &vm_elf[s_start..s_end],
+        );
+    }
+}
+

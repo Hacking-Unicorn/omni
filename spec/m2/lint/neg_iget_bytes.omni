@@ -1,0 +1,8 @@
+// L4 IGET2_NON_ARRAY: 2-op IGET on bytes reads the input window natively (A:345-347).
+fn main(x: i64) -> i64 {
+    let w: bytes = anew(0);
+    w = iset(w, 7);
+    let v: i64 = iget(w, 0);
+    let r: i64 = v + x;
+    return r;
+}

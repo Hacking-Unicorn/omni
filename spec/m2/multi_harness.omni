@@ -1,0 +1,12 @@
+// ==============================================================================
+// spec/m2/multi_harness.omni  (M2-15 test driver)
+// ==============================================================================
+// Link order: pure/m2/util.omni, pure/isa/table.omni, pure/m2/decode.omni,
+//             pure/m2/labels.omni, pure/m2/arena.omni, pure/m2/elf.omni,
+//             pure/m2/emit_x86.omni, pure/m2/emit_multi.omni, this file.
+// ==============================================================================
+
+#[strict]
+fn m2_multi_main(arena: bytes, arr: array, arg0: i64, arg1: i64, arg2: i64) -> bytes {
+    return m2_compile_multi_x86(arena, arr, arg0, arg1, arg2);
+}

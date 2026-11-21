@@ -1,1 +1,0 @@
-fn idiv_zero(x: i64) -> i64 { let r = x / 0; return r; }

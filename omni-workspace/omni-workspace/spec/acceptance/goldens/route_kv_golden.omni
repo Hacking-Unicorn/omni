@@ -1,8 +1,0 @@
-#[strict]
-#[cap(NET, DB_R, DB_W)]
-route GET /users/:id (req: i64) {
-    let id: i64 = req.param("id");
-    let saved: i64 = kv_put(id, 777);
-    let row: i64 = db_get(id);
-    respond(200, row);
-}

@@ -1,0 +1,12 @@
+// ==============================================================================
+// spec/m3/lower_harness.omni  (Milestone 3, M3-10) — Lowering u16 diff harness
+// ==============================================================================
+// Entry point for `omnic m3-lower`: invokes `m3_compile_all(arena, src, strict_arg)`
+// and returns the exact little-endian u16 `.omni_bc` bytecode stream slice
+// (or a 16-byte error sentinel).
+// ==============================================================================
+
+#[strict]
+fn m3_lower_main(arena: bytes, src: array, strict_arg: i64) -> bytes {
+    return m3_compile_all(arena, src, strict_arg);
+}

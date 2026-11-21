@@ -1,0 +1,94 @@
+// ==============================================================================
+// pure/m2/driver.omni  (Milestone 2, M2-12/M2-13) — Pure-Omni 2-pass x86-64 driver
+// ==============================================================================
+// Link order: pure/m2/util.omni, pure/isa/table.omni, pure/m2/decode.omni,
+//             pure/m2/labels.omni, pure/m2/arena.omni, pure/m2/elf.omni,
+//             pure/m2/emit_x86.omni, this file.
+// Compiles a single-function Omni u16 token stream (including the 19,731-word
+// Stage-1 self-compiler stream) directly into a Linux x86-64 ELF64 binary in two
+// passes, returning the exact ELF slice via M2-06 `ret_slice`.
+// Iterative, zero recursion, zero ANEW, gated by `omni m2-lint` with 0 findings.
+// ==============================================================================
+
+// Dispatches ALU & compare opcodes (keeps every dispatcher fn <= 12 labels).
+#[strict]
+fn m2d_emit_alu_group(arena: bytes, op: i64, d: i64, p0: i64, p1: i64, p2: i64) -> bytes {
+    let c_ar: trit = m2u_in(op, 32528, 32530) <=> 0;
+    let c_bit: trit = (m2u_in(op, 32542, 32544) + m2u_in(op, 32546, 32547)) <=> 0;
+    let c_cmp: trit = (m2u_in(op, 32548, 32551) + m2u_eq(op, 32557)) <=> 0;
+    let c_mm: trit = (m2u_in(op, 32535, 32536) + m2u_in(op, 32553, 32555)) <=> 0;
+    let c_misc: trit = (m2u_in(op, 32531, 32534) + m2u_eq(op, 32545) + m2u_eq(op, 32552) + m2u_eq(op, 32556)) <=> 0;
+    let r1: bytes = if_pos c_ar { m2x_emit_alu_arith(arena, op, d, p0, p1) } else { arena };
+    let r2: bytes = if_pos c_bit { m2x_emit_alu_bit(r1, op, d, p0, p1) } else { r1 };
+    let r3: bytes = if_pos c_cmp { m2x_emit_cmp(r2, op, d, p0, p1) } else { r2 };
+    let r4: bytes = if_pos c_mm { m2x_emit_minmax_txor(r3, op, d, p0, p1) } else { r3 };
+    let r5: bytes = if_pos c_misc { m2x_emit_alu_misc(r4, op, d, p0, p1, p2) } else { r4 };
+    return r5;
+}
+
+// Dispatches one decoded instruction at `cur` to the matching x86-64 emitter.
+#[strict]
+fn m2d_emit_one_ins(arena: bytes, arr: array, n: i64, cur: i64, pass: i64, is_bytes: i64) -> bytes {
+    let has_d: i64 = m2d_ins_has_dest(arr, n, cur);
+    let d: i64 = m2d_ins_dest(arr, n, cur);
+    let op: i64 = m2d_ins_op(arr, n, cur);
+    let ops_start: i64 = cur + 1 + has_d * 3;
+    let p0: i64 = m2d_operand(arr, n, ops_start);
+    let p1: i64 = m2d_operand(arr, n, m2d_next(p0));
+    let p2: i64 = m2d_operand(arr, n, m2d_next(p1));
+    let p3: i64 = m2d_operand(arr, n, m2d_next(p2));
+    let scan: i64 = m2d_ins_scan(arr, n, cur);
+    let nops: i64 = (scan >> 20) & 65535;
+    let c_basic: trit = (m2u_in(op, 32513, 32516) + m2u_eq(op, 32518) + m2u_eq(op, 32521) + m2u_eq(op, 32525) + m2u_eq(op, 32592) + m2u_in(op, 32599, 32601)) <=> 0;
+    let c_iget: trit = m2u_eq(op, 32526) <=> 0;
+    let c_iset: trit = m2u_eq(op, 32527) <=> 0;
+    let c_alu: trit = m2u_in(op, 32528, 32557) <=> 0;
+    let c_br: trit = m2u_in(op, 32576, 32580) <=> 0;
+    let c_sr: trit = (m2u_eq(op, 32581) + m2u_eq(op, 32586)) <=> 0;
+    let r1: bytes = if_pos c_basic { m2x_emit_basic(arena, op, d, p0) } else { arena };
+    let r2: bytes = if_pos c_iget { m2x_emit_iget(r1, p1, d) } else { r1 };
+    let r3: bytes = if_pos c_iset { m2x_emit_iset(r2, arr, n, ops_start, nops, d) } else { r2 };
+    let r4: bytes = if_pos c_alu { m2d_emit_alu_group(r3, op, d, p0, p1, p2) } else { r3 };
+    let r5: bytes = if_pos c_br { m2x_emit_branch(r4, op, p0, p1, p2, p3, pass) } else { r4 };
+    let r6: bytes = if_pos c_sr { m2x_emit_sel_ret(r5, op, d, p0, p1, p2, p3, is_bytes) } else { r5 };
+    return r6;
+}
+
+// Runs one full pass (pass=1 collects labels, pass=2 patches rel32) over all instructions.
+#[strict]
+fn m2_run_pass(arena: bytes, arr: array, n: i64, ins_start: i64, ins_cnt: i64, pass: i64, is_bytes: i64) -> bytes {
+    let w: bytes = arena;
+    let cur: i64 = ins_start;
+    let ii: i64 = 0;
+    while ins_cnt - ii <=> 0 {
+        w = m2d_emit_one_ins(w, arr, n, cur, pass, is_bytes);
+        let nxt: i64 = m2d_decode_at(arr, n, cur);
+        cur = m2u_sel(m2d_is_err(nxt), n, nxt);
+        ii = ii + 1;
+    }
+    return w;
+}
+
+// Top-level Pure-Omni two-pass single-function u16 -> x86-64 ELF64 compiler.
+#[strict]
+fn m2_compile_single_x86(arena: bytes, arr: array, arg0: i64, arg1: i64, arg2: i64) -> bytes {
+    let n: i64 = slen(arr);
+    let p_cnt: i64 = m2u_tok(arr, n, 3);
+    let sig_pos: i64 = 4 + p_cnt * 3;
+    let ret_ty: i64 = m2u_tok(arr, n, sig_pos);
+    let is_bytes: i64 = m2u_eq(ret_ty, 32646);              // TY_BYTES = 0x7F86
+    let ins_cnt: i64 = m2u_tok(arr, n, sig_pos + 2);
+    let ins_start: i64 = sig_pos + 3;
+    let w: bytes = m2a_init(arena, n, 0, is_bytes);
+    // Pass 1: emit placeholder header + prologue + body, recording every LABEL byte offset.
+    w = m2e_emit_elf64_hdr(w, 120);
+    w = m2x_single_prologue(w, is_bytes, arg0, arg1, arg2);
+    w = m2_run_pass(w, arr, n, ins_start, ins_cnt, 1, is_bytes);
+    let total_size: i64 = ld_u64(w, m2l_regs());
+    // Pass 2: reset out_len = 0, emit final header (total_size) + prologue + body with resolved rel32.
+    w = m2a_g_set(w, m2g_out_len(), 0);
+    w = m2e_emit_elf64_hdr(w, total_size);
+    w = m2x_single_prologue(w, is_bytes, arg0, arg1, arg2);
+    w = m2_run_pass(w, arr, n, ins_start, ins_cnt, 2, is_bytes);
+    return m2a_finish_slice(w);
+}

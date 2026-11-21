@@ -1,0 +1,192 @@
+// ==============================================================================
+// pure/m2/arena.omni  (Milestone 2, M2-11) — M2 arena state & output emitter
+// ==============================================================================
+// Link order: pure/m2/util.omni, pure/isa/table.omni, pure/m2/decode.omni,
+//             pure/m2/labels.omni, this file.
+// Uses the approved D-8 multi-mode arena layout (constants in decode.omni):
+//   0x00000..0x1FFFF  tokens (128 KiB = 65,536 u16 words; >65536 = hard reject D-7)
+//   0x20000..0x23FFF  label table (4096 x u32, owned by pure/m2/labels.omni)
+//   0x24000..0x27FFF  register / pass / global state (2048 x i64 words)
+//   0x28000..0x7FEFF  ELF output buffer (351.75 KiB; 8-byte tail slack for st_u16/32)
+//   0x7FF00..0x7FFFF  decoder scratch (D-14)
+// Iterative, zero recursion, zero ANEW, gated by `omni m2-lint` with 0 findings.
+// ==============================================================================
+
+// Global state slot indices (in 0x24000..0x27FFF, 8 bytes per slot).
+#[strict]
+fn m2g_out_len() -> i64 { return 0; }
+#[strict]
+fn m2g_pass() -> i64 { return 1; }
+#[strict]
+fn m2g_err() -> i64 { return 2; }
+#[strict]
+fn m2g_nwords() -> i64 { return 3; }
+#[strict]
+fn m2g_mode() -> i64 { return 4; }
+#[strict]
+fn m2g_ret_ty() -> i64 { return 5; }
+
+// Error codes stored in m2g_err().
+#[strict]
+fn m2err_ok() -> i64 { return 0; }
+#[strict]
+fn m2err_input_over_128k() -> i64 { return 1; }
+#[strict]
+fn m2err_out_cap() -> i64 { return 2; }
+#[strict]
+fn m2err_label_oob() -> i64 { return 3; }
+#[strict]
+fn m2err_size_mismatch() -> i64 { return 4; }
+
+// Usable output capacity (m2l_out_end - m2l_out - 8 bytes slack so st_u16/32/64 stay in-band).
+#[strict]
+fn m2a_out_cap() -> i64 {
+    let r: i64 = (m2l_out_end() - m2l_out()) - 8;
+    return r;
+}
+
+// Reads global i64 state word `slot` (0..2047) from 0x24000 + slot*8.
+#[strict]
+fn m2a_g_get(arena: bytes, slot: i64) -> i64 {
+    let ok: trit = m2u_in(slot, 0, 2047) <=> 0;
+    let r: i64 = if_pos ok {
+        ld_u64(arena, m2l_regs() + (slot << 3))
+    } else {
+        0
+    };
+    return r;
+}
+
+// Writes global i64 state word `slot` (0..2047) at 0x24000 + slot*8.
+#[strict]
+fn m2a_g_set(arena: bytes, slot: i64, val: i64) -> bytes {
+    let ok: trit = m2u_in(slot, 0, 2047) <=> 0;
+    let r: bytes = if_pos ok {
+        iset_patch_i64(arena, m2l_regs() + (slot << 3), val)
+    } else {
+        arena
+    };
+    return r;
+}
+
+// Returns 1 if `need >= 0` bytes can be appended without exceeding m2a_out_cap(), else 0.
+#[strict]
+fn m2a_chk_cap(arena: bytes, need: i64) -> i64 {
+    let cur: i64 = ld_u64(arena, m2l_regs());
+    let cap: i64 = m2a_out_cap();
+    let ok: i64 = m2u_ge(need, 0) * m2u_ge(cap, cur + need);
+    return ok;
+}
+
+// Initializes M2 arena state for a compilation run.
+// D-7: hard-rejects input > 128 KiB (nwords > 65536) or < 0 with m2err_input_over_128k.
+#[strict]
+fn m2a_init(arena: bytes, nwords: i64, mode: i64, ret_ty: i64) -> bytes {
+    let w: bytes = arena;
+    let i: i64 = 0;
+    while 16 - i <=> 0 {
+        w = m2a_g_set(w, i, 0);
+        i = i + 1;
+    }
+    let ok: trit = m2u_in(nwords, 0, m2l_window_words()) <=> 0;
+    let r: bytes = if_pos ok {
+        let w2: bytes = m2a_g_set(w, m2g_nwords(), nwords);
+        w2 = m2a_g_set(w2, m2g_mode(), mode);
+        w2 = m2a_g_set(w2, m2g_ret_ty(), ret_ty);
+        w2 = m2a_g_set(w2, m2g_pass(), 1);
+        w2 = m2lbl_clear_all(w2);
+        w2
+    } else {
+        m2a_g_set(w, m2g_err(), m2err_input_over_128k())
+    };
+    return r;
+}
+
+// Emits 1 byte into the output band (at m2l_out() + out_len).
+#[strict]
+fn m2a_emit_u8(arena: bytes, b: i64) -> bytes {
+    let pos: i64 = ld_u64(arena, m2l_regs());
+    let ok: trit = m2u_ge(m2a_out_cap(), pos + 1) <=> 0;
+    let r: bytes = if_pos ok {
+        let w: bytes = st_u16(arena, m2l_out() + pos, b & 255);
+        iset_patch_i64(w, m2l_regs(), pos + 1)
+    } else {
+        iset_patch_i64(arena, m2l_regs() + 16, m2err_out_cap())
+    };
+    return r;
+}
+
+// Emits a 16-bit little-endian integer into the output band.
+#[strict]
+fn m2a_emit_u16(arena: bytes, v: i64) -> bytes {
+    let pos: i64 = ld_u64(arena, m2l_regs());
+    let ok: trit = m2u_ge(m2a_out_cap(), pos + 2) <=> 0;
+    let r: bytes = if_pos ok {
+        let w: bytes = st_u16(arena, m2l_out() + pos, v & 65535);
+        iset_patch_i64(w, m2l_regs(), pos + 2)
+    } else {
+        iset_patch_i64(arena, m2l_regs() + 16, m2err_out_cap())
+    };
+    return r;
+}
+
+// Emits a 32-bit little-endian integer into the output band.
+#[strict]
+fn m2a_emit_u32(arena: bytes, v: i64) -> bytes {
+    let pos: i64 = ld_u64(arena, m2l_regs());
+    let ok: trit = m2u_ge(m2a_out_cap(), pos + 4) <=> 0;
+    let r: bytes = if_pos ok {
+        let w: bytes = st_u32(arena, m2l_out() + pos, v);
+        iset_patch_i64(w, m2l_regs(), pos + 4)
+    } else {
+        iset_patch_i64(arena, m2l_regs() + 16, m2err_out_cap())
+    };
+    return r;
+}
+
+// Emits a 64-bit little-endian integer into the output band.
+#[strict]
+fn m2a_emit_u64(arena: bytes, v: i64) -> bytes {
+    let pos: i64 = ld_u64(arena, m2l_regs());
+    let ok: trit = m2u_ge(m2a_out_cap(), pos + 8) <=> 0;
+    let r: bytes = if_pos ok {
+        let w: bytes = iset_patch_i64(arena, m2l_out() + pos, v);
+        iset_patch_i64(w, m2l_regs(), pos + 8)
+    } else {
+        iset_patch_i64(arena, m2l_regs() + 16, m2err_out_cap())
+    };
+    return r;
+}
+
+// Patches a 32-bit LE integer at `rel_off` within the emitted output slice.
+#[strict]
+fn m2a_patch_u32(arena: bytes, rel_off: i64, v: i64) -> bytes {
+    let cur: i64 = ld_u64(arena, m2l_regs());
+    let ok: trit = (m2u_ge(rel_off, 0) * m2u_ge(cur, rel_off + 4)) <=> 0;
+    let r: bytes = if_pos ok {
+        st_u32(arena, m2l_out() + rel_off, v)
+    } else {
+        iset_patch_i64(arena, m2l_regs() + 16, m2err_out_cap())
+    };
+    return r;
+}
+
+// Patches a 64-bit LE integer at `rel_off` within the emitted output slice.
+#[strict]
+fn m2a_patch_u64(arena: bytes, rel_off: i64, v: i64) -> bytes {
+    let cur: i64 = ld_u64(arena, m2l_regs());
+    let ok: trit = (m2u_ge(rel_off, 0) * m2u_ge(cur, rel_off + 8)) <=> 0;
+    let r: bytes = if_pos ok {
+        iset_patch_i64(arena, m2l_out() + rel_off, v)
+    } else {
+        iset_patch_i64(arena, m2l_regs() + 16, m2err_out_cap())
+    };
+    return r;
+}
+
+// Returns the emitted ELF slice `[m2l_out() .. m2l_out() + out_len]` via M2-06 ret_slice.
+#[strict]
+fn m2a_finish_slice(arena: bytes) -> bytes {
+    let n: i64 = ld_u64(arena, m2l_regs());
+    return ret_slice(arena, m2l_out(), n);
+}

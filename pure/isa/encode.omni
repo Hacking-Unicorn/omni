@@ -1,0 +1,296 @@
+// ==============================================================================
+// pure/isa/encode.omni  (Milestone 3, M3-04) — shared u16 packet & module encoder
+// ==============================================================================
+// Link order: pure/m2/util.omni, pure/isa/table.omni, pure/m2/decode.omni, this file.
+// Iterative (no recursion), <= 120 SSA / <= 12 labels per fn, zero ANEW (caller owns
+// the output bytes buffer), gated by `omni m2-lint` with 0 findings.
+//
+// Encodes structured Omni ISA tokens and instruction packets into little-endian u16
+// words appended to `out: bytes`, matching `encode_u16_stream_to_bytes` /
+// `encode_asm_ins_packet_u16` bit-for-bit.
+// ==============================================================================
+
+#[strict]
+fn enc_u16(out: bytes, w: i64) -> bytes {
+    let lo: i64 = w & 255;
+    let hi: i64 = (w >> 8) & 255;
+    let r: bytes = iset(out, lo, hi);
+    return r;
+}
+
+#[strict]
+fn enc_mod_begin(out: bytes) -> bytes {
+    let r: bytes = enc_u16(out, 32480);
+    return r;
+}
+
+#[strict]
+fn enc_mod_end(out: bytes) -> bytes {
+    let r: bytes = enc_u16(out, 32495);
+    return r;
+}
+
+#[strict]
+fn enc_ins_end(out: bytes) -> bytes {
+    let r: bytes = enc_u16(out, 32484);
+    return r;
+}
+
+#[strict]
+fn enc_fn_hdr(out: bytes, fn_idx: i64, p_cnt: i64) -> bytes {
+    let a: bytes = enc_u16(out, 32483);
+    let b: bytes = enc_u16(a, fn_idx & 65535);
+    let c: bytes = enc_u16(b, p_cnt & 65535);
+    return c;
+}
+
+#[strict]
+fn enc_fn_param(out: bytes, par_tok: i64, ty_tok: i64, tc_tok: i64) -> bytes {
+    let a: bytes = enc_u16(out, par_tok & 65535);
+    let b: bytes = enc_u16(a, ty_tok & 65535);
+    let c: bytes = enc_u16(b, tc_tok & 65535);
+    return c;
+}
+
+#[strict]
+fn enc_fn_sig(out: bytes, ret_ty: i64, cap_mask: i64, ins_cnt: i64) -> bytes {
+    let a: bytes = enc_u16(out, ret_ty & 65535);
+    let b: bytes = enc_u16(a, cap_mask & 65535);
+    let c: bytes = enc_u16(b, ins_cnt & 65535);
+    return c;
+}
+
+#[strict]
+fn enc_ins_hdr(out: bytes, dest: i64, op_tok: i64, ty_tok: i64, tc_tok: i64) -> bytes {
+    let has_d: trit = dest <=> (0 - 1);
+    let r: bytes = if_pos has_d {
+        let a: bytes = enc_u16(out, (32256 + dest) & 65535);
+        let b: bytes = enc_u16(a, op_tok & 65535);
+        let c: bytes = enc_u16(b, ty_tok & 65535);
+        let d: bytes = enc_u16(c, tc_tok & 65535);
+        d
+    } else {
+        enc_u16(out, op_tok & 65535)
+    };
+    return r;
+}
+
+#[strict]
+fn enc_op_imm(out: bytes, v: i64) -> bytes {
+    let fits16: i64 = m2u_in(v, 0 - 32768, 32767);
+    let c: trit = fits16 <=> 0;
+    let r: bytes = if_pos c {
+        let a: bytes = enc_u16(out, 32485);
+        let b: bytes = enc_u16(a, v & 65535);
+        b
+    } else {
+        let a: bytes = enc_u16(out, 32486);
+        let b: bytes = enc_u16(a, (v >> 16) & 65535);
+        let d: bytes = enc_u16(b, v & 65535);
+        d
+    };
+    return r;
+}
+
+#[strict]
+fn enc_op_sym(out: bytes, kind: i64, idx: i64) -> bytes {
+    let tok: i64 = 32491 + (kind - 7);
+    let a: bytes = enc_u16(out, tok);
+    let b: bytes = enc_u16(a, idx & 65535);
+    return b;
+}
+
+#[strict]
+fn enc_op_simple(out: bytes, kind: i64, val: i64) -> bytes {
+    let is_reg: i64 = m2u_eq(kind, 1);
+    let is_par: i64 = m2u_eq(kind, 2);
+    let is_lbl: i64 = m2u_eq(kind, 3);
+    let is_tr: i64 = m2u_eq(kind, 4);
+    let tok: i64 = is_reg * (32256 + val)
+        + is_par * (32448 + val)
+        + is_lbl * val
+        + is_tr * (32487 + val);
+    let r: bytes = enc_u16(out, tok & 65535);
+    return r;
+}
+
+#[strict]
+fn enc_eng_span(out: bytes, arr: array, n: i64, start: i64, len: i64) -> bytes {
+    let w: bytes = enc_u16(out, 32490);
+    w = enc_u16(w, len & 65535);
+    let k: i64 = 0;
+    while len - k <=> 0 {
+        let tok: i64 = m2u_tok(arr, n, start + k);
+        w = enc_u16(w, tok & 65535);
+        k = k + 1;
+    }
+    return w;
+}
+
+#[strict]
+fn enc_one_operand(out: bytes, arr: array, n: i64, packed: i64) -> bytes {
+    let kind: i64 = m2d_kind(packed);
+    let simple: i64 = m2u_in(kind, 1, 4);
+    let c1: trit = simple <=> 0;
+    let r: bytes = if_pos c1 {
+        enc_op_simple(out, kind, m2d_uval(packed))
+    } else {
+        let is_imm: trit = m2u_eq(kind, 5) <=> 0;
+        let r2: bytes = if_pos is_imm {
+            enc_op_imm(out, m2d_ival(packed))
+        } else {
+            let is_eng: trit = m2u_eq(kind, 6) <=> 0;
+            let r3: bytes = if_pos is_eng {
+                let elen: i64 = m2d_uval(packed);
+                let estart: i64 = m2d_next(packed) - elen;
+                enc_eng_span(out, arr, n, estart, elen)
+            } else {
+                enc_op_sym(out, kind, m2d_uval(packed))
+            };
+            r3
+        };
+        r2
+    };
+    return r;
+}
+
+// Re-encodes one instruction starting at word offset `off` in `arr[0..n]` by decoding
+// its header and operands through `pure/m2/decode.omni` and emitting them through `enc_*`.
+#[strict]
+fn enc_reencode_ins(out: bytes, arr: array, n: i64, off: i64) -> bytes {
+    let dest: i64 = m2d_ins_dest(arr, n, off);
+    let op: i64 = m2d_ins_op(arr, n, off);
+    let ty: i64 = m2d_ins_ty(arr, n, off);
+    let tc: i64 = m2d_ins_tc(arr, n, off);
+    let w: bytes = enc_ins_hdr(out, dest, op, ty, tc);
+    let has_d: i64 = m2d_ins_has_dest(arr, n, off);
+    let cur: i64 = off + 1 + has_d * 3;
+    let done: i64 = 0;
+    while 1 - done <=> 0 {
+        let tok: i64 = m2u_tok(arr, n, cur);
+        let at_end: i64 = m2u_eq(tok, 32484) + m2u_ge(cur, n);
+        let c: trit = at_end <=> 0;
+        if_pos c {
+            done = 1;
+        } else {
+            let pw: i64 = m2d_operand(arr, n, cur);
+            let bad: trit = m2d_is_err(pw) <=> 0;
+            if_pos bad {
+                done = 1;
+            } else {
+                w = enc_one_operand(w, arr, n, pw);
+                cur = m2d_next(pw);
+            }
+        }
+    }
+    w = enc_ins_end(w);
+    return w;
+}
+
+// Re-encodes one function starting at TOK_FN_DEF word `off` into `out`.
+#[strict]
+fn enc_reencode_fn(out: bytes, arr: array, n: i64, off: i64) -> bytes {
+    let fn_idx: i64 = m2u_tok(arr, n, off + 1);
+    let p_cnt: i64 = m2u_tok(arr, n, off + 2);
+    let w: bytes = enc_fn_hdr(out, fn_idx, p_cnt);
+    let cur: i64 = off + 3;
+    let pi: i64 = 0;
+    while p_cnt - pi <=> 0 {
+        w = enc_fn_param(w, m2u_tok(arr, n, cur), m2u_tok(arr, n, cur + 1), m2u_tok(arr, n, cur + 2));
+        cur = cur + 3;
+        pi = pi + 1;
+    }
+    let ret_ty: i64 = m2u_tok(arr, n, cur);
+    let cap_mask: i64 = m2u_tok(arr, n, cur + 1);
+    let ins_cnt: i64 = m2u_tok(arr, n, cur + 2);
+    w = enc_fn_sig(w, ret_ty, cap_mask, ins_cnt);
+    cur = cur + 3;
+    let ii: i64 = 0;
+    while ins_cnt - ii <=> 0 {
+        w = enc_reencode_ins(w, arr, n, cur);
+        let nxt: i64 = m2d_decode_at(arr, n, cur);
+        let bad: i64 = m2d_is_err(nxt);
+        cur = m2u_sel(bad, n, nxt);
+        ii = ii + 1;
+    }
+    return w;
+}
+
+#[strict]
+fn enc_copy_words(out: bytes, arr: array, n: i64, start: i64, count: i64) -> bytes {
+    let w: bytes = out;
+    let k: i64 = 0;
+    while count - k <=> 0 {
+        w = enc_u16(w, m2u_tok(arr, n, start + k));
+        k = k + 1;
+    }
+    return w;
+}
+
+#[strict]
+fn enc_skip_fn(arr: array, n: i64, off: i64) -> i64 {
+    let p_cnt: i64 = m2u_tok(arr, n, off + 2);
+    let sig_pos: i64 = off + 3 + p_cnt * 3;
+    let ins_cnt: i64 = m2u_tok(arr, n, sig_pos + 2);
+    let cur: i64 = sig_pos + 3;
+    let k: i64 = 0;
+    while ins_cnt - k <=> 0 {
+        let nxt: i64 = m2d_decode_at(arr, n, cur);
+        cur = m2u_sel(m2d_is_err(nxt), n, nxt);
+        k = k + 1;
+    }
+    return cur;
+}
+
+#[strict]
+fn enc_next_top(arr: array, n: i64, pos: i64) -> i64 {
+    let tag: i64 = m2u_tok(arr, n, pos);
+    let is_fn: trit = m2u_eq(tag, 32483) <=> 0;
+    let r: i64 = if_pos is_fn {
+        enc_skip_fn(arr, n, pos)
+    } else {
+        let is_sch: i64 = m2u_eq(tag, 32481);
+        let is_exp: i64 = m2u_eq(tag, 32482);
+        let fc: i64 = m2u_tok(arr, n, pos + 2);
+        let step: i64 = is_sch * (3 + fc * 2) + is_exp * 5;
+        m2u_sel(is_sch + is_exp, pos + step, n)
+    };
+    return r;
+}
+
+#[strict]
+fn enc_reencode_top(out: bytes, arr: array, n: i64, pos: i64) -> bytes {
+    let tag: i64 = m2u_tok(arr, n, pos);
+    let is_fn: trit = m2u_eq(tag, 32483) <=> 0;
+    let r: bytes = if_pos is_fn {
+        enc_reencode_fn(out, arr, n, pos)
+    } else {
+        let is_sch: i64 = m2u_eq(tag, 32481);
+        let is_exp: i64 = m2u_eq(tag, 32482);
+        let fc: i64 = m2u_tok(arr, n, pos + 2);
+        let count: i64 = is_sch * (3 + fc * 2) + is_exp * 5;
+        enc_copy_words(out, arr, n, pos, count)
+    };
+    return r;
+}
+
+// Re-encodes a complete u16 module stream `arr[0..n]` (MOD_BEGIN .. MOD_END) into `out`.
+#[strict]
+fn enc_reencode_module(out: bytes, arr: array, n: i64) -> bytes {
+    let w: bytes = enc_mod_begin(out);
+    let pos: i64 = 1;
+    let done: i64 = 0;
+    while 1 - done <=> 0 {
+        let eof: i64 = m2u_ge(pos, n);
+        let tag: i64 = m2u_tok(arr, n, pos);
+        let stop: trit = (eof + m2u_eq(tag, 32495)) <=> 0;
+        if_pos stop {
+            w = enc_mod_end(w);
+            done = 1;
+        } else {
+            w = enc_reencode_top(w, arr, n, pos);
+            pos = enc_next_top(arr, n, pos);
+        }
+    }
+    return w;
+}

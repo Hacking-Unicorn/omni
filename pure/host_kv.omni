@@ -1,0 +1,389 @@
+// ==============================================================================
+// OMNI HOST KV — `pure/host_kv.omni`
+// Version: omni-host-kv-v0.1.0
+// ==============================================================================
+//
+// Port-plan step 9 (KV slice only): the Rust VM `kv_store: BTreeMap<i64, i64>`
+// (omni_rust_bootstrap.rs:1034) and its KV arms DB_GET/DB_QRY 0x7F64/0x7F65
+// (1504-1527), DB_CNT 0x7F68 (1528-1531), KV_PUT 0x7F6B (1532-1542) as an
+// arena-resident sorted array with iterative binary search (HR-3).
+// DB_UPD 0x7F66 / DB_DEL 0x7F67 have no VM arm (fall to Void at 1674): op 7 is a
+// no-op returning tag 0, never a delete. DB_INS tables are out of scope.
+// VM-only by design: DB/KV opcodes are rejected by every AOT backend.
+// NOT in PURE_OMNI_CORE_SUITE_MODULES: no frozen hash depends on this file.
+//
+// Band mapping (HR-1, port plan v2 4.1). On the VM a `bytes` value is the
+// window; band addresses are compile-time constants:
+//   state[0..64)    <-> control block 0x100100..0x10013F (KV words)
+//   state[64+32*i]  <-> KV entry i at 0x1B0000 + 32*i (key, tag, value, pad)
+//   capacity        = (0x1F0000 - 0x1B0000) / 32 = 8192 entries = OMNI_VM_KV_MAX_KEYS
+// Control words: 0 count, 1 mem_used, 2 mem_budget, 3 cap, 4 res_tag, 5 res_val.
+//
+// Program (i64 LE words): cap, mem_budget, n_ops, then n_ops x (op, a, b).
+// ops: 1 KV_PUT(a,b) 2 DB_GET(a) 3 DB_QRY(a,b) 4 DB_QRY(a) 5 DB_GET(a,b)
+//      6 DB_CNT 7 DB_DEL(a)
+// Output (i64 LE words): n_ops x (tag, val), count, mem_used, count x (key, val).
+// tags: 0 Void, 1 Int, 2 BUDGET_EXCEEDED (VM memory budget, or a new distinct key
+// past the 8192-key cap; store and charge unchanged, same as Rust OMNI_VM_KV_MAX_KEYS).
+// ==============================================================================
+
+#[strict]
+fn hkv_is_eq(a: i64, b: i64) -> i64 {
+    let c: trit = a <=> b;
+    let r: i64 = sel_trit(c, 0, 1, 0);
+    return r;
+}
+
+#[strict]
+fn hkv_is_lt(a: i64, b: i64) -> i64 {
+    let c: trit = a <=> b;
+    let r: i64 = sel_trit(c, 1, 0, 0);
+    return r;
+}
+
+#[strict]
+fn hkv_is_gt(a: i64, b: i64) -> i64 {
+    let c: trit = a <=> b;
+    let r: i64 = sel_trit(c, 0, 0, 1);
+    return r;
+}
+
+#[strict]
+fn hkv_ctl_base() -> i64 {
+    return 1048832;
+}
+
+#[strict]
+fn hkv_kv_base() -> i64 {
+    return 1769472;
+}
+
+#[strict]
+fn hkv_kv_end() -> i64 {
+    return 2031616;
+}
+
+#[strict]
+fn hkv_entry_bytes() -> i64 {
+    return 32;
+}
+
+#[strict]
+fn hkv_hdr_bytes() -> i64 {
+    return 64;
+}
+
+#[strict]
+fn hkv_max_entries() -> i64 {
+    let span: i64 = hkv_kv_end() - hkv_kv_base();
+    let n: i64 = span >> 5;
+    return n;
+}
+
+#[strict]
+fn hkv_put_charge() -> i64 {
+    return 16;
+}
+
+#[strict]
+fn hkv_miss() -> i64 {
+    let miss: i64 = 0 - 1;
+    return miss;
+}
+
+#[strict]
+fn hkv_composite_mul() -> i64 {
+    return 1000000;
+}
+
+#[strict]
+fn hkv_load(buf: bytes, off: i64) -> i64 {
+    let b0: i64 = iget(buf, off);
+    let b1: i64 = iget(buf, off + 1);
+    let b2: i64 = iget(buf, off + 2);
+    let b3: i64 = iget(buf, off + 3);
+    let b4: i64 = iget(buf, off + 4);
+    let b5: i64 = iget(buf, off + 5);
+    let b6: i64 = iget(buf, off + 6);
+    let b7: i64 = iget(buf, off + 7);
+    let lo: i64 = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+    let hi: i64 = b4 | (b5 << 8) | (b6 << 16) | (b7 << 24);
+    let v: i64 = lo | (hi << 32);
+    return v;
+}
+
+#[strict]
+fn hkv_ctl_off(word: i64) -> i64 {
+    let addr: i64 = hkv_ctl_base() + word * 8;
+    let off: i64 = addr - hkv_ctl_base();
+    return off;
+}
+
+#[strict]
+fn hkv_ent_off(idx: i64) -> i64 {
+    let addr: i64 = hkv_kv_base() + idx * hkv_entry_bytes();
+    let off: i64 = hkv_hdr_bytes() + addr - hkv_kv_base();
+    return off;
+}
+
+#[strict]
+fn hkv_ctl_get(st: bytes, word: i64) -> i64 {
+    let v: i64 = hkv_load(st, hkv_ctl_off(word));
+    return v;
+}
+
+#[strict]
+fn hkv_ctl_set(st: bytes, word: i64, val: i64) -> bytes {
+    let w: bytes = iset_patch_i64(st, hkv_ctl_off(word), val);
+    return w;
+}
+
+#[strict]
+fn hkv_key_at(st: bytes, idx: i64) -> i64 {
+    let v: i64 = hkv_load(st, hkv_ent_off(idx));
+    return v;
+}
+
+#[strict]
+fn hkv_val_at(st: bytes, idx: i64) -> i64 {
+    let v: i64 = hkv_load(st, hkv_ent_off(idx) + 16);
+    return v;
+}
+
+#[strict]
+fn hkv_set_result(st: bytes, tag: i64, val: i64) -> bytes {
+    let a: bytes = hkv_ctl_set(st, 4, tag);
+    let b: bytes = hkv_ctl_set(a, 5, val);
+    return b;
+}
+
+#[strict]
+fn hkv_write_entry(st: bytes, idx: i64, key: i64, val: i64) -> bytes {
+    let off: i64 = hkv_ent_off(idx);
+    let a: bytes = iset_patch_i64(st, off, key);
+    let b: bytes = iset_patch_i64(a, off + 8, 1);
+    let c: bytes = iset_patch_i64(b, off + 16, val);
+    let d: bytes = iset_patch_i64(c, off + 24, 0);
+    return d;
+}
+
+#[strict]
+fn hkv_init(cap_in: i64, budget: i64) -> bytes {
+    let st: bytes = anew(0);
+    let i: i64 = 0;
+    while 8 - i <=> 0 {
+        st = iset_i64(st, 0);
+        i = i + 1;
+    }
+    let mx: i64 = hkv_max_entries();
+    let pos_cap: i64 = hkv_is_gt(cap_in, 0) * cap_in;
+    let over: i64 = hkv_is_gt(pos_cap, mx);
+    let cap: i64 = over * mx + (1 - over) * pos_cap;
+    st = hkv_ctl_set(st, 2, budget);
+    st = hkv_ctl_set(st, 3, cap);
+    return st;
+}
+
+#[strict]
+fn hkv_lower_bound(st: bytes, key: i64) -> i64 {
+    let lo: i64 = 0;
+    let hi: i64 = hkv_ctl_get(st, 0);
+    while hi - lo <=> 0 {
+        let mid: i64 = (lo + hi) >> 1;
+        let k: i64 = hkv_key_at(st, mid);
+        let lt: i64 = hkv_is_lt(k, key);
+        lo = lt * (mid + 1) + (1 - lt) * lo;
+        hi = lt * hi + (1 - lt) * mid;
+    }
+    return lo;
+}
+
+#[strict]
+fn hkv_find(st: bytes, key: i64) -> i64 {
+    let pos: i64 = hkv_lower_bound(st, key);
+    let in_rng: i64 = hkv_is_lt(pos, hkv_ctl_get(st, 0));
+    let hit: i64 = in_rng * hkv_is_eq(hkv_key_at(st, pos), key);
+    let r: i64 = hit * pos + (1 - hit) * hkv_miss();
+    return r;
+}
+
+#[strict]
+fn hkv_grow_one(st: bytes) -> bytes {
+    let a: bytes = iset_i64(st, 0);
+    let b: bytes = iset_i64(a, 0);
+    let c: bytes = iset_i64(b, 0);
+    let d: bytes = iset_i64(c, 0);
+    return d;
+}
+
+#[strict]
+fn hkv_copy_entry(st: bytes, src: i64, dst: i64) -> bytes {
+    let so: i64 = hkv_ent_off(src);
+    let dof: i64 = hkv_ent_off(dst);
+    let k: i64 = hkv_load(st, so);
+    let t: i64 = hkv_load(st, so + 8);
+    let v: i64 = hkv_load(st, so + 16);
+    let a: bytes = iset_patch_i64(st, dof, k);
+    let b: bytes = iset_patch_i64(a, dof + 8, t);
+    let c: bytes = iset_patch_i64(b, dof + 16, v);
+    return c;
+}
+
+#[strict]
+fn hkv_shift_up(st: bytes, pos: i64, count: i64) -> bytes {
+    let w: bytes = st;
+    let j: i64 = count;
+    while j - pos <=> 0 {
+        w = hkv_copy_entry(w, j - 1, j);
+        j = j - 1;
+    }
+    return w;
+}
+
+#[strict]
+fn hkv_insert_at(st: bytes, pos: i64, count: i64, key: i64, val: i64) -> bytes {
+    let a: bytes = hkv_grow_one(st);
+    let b: bytes = hkv_shift_up(a, pos, count);
+    let c: bytes = hkv_write_entry(b, pos, key, val);
+    let d: bytes = hkv_ctl_set(c, 0, count + 1);
+    return d;
+}
+
+#[strict]
+fn hkv_put_new(st: bytes, key: i64, val: i64, next_used: i64, pos: i64, count: i64) -> bytes {
+    let w: bytes = st;
+    let full: i64 = 1 - hkv_is_lt(count, hkv_ctl_get(w, 3));
+    let c: trit = full <=> 0;
+    let out: bytes = if_pos c {
+        hkv_set_result(w, 2, 0)
+    } else {
+        let a: bytes = hkv_insert_at(w, pos, count, key, val);
+        let b: bytes = hkv_ctl_set(a, 1, next_used);
+        let r: bytes = hkv_set_result(b, 1, val);
+        r
+    };
+    return out;
+}
+
+#[strict]
+fn hkv_put_store(st: bytes, key: i64, val: i64, next_used: i64) -> bytes {
+    let w: bytes = st;
+    let pos: i64 = hkv_lower_bound(w, key);
+    let count: i64 = hkv_ctl_get(w, 0);
+    let found: i64 = hkv_is_lt(pos, count) * hkv_is_eq(hkv_key_at(w, pos), key);
+    let c: trit = found <=> 0;
+    let out: bytes = if_pos c {
+        let a: bytes = iset_patch_i64(w, hkv_ent_off(pos) + 16, val);
+        let b: bytes = hkv_ctl_set(a, 1, next_used);
+        let r: bytes = hkv_set_result(b, 1, val);
+        r
+    } else {
+        hkv_put_new(w, key, val, next_used, pos, count)
+    };
+    return out;
+}
+
+#[strict]
+fn hkv_op_put(st: bytes, key: i64, val: i64) -> bytes {
+    let w: bytes = st;
+    let next_used: i64 = hkv_ctl_get(w, 1) + hkv_put_charge();
+    let over: i64 = hkv_is_gt(next_used, hkv_ctl_get(w, 2));
+    let c: trit = over <=> 0;
+    let out: bytes = if_pos c {
+        hkv_set_result(w, 2, 0)
+    } else {
+        hkv_put_store(w, key, val, next_used)
+    };
+    return out;
+}
+
+#[strict]
+fn hkv_get1(st: bytes, key: i64) -> i64 {
+    let idx: i64 = hkv_find(st, key);
+    let f: i64 = 1 - hkv_is_lt(idx, 0);
+    let r: i64 = f * hkv_val_at(st, idx) + (1 - f) * hkv_miss();
+    return r;
+}
+
+#[strict]
+fn hkv_get2(st: bytes, tbl: i64, key: i64) -> i64 {
+    let comp: i64 = tbl * hkv_composite_mul() + key;
+    let i1: i64 = hkv_find(st, comp);
+    let f1: i64 = 1 - hkv_is_lt(i1, 0);
+    let fb: i64 = hkv_get1(st, key);
+    let r: i64 = f1 * hkv_val_at(st, i1) + (1 - f1) * fb;
+    return r;
+}
+
+#[strict]
+fn hkv_read_val(st: bytes, op: i64, a: i64, b: i64) -> i64 {
+    let one: i64 = hkv_is_eq(op, 2) + hkv_is_eq(op, 4);
+    let two: i64 = hkv_is_eq(op, 3) + hkv_is_eq(op, 5);
+    let cnt: i64 = hkv_is_eq(op, 6);
+    let v1: i64 = one * hkv_get1(st, a);
+    let v2: i64 = two * hkv_get2(st, a, b);
+    let v3: i64 = cnt * hkv_ctl_get(st, 0);
+    let r: i64 = v1 + v2 + v3;
+    return r;
+}
+
+#[strict]
+fn hkv_read_tag(op: i64) -> i64 {
+    let ge2: i64 = 1 - hkv_is_lt(op, 2);
+    let le6: i64 = hkv_is_lt(op, 7);
+    let r: i64 = ge2 * le6;
+    return r;
+}
+
+#[strict]
+fn hkv_apply(st: bytes, op: i64, a: i64, b: i64) -> bytes {
+    let w: bytes = st;
+    let is_put: i64 = hkv_is_eq(op, 1);
+    let c: trit = is_put <=> 0;
+    let out: bytes = if_pos c {
+        hkv_op_put(w, a, b)
+    } else {
+        let tag: i64 = hkv_read_tag(op);
+        let val: i64 = tag * hkv_read_val(w, op, a, b);
+        let r: bytes = hkv_set_result(w, tag, val);
+        r
+    };
+    return out;
+}
+
+#[strict]
+fn hkv_dump(out: bytes, st: bytes) -> bytes {
+    let o: bytes = out;
+    let n: i64 = hkv_ctl_get(st, 0);
+    o = iset_i64(o, n);
+    o = iset_i64(o, hkv_ctl_get(st, 1));
+    let i: i64 = 0;
+    while n - i <=> 0 {
+        o = iset_i64(o, hkv_key_at(st, i));
+        o = iset_i64(o, hkv_val_at(st, i));
+        i = i + 1;
+    }
+    return o;
+}
+
+#[strict]
+fn omni_host_kv_run(prog: bytes) -> bytes {
+    let cap: i64 = hkv_load(prog, 0);
+    let budget: i64 = hkv_load(prog, 8);
+    let n: i64 = hkv_load(prog, 16);
+    let st: bytes = hkv_init(cap, budget);
+    let out: bytes = anew(0);
+    let i: i64 = 0;
+    while n - i <=> 0 {
+        let base: i64 = 24 + i * 24;
+        let op: i64 = hkv_load(prog, base);
+        let a: i64 = hkv_load(prog, base + 8);
+        let b: i64 = hkv_load(prog, base + 16);
+        st = hkv_apply(st, op, a, b);
+        out = iset_i64(out, hkv_ctl_get(st, 4));
+        out = iset_i64(out, hkv_ctl_get(st, 5));
+        i = i + 1;
+    }
+    let r: bytes = hkv_dump(out, st);
+    return r;
+}

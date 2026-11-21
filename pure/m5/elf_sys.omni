@@ -1,0 +1,73 @@
+// ==============================================================================
+// pure/m5/elf_sys.omni (Phase 5, P5-2) — Zero-Shim Linux x86-64 Syscall Emitter
+// ==============================================================================
+// Emits raw Linux x86-64 `syscall` (0F 05) intrinsics (`sys_read`, `sys_write`,
+// `sys_exit`) plus a minimal `_start` stack-arena entry stub directly in Pure-Omni.
+// No Rust, no C, no shim program: the only layer below the emitted ELF64 is the
+// Linux kernel. Obeys all M2 lint budgets (<= 120 SSA, <= 12 labels, zero ANEW).
+// ==============================================================================
+
+// Minimal `_start` stack-arena setup (10 bytes):
+//   48 81 EC imm32(arena_bytes)   ; sub rsp, arena_bytes
+//   48 89 E3                      ; mov rbx, rsp
+#[strict]
+fn m5s_emit_arena_entry(w: bytes, arena_bytes: i64) -> bytes {
+    let w1: bytes = m2a_emit_u16(w, 33096);        // 48 81
+    let w2: bytes = m2a_emit_u8(w1, 236);          // EC
+    let w3: bytes = m2a_emit_u32(w2, arena_bytes); // imm32(arena_bytes)
+    let w4: bytes = m2a_emit_u16(w3, 35144);       // 48 89
+    return m2a_emit_u8(w4, 227);                   // E3 (mov rbx, rsp)
+}
+
+// Raw Linux x86-64 `sys_read(fd, rbx, max_bytes)` -> rax = bytes_read (17 bytes):
+//   31 C0                         ; xor eax, eax (syscall 0 = sys_read)
+//   BF imm32(fd)                  ; mov edi, fd
+//   48 89 DE                      ; mov rsi, rbx
+//   BA imm32(max_bytes)           ; mov edx, max_bytes
+//   0F 05                         ; syscall
+#[strict]
+fn m5s_emit_sys_read(w: bytes, fd: i64, max_bytes: i64) -> bytes {
+    let w1: bytes = m2a_emit_u16(w, 49201);        // 31 C0 (xor eax, eax)
+    let w2: bytes = m2a_emit_u8(w1, 191);          // BF (mov edi, imm32)
+    let w3: bytes = m2a_emit_u32(w2, fd);          // imm32(fd)
+    let w4: bytes = m2a_emit_u16(w3, 35144);       // 48 89
+    let w5: bytes = m2a_emit_u8(w4, 222);          // DE (mov rsi, rbx)
+    let w6: bytes = m2a_emit_u8(w5, 186);          // BA (mov edx, imm32)
+    let w7: bytes = m2a_emit_u32(w6, max_bytes);   // imm32(max_bytes)
+    return m2a_emit_u16(w7, 1295);                 // 0F 05 (syscall)
+}
+
+// Raw Linux x86-64 `sys_write(fd, rbx, rax)` (18 bytes):
+//   48 89 C2                      ; mov rdx, rax
+//   48 89 DE                      ; mov rsi, rbx
+//   BF imm32(fd)                  ; mov edi, fd
+//   B8 01 00 00 00                ; mov eax, 1 (syscall 1 = sys_write)
+//   0F 05                         ; syscall
+#[strict]
+fn m5s_emit_sys_write(w: bytes, fd: i64) -> bytes {
+    let w1: bytes = m2a_emit_u16(w, 35144);        // 48 89
+    let w2: bytes = m2a_emit_u8(w1, 194);          // C2 (mov rdx, rax)
+    let w3: bytes = m2a_emit_u16(w2, 35144);       // 48 89
+    let w4: bytes = m2a_emit_u8(w3, 222);          // DE (mov rsi, rbx)
+    let w5: bytes = m2a_emit_u8(w4, 191);          // BF (mov edi, imm32)
+    let w6: bytes = m2a_emit_u32(w5, fd);          // imm32(fd)
+    let w7: bytes = m2a_emit_u8(w6, 184);          // B8 (mov eax, imm32)
+    let w8: bytes = m2a_emit_u32(w7, 1);           // 1 (sys_write)
+    return m2a_emit_u16(w8, 1295);                 // 0F 05 (syscall)
+}
+
+// Emits a complete, standalone, zero-shim Linux x86-64 ELF64 binary (177 bytes):
+//   120-B ELF64 header + PT_LOAD (entry 0x400078)
+//   _start: alloc stack arena (`arena_bytes`), sys_read(0, rbx, arena_bytes),
+//           sys_write(1, rbx, rax), sys_exit(0).
+#[strict]
+fn m5s_emit_zero_shim_elf(w_in: bytes, arena_bytes: i64) -> bytes {
+    let w0: bytes = m2a_init(w_in, 0, 0, 0);
+    let w1: bytes = m2e_emit_elf64_hdr(w0, 0);
+    let w2: bytes = m5s_emit_arena_entry(w1, arena_bytes);
+    let w3: bytes = m5s_emit_sys_read(w2, 0, arena_bytes);
+    let w4: bytes = m5s_emit_sys_write(w3, 1);
+    let w5: bytes = m2e_emit_trap_stub(w4, 0);
+    let total: i64 = ld_u64(w5, m2l_regs());
+    return m2e_patch_elf64_size(w5, total);
+}

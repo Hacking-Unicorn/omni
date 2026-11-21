@@ -1,0 +1,11 @@
+// ==============================================================================
+// spec/m3/skim_harness.omni  (Milestone 3, M3-07) — Pass S differential harness
+// ==============================================================================
+// Entry point for `omnic m3-skim`: invokes `m3_skim_all(arena, src, strict_arg)`
+// and returns either the 32-byte/fn table slice or a 16-byte error sentinel.
+// ==============================================================================
+
+#[strict]
+fn m3_skim_main(arena: bytes, src: array, strict_arg: i64) -> bytes {
+    return m3_skim_all(arena, src, strict_arg);
+}

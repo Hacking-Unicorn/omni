@@ -1,0 +1,9 @@
+// Q2: +1t / -1t / 0t lexing, and 0t followed by an identifier char.
+fn main(x: i64) -> trit {
+    let a: trit = +1t;
+    let b: trit = -1t;
+    let c: trit = 0t;
+    let d: trit = tand(a, b);
+    let e: trit = tor(d, c);
+    return e;
+}

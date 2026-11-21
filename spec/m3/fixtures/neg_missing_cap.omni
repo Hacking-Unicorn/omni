@@ -1,0 +1,5 @@
+// neg MISSING_CAP: unknown capability name in a cap attribute.
+#[cap(TELEPORT)]
+fn main(x: i64) -> i64 {
+    return x;
+}

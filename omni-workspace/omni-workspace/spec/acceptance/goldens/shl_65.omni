@@ -1,1 +1,0 @@
-fn shl_65(x: i64) -> i64 { let r = x << 65; return r; }

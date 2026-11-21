@@ -1,0 +1,11 @@
+// ==============================================================================
+// spec/m3/expr_harness.omni  (Milestone 3, M3-08) — Expr AST differential harness
+// ==============================================================================
+// Entry point for `omnic m3-expr`: invokes `m3_expr_parse_all(arena, src, strict_arg)`
+// and returns the 16-byte/node AST pool slice (or 16-byte error sentinel).
+// ==============================================================================
+
+#[strict]
+fn m3_expr_main(arena: bytes, src: array, strict_arg: i64) -> bytes {
+    return m3_expr_parse_all(arena, src, strict_arg);
+}

@@ -1,0 +1,147 @@
+// Phase 4 (P4-1/P4-5): Flat linear arena layout & accessors for the Pure-Omni VM.
+// Total arena: 512 KiB (524,288 B), zero recursion, zero ANEW, strict linear bytes.
+//
+// Band map:
+//   0x20000 .. 0x23FFF (131072..147455) : m2l_labels()  (16 KiB, shared with pure/m2/labels.omni)
+//   0x28000 .. 0x28FFF (163840..167935) : FN_TABLE      (256 x 16 B: fn_idx, pcnt, ins_start, ins_cnt)
+//   0x29000 .. 0x29FFF (167936..172031) : VM_STATE      (fn_cnt, sp, fuel, heap_top, trace_mode, trace_cnt, err_code, ret_val, ret_tag, steps)
+//   0x30000 .. 0x4FFFF (196608..327679) : CALL_FRAMES   (64 x 2048 B: 224*8 B regs, 224 B tags, 32 B meta)
+//   0x50000 .. 0x6FFFF (327680..458751) : VM_HEAP       (128 KiB bump-allocated byte buffers)
+//   0x70000 .. 0x7FFFF (458752..524287) : TRACE_RING    (4096 x 16 B: step_u32, fn_u16, op_u16, pc_u32, res_lo32)
+
+#[strict]
+fn m4a_fn_tbl() -> i64 { return 163840; }
+#[strict]
+fn m4a_state() -> i64 { return 167936; }
+#[strict]
+fn m4a_frames() -> i64 { return 196608; }
+#[strict]
+fn m4a_heap() -> i64 { return 327680; }
+#[strict]
+fn m4a_heap_cap() -> i64 { return 131072; }
+#[strict]
+fn m4a_trace() -> i64 { return 458752; }
+#[strict]
+fn m4a_trace_cap() -> i64 { return 4096; }
+#[strict]
+fn m4a_mask32() -> i64 { return (1 << 32) - 1; }
+
+// VM_STATE field offsets
+#[strict]
+fn m4s_fn_cnt() -> i64 { return 167936; }
+#[strict]
+fn m4s_sp() -> i64 { return 167940; }
+#[strict]
+fn m4s_fuel() -> i64 { return 167944; }
+#[strict]
+fn m4s_heap_top() -> i64 { return 167952; }
+#[strict]
+fn m4s_trace_mode() -> i64 { return 167956; }
+#[strict]
+fn m4s_trace_cnt() -> i64 { return 167960; }
+#[strict]
+fn m4s_err() -> i64 { return 167964; }
+#[strict]
+fn m4s_ret_val() -> i64 { return 167968; }
+#[strict]
+fn m4s_ret_tag() -> i64 { return 167976; }
+#[strict]
+fn m4s_steps() -> i64 { return 167980; }
+
+// Error codes: 0=OK, 1=DECODE, 2=OOB, 3=FUEL, 4=DEPTH, 5=UNSUPPORTED_OP, 6=BAD_CALL
+#[strict]
+fn m4_set_err(w: bytes, code: i64) -> bytes {
+    let cur: i64 = ld_u32(w, m4s_err());
+    let out: bytes = if_pos cur <=> 0 {
+        w
+    } else {
+        st_u32(w, m4s_err(), code)
+    };
+    return out;
+}
+
+// Frame base for call depth `sp` (0..63)
+#[strict]
+fn m4f_base(sp: i64) -> i64 { return m4a_frames() + sp * 2048; }
+
+// Frame metadata offsets (relative to frame base):
+//   +2016: fn_slot, +2020: cur_off, +2024: ins_idx, +2028: dest_slot, +2032: ins_start, +2036: ins_cnt
+#[strict]
+fn m4f_get_slot_val(w: bytes, sp: i64, slot: i64) -> i64 {
+    return ld_u64(w, m4f_base(sp) + slot * 8);
+}
+
+#[strict]
+fn m4f_set_slot_val(w: bytes, sp: i64, slot: i64, val: i64) -> bytes {
+    let off: i64 = m4f_base(sp) + slot * 8;
+    return iset_patch_i64(w, off, val);
+}
+
+#[strict]
+fn m4f_get_slot_tag(w: bytes, sp: i64, slot: i64) -> i64 {
+    return ld_u8(w, m4f_base(sp) + 1792 + slot);
+}
+
+#[strict]
+fn m4f_set_slot_tag(w: bytes, sp: i64, slot: i64, tag: i64) -> bytes {
+    let off: i64 = m4f_base(sp) + 1792 + slot;
+    let hi: i64 = ld_u8(w, off + 1);
+    let pair: i64 = (tag & 255) | ((hi & 255) << 8);
+    return st_u16(w, off, pair);
+}
+
+#[strict]
+fn m4f_set_meta(w: bytes, sp: i64, fn_slot: i64, cur_off: i64, ins_idx: i64, dest_slot: i64, ins_start: i64, ins_cnt: i64) -> bytes {
+    let b: i64 = m4f_base(sp) + 2016;
+    let w1: bytes = st_u32(w, b, fn_slot);
+    let w2: bytes = st_u32(w1, b + 4, cur_off);
+    let w3: bytes = st_u32(w2, b + 8, ins_idx);
+    let w4: bytes = st_u32(w3, b + 12, dest_slot);
+    let w5: bytes = st_u32(w4, b + 16, ins_start);
+    return st_u32(w5, b + 20, ins_cnt);
+}
+
+// Convert register/param token to slot (0..223), or -1 if not reg/param.
+#[strict]
+fn m4_tok_to_slot(kind: i64, uval: i64) -> i64 {
+    let is_reg: i64 = m2u_eq(kind, m2k_reg());
+    let is_par: i64 = m2u_eq(kind, m2k_param());
+    let slot: i64 = is_reg * uval + is_par * (192 + uval) + (1 - is_reg - is_par) * (0 - 1);
+    return slot;
+}
+
+// P4-5: Record one 16-byte binary execution trace entry into TRACE_RING if trace_mode != 0.
+// Format: [step_idx: u32, fn_idx: u16, op_tok: u16, pc_off: u32, res_lo32: u32]
+#[strict]
+fn m4_trace_push(w: bytes, step_idx: i64, fn_idx: i64, op_tok: i64, pc_off: i64, res_val: i64) -> bytes {
+    let mode: i64 = ld_u32(w, m4s_trace_mode());
+    let out: bytes = if_pos mode <=> 0 {
+        let cnt: i64 = ld_u32(w, m4s_trace_cnt());
+        let idx: i64 = cnt & 4095;
+        let off: i64 = m4a_trace() + idx * 16;
+        let w1: bytes = st_u32(w, off, step_idx);
+        let w2: bytes = st_u16(w1, off + 4, fn_idx & 65535);
+        let w3: bytes = st_u16(w2, off + 6, op_tok & 65535);
+        let w4: bytes = st_u32(w3, off + 8, pc_off);
+        let w5: bytes = st_u32(w4, off + 12, res_val & m4a_mask32());
+        st_u32(w5, m4s_trace_cnt(), cnt + 1)
+    } else {
+        w
+    };
+    return out;
+}
+
+// Initialize VM state for a fresh run.
+#[strict]
+fn m4a_init(w_in: bytes, fuel: i64, trace_mode: i64) -> bytes {
+    let w1: bytes = st_u32(w_in, m4s_fn_cnt(), 0);
+    let w2: bytes = st_u32(w1, m4s_sp(), 0);
+    let w3: bytes = iset_patch_i64(w2, m4s_fuel(), fuel);
+    let w4: bytes = st_u32(w3, m4s_heap_top(), 0);
+    let w5: bytes = st_u32(w4, m4s_trace_mode(), trace_mode);
+    let w6: bytes = st_u32(w5, m4s_trace_cnt(), 0);
+    let w7: bytes = st_u32(w6, m4s_err(), 0);
+    let w8: bytes = iset_patch_i64(w7, m4s_ret_val(), 0);
+    let w9: bytes = st_u32(w8, m4s_ret_tag(), 0);
+    return st_u32(w9, m4s_steps(), 0);
+}
