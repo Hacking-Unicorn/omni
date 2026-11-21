@@ -67,6 +67,26 @@ Plain integer measurements cross into balanced ternary (`{-1t, 0t, +1t}`) strict
 
 ---
 
+## P7-0a — Measurement, Second Round (Sharpen, Then Stop)
+
+Sharpen the measurement engine with repeated-run consensus, subsystem attribution, and trace-ring opcode histograms, prove it against two canaries, and then **stop refining measurement** and move on to actual improvements (M2 Emitter).
+
+### 1. Pure-Omni Additions (`pure/m7/judge.omni`)
+
+- **`p7_attribute_subsystem(v_m3: trit, v_m2: trit, v_m4: trit) -> i64`:** Branchless subsystem attribution bitmask (`0` = `NONE`, `1` = `M3_FRONTEND`, `2` = `M2_EMITTER`, `4` = `M4_VM`, combinations `3`/`5`/`6`/`7`).
+- **`p7_judge_5runs(b0..c4, band) -> trit`:** 5-run paired comparison feeding `p7_cmp_band` into `p7_vote5` so single-run noise cannot flip verdicts.
+- **`p7_op_class(op_tok) -> i64` + `p7_trace_histogram(w: bytes) -> i64`:** Reads the live P4-5 binary trace ring (`0x70000..0x7FFFF`) and packs 4 × 16-bit opcode class counts `(call_ret << 48) | (ctrl << 32) | (mem << 16) | alu` with invariant `alu + mem + ctrl + call_ret == min(trace_ops, 4096)`.
+
+### 2. Phase-Separated Metrics & Two-Part Canary Proof (`omnic p7-canary`)
+
+- Every benchmark records phase-separated timings (`fe_us`, `emit_us`, `vm_us`) alongside deterministic metrics (`bc_words`, `elf_bytes`, `vm_steps`, `trace_ops`, `arena_bytes`, 4-class trace histogram) across **5 repeated runs** with zero-variance verification on deterministic fields.
+- **Canary A (Predictable M2 Emitter Tweak — `compact_zero_imm`):** Lowering `ImmInt(0)`/`ImmTrit(0)` via 2-byte `xor eax,eax`/`xor ecx,ecx` instead of 10-byte `mov reg, 0` saves exactly `8 * zero_loads` bytes. Judged **`+1t` (ADOPT)** across 5 runs, strictly attributed to **`M2_EMITTER` (`2`)**, zero trace-histogram drift, and natively verified on Linux x86-64.
+- **Canary B (Deliberately Neutral Change):** Comment/whitespace-only source change across 5 runs. Judged **`0t` (HOLD)** and attributed to **`NONE` (`0`)**.
+- **Discrimination Check:** Closed-form `bench_loop_sum` attributes to **`7` (`M3+M2+M4`)** and drops `hist_ctrl` to `0`, cleanly separated from pure M2 emitter moves (`2`).
+- **Frozen Hashes:** All 5 frozen FNV-1a64 hashes and all 3 committed seeds remain completely untouched.
+
+---
+
 ## Hard Rules (All of Phase 7)
 
 - The verifier, determinism, and capability model are never self-modified.

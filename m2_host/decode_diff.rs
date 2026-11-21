@@ -2918,12 +2918,18 @@ pub fn m2_decode_cli(args: &[String]) -> i32 {
 pub struct P7BenchMetrics {
     pub name: &'static str,
     pub compile_us: i64,
+    pub emit_us: i64,
+    pub vm_us: i64,
     pub bc_words: i64,
     pub elf_bytes: i64,
     pub vm_steps: i64,
     pub trace_ops: i64,
     pub arena_bytes: i64,
     pub trace_csum: i64,
+    pub hist_alu: i64,
+    pub hist_mem: i64,
+    pub hist_ctrl: i64,
+    pub hist_call_ret: i64,
     pub ret_val: i64,
 }
 
@@ -2962,24 +2968,105 @@ pub const P7_BENCHMARK_CORPUS: &[(&str, &str, [i64; 3], i64)] = &[
     ),
 ];
 
-/// Measures one `.omni` program end-to-end:
+/// Counts exact `ImmInt(0)` / `ImmTrit(0)` operands lowered through `emit_load_op`
+/// in `compile_pure_u16_to_x86_64_elf_multi_opts` (each saves 8 B under `compact_zero_imm`).
+fn p7_count_m2_zero_imm_loads(module: &BinModule) -> i64 {
+    let is_zero = |op: &BinOperand| matches!(*op, BinOperand::ImmInt(0) | BinOperand::ImmTrit(0));
+    let mut cnt = 0i64;
+    for func in &module.functions {
+        for ins in &func.instructions {
+            match ins.op_tok {
+                0x7F01 | 0x7F02 | 0x7F03 | 0x7F04 | 0x7F06 | 0x7F09 | 0x7F57 | 0x7F58 | 0x7F59
+                | 0x7F15 | 0x7F16 | 0x7F21 | 0x7F28 | 0x7F35 | 0x7F3F | 0x7F42 | 0x7F43 | 0x7F44 => {
+                    if let Some(op) = ins.operands.first() {
+                        if is_zero(op) { cnt += 1; }
+                    }
+                }
+                0x7F0E => {
+                    let idx = if ins.operands.len() == 3 { 2 } else { 1 };
+                    if let Some(op) = ins.operands.get(idx) {
+                        if is_zero(op) { cnt += 1; }
+                    }
+                }
+                0x7F0F => {
+                    if ins.operands.len() == 3
+                        && (ins.operands[1] == BinOperand::ImmInt(-4) || ins.operands[1] == BinOperand::ImmInt(-8))
+                    {
+                        if is_zero(&ins.operands[2]) { cnt += 1; }
+                    } else if ins.operands.len() == 4
+                        && (ins.operands[1] == BinOperand::ImmInt(-9)
+                            || ins.operands[1] == BinOperand::ImmInt(-2)
+                            || ins.operands[1] == BinOperand::ImmInt(-4))
+                    {
+                        if is_zero(&ins.operands[2]) { cnt += 1; }
+                        if is_zero(&ins.operands[3]) { cnt += 1; }
+                    } else if ins.operands.len() > 1 {
+                        for op in &ins.operands[1..] {
+                            if is_zero(op) { cnt += 1; }
+                        }
+                    }
+                }
+                0x7F10 | 0x7F11 | 0x7F12 | 0x7F13 | 0x7F14 | 0x7F17 | 0x7F18 | 0x7F1E | 0x7F1F | 0x7F20
+                | 0x7F22 | 0x7F23 | 0x7F24 | 0x7F25 | 0x7F26 | 0x7F27 | 0x7F29 | 0x7F2A | 0x7F2B | 0x7F2D => {
+                    if ins.operands.len() >= 2 {
+                        if is_zero(&ins.operands[0]) { cnt += 1; }
+                        if is_zero(&ins.operands[1]) { cnt += 1; }
+                    }
+                }
+                0x7F2C => {
+                    for op in ins.operands.iter().take(3) {
+                        if is_zero(op) { cnt += 1; }
+                    }
+                }
+                0x7F45 => {
+                    for op in ins.operands.iter().take(4) {
+                        if is_zero(op) { cnt += 1; }
+                    }
+                }
+                0x7F48 => {
+                    if ins.operands.len() > 1 {
+                        for op in &ins.operands[1..] {
+                            if is_zero(op) { cnt += 1; }
+                        }
+                    }
+                }
+                0x7F4A => {
+                    if func.ret_ty_tok == TY_BYTES {
+                        if ins.operands.len() == 3 {
+                            if is_zero(&ins.operands[1]) { cnt += 1; }
+                            if is_zero(&ins.operands[2]) { cnt += 1; }
+                        }
+                    } else if let Some(op) = ins.operands.first() {
+                        if is_zero(op) { cnt += 1; }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    cnt
+}
+
+/// Measures one `.omni` program end-to-end with phase-separated timings and P4-5 histogram:
 ///   1. Compile `.omni` -> `.omni_bc` (measuring `compile_us` and `bc_words`)
-///   2. Lower `.omni_bc` -> native x86-64 ELF64 via M2-multi (`elf_bytes`)
-///   3. Execute `.omni_bc` on Pure-Omni M4 VM (`m4_vm_run_i64`) with P4-5 trace ring active
-///   4. Verify live P4-5 trace ring in Pure-Omni (`pure/m7/judge.omni::p7_verify_trace_ring`)
-pub fn p7_measure_program(
+///   2. Lower `.omni_bc` -> native x86-64 ELF64 via M2-multi (`emit_us`, `elf_bytes`)
+///   3. Execute `.omni_bc` on Pure-Omni M4 VM (`m4_vm_run_i64`) with P4-5 trace ring active (`vm_us`)
+///   4. Verify live P4-5 trace ring & compute 4-class opcode histogram in Pure-Omni (`pure/m7/judge.omni`)
+pub fn p7_measure_program_with_opts(
     m4_mod: &BinModule,
     m4_run_fn: u16,
     judge_mod: &BinModule,
     trace_fn: u16,
+    hist_fn: u16,
     name: &'static str,
     src: &str,
     args: [i64; 3],
     expected_val: i64,
-) -> Result<P7BenchMetrics, String> {
-    let t0 = std::time::Instant::now();
+    compact_zero_imm: bool,
+) -> Result<(P7BenchMetrics, Vec<u8>, i64), String> {
+    let t_fe = std::time::Instant::now();
     let bc = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(src))?;
-    let compile_us = t0.elapsed().as_micros() as i64;
+    let compile_us = t_fe.elapsed().as_micros() as i64;
     let decoded = decode_omni_token_stream(&bc)?;
     for f in &decoded.functions {
         let rep = verify_binary_function(f);
@@ -2987,8 +3074,12 @@ pub fn p7_measure_program(
             return Err(format!("P7-0 {} failed verifier: {:?}", name, rep.errors));
         }
     }
-    let elf = compile_pure_u16_to_x86_64_elf_multi(&bc, args[0], args[1], args[2])?;
+    let zero_loads = p7_count_m2_zero_imm_loads(&decoded);
+    let t_emit = std::time::Instant::now();
+    let elf = compile_pure_u16_to_x86_64_elf_multi_opts(&bc, args[0], args[1], args[2], compact_zero_imm)?;
+    let emit_us = t_emit.elapsed().as_micros() as i64;
     let mut vm = OmniBinaryVm::with_budgets(50_000_000, 64 * 1024 * 1024);
+    let t_vm = std::time::Instant::now();
     let arena_out = match vm.execute_function(
         m4_mod,
         m4_run_fn,
@@ -3005,6 +3096,7 @@ pub fn p7_measure_program(
         OmniValue::Bytes(b) => b,
         other => return Err(format!("P7-0 {} M4 VM returned {:?}", name, other)),
     };
+    let vm_us = t_vm.elapsed().as_micros() as i64;
     if arena_out.len() != 524_288 {
         return Err(format!("P7-0 {} expected 512 KiB arena, got {}", name, arena_out.len()));
     }
@@ -3026,7 +3118,7 @@ pub fn p7_measure_program(
             name, steps, trace_cnt
         ));
     }
-    let trace_summary = match vm.execute_function(judge_mod, trace_fn, vec![OmniValue::Bytes(arena_out)])? {
+    let trace_summary = match vm.execute_function(judge_mod, trace_fn, vec![OmniValue::Bytes(arena_out.clone())])? {
         OmniValue::Int(v) => v,
         other => return Err(format!("P7-0 {} p7_verify_trace_ring returned {:?}", name, other)),
     };
@@ -3040,17 +3132,60 @@ pub fn p7_measure_program(
             name, trace_cnt, ring_cnt
         ));
     }
-    Ok(P7BenchMetrics {
-        name,
-        compile_us,
-        bc_words: bc.len() as i64,
-        elf_bytes: elf.len() as i64,
-        vm_steps: steps,
-        trace_ops: trace_cnt,
-        arena_bytes: heap_top,
-        trace_csum: trace_summary & 0x7FFF_FFFF,
-        ret_val,
-    })
+    let hist_packed = match vm.execute_function(judge_mod, hist_fn, vec![OmniValue::Bytes(arena_out)])? {
+        OmniValue::Int(v) => v as u64,
+        other => return Err(format!("P7-0a {} p7_trace_histogram returned {:?}", name, other)),
+    };
+    let hist_alu = (hist_packed & 0xFFFF) as i64;
+    let hist_mem = ((hist_packed >> 16) & 0xFFFF) as i64;
+    let hist_ctrl = ((hist_packed >> 32) & 0xFFFF) as i64;
+    let hist_call_ret = ((hist_packed >> 48) & 0xFFFF) as i64;
+    let expected_cap = trace_cnt.min(4096);
+    if hist_alu + hist_mem + hist_ctrl + hist_call_ret != expected_cap {
+        return Err(format!(
+            "P7-0a {} histogram sum mismatch: {}+{}+{}+{} != {}",
+            name, hist_alu, hist_mem, hist_ctrl, hist_call_ret, expected_cap
+        ));
+    }
+    Ok((
+        P7BenchMetrics {
+            name,
+            compile_us,
+            emit_us,
+            vm_us,
+            bc_words: bc.len() as i64,
+            elf_bytes: elf.len() as i64,
+            vm_steps: steps,
+            trace_ops: trace_cnt,
+            arena_bytes: heap_top,
+            trace_csum: trace_summary & 0x7FFF_FFFF,
+            hist_alu,
+            hist_mem,
+            hist_ctrl,
+            hist_call_ret,
+            ret_val,
+        },
+        elf,
+        zero_loads,
+    ))
+}
+
+pub fn p7_measure_program(
+    m4_mod: &BinModule,
+    m4_run_fn: u16,
+    judge_mod: &BinModule,
+    trace_fn: u16,
+    name: &'static str,
+    src: &str,
+    args: [i64; 3],
+    expected_val: i64,
+) -> Result<P7BenchMetrics, String> {
+    let n_jfns = judge_mod.functions.len();
+    let hist_fn = judge_mod.functions[n_jfns - 5].fn_idx;
+    let (m, _elf, _zl) = p7_measure_program_with_opts(
+        m4_mod, m4_run_fn, judge_mod, trace_fn, hist_fn, name, src, args, expected_val, false,
+    )?;
+    Ok(m)
 }
 
 /// P7-0 Hard Gate (`omnic p7-measure`):
@@ -3275,5 +3410,363 @@ pub fn selftest_p7_0_measure() -> Result<(usize, Vec<P7BenchMetrics>, u8), Strin
     checks += 1;
 
     Ok((checks, baseline, packed_better))
+}
+
+/// Executes a native Linux x86-64 ELF64 binary returning an 8-byte little-endian `i64` on stdout.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn p7_verify_native_elf_i64(name: &str, elf: &[u8], expected_val: i64) -> Result<bool, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::env::temp_dir().join(format!(
+        "omni_p7_canary_{}_{}.elf",
+        name,
+        std::process::id()
+    ));
+    std::fs::write(&path, elf).map_err(|e| format!("P7-0a write {}: {}", name, e))?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("P7-0a chmod {}: {}", name, e))?;
+    let out = std::process::Command::new(&path)
+        .output()
+        .map_err(|e| format!("P7-0a exec {}: {}", name, e))?;
+    let _ = std::fs::remove_file(&path);
+    if !out.status.success() {
+        return Err(format!("P7-0a native {} exited with {:?}", name, out.status));
+    }
+    if out.stdout.len() != 8 {
+        return Err(format!(
+            "P7-0a native {} expected 8 stdout bytes, got {}",
+            name,
+            out.stdout.len()
+        ));
+    }
+    let got = i64::from_le_bytes(out.stdout[0..8].try_into().unwrap());
+    if got != expected_val {
+        return Err(format!(
+            "P7-0a native {} returned {}, want {}",
+            name, got, expected_val
+        ));
+    }
+    Ok(true)
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+fn p7_verify_native_elf_i64(_name: &str, _elf: &[u8], _expected_val: i64) -> Result<bool, String> {
+    Ok(false)
+}
+
+/// P7-0a Hard Gate (`omnic p7-canary`):
+/// Proves multi-run consensus (`p7_judge_5runs` / `p7_vote5`), subsystem attribution
+/// (`p7_attribute_subsystem`: M3 frontend vs M2 emitter vs M4 VM), P4-5 trace-ring 4-class
+/// opcode histograms (`p7_trace_histogram`), and the two-part canary proof:
+///   1. Predictable M2 emitter tweak (`compact_zero_imm`: `xor eax,eax` / `xor ecx,ecx`) ->
+///      judged `+1t` (ADOPT) by the exact predicted `8 * zero_loads` byte margin and strictly
+///      attributed to `M2_EMITTER` (`2`), with zero trace-histogram drift.
+///   2. Deliberately neutral change (comment/whitespace-only) ->
+///      judged `0t` (HOLD) across 5 repeated runs and attributed to `NONE` (`0`).
+pub fn selftest_p7_0a_canary() -> Result<(usize, i64, i64, i64, bool), String> {
+    let mut checks = 0usize;
+
+    let judge_u16 = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(P7_JUDGE_OMNI_SRC))?;
+    let judge_mod = decode_omni_token_stream(&judge_u16)?;
+    let n_jfns = judge_mod.functions.len();
+    if n_jfns < 8 {
+        return Err(format!("P7-0a judge module too small: {} fns", n_jfns));
+    }
+    // Function order at end of judge_harness.omni:
+    //   p7_attr_entry (-7), p7_judge_5runs_entry (-6), p7_trace_hist_entry (-5),
+    //   p7_judge_metrics_entry (-4), p7_trace_ring_entry (-3), p7_judge_dispatch6 (-2), main (-1)
+    let judge_attr_fn = judge_mod.functions[n_jfns - 7].fn_idx;
+    let judge_5runs_fn = judge_mod.functions[n_jfns - 6].fn_idx;
+    let judge_hist_fn = judge_mod.functions[n_jfns - 5].fn_idx;
+    let judge_trace_fn = judge_mod.functions[n_jfns - 3].fn_idx;
+    let judge_main = judge_mod.functions[n_jfns - 2].fn_idx;
+
+    let m4_u16 = if let Ok(raw) = std::fs::read("pure/m4/m4.omni_bc") {
+        decode_bytes_to_u16_stream(&raw)
+    } else {
+        with_lockstep_suspended(|| compile_omni_surface_to_u16(M4_VM_OMNI_SRC))?
+    };
+    let m4_mod = decode_omni_token_stream(&m4_u16)?;
+    let m4_run_fn = m4_mod.functions[m4_mod.functions.len() - 2].fn_idx;
+
+    let mut vm = OmniBinaryVm::with_budgets(50_000_000, 64 * 1024 * 1024);
+
+    let call_judge = |vm: &mut OmniBinaryVm, mode: i64, a: i64, b: i64, c: i64, d: i64, e: i64| -> Result<i64, String> {
+        match vm.execute_function(
+            &judge_mod,
+            judge_main,
+            vec![
+                OmniValue::Int(mode),
+                OmniValue::Int(a),
+                OmniValue::Int(b),
+                OmniValue::Int(c),
+                OmniValue::Int(d),
+                OmniValue::Int(e),
+            ],
+        )? {
+            OmniValue::Int(v) => Ok(v),
+            other => Err(format!("P7-0a judge mode={} returned {:?}", mode, other)),
+        }
+    };
+
+    let call_attr = |vm: &mut OmniBinaryVm, vm3: i64, vm2: i64, vm4: i64| -> Result<i64, String> {
+        match vm.execute_function(
+            &judge_mod,
+            judge_attr_fn,
+            vec![OmniValue::Int(vm3), OmniValue::Int(vm2), OmniValue::Int(vm4)],
+        )? {
+            OmniValue::Int(v) => Ok(v),
+            other => Err(format!("P7-0a p7_attr_entry returned {:?}", other)),
+        }
+    };
+
+    let call_5runs = |vm: &mut OmniBinaryVm, b: &[i64; 5], c: &[i64; 5], band: i64| -> Result<i64, String> {
+        match vm.execute_function(
+            &judge_mod,
+            judge_5runs_fn,
+            vec![
+                OmniValue::Int(b[0]), OmniValue::Int(c[0]),
+                OmniValue::Int(b[1]), OmniValue::Int(c[1]),
+                OmniValue::Int(b[2]), OmniValue::Int(c[2]),
+                OmniValue::Int(b[3]), OmniValue::Int(c[3]),
+                OmniValue::Int(b[4]), OmniValue::Int(c[4]),
+                OmniValue::Int(band),
+            ],
+        )? {
+            OmniValue::Int(v) => Ok(v),
+            other => Err(format!("P7-0a p7_judge_5runs_entry returned {:?}", other)),
+        }
+    };
+
+    // Check 1: Pure-Omni subsystem attribution bitmask & 5-run noisy consensus unit proof.
+    for &(vm3, vm2, vm4, want) in &[
+        (0i64, 0, 0, 0i64),  // NONE
+        (1, 0, 0, 1),        // M3_FRONTEND
+        (0, 1, 0, 2),        // M2_EMITTER
+        (0, -1, 0, 2),       // M2_EMITTER (regression also attributes to M2)
+        (0, 0, 1, 4),        // M4_VM
+        (1, 1, 0, 3),        // M3 + M2
+        (1, 1, 1, 7),        // M3 + M2 + M4
+    ] {
+        let got = call_attr(&mut vm, vm3, vm2, vm4)?;
+        if got != want {
+            return Err(format!("P7-0a p7_attribute_subsystem({},{},{}) got {} want {}", vm3, vm2, vm4, got, want));
+        }
+    }
+    // Noisy 5-run consensus: 4 improved runs + 1 noisy spike still resolves to +1t.
+    let noisy_better = call_5runs(&mut vm, &[100, 100, 100, 100, 100], &[80, 82, 115, 79, 81], 5)?;
+    // Noisy 5-run neutral: 1 positive glitch + 1 negative glitch + 3 inside-band resolves to 0t.
+    let noisy_neutral = call_5runs(&mut vm, &[100, 100, 100, 100, 100], &[102, 85, 99, 118, 100], 5)?;
+    if noisy_better != 1 || noisy_neutral != 0 {
+        return Err(format!("P7-0a 5-run consensus failed: noisy_better={} noisy_neutral={}", noisy_better, noisy_neutral));
+    }
+    checks += 1;
+
+    // Check 2: Collect 5 repeated baseline runs across the 5-benchmark corpus and verify
+    // zero variance on deterministic metrics + architectural opcode histogram signatures.
+    let mut base_runs: Vec<[P7BenchMetrics; 5]> = Vec::with_capacity(5);
+    let mut zero_loads_per_bench = [0i64; 5];
+    for (bi, &(bname, bsrc, bargs, want)) in P7_BENCHMARK_CORPUS.iter().enumerate() {
+        let mut arr: Vec<P7BenchMetrics> = Vec::with_capacity(5);
+        for _ in 0..5 {
+            let (m, _elf, zl) = p7_measure_program_with_opts(
+                &m4_mod, m4_run_fn, &judge_mod, judge_trace_fn, judge_hist_fn,
+                bname, bsrc, bargs, want, false,
+            )?;
+            zero_loads_per_bench[bi] = zl;
+            arr.push(m);
+        }
+        for r in 1..5 {
+            if arr[r].bc_words != arr[0].bc_words
+                || arr[r].elf_bytes != arr[0].elf_bytes
+                || arr[r].vm_steps != arr[0].vm_steps
+                || arr[r].trace_ops != arr[0].trace_ops
+                || arr[r].arena_bytes != arr[0].arena_bytes
+                || arr[r].hist_alu != arr[0].hist_alu
+                || arr[r].hist_mem != arr[0].hist_mem
+                || arr[r].hist_ctrl != arr[0].hist_ctrl
+                || arr[r].hist_call_ret != arr[0].hist_call_ret
+            {
+                return Err(format!("P7-0a non-deterministic baseline metric on {} run {}", bname, r));
+            }
+        }
+        base_runs.push(arr.try_into().unwrap());
+    }
+    // Verify architectural histogram signatures on the corpus:
+    //   bench_loop_sum (1) & bench_branch_tree (2) exercise control flow;
+    //   bench_multi_call (3) exercises CALL/RET;
+    //   bench_arena_buf (4) exercises Memory/Arena ops.
+    if base_runs[1][0].hist_ctrl <= 0
+        || base_runs[2][0].hist_ctrl <= 0
+        || base_runs[3][0].hist_call_ret < 2
+        || base_runs[4][0].hist_mem <= 0
+    {
+        return Err(format!(
+            "P7-0a histogram signature mismatch: loop.ctrl={} branch.ctrl={} call.cr={} arena.mem={}",
+            base_runs[1][0].hist_ctrl,
+            base_runs[2][0].hist_ctrl,
+            base_runs[3][0].hist_call_ret,
+            base_runs[4][0].hist_mem
+        ));
+    }
+    checks += 1;
+
+    // Check 3: Canary A — Predictable, verified M2 emitter tweak (`compact_zero_imm = true`).
+    // Must shrink ELF64 by the exact predicted `8 * zero_loads` bytes, execute identically on Linux,
+    // judge `+1t` (ADOPT) via 5-run Pure-Omni consensus, and attribute strictly to `M2_EMITTER` (2).
+    let mut canary_m3 = [0i64; 5];
+    let mut canary_m2 = [0i64; 5];
+    let mut canary_m4 = [0i64; 5];
+    let mut canary_bench_v = [0i64; 5];
+    let mut total_saved_bytes = 0i64;
+    let mut native_verified = false;
+    for (bi, &(bname, bsrc, bargs, want)) in P7_BENCHMARK_CORPUS.iter().enumerate() {
+        let mut b_bc = [0i64; 5];
+        let mut c_bc = [0i64; 5];
+        let mut b_elf = [0i64; 5];
+        let mut c_elf = [0i64; 5];
+        let mut b_steps = [0i64; 5];
+        let mut c_steps = [0i64; 5];
+        let mut b_arena = [0i64; 5];
+        let mut c_arena = [0i64; 5];
+        let mut canary_elf_once: Option<Vec<u8>> = None;
+        for r in 0..5 {
+            let (cm, celf, _zl) = p7_measure_program_with_opts(
+                &m4_mod, m4_run_fn, &judge_mod, judge_trace_fn, judge_hist_fn,
+                bname, bsrc, bargs, want, true,
+            )?;
+            let bm = &base_runs[bi][r];
+            let expected_delta = 8 * zero_loads_per_bench[bi];
+            if bm.elf_bytes - cm.elf_bytes != expected_delta {
+                return Err(format!(
+                    "P7-0a canary {} expected {}B reduction (8 * {}), got {}B ({} -> {})",
+                    bname, expected_delta, zero_loads_per_bench[bi],
+                    bm.elf_bytes - cm.elf_bytes, bm.elf_bytes, cm.elf_bytes
+                ));
+            }
+            // Histogram must be 100% identical (M4 VM did not move).
+            if bm.hist_alu != cm.hist_alu
+                || bm.hist_mem != cm.hist_mem
+                || bm.hist_ctrl != cm.hist_ctrl
+                || bm.hist_call_ret != cm.hist_call_ret
+            {
+                return Err(format!("P7-0a canary {} unexpectedly altered P4-5 trace histogram", bname));
+            }
+            b_bc[r] = bm.bc_words;
+            c_bc[r] = cm.bc_words;
+            b_elf[r] = bm.elf_bytes;
+            c_elf[r] = cm.elf_bytes;
+            b_steps[r] = bm.vm_steps;
+            c_steps[r] = cm.vm_steps;
+            b_arena[r] = bm.arena_bytes;
+            c_arena[r] = cm.arena_bytes;
+            if canary_elf_once.is_none() {
+                canary_elf_once = Some(celf);
+            }
+        }
+        if let Some(ref celf) = canary_elf_once {
+            if p7_verify_native_elf_i64(bname, celf, want)? {
+                native_verified = true;
+            }
+        }
+        total_saved_bytes += b_elf[0] - c_elf[0];
+        canary_m3[bi] = call_5runs(&mut vm, &b_bc, &c_bc, 0)?;
+        canary_m2[bi] = call_5runs(&mut vm, &b_elf, &c_elf, 0)?;
+        let v_steps = call_5runs(&mut vm, &b_steps, &c_steps, 0)?;
+        let v_arena = call_5runs(&mut vm, &b_arena, &c_arena, 0)?;
+        canary_m4[bi] = call_judge(&mut vm, 3, v_steps, v_arena, 0, 0, 0)?;
+        canary_bench_v[bi] = call_judge(&mut vm, 3, canary_m3[bi], canary_m2[bi], canary_m4[bi], 0, 0)?;
+    }
+    let suite_m3 = call_judge(&mut vm, 3, canary_m3[0], canary_m3[1], canary_m3[2], canary_m3[3], canary_m3[4])?;
+    let suite_m2 = call_judge(&mut vm, 3, canary_m2[0], canary_m2[1], canary_m2[2], canary_m2[3], canary_m2[4])?;
+    let suite_m4 = call_judge(&mut vm, 3, canary_m4[0], canary_m4[1], canary_m4[2], canary_m4[3], canary_m4[4])?;
+    let canary_suite = call_judge(&mut vm, 3, canary_bench_v[0], canary_bench_v[1], canary_bench_v[2], canary_bench_v[3], canary_bench_v[4])?;
+    let canary_adopt = call_judge(&mut vm, 4, 1, canary_suite, 0, 0, 0)?;
+    let canary_attr = call_attr(&mut vm, suite_m3, suite_m2, suite_m4)?;
+    if total_saved_bytes <= 0 || canary_suite != 1 || canary_adopt != 1 || canary_attr != 2 {
+        return Err(format!(
+            "P7-0a canary A gate failed: saved={}B suite={} adopt={} attr={} (m3={},m2={},m4={})",
+            total_saved_bytes, canary_suite, canary_adopt, canary_attr, suite_m3, suite_m2, suite_m4
+        ));
+    }
+    checks += 1;
+
+    // Check 4: Canary B — Deliberately neutral change (comment/whitespace-only source change,
+    // baseline emitter) across 5 repeated runs -> judged `0t` (HOLD) and attributed to `NONE` (0).
+    let mut neut_m3 = [0i64; 5];
+    let mut neut_m2 = [0i64; 5];
+    let mut neut_m4 = [0i64; 5];
+    let mut neut_bench_v = [0i64; 5];
+    for (bi, &(bname, bsrc, bargs, want)) in P7_BENCHMARK_CORPUS.iter().enumerate() {
+        let neutral_src = format!("// P7-0a neutral comment\n{}\n", bsrc);
+        let mut b_bc = [0i64; 5];
+        let mut c_bc = [0i64; 5];
+        let mut b_elf = [0i64; 5];
+        let mut c_elf = [0i64; 5];
+        let mut b_steps = [0i64; 5];
+        let mut c_steps = [0i64; 5];
+        let mut b_arena = [0i64; 5];
+        let mut c_arena = [0i64; 5];
+        for r in 0..5 {
+            let (nm, _nelf, _zl) = p7_measure_program_with_opts(
+                &m4_mod, m4_run_fn, &judge_mod, judge_trace_fn, judge_hist_fn,
+                bname, &neutral_src, bargs, want, false,
+            )?;
+            let bm = &base_runs[bi][r];
+            b_bc[r] = bm.bc_words;
+            c_bc[r] = nm.bc_words;
+            b_elf[r] = bm.elf_bytes;
+            c_elf[r] = nm.elf_bytes;
+            b_steps[r] = bm.vm_steps;
+            c_steps[r] = nm.vm_steps;
+            b_arena[r] = bm.arena_bytes;
+            c_arena[r] = nm.arena_bytes;
+        }
+        neut_m3[bi] = call_5runs(&mut vm, &b_bc, &c_bc, 0)?;
+        neut_m2[bi] = call_5runs(&mut vm, &b_elf, &c_elf, 0)?;
+        let v_steps = call_5runs(&mut vm, &b_steps, &c_steps, 0)?;
+        let v_arena = call_5runs(&mut vm, &b_arena, &c_arena, 0)?;
+        neut_m4[bi] = call_judge(&mut vm, 3, v_steps, v_arena, 0, 0, 0)?;
+        neut_bench_v[bi] = call_judge(&mut vm, 3, neut_m3[bi], neut_m2[bi], neut_m4[bi], 0, 0)?;
+    }
+    let nm3 = call_judge(&mut vm, 3, neut_m3[0], neut_m3[1], neut_m3[2], neut_m3[3], neut_m3[4])?;
+    let nm2 = call_judge(&mut vm, 3, neut_m2[0], neut_m2[1], neut_m2[2], neut_m2[3], neut_m2[4])?;
+    let nm4 = call_judge(&mut vm, 3, neut_m4[0], neut_m4[1], neut_m4[2], neut_m4[3], neut_m4[4])?;
+    let neutral_suite = call_judge(&mut vm, 3, neut_bench_v[0], neut_bench_v[1], neut_bench_v[2], neut_bench_v[3], neut_bench_v[4])?;
+    let neutral_adopt = call_judge(&mut vm, 4, 1, neutral_suite, 0, 0, 0)?;
+    let neutral_attr = call_attr(&mut vm, nm3, nm2, nm4)?;
+    if neutral_suite != 0 || neutral_adopt != 0 || neutral_attr != 0 {
+        return Err(format!(
+            "P7-0a canary B (neutral) gate failed: suite={} adopt={} attr={}",
+            neutral_suite, neutral_adopt, neutral_attr
+        ));
+    }
+    checks += 1;
+
+    // Check 5: Attribution discrimination — an algorithmic/source change (`bench_loop_sum` closed form)
+    // moves M3 + M2 + M4 together (attr = 7) AND drops `hist_ctrl` to 0, clearly distinct from a pure
+    // M2 emitter move (attr = 2, histogram unchanged).
+    let closed_src = "#[strict]\nfn main(n: i64) -> i64 {\n    return (n * (n + 1)) / 2;\n}\n";
+    let (closed_m, _celf, _zl) = p7_measure_program_with_opts(
+        &m4_mod, m4_run_fn, &judge_mod, judge_trace_fn, judge_hist_fn,
+        "bench_loop_sum_closed", closed_src, [100, 0, 0], 5050, false,
+    )?;
+    let bm1 = &base_runs[1][0];
+    let dm3 = call_judge(&mut vm, 0, bm1.bc_words, closed_m.bc_words, 0, 0, 0)?;
+    let dm2 = call_judge(&mut vm, 0, bm1.elf_bytes, closed_m.elf_bytes, 0, 0, 0)?;
+    let dm4 = call_judge(&mut vm, 0, bm1.vm_steps, closed_m.vm_steps, 0, 0, 0)?;
+    let closed_attr = call_attr(&mut vm, dm3, dm2, dm4)?;
+    if closed_attr != 7 || closed_m.hist_ctrl != 0 || bm1.hist_ctrl <= 0 {
+        return Err(format!(
+            "P7-0a attribution discrimination failed: attr={} (want 7), base.ctrl={} closed.ctrl={}",
+            closed_attr, bm1.hist_ctrl, closed_m.hist_ctrl
+        ));
+    }
+    checks += 1;
+
+    // Check 6: Frozen hashes untouched.
+    selftest_m2_frozen_hashes()?;
+    checks += 1;
+
+    Ok((checks, total_saved_bytes, canary_attr, neutral_attr, native_verified))
 }
 

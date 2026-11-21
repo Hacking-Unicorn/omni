@@ -44,6 +44,28 @@ fn p7_dispatch_hi(mode: i64, a: i64, b: i64, c: i64, d: i64, e: i64) -> i64 {
 }
 
 #[strict]
+fn p7_attr_entry(vm3: i64, vm2: i64, vm4: i64) -> i64 {
+    return p7_attribute_subsystem(p7_i64_to_trit(vm3), p7_i64_to_trit(vm2), p7_i64_to_trit(vm4));
+}
+
+#[strict]
+fn p7_judge_5runs_entry(
+    b0: i64, c0: i64,
+    b1: i64, c1: i64,
+    b2: i64, c2: i64,
+    b3: i64, c3: i64,
+    b4: i64, c4: i64,
+    band: i64
+) -> i64 {
+    return p7_trit_to_i64(p7_judge_5runs(b0, c0, b1, c1, b2, c2, b3, c3, b4, c4, band));
+}
+
+#[strict]
+fn p7_trace_hist_entry(w: bytes) -> i64 {
+    return p7_trace_histogram(w);
+}
+
+#[strict]
 fn p7_judge_metrics_entry(
     base_bc: i64, cand_bc: i64, band_bc: i64,
     base_elf: i64, cand_elf: i64, band_elf: i64,

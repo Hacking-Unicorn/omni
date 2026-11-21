@@ -201,3 +201,92 @@ fn p7_verify_trace_ring(w: bytes) -> i64 {
     };
     return res;
 }
+
+// ==============================================================================
+// P7-0a — MULTI-RUN CONSENSUS, SUBSYSTEM ATTRIBUTION & TRACE-RING HISTOGRAM
+// ==============================================================================
+
+// Subsystem attribution bitmask from balanced-ternary per-subsystem verdicts:
+//   bit 0 (1): M3_FRONTEND moved (v_m3 != 0t)
+//   bit 1 (2): M2_EMITTER  moved (v_m2 != 0t)
+//   bit 2 (4): M4_VM       moved (v_m4 != 0t)
+//   0 = NONE (neutral), 2 = pure M2_EMITTER, 4 = pure M4_VM, 7 = M3+M2+M4.
+#[strict]
+fn p7_attribute_subsystem(v_m3: trit, v_m2: trit, v_m4: trit) -> i64 {
+    let b_m3: i64 = sel_trit(v_m3, 1, 0, 1);
+    let b_m2: i64 = sel_trit(v_m2, 2, 0, 2);
+    let b_m4: i64 = sel_trit(v_m4, 4, 0, 4);
+    return b_m3 | b_m2 | b_m4;
+}
+
+// 5-run paired consensus comparison (lower-is-better with division-free noise band):
+// Evaluates p7_cmp_band on each of 5 repeated runs and collapses via p7_vote5.
+#[strict]
+fn p7_judge_5runs(
+    b0: i64, c0: i64,
+    b1: i64, c1: i64,
+    b2: i64, c2: i64,
+    b3: i64, c3: i64,
+    b4: i64, c4: i64,
+    band: i64
+) -> trit {
+    let t0: trit = p7_cmp_band(b0, c0, band);
+    let t1: trit = p7_cmp_band(b1, c1, band);
+    let t2: trit = p7_cmp_band(b2, c2, band);
+    let t3: trit = p7_cmp_band(b3, c3, band);
+    let t4: trit = p7_cmp_band(b4, c4, band);
+    return p7_vote5(t0, t1, t2, t3, t4);
+}
+
+// Classify a 16-bit Omni opcode token (`0x7F00..=0x7F7F`) into 4 architectural buckets:
+//   0 = ALU / Data / Ternary
+//   1 = Memory / Arena (`ANEW`=13, `IGET/LD`=14, `ISET/ST`=15, `SLEN/LEN`=80)
+//   2 = Control Flow (`LABEL`=64, `JMP`=65, `BR_TRIT`=66, `BR_POS`=67, `BR_NEG`=68)
+//   3 = Call / Return (`CALL`=72, `RET`=74)
+#[strict]
+fn p7_op_class(op_tok: i64) -> i64 {
+    let idx: i64 = op_tok - 32512;
+    let is_mem_lo: i64 = sel_trit(idx <=> 13, 0, 1, 1);
+    let is_mem_hi: i64 = sel_trit(idx <=> 15, 1, 1, 0);
+    let is_slen: i64 = sel_trit(idx <=> 80, 0, 1, 0);
+    let is_mem: i64 = (is_mem_lo * is_mem_hi) | is_slen;
+
+    let is_ctrl_lo: i64 = sel_trit(idx <=> 64, 0, 1, 1);
+    let is_ctrl_hi: i64 = sel_trit(idx <=> 68, 1, 1, 0);
+    let is_ctrl: i64 = is_ctrl_lo * is_ctrl_hi;
+
+    let is_call: i64 = sel_trit(idx <=> 72, 0, 1, 0);
+    let is_ret: i64 = sel_trit(idx <=> 74, 0, 1, 0);
+    let is_cr: i64 = is_call | is_ret;
+
+    return is_mem + is_ctrl * 2 + is_cr * 3;
+}
+
+// P4-5 trace-ring 4-class opcode histogram (Pure-Omni):
+// Reads `0x70000..0x7FFFF` from the 512 KiB M4 VM arena (`w`) and packs 4 x 16-bit
+// bucket counts into one i64: `(call_ret << 48) | (ctrl << 32) | (mem << 16) | alu`.
+#[strict]
+fn p7_trace_histogram(w: bytes) -> i64 {
+    let trace_cnt: i64 = ld_u32(w, 167960);
+    let cap: i64 = imin(trace_cnt, 4096);
+    let i: i64 = 0;
+    let c_alu: i64 = 0;
+    let c_mem: i64 = 0;
+    let c_ctrl: i64 = 0;
+    let c_cr: i64 = 0;
+    while i < cap {
+        let off: i64 = 458752 + i * 16;
+        let op_tok: i64 = ld_u16(w, off + 6);
+        let cls: i64 = p7_op_class(op_tok);
+        let is0: i64 = sel_trit(cls <=> 0, 0, 1, 0);
+        let is1: i64 = sel_trit(cls <=> 1, 0, 1, 0);
+        let is2: i64 = sel_trit(cls <=> 2, 0, 1, 0);
+        let is3: i64 = sel_trit(cls <=> 3, 0, 1, 0);
+        c_alu = c_alu + is0;
+        c_mem = c_mem + is1;
+        c_ctrl = c_ctrl + is2;
+        c_cr = c_cr + is3;
+        i = i + 1;
+    }
+    return (c_cr << 48) | (c_ctrl << 32) | (c_mem << 16) | c_alu;
+}

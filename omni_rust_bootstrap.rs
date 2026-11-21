@@ -18127,6 +18127,18 @@ pub fn compile_pure_u16_to_x86_64_elf_multi(
     arg1: i64,
     arg2: i64,
 ) -> Result<Vec<u8>, String> {
+    compile_pure_u16_to_x86_64_elf_multi_opts(stream, arg0, arg1, arg2, false)
+}
+
+/// Multi-function x86-64 ELF64 AOT compiler with explicit emitter flags
+/// (`compact_zero_imm`: emit 2-byte `xor eax,eax`/`xor ecx,ecx` instead of 10-byte `mov reg, 0`).
+pub fn compile_pure_u16_to_x86_64_elf_multi_opts(
+    stream: &[u16],
+    arg0: i64,
+    arg1: i64,
+    arg2: i64,
+    compact_zero_imm: bool,
+) -> Result<Vec<u8>, String> {
     let module = decode_omni_token_stream(stream)?;
     verify_module_for_multi_aot(&module)?;
     for func in &module.functions {
@@ -18285,6 +18297,9 @@ pub fn compile_pure_u16_to_x86_64_elf_multi(
                 let disp: i32 = -8 * (((r_tok - REG_BASE) as i32) + 1);
                 c.extend_from_slice(&[0x48, 0x8B, if into_rcx { 0x8D } else { 0x85 }]);
                 c.extend_from_slice(&disp.to_le_bytes());
+            }
+            BinOperand::ImmInt(0) | BinOperand::ImmTrit(0) if compact_zero_imm => {
+                c.extend_from_slice(&[0x31, if into_rcx { 0xC9 } else { 0xC0 }]);
             }
             BinOperand::ImmInt(v) => {
                 c.extend_from_slice(&[0x48, if into_rcx { 0xB9 } else { 0xB8 }]);
@@ -23304,6 +23319,7 @@ pub fn run_m2_foundation_selftests() -> Result<usize, String> {
     n += selftest_p4_4_wasm_host()?;
     n += selftest_p5_2_zero_shim_sys()?.0;
     n += selftest_p7_0_measure()?.0;
+    n += selftest_p7_0a_canary()?.0;
     Ok(n)
 }
 
@@ -23675,8 +23691,9 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
             Ok((n, metrics, packed_better)) => {
                 for m in &metrics {
                     println!(
-                        "  [P7-BENCH] {:<18} ret={:<5} bc={}w elf={}B steps={} trace={} arena={}B compile={}us",
-                        m.name, m.ret_val, m.bc_words, m.elf_bytes, m.vm_steps, m.trace_ops, m.arena_bytes, m.compile_us
+                        "  [P7-BENCH] {:<18} ret={:<5} bc={}w elf={}B steps={} trace={} arena={}B hist(alu/mem/ctrl/cr)={}/{}/{}/{} fe={}us emit={}us vm={}us",
+                        m.name, m.ret_val, m.bc_words, m.elf_bytes, m.vm_steps, m.trace_ops, m.arena_bytes,
+                        m.hist_alu, m.hist_mem, m.hist_ctrl, m.hist_call_ret, m.compile_us, m.emit_us, m.vm_us
                     );
                 }
                 println!(
@@ -23687,6 +23704,20 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
             }
             Err(e) => {
                 eprintln!("[P7-MEASURE FAIL] {}", e);
+                1
+            }
+        },
+        "p7-canary" => match selftest_p7_0a_canary() {
+            Ok((n, saved_bytes, canary_attr, neutral_attr, native)) => {
+                println!(
+                    "[P7-CANARY PASS] {} checks | 5-run consensus: canary=+1t (ADOPT, saved={}B, attr={} [M2_EMITTER]) | neutral=0t (HOLD, attr={} [NONE]) | native={} | frozen hashes intact",
+                    n, saved_bytes, canary_attr, neutral_attr,
+                    if native { "VERIFIED" } else { "SKIPPED on non-Linux-x86-64" }
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("[P7-CANARY FAIL] {}", e);
                 1
             }
         },
@@ -24164,6 +24195,7 @@ fn main() {
                 println!("  p4-vm | p4-shim | p4-wasm | p4-exec <file.omni_bc> [a0] [a1] [a2] [--trace]");
                 println!("  p5-sys | p5-selfhost [--write-seed]");
                 println!("  p7-measure                        Phase 7 (P7-0) benchmark corpus, P4-5 trace ring & ternary verdict gate");
+                println!("  p7-canary                         Phase 7 (P7-0a) 5-run consensus, subsystem attribution & M2 emitter canary gate");
                 println!();
                 println!("Compilation, Execution & Tooling:");
                 println!("  run <file.omni|file.omni_bc> [args...]   Compile/verify and execute on VM");
@@ -24191,7 +24223,7 @@ fn main() {
             "harness" | "--harness" => {
                 std::process::exit(run_omni_harness_cli(&cli_args[2..]));
             }
-            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" => {
+            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" => {
                 std::process::exit(run_m2_cli(&cli_args[1..]));
             }
             "agent-driver" | "--agent-driver" => {
