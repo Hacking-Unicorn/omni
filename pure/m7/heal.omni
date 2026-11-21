@@ -1,0 +1,118 @@
+// ==============================================================================
+// OMNI PHASE 7 (P7-1) — PURE-OMNI SELF-HEALING ENGINE
+// `pure/m7/heal.omni`
+// ==============================================================================
+//
+// Components:
+//   1. Balanced-ternary failure taxonomy (`p7_classify_failure`):
+//        0t = OK (err_code == 0)
+//       +1t = HEALABLE (1=DECODE_CORRUPT, 2=VERIFY_REJECT, 3=RUNTIME_TRAP,
+//                       4=OUTPUT_MISMATCH, 5=GATE_REGRESS)
+//       -1t = FATAL (10=VERIFIER_TAMPER, 11=CAP_VIOLATION, 12=FROZEN_HASH_DRIFT,
+//                    13=ROLLBACK_CORRUPT, or any unknown/negative code -> fail-closed)
+//   2. Bounded N-attempt repair state machine (`p7_heal_decide`):
+//        0 = ACTION_PASS
+//        1 = ACTION_ROLLBACK_AND_RETRY
+//        2 = ACTION_ROLLBACK_FINAL (bounded attempt budget exhausted -> keep verified rollback)
+//        3 = ACTION_FATAL_ABORT (never retry fatal fault or corrupt rollback target)
+//   3. Binary healing log in trace buffer (`p7_heal_log_push`, `p7_heal_log_verify`):
+//        4 KiB buffer: [0..4]=count, [4..8]=status, [16 + i*16 .. +16] =
+//        [attempt:u32, err_code:u32, action:u32, hash_lo32:u32] (max 255 entries).
+//
+// Invariants: `#[strict]`, zero recursion, zero ANEW, zero IDIV/IMOD, zero PACK5,
+// `<= 12` labels and `<= 120` SSA per function (`m2-lint` clean).
+// ==============================================================================
+
+// Convert a trit `{-1t, 0t, +1t}` to an `i64` `{-1, 0, +1}` branchlessly.
+#[strict]
+fn p7h_trit_to_i64(t: trit) -> i64 {
+    return sel_trit(t, -1, 0, 1);
+}
+
+// Balanced-ternary failure taxonomy (fail-closed):
+//   err_code == 0      ->  0t (OK)
+//   1 <= err_code <= 5 -> +1t (HEALABLE)
+//   otherwise          -> -1t (FATAL: verifier tamper, cap violation, frozen drift,
+//                              corrupt rollback, or unknown error code)
+#[strict]
+fn p7_classify_failure(err_code: i64) -> trit {
+    let is_ok: i64 = sel_trit(err_code <=> 0, 0, 1, 0);
+    let ge1: i64 = sel_trit(err_code <=> 1, 0, 1, 1);
+    let le5: i64 = sel_trit(err_code <=> 5, 1, 1, 0);
+    let is_heal: i64 = ge1 * le5;
+    let is_fatal: i64 = 1 - is_ok - is_heal;
+    return (is_heal - is_fatal) <=> 0;
+}
+
+// Bounded N-attempt self-healing decision function:
+//   - err_code == 0                         -> 0 (ACTION_PASS)
+//   - fatal (-1t) OR rollback_hash_ok == 0  -> 3 (ACTION_FATAL_ABORT)
+//   - healable (+1t) & attempt < max_att    -> 1 (ACTION_ROLLBACK_AND_RETRY)
+//   - healable (+1t) & attempt >= max_att   -> 2 (ACTION_ROLLBACK_FINAL)
+#[strict]
+fn p7_heal_decide(err_code: i64, attempt: i64, max_attempts: i64, rollback_hash_ok: i64) -> i64 {
+    let cls: trit = p7_classify_failure(err_code);
+    let is_ok: i64 = sel_trit(cls, 0, 1, 0);
+    let is_heal: i64 = sel_trit(cls, 0, 0, 1);
+    let rb_ok: i64 = sel_trit(rollback_hash_ok <=> 0, 0, 0, 1);
+    let has_budget: i64 = sel_trit(attempt <=> max_attempts, 1, 0, 0);
+    let do_retry: i64 = is_heal * rb_ok * has_budget;
+    let do_final: i64 = is_heal * rb_ok * (1 - has_budget);
+    let do_abort: i64 = 1 - is_ok - do_retry - do_final;
+    return do_retry + do_final * 2 + do_abort * 3;
+}
+
+// Append one 16-byte healing record into the 4 KiB healing log buffer `log`:
+//   Header: [0..4]=count (u32), [4..8]=last_action (u32)
+//   Record i (i < 255) at `16 + i * 16`: [attempt:u32, err_code:u32, action:u32, hash_lo32:u32].
+#[strict]
+fn p7_heal_log_push(log: bytes, attempt: i64, err_code: i64, action: i64, hash_lo32: i64) -> bytes {
+    let cnt: i64 = ld_u32(log, 0);
+    let can_write: trit = (255 - cnt) <=> 0;
+    let out: bytes = if_pos can_write {
+        let off: i64 = 16 + cnt * 16;
+        let w1: bytes = st_u32(log, off, attempt);
+        let w2: bytes = st_u32(w1, off + 4, err_code);
+        let w3: bytes = st_u32(w2, off + 8, action);
+        let w4: bytes = st_u32(w3, off + 12, hash_lo32);
+        let w5: bytes = st_u32(w4, 0, cnt + 1);
+        st_u32(w5, 4, action)
+    } else {
+        log
+    };
+    return out;
+}
+
+// Verify integrity of the binary healing log buffer `log`:
+//   - Checks `count <= 255`
+//   - Checks monotonic `attempt` (`attempt_i >= prev_attempt`) and valid `action` (`0..=3`)
+//   - Returns `-1` on corruption, or `(count << 32) | checksum_lo32` when valid.
+#[strict]
+fn p7_heal_log_verify(log: bytes) -> i64 {
+    let cnt: i64 = ld_u32(log, 0);
+    let ok_cnt: i64 = sel_trit(cnt <=> 255, 1, 1, 0);
+    let i: i64 = 0;
+    let prev_att: i64 = -1;
+    let ok: i64 = ok_cnt;
+    let csum: i64 = 0;
+    let cap: i64 = imin(cnt, 255);
+    while i < cap {
+        let off: i64 = 16 + i * 16;
+        let att: i64 = ld_u32(log, off);
+        let err: i64 = ld_u32(log, off + 4);
+        let act: i64 = ld_u32(log, off + 8);
+        let hlo: i64 = ld_u32(log, off + 12);
+        let mono: i64 = sel_trit(att <=> prev_att, 0, 1, 1);
+        let act_ok: i64 = sel_trit(act <=> 3, 1, 1, 0);
+        ok = ok * mono * act_ok;
+        prev_att = att;
+        csum = (csum + att + err * 7 + act * 31 + (hlo & 65535)) & 2147483647;
+        i = i + 1;
+    }
+    let res: i64 = if_pos ok <=> 0 {
+        (cnt << 32) | csum
+    } else {
+        -1
+    };
+    return res;
+}

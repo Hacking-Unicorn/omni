@@ -1,0 +1,27 @@
+// Phase 7 (P7-1) harness for `pure/m7/heal.omni`.
+// Exposes entry points for differential testing & M2-multi AOT compliance (main <= 4 params).
+
+#[strict]
+fn p7_heal_classify_entry(err_code: i64) -> i64 {
+    return p7h_trit_to_i64(p7_classify_failure(err_code));
+}
+
+#[strict]
+fn p7_heal_decide_entry(err_code: i64, attempt: i64, max_attempts: i64, rollback_hash_ok: i64) -> i64 {
+    return p7_heal_decide(err_code, attempt, max_attempts, rollback_hash_ok);
+}
+
+#[strict]
+fn p7_heal_log_push_entry(log: bytes, attempt: i64, err_code: i64, action: i64, hash_lo32: i64) -> bytes {
+    return p7_heal_log_push(log, attempt, err_code, action, hash_lo32);
+}
+
+#[strict]
+fn p7_heal_log_verify_entry(log: bytes) -> i64 {
+    return p7_heal_log_verify(log);
+}
+
+#[strict]
+fn main(err_code: i64, attempt: i64, max_attempts: i64, rollback_hash_ok: i64) -> i64 {
+    return p7_heal_decide(err_code, attempt, max_attempts, rollback_hash_ok);
+}

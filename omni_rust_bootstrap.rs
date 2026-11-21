@@ -23361,6 +23361,7 @@ pub fn run_m2_foundation_selftests() -> Result<usize, String> {
     n += selftest_p5_2_zero_shim_sys()?.0;
     n += selftest_p7_0_measure()?.0;
     n += selftest_p7_0a_canary()?.0;
+    n += selftest_p7_1_self_heal()?.0;
     Ok(n)
 }
 
@@ -23759,6 +23760,19 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
             }
             Err(e) => {
                 eprintln!("[P7-CANARY FAIL] {}", e);
+                1
+            }
+        },
+        "p7-heal" => match selftest_p7_1_self_heal() {
+            Ok((n, rb_hash, log_entries)) => {
+                println!(
+                    "[P7-HEAL PASS] {} checks | fault-injected corrupt stream -> rollback FNV-1a64=0x{:016X} -> re-emit PASS ({} log entries) | bounded N=3 cap + fatal fail-closed + frozen hashes intact",
+                    n, rb_hash, log_entries
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("[P7-HEAL FAIL] {}", e);
                 1
             }
         },
@@ -24237,6 +24251,7 @@ fn main() {
                 println!("  p5-sys | p5-selfhost [--write-seed]");
                 println!("  p7-measure                        Phase 7 (P7-0) benchmark corpus, P4-5 trace ring & ternary verdict gate");
                 println!("  p7-canary                         Phase 7 (P7-0a) 5-run consensus, subsystem attribution & M2 emitter canary gate");
+                println!("  p7-heal                           Phase 7 (P7-1) self-healing taxonomy, FNV-1a64 rollback, bounded repair & fault-injection gate");
                 println!();
                 println!("Compilation, Execution & Tooling:");
                 println!("  run <file.omni|file.omni_bc> [args...]   Compile/verify and execute on VM");
@@ -24264,7 +24279,7 @@ fn main() {
             "harness" | "--harness" => {
                 std::process::exit(run_omni_harness_cli(&cli_args[2..]));
             }
-            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" => {
+            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" | "p7-heal" => {
                 std::process::exit(run_m2_cli(&cli_args[1..]));
             }
             "agent-driver" | "--agent-driver" => {

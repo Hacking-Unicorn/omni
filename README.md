@@ -35,6 +35,7 @@ These limits are intentional invariants (`HANDOFF.md` §2):
 | `pure/m4/*.omni` (`arena`, `ops_core`, `vm`) | 962 | Phase 4/7 AI-native Pure-Omni deterministic token-stream VM (`P4-1..P4-5` + Phase 7 hot-path tuning: O(1) pre-indexed label cache in `0x20000..0x23FFF`, guarded opcode-family dispatch, `LABEL`/`NOP` fast path, single `m2d_ins_scan` per step): executes raw `.omni_bc` directly in a 512 KiB flat arena (64-deep call stack, 224 slots/frame, fuel cap, ISA-B byte buffers, built-in 64 KiB binary trace ring `0x70000..0x7FFFF`), backed by a minimal 3-op thin shim (`p4_shim/mod.rs`: `read_bytes`/`write_bytes`/`spawn`) and running on M2-10 Wasm-multi (`p4-vm`, `p4-exec`, `p4-shim`, `p4-wasm`). Deterministic seed `pure/m4/m4.omni_bc` (`26,076` words, `0x00299F8C0BB3F88A`) compiles via Pure-Omni M3 (`0`-word diff) and lowers via Pure-Omni M2 to `78,020`-B ELF64 (`0xF66A7081E2B43319`, `0`-byte diff; `p5-selfhost`). |
 | `pure/m5/elf_sys.omni` | 73 | Phase 5 zero-shim Linux x86-64 syscall emitter (`P5-2`): emits raw `0F 05` syscalls (`sys_read`, `sys_write`, `sys_exit`) + `_start` stack-arena entry stub into a standalone `177`-byte Linux x86-64 ELF64 binary with zero Rust, zero C, and zero shim (`p5-sys`). |
 | `pure/m7/judge.omni` | 292 | Phase 7 (`P7-0`/`P7-0a`) balanced-ternary measurement decision layer: noise-band thresholding without division (`p7_cmp_band`), 3/5-run ternary consensus (`tmaj`, `p7_judge_5runs`), subsystem attribution (`p7_attribute_subsystem`), written adopt/reject & no-regression rules, `@PACK5` radix-3 verdict packing/unpacking, and Pure-Omni P4-5 trace-ring verification & 4-class opcode histograms (`p7-measure`, `p7-canary`). |
+| `pure/m7/heal.omni` | 118 | Phase 7 (`P7-1`) Pure-Omni self-healing engine: balanced-ternary failure taxonomy (`p7_classify_failure`: `+1t` healable / `0t` OK / `-1t` fatal fail-closed), bounded N-attempt repair state machine (`p7_heal_decide`), content-addressed FNV-1a64 rollback integrity verification, and 16-B binary healing log writer/verifier (`p7_heal_log_push`/`p7_heal_log_verify`; `p7-heal`). |
 | `std/*.omni` (7) + `pure/programs/*.omni` (6) | 518 | Standard library helpers and small production-style programs, served directly from disk via `include_str!` (`M3-16`). |
 | `pure/compiler.omni`, `pure/verifier.omni`, `pure/host_runtime.omni`, `pure/tooling.omni`, `pure/selfhost_suite.omni` | 402 | Legacy Phase 7/A–D integer decision kernels (frozen for regression hashes; not the M2/M3 compilers). |
 
@@ -80,9 +81,10 @@ All 5 frozen artifacts are asserted by FNV-1a64 hash and exact size in `selftest
 
 ```bash
 rustc -O omni_rust_bootstrap.rs -o omnic
-./omnic selftest              # 1,403 checks on Windows / 1,519 on Linux x86-64 (13AY diff4, 13AZ KV, 13BA ISA table, 13BF hash pin, M2/M3/P4/P5/P7 locks)
+./omnic selftest              # 1,409 checks on Windows / 1,525 on Linux x86-64 (13AY diff4, 13AZ KV, 13BA ISA table, 13BF hash pin, M2/M3/P4/P5/P7 locks)
 ./omnic p7-measure            # Phase 7 (P7-0): 5-benchmark corpus + P4-5 trace ring + pure/m7/judge.omni ternary (+1t/0t/-1t) + @PACK5 verdict gate
 ./omnic p7-canary             # Phase 7 (P7-0a): 5-run consensus + subsystem attribution (M3/M2/M4) + M2 emitter canary (+1t) & neutral (0t) gate
+./omnic p7-heal               # Phase 7 (P7-1): self-healing taxonomy, FNV-1a64 rollback, bounded N-attempt repair & fault-injection gate
 ./omnic p5-selfhost           # Phase 5 full zero-Rust chain: M3->pure/m4/m4.omni_bc (26,076w)->M2 ELF64 (78,020 B) + M3->M4/M2 loop
 ./omnic p5-sys                # Phase 5 zero-shim Linux x86-64 ELF64 (177 B, raw 0F 05 sys_read/sys_write/sys_exit; native exec on Linux)
 ./omnic p4-vm                 # Phase 4 Pure-Omni token-stream VM == Rust OmniBinaryVm (11/11 checks incl. P4-5 trace ring)

@@ -80,6 +80,12 @@ pub const P7_JUDGE_OMNI_SRC: &str = concat!(
     include_str!("../spec/m7/judge_harness.omni"),
 );
 
+pub const P7_HEAL_OMNI_SRC: &str = concat!(
+    include_str!("../pure/m7/heal.omni"),
+    "\n",
+    include_str!("../spec/m7/heal_harness.omni"),
+);
+
 pub const M5_SYS_OMNI_SRC: &str = concat!(
     include_str!("../pure/m2/util.omni"),
     "\n",
@@ -3813,5 +3819,315 @@ pub fn selftest_p7_0a_canary() -> Result<(usize, i64, i64, i64, bool), String> {
     checks += 1;
 
     Ok((checks, prod_saved_bytes, canary_attr, neutral_attr, native_verified))
+}
+
+// ==============================================================================
+// PHASE 7 (P7-1): SELF-HEALING — FAILURE TAXONOMY, CONTENT-ADDRESSED ROLLBACK,
+// BOUNDED REPAIR LOOP, BINARY HEALING LOG & FAULT-INJECTION GATE
+// ==============================================================================
+
+#[derive(Clone, Debug)]
+pub struct P7RollbackTarget {
+    pub stream: Vec<u16>,
+    pub content_hash: u64,
+}
+
+impl P7RollbackTarget {
+    pub fn from_passing_stream(stream: Vec<u16>) -> Self {
+        let content_hash = fnv1a_64_hash(&encode_u16_stream_to_bytes(&stream));
+        Self { stream, content_hash }
+    }
+
+    pub fn verify_integrity(&self) -> bool {
+        fnv1a_64_hash(&encode_u16_stream_to_bytes(&self.stream)) == self.content_hash
+    }
+}
+
+/// Evaluates a candidate `.omni_bc` token stream against decode, static verifier,
+/// M2-multi ELF64 lowering, and Pure-Omni M4 VM execution.
+/// Returns `0` (OK) or a P7-1 taxonomy code (`1`=DECODE_CORRUPT, `2`=VERIFY_REJECT,
+/// `3`=RUNTIME_TRAP, `4`=OUTPUT_MISMATCH).
+fn p7_validate_candidate_stream(
+    m4_mod: &BinModule,
+    m4_run_fn: u16,
+    stream: &[u16],
+    args: [i64; 3],
+    expected_val: i64,
+) -> i64 {
+    let decoded = match decode_omni_token_stream(stream) {
+        Ok(m) => m,
+        Err(_) => return 1, // DECODE_CORRUPT
+    };
+    if decoded.functions.is_empty() {
+        return 1;
+    }
+    for f in &decoded.functions {
+        if !verify_binary_function(f).passed {
+            return 2; // VERIFY_REJECT
+        }
+    }
+    if compile_pure_u16_to_x86_64_elf_multi(stream, args[0], args[1], args[2]).is_err() {
+        return 2; // VERIFY_REJECT / AOT-ineligible
+    }
+    let mut vm = OmniBinaryVm::with_budgets(50_000_000, 64 * 1024 * 1024);
+    let arena_out = match vm.execute_function(
+        m4_mod,
+        m4_run_fn,
+        vec![
+            OmniValue::Bytes(vec![0u8; 524_288]),
+            OmniValue::U16Array(stream.to_vec()),
+            OmniValue::Int(args[0]),
+            OmniValue::Int(args[1]),
+            OmniValue::Int(args[2]),
+            OmniValue::Int(200_000),
+            OmniValue::Int(1),
+        ],
+    ) {
+        Ok(OmniValue::Bytes(b)) if b.len() == 524_288 => b,
+        _ => return 3, // RUNTIME_TRAP
+    };
+    let st = 167_936usize;
+    let err_code = u32::from_le_bytes(arena_out[st + 28..st + 32].try_into().unwrap());
+    let ret_val = i64::from_le_bytes(arena_out[st + 32..st + 40].try_into().unwrap());
+    if err_code != 0 {
+        return 3; // RUNTIME_TRAP
+    }
+    if ret_val != expected_val {
+        return 4; // OUTPUT_MISMATCH
+    }
+    0 // OK
+}
+
+/// P7-1 Hard Gate (`omnic p7-heal`):
+///   1. `pure/m7/heal.omni` compiles via M2-multi to valid x86-64 ELF64.
+///   2. Pure-Omni failure taxonomy (`+1t` healable, `0t` OK, `-1t` fatal) and bounded repair
+///      decision table (`0`=PASS, `1`=ROLLBACK_AND_RETRY, `2`=ROLLBACK_FINAL, `3`=FATAL_ABORT).
+///   3. Fault Injection #1 (corrupt token stream): detect -> roll back to FNV-1a64-verified
+///      target -> re-emit passing stream -> execute on M4 VM -> log & verify binary healing trace.
+///   4. Fault Injection #2 (verifier-invalid stream exhausting `max_attempts = 3`): bounded loop
+///      halts cleanly at attempt 3 (`ACTION_ROLLBACK_FINAL`), restores verified rollback target.
+///   5. Fatal Fault Injection (`VERIFIER_TAMPER`, `CAP_VIOLATION`, `FROZEN_HASH_DRIFT`, and
+///      tampered rollback buffer -> `ROLLBACK_CORRUPT`): immediate `ACTION_FATAL_ABORT` (no retry).
+///   6. Verifier and all 5 frozen FNV-1a64 hashes remain completely unchanged.
+pub fn selftest_p7_1_self_heal() -> Result<(usize, u64, i64), String> {
+    let mut checks = 0usize;
+
+    let heal_u16 = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(P7_HEAL_OMNI_SRC))?;
+    let heal_mod = decode_omni_token_stream(&heal_u16)?;
+    let n_hfns = heal_mod.functions.len();
+    if n_hfns < 5 {
+        return Err(format!("P7-1 heal module too small: {} fns", n_hfns));
+    }
+    // Function order at end of spec/m7/heal_harness.omni:
+    //   p7_heal_classify_entry (-5), p7_heal_decide_entry (-4),
+    //   p7_heal_log_push_entry (-3), p7_heal_log_verify_entry (-2), main (-1)
+    let fn_classify = heal_mod.functions[n_hfns - 5].fn_idx;
+    let fn_decide = heal_mod.functions[n_hfns - 4].fn_idx;
+    let fn_log_push = heal_mod.functions[n_hfns - 3].fn_idx;
+    let fn_log_verify = heal_mod.functions[n_hfns - 2].fn_idx;
+
+    let m4_u16 = if let Ok(raw) = std::fs::read("pure/m4/m4.omni_bc") {
+        decode_bytes_to_u16_stream(&raw)
+    } else {
+        with_lockstep_suspended(|| compile_omni_surface_to_u16(M4_VM_OMNI_SRC))?
+    };
+    let m4_mod = decode_omni_token_stream(&m4_u16)?;
+    let m4_run_fn = m4_mod.functions[m4_mod.functions.len() - 2].fn_idx;
+
+    let mut vm = OmniBinaryVm::with_budgets(50_000_000, 64 * 1024 * 1024);
+
+    // Check 1: M2-multi ELF64 compilation of pure/m7/heal.omni succeeds.
+    let heal_elf = compile_pure_u16_to_x86_64_elf_multi(&heal_u16, 2, 0, 3)?;
+    if heal_elf.len() < 120 || &heal_elf[0..4] != &[0x7F, b'E', b'L', b'F'] {
+        return Err(String::from("P7-1 pure/m7/heal.omni failed M2-multi ELF64 emission"));
+    }
+    checks += 1;
+
+    let call_classify = |vm: &mut OmniBinaryVm, err_code: i64| -> Result<i64, String> {
+        match vm.execute_function(&heal_mod, fn_classify, vec![OmniValue::Int(err_code)])? {
+            OmniValue::Int(v) => Ok(v),
+            other => Err(format!("P7-1 classify returned {:?}", other)),
+        }
+    };
+    let call_decide = |vm: &mut OmniBinaryVm, err_code: i64, att: i64, max_att: i64, rb_ok: i64| -> Result<i64, String> {
+        match vm.execute_function(
+            &heal_mod,
+            fn_decide,
+            vec![
+                OmniValue::Int(err_code),
+                OmniValue::Int(att),
+                OmniValue::Int(max_att),
+                OmniValue::Int(rb_ok),
+            ],
+        )? {
+            OmniValue::Int(v) => Ok(v),
+            other => Err(format!("P7-1 decide returned {:?}", other)),
+        }
+    };
+    let call_log_push = |vm: &mut OmniBinaryVm, log: Vec<u8>, att: i64, err_code: i64, act: i64, hlo: i64| -> Result<Vec<u8>, String> {
+        match vm.execute_function(
+            &heal_mod,
+            fn_log_push,
+            vec![
+                OmniValue::Bytes(log),
+                OmniValue::Int(att),
+                OmniValue::Int(err_code),
+                OmniValue::Int(act),
+                OmniValue::Int(hlo),
+            ],
+        )? {
+            OmniValue::Bytes(b) => Ok(b),
+            other => Err(format!("P7-1 log_push returned {:?}", other)),
+        }
+    };
+    let call_log_verify = |vm: &mut OmniBinaryVm, log: Vec<u8>| -> Result<i64, String> {
+        match vm.execute_function(&heal_mod, fn_log_verify, vec![OmniValue::Bytes(log)])? {
+            OmniValue::Int(v) => Ok(v),
+            other => Err(format!("P7-1 log_verify returned {:?}", other)),
+        }
+    };
+
+    // Check 2: Failure taxonomy & bounded decision table (Pure-Omni).
+    for &(code, want) in &[
+        (0i64, 0i64),   // OK -> 0t
+        (1, 1),         // DECODE_CORRUPT -> +1t (healable)
+        (2, 1),         // VERIFY_REJECT -> +1t
+        (3, 1),         // RUNTIME_TRAP -> +1t
+        (4, 1),         // OUTPUT_MISMATCH -> +1t
+        (5, 1),         // GATE_REGRESS -> +1t
+        (10, -1),       // VERIFIER_TAMPER -> -1t (fatal)
+        (11, -1),       // CAP_VIOLATION -> -1t (fatal)
+        (12, -1),       // FROZEN_HASH_DRIFT -> -1t (fatal)
+        (13, -1),       // ROLLBACK_CORRUPT -> -1t (fatal)
+        (-1, -1),       // unknown negative -> -1t (fail-closed)
+        (99, -1),       // unknown high -> -1t (fail-closed)
+    ] {
+        let got = call_classify(&mut vm, code)?;
+        if got != want {
+            return Err(format!("P7-1 classify({}) got {} want {}", code, got, want));
+        }
+    }
+    for &(err, att, max_att, rb_ok, want) in &[
+        (0i64, 0, 3, 1, 0i64), // PASS
+        (1, 0, 3, 1, 1),       // ROLLBACK_AND_RETRY
+        (2, 2, 3, 1, 1),       // ROLLBACK_AND_RETRY (last retry before cap)
+        (2, 3, 3, 1, 2),       // ROLLBACK_FINAL (budget exhausted)
+        (1, 0, 3, 0, 3),       // corrupt rollback -> FATAL_ABORT
+        (10, 0, 3, 1, 3),      // VERIFIER_TAMPER -> FATAL_ABORT
+        (11, 0, 3, 1, 3),      // CAP_VIOLATION -> FATAL_ABORT
+        (12, 0, 3, 1, 3),      // FROZEN_HASH_DRIFT -> FATAL_ABORT
+    ] {
+        let got = call_decide(&mut vm, err, att, max_att, rb_ok)?;
+        if got != want {
+            return Err(format!("P7-1 decide({},{},{},{}) got {} want {}", err, att, max_att, rb_ok, got, want));
+        }
+    }
+    checks += 1;
+
+    // Build verified baseline rollback target from bench_loop_sum (expected 5050).
+    let (bname, bsrc, bargs, want_val) = P7_BENCHMARK_CORPUS[1];
+    let good_bc = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(bsrc))?;
+    if p7_validate_candidate_stream(&m4_mod, m4_run_fn, &good_bc, bargs, want_val) != 0 {
+        return Err(format!("P7-1 baseline {} failed validation", bname));
+    }
+    let rollback = P7RollbackTarget::from_passing_stream(good_bc.clone());
+    let rb_hash_lo = (rollback.content_hash & 0xFFFF_FFFF) as i64;
+
+    // Check 3: Fault Injection #1 — Corrupt token stream -> detect, roll back, re-emit passing stream, log repair.
+    let mut corrupt_bc = good_bc.clone();
+    corrupt_bc[5] = 0xDEAD; // invalid opcode / corrupt token stream
+    corrupt_bc.truncate(corrupt_bc.len() / 2);
+    let mut heal_log = vec![0u8; 4096];
+    let mut active_stream = corrupt_bc;
+    let mut healed_ok = false;
+    for attempt in 0..=3i64 {
+        let err = p7_validate_candidate_stream(&m4_mod, m4_run_fn, &active_stream, bargs, want_val);
+        let rb_ok = if rollback.verify_integrity() { 1 } else { 0 };
+        let act = call_decide(&mut vm, err, attempt, 3, rb_ok)?;
+        let cur_hlo = (fnv1a_64_hash(&encode_u16_stream_to_bytes(&active_stream)) & 0xFFFF_FFFF) as i64;
+        heal_log = call_log_push(&mut vm, heal_log, attempt, err, act, cur_hlo)?;
+        if act == 0 {
+            healed_ok = true;
+            break;
+        } else if act == 1 {
+            // Roll back to content-addressed target and re-emit clean verified stream.
+            active_stream = rollback.stream.clone();
+        } else {
+            return Err(format!("P7-1 fault #1 unexpected action {} at attempt {}", act, attempt));
+        }
+    }
+    let log_summary = call_log_verify(&mut vm, heal_log.clone())?;
+    let log_cnt = log_summary >> 32;
+    if !healed_ok || log_summary < 0 || log_cnt != 2 || active_stream != rollback.stream {
+        return Err(format!(
+            "P7-1 fault #1 repair failed: healed={} log_summary={} log_cnt={}",
+            healed_ok, log_summary, log_cnt
+        ));
+    }
+    checks += 1;
+
+    // Check 4: Fault Injection #2 — Repeated verifier-invalid streams exhaust bounded `max_attempts = 3`,
+    // cleanly hitting `ACTION_ROLLBACK_FINAL (2)` and restoring the verified rollback target.
+    let mut bad_verify_bc = good_bc.clone();
+    // Corrupt first instruction operand/register to trigger verifier failure (or decode failure).
+    if bad_verify_bc.len() > 12 {
+        bad_verify_bc[10] = 0x7FFF;
+    }
+    let mut bound_log = vec![0u8; 4096];
+    let mut hit_final = false;
+    let mut restored_stream: Vec<u16> = Vec::new();
+    for attempt in 0..=3i64 {
+        let err = p7_validate_candidate_stream(&m4_mod, m4_run_fn, &bad_verify_bc, bargs, want_val);
+        let rb_ok = if rollback.verify_integrity() { 1 } else { 0 };
+        let act = call_decide(&mut vm, err, attempt, 3, rb_ok)?;
+        bound_log = call_log_push(&mut vm, bound_log, attempt, err, act, rb_hash_lo)?;
+        if act == 2 {
+            hit_final = true;
+            restored_stream = rollback.stream.clone();
+            break;
+        }
+    }
+    let bound_summary = call_log_verify(&mut vm, bound_log)?;
+    if !hit_final
+        || bound_summary < 0
+        || (bound_summary >> 32) != 4
+        || p7_validate_candidate_stream(&m4_mod, m4_run_fn, &restored_stream, bargs, want_val) != 0
+    {
+        return Err(format!(
+            "P7-1 bounded-attempt gate failed: hit_final={} bound_cnt={}",
+            hit_final,
+            bound_summary >> 32
+        ));
+    }
+    checks += 1;
+
+    // Check 5: Fatal Fault Injection — verifier tamper, cap violation, frozen drift, and tampered rollback buffer
+    // MUST immediately return `ACTION_FATAL_ABORT (3)` with zero retries; corrupt log also rejected (`-1`).
+    let mut tampered_rb = rollback.clone();
+    tampered_rb.stream[0] ^= 0x0001;
+    let rb_tamper_ok = if tampered_rb.verify_integrity() { 1 } else { 0 };
+    if rb_tamper_ok != 0
+        || call_decide(&mut vm, 1, 0, 3, rb_tamper_ok)? != 3
+        || call_decide(&mut vm, 10, 0, 3, 1)? != 3
+        || call_decide(&mut vm, 11, 0, 3, 1)? != 3
+        || call_decide(&mut vm, 12, 0, 3, 1)? != 3
+    {
+        return Err(String::from("P7-1 fatal fault failed to abort immediately"));
+    }
+    // Corrupt healing log (non-monotonic attempt 5 -> 2) must be rejected by Pure-Omni verifier.
+    let mut bad_log = vec![0u8; 4096];
+    bad_log[0..4].copy_from_slice(&2u32.to_le_bytes());
+    bad_log[16..20].copy_from_slice(&5u32.to_le_bytes());
+    bad_log[32..36].copy_from_slice(&2u32.to_le_bytes());
+    if call_log_verify(&mut vm, bad_log)? != -1 {
+        return Err(String::from("P7-1 corrupt healing log must return -1"));
+    }
+    checks += 1;
+
+    // Check 6: Frozen FNV-1a64 hashes untouched.
+    selftest_m2_frozen_hashes()?;
+    checks += 1;
+
+    Ok((checks, rollback.content_hash, log_cnt))
 }
 

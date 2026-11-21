@@ -125,6 +125,21 @@ Profile-guided tuning driven by the P4-5 trace ring (`bench_loop_sum`: 404/809 c
 
 ---
 
+## P7-1 — Self-Healing (`pure/m7/heal.omni`, `omnic p7-heal`)
+
+Pure-Omni self-healing decision & trace engine (`pure/m7/heal.omni`, 118 lines, registered in `m2-lint` 17/17 with 0 findings):
+
+1. **Balanced-Ternary Failure Taxonomy (`p7_classify_failure`):**
+   - `0t` = `OK` (`0`)
+   - `+1t` = **Healable** (`1`=DECODE_CORRUPT, `2`=VERIFY_REJECT, `3`=RUNTIME_TRAP, `4`=OUTPUT_MISMATCH, `5`=GATE_REGRESS)
+   - `-1t` = **Fatal (fail-closed)** (`10`=VERIFIER_TAMPER, `11`=CAP_VIOLATION, `12`=FROZEN_HASH_DRIFT, `13`=ROLLBACK_CORRUPT, or any unknown/negative code)
+2. **Content-Addressed Rollback Target (`P7RollbackTarget`):** Verifies `fnv1a_64_hash(rollback_stream) == expected_hash` before every rollback; a tampered rollback buffer triggers `ACTION_FATAL_ABORT`.
+3. **Bounded N-Attempt Repair State Machine (`p7_heal_decide`):** `0`=PASS, `1`=ROLLBACK_AND_RETRY (`attempt < max_attempts`), `2`=ROLLBACK_FINAL (`attempt >= max_attempts` -> stop retrying and keep verified rollback), `3`=FATAL_ABORT (immediate halt on any fatal fault or corrupt rollback).
+4. **Binary Healing Log (`p7_heal_log_push`, `p7_heal_log_verify`):** 16-B records `[attempt:u32, err_code:u32, action:u32, hash_lo32:u32]` in a 4 KiB buffer with monotonic-attempt & action-range integrity verification.
+5. **Hard Gate (`omnic p7-heal`, 6 checks):** Fault-injected corrupt token stream (`0xDEAD` + truncated) → detected, rolled back to FNV-1a64-verified target (`0x51E71970112F81B7`), re-emitted passing stream (`ret=5050` on M4 VM), logged & verified (`2` entries); repeated bad streams cleanly halt at `max_attempts = 3`; fatal faults & tampered rollback abort immediately; verifier & all 5 frozen FNV-1a64 hashes remain untouched.
+
+---
+
 ## Hard Rules (All of Phase 7)
 
 - The verifier, determinism, and capability model are never self-modified.

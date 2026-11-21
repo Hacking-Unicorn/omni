@@ -49,6 +49,7 @@ jobs:
           ./omni p5-selfhost
           ./omni p7-measure
           ./omni p7-canary
+          ./omni p7-heal
           ./omni backend-diff --suite
           ./omni selftest
           ./omni pure-omni-diff
