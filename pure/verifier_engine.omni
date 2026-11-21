@@ -943,6 +943,57 @@ fn verify_one_fn(stream: bytes, ws: bytes, fn_idx: i64, p_cnt: i64, p_pos: i64, 
     return w;
 }
 
+// ==============================================================================
+// STAGE 1 NEW-LEVEL API PURE VERIFIER RULES (Pure-Omni only; Rust verifier untouched)
+// Error codes:
+//   1010 = MISSING_CAP_TERNARY (ternary/expert op missing required capability bit)
+//   1011 = TAINT_ON_CONSENSUS  (@UNTRUSTED value flows to consensus/expert without sanitizer)
+//   1012 = LINEAR_REFLECT      (reflective call consumes linear buffer without drop/transfer)
+//   1013 = CAP_NARROW_EXPAND   (cap_narrow result used as if masked-off/dynamic bits survived)
+// ==============================================================================
+
+// Effective surviving capabilities after `cap_narrow(old_cap, mask)`:
+//   - When `mask_is_const != 0`: surviving bits = `old_cap & mask` (subset of old_cap).
+//   - When `mask_is_const == 0` (dynamic mask): surviving bits = `0` for capability checks
+//     (value may still be stored/passed, but requiring any capability bit triggers 1013).
+#[strict]
+fn omni_verify_cap_narrow_eff(old_cap: i64, mask: i64, mask_is_const: i64) -> i64 {
+    let is_c: i64 = is_gt(mask_is_const, 0);
+    return (old_cap & mask) * is_c;
+}
+
+// Pure-Omni Stage 1/2 API surface verifier rule check:
+//   op_kind: 1 = ternary/expert cap check, 2 = consensus/expert taint check,
+//            3 = reflective linear-buffer check, 4 = cap_narrow expansion check.
+// Returns `0` on pass, or error code (`1010`/`1011`/`1012`/`1013`) on violation.
+#[strict]
+fn omni_verify_api_surface(
+    op_kind: i64,
+    fn_cap: i64,
+    req_cap: i64,
+    taint_in: i64,
+    mask_is_const: i64,
+    narrow_mask: i64,
+    linear_live: i64
+) -> i64 {
+    let is_k1: i64 = is_eq(op_kind, 1);
+    let is_k2: i64 = is_eq(op_kind, 2);
+    let is_k3: i64 = is_eq(op_kind, 3);
+    let is_k4: i64 = is_eq(op_kind, 4);
+
+    // 1010 MISSING_CAP_TERNARY: required capability bits not all present in fn_cap.
+    let miss_cap: i64 = is_k1 * (1 - is_eq(fn_cap & req_cap, req_cap));
+    // 1011 TAINT_ON_CONSENSUS: untrusted input reaches consensus or expert routing.
+    let bad_taint: i64 = is_k2 * is_gt(taint_in, 0);
+    // 1012 LINEAR_REFLECT: reflective call consumes linear buffer while still live/untransferred.
+    let bad_lin: i64 = is_k3 * is_gt(linear_live, 0);
+    // 1013 CAP_NARROW_EXPAND: narrowed cap used with req_cap not covered by surviving bits.
+    let eff_cap: i64 = omni_verify_cap_narrow_eff(fn_cap, narrow_mask, mask_is_const);
+    let bad_narrow: i64 = is_k4 * is_gt(req_cap, 0) * (1 - is_eq(eff_cap & req_cap, req_cap));
+
+    return miss_cap * 1010 + bad_taint * 1011 + bad_lin * 1012 + bad_narrow * 1013;
+}
+
 #[strict]
 fn omni_verify_module(stream: bytes) -> bytes {
     let nbytes: i64 = slen(stream);

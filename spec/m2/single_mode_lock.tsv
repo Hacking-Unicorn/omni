@@ -208,7 +208,7 @@ suite:pure/programs/pack5_decision_controller.omni	u16	1039	0x59AB2A61BA6B4374
 suite:pure/programs/pack5_decision_controller.omni	x86_000	657	0x05D1E649C538BF67
 suite:pure/programs/pack5_decision_controller.omni	x86_454090	657	0x9960CA97FF532D0C
 suite:pure/programs/pack5_decision_controller.omni	wasm	276	0x438F365314C224A8
-pure/verifier_engine.omni	u16	11893	0x7E8B1BDCE0870665
+pure/verifier_engine.omni	u16	12181	0x334B9A0A1F1D665A
 pure/verifier_engine.omni	x86_000	578	0xB8217EA557A98960
 pure/verifier_engine.omni	x86_454090	578	0x17C36FA2378CE251
 pure/verifier_engine.omni	wasm	89	0xED536F43A04128DA

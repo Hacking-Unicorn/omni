@@ -17,6 +17,10 @@
     {"code": "BUDGET_EXCEEDED", "non_null_span": true, "has_retry_hint": true, "stage": "runtime_or_lowering"},
     {"code": "CORRUPT_PACK5", "non_null_span": true, "has_retry_hint": true, "stage": "pack5_validator"},
     {"code": "AMBIGUOUS_GRAMMAR", "non_null_span": true, "has_retry_hint": true, "stage": "strict_front_end"},
-    {"code": "SYNTAX_ERROR", "non_null_span": true, "has_retry_hint": true, "stage": "lexer_or_parser"}
+    {"code": "SYNTAX_ERROR", "non_null_span": true, "has_retry_hint": true, "stage": "lexer_or_parser"},
+    {"code": "MISSING_CAP_TERNARY", "non_null_span": true, "has_retry_hint": true, "stage": "pure_verifier"},
+    {"code": "TAINT_ON_CONSENSUS", "non_null_span": true, "has_retry_hint": true, "stage": "pure_verifier"},
+    {"code": "LINEAR_REFLECT", "non_null_span": true, "has_retry_hint": true, "stage": "pure_verifier"},
+    {"code": "CAP_NARROW_EXPAND", "non_null_span": true, "has_retry_hint": true, "stage": "pure_verifier"}
   ]
 }

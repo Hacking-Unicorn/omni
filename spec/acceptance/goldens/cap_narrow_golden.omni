@@ -1,0 +1,11 @@
+// Stage 1 positive golden: strict capability narrowing (`old_cap & const_mask`).
+#[strict]
+fn cap_narrow(old_cap: i64, mask: i64) -> i64 {
+    return old_cap & mask;
+}
+
+#[strict]
+fn main(old_cap: i64) -> i64 {
+    let narrowed: i64 = cap_narrow(old_cap, 3);
+    return narrowed;
+}

@@ -49,5 +49,18 @@
   ],
   "deferred_multi_file_goldens": [
     {"id": "neg_circular_include", "file": "goldens/neg_circular_include.omni", "expected_code": "CIRCULAR_INCLUDE", "reason": "Requires filesystem/VFS include resolution rather than single-string surface compilation; verified by selftest 6g (resolve_omni_surface_includes), spec/m3/fixtures/neg_circular_include.omni (M3 corpus.tsv), and M2_GOLDEN_SOURCES."}
-  ]
+  ],
+  "pure_api_stage1_goldens": {
+    "positive": [
+      {"id": "ternary_route_golden", "file": "goldens/ternary_route_golden.omni", "args": ["20"], "expected_result": "+1t"},
+      {"id": "consensus_golden", "file": "goldens/consensus_golden.omni", "args": ["242", "242"], "expected_result": "+1t"},
+      {"id": "expert_pack5_golden", "file": "goldens/expert_pack5_golden.omni", "args": ["3", "242"], "expected_result": "778"},
+      {"id": "cap_narrow_golden", "file": "goldens/cap_narrow_golden.omni", "args": ["15"], "expected_result": "3"}
+    ],
+    "negative_pure_verifier": [
+      {"id": "neg_missing_cap_ternary", "file": "goldens/neg_missing_cap_ternary.omni", "expected_code": "MISSING_CAP_TERNARY", "expected_num": 1010, "expected_line": 5, "expected_col": 5},
+      {"id": "neg_taint_consensus", "file": "goldens/neg_taint_consensus.omni", "expected_code": "TAINT_ON_CONSENSUS", "expected_num": 1011, "expected_line": 4, "expected_col": 5},
+      {"id": "neg_cap_narrow_expand", "file": "goldens/neg_cap_narrow_expand.omni", "expected_code": "CAP_NARROW_EXPAND", "expected_num": 1013, "expected_line": 5, "expected_col": 5}
+    ]
+  }
 }

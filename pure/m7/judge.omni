@@ -179,7 +179,7 @@ fn p7_unpack5_trit(packed_byte: i64, idx: i64) -> trit {
 #[strict]
 fn p7_verify_trace_ring(w: bytes) -> i64 {
     let trace_cnt: i64 = ld_u32(w, 167960);
-    let cap: i64 = imin(trace_cnt, 4096);
+    let cap: i64 = if_pos (trace_cnt - 4096) <=> 0 { 4096 } else { trace_cnt };
     let i: i64 = 0;
     let prev_step: i64 = -1;
     let ok: i64 = 1;
@@ -268,7 +268,7 @@ fn p7_op_class(op_tok: i64) -> i64 {
 #[strict]
 fn p7_trace_histogram(w: bytes) -> i64 {
     let trace_cnt: i64 = ld_u32(w, 167960);
-    let cap: i64 = imin(trace_cnt, 4096);
+    let cap: i64 = if_pos (trace_cnt - 4096) <=> 0 { 4096 } else { trace_cnt };
     let i: i64 = 0;
     let c_alu: i64 = 0;
     let c_mem: i64 = 0;

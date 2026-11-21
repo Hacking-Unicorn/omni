@@ -36,6 +36,7 @@ These limits are intentional invariants (`HANDOFF.md` §2):
 | `pure/m5/elf_sys.omni` | 73 | Phase 5 zero-shim Linux x86-64 syscall emitter (`P5-2`): emits raw `0F 05` syscalls (`sys_read`, `sys_write`, `sys_exit`) + `_start` stack-arena entry stub into a standalone `177`-byte Linux x86-64 ELF64 binary with zero Rust, zero C, and zero shim (`p5-sys`). |
 | `pure/m7/judge.omni` | 292 | Phase 7 (`P7-0`/`P7-0a`) balanced-ternary measurement decision layer: noise-band thresholding without division (`p7_cmp_band`), 3/5-run ternary consensus (`tmaj`, `p7_judge_5runs`), subsystem attribution (`p7_attribute_subsystem`), written adopt/reject & no-regression rules, `@PACK5` radix-3 verdict packing/unpacking, and Pure-Omni P4-5 trace-ring verification & 4-class opcode histograms (`p7-measure`, `p7-canary`). |
 | `pure/m7/heal.omni` | 118 | Phase 7 (`P7-1`) Pure-Omni self-healing engine: balanced-ternary failure taxonomy (`p7_classify_failure`: `+1t` healable / `0t` OK / `-1t` fatal fail-closed), bounded N-attempt repair state machine (`p7_heal_decide`), content-addressed FNV-1a64 rollback integrity verification, and 16-B binary healing log writer/verifier (`p7_heal_log_push`/`p7_heal_log_verify`; `p7-heal`). |
+| `pure/api/ternary.omni` + `pure/api/api_main.omni` | 136 | New-Level API Stage 1: pure ternary capability surface (`api_route_trit`, `api_consensus`, `api_expert_pack5`, `api_cap_narrow`, plus thin wrappers `api_vote5`/`api_pack5_verdict` over `pure/m7/judge.omni`), library-first with zero `pure/m3/` changes; self-compiles via Pure-Omni M3 (`3,131` w, `0`-word diff) and lowers via Pure-Omni M2 (`7,590` B ELF64, `0`-byte diff), backed by Pure-Omni verifier rules `1010..1013` in `pure/verifier_engine.omni` (`api-stage1`). |
 | `std/*.omni` (7) + `pure/programs/*.omni` (6) | 518 | Standard library helpers and small production-style programs, served directly from disk via `include_str!` (`M3-16`). |
 | `pure/compiler.omni`, `pure/verifier.omni`, `pure/host_runtime.omni`, `pure/tooling.omni`, `pure/selfhost_suite.omni` | 402 | Legacy Phase 7/A–D integer decision kernels (frozen for regression hashes; not the M2/M3 compilers). |
 
@@ -81,10 +82,11 @@ All 5 frozen artifacts are asserted by FNV-1a64 hash and exact size in `selftest
 
 ```bash
 rustc -O omni_rust_bootstrap.rs -o omnic
-./omnic selftest              # 1,410 checks on Windows / 1,526 on Linux x86-64 (13AY diff4, 13AZ KV, 13BA ISA table, 13BF hash pin, M2/M3/P4/P5/P7 locks)
+./omnic selftest              # 1,415 checks on Windows / 1,531 on Linux x86-64 (13AY diff4, 13AZ KV, 13BA ISA table, 13BF hash pin, M2/M3/P4/P5/P7/API locks)
 ./omnic p7-measure            # Phase 7 (P7-0): 5-benchmark corpus + P4-5 trace ring + pure/m7/judge.omni ternary (+1t/0t/-1t) + @PACK5 verdict gate
 ./omnic p7-canary             # Phase 7 (P7-0a): 5-run consensus + subsystem attribution (M3/M2/M4) + M2 emitter canary (+1t) & neutral (0t) gate
 ./omnic p7-heal               # Phase 7 (P7-1): self-healing taxonomy, FNV-1a64 rollback, bounded N-attempt repair & fault-injection gate
+./omnic api-stage1            # New-Level API Stage 1: pure/api/ternary.omni + cap_narrow + Pure-Omni verifier 1010..1013 + 7 goldens (0-diff M3/M2/M4)
 ./omnic p5-selfhost           # Phase 5 full zero-Rust chain: M3->pure/m4/m4.omni_bc (26,076w)->M2 ELF64 (78,020 B) + M3->M4/M2 loop
 ./omnic p5-sys                # Phase 5 zero-shim Linux x86-64 ELF64 (177 B, raw 0F 05 sys_read/sys_write/sys_exit; native exec on Linux)
 ./omnic p4-vm                 # Phase 4 Pure-Omni token-stream VM == Rust OmniBinaryVm (11/11 checks incl. P4-5 trace ring)

@@ -1,0 +1,7 @@
+// Stage 1 negative golden (pure verifier): MISSING_CAP_TERNARY (1010)
+// Privileged ternary expert routing invoked without required AI capability bit (cap=0, req=8).
+#[strict]
+fn main(expert_id: i64, packed: i64) -> i64 {
+    let req_cap: i64 = 8;
+    return (expert_id << 8) | (packed & 255) | (req_cap & 0);
+}

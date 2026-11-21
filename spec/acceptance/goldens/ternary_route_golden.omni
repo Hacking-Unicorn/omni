@@ -1,0 +1,12 @@
+// Stage 1 positive golden: 3-way ternary routing (`api_route_trit` semantics).
+#[strict]
+fn route_trit(cond: trit, neg_v: i64, zero_v: i64, pos_v: i64) -> trit {
+    let routed: i64 = sel_trit(cond, neg_v, zero_v, pos_v);
+    return routed <=> 0;
+}
+
+#[strict]
+fn main(x: i64) -> trit {
+    let c: trit = x <=> 10;
+    return route_trit(c, -5, 0, 25);
+}

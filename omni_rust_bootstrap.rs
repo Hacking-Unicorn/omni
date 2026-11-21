@@ -23362,6 +23362,7 @@ pub fn run_m2_foundation_selftests() -> Result<usize, String> {
     n += selftest_p7_0_measure()?.0;
     n += selftest_p7_0a_canary()?.0;
     n += selftest_p7_1_self_heal()?.0;
+    n += selftest_api_stage1()?.0;
     Ok(n)
 }
 
@@ -23773,6 +23774,19 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
             }
             Err(e) => {
                 eprintln!("[P7-HEAL FAIL] {}", e);
+                1
+            }
+        },
+        "api-stage1" => match selftest_api_stage1() {
+            Ok((n, api_words, api_elf_bytes)) => {
+                println!(
+                    "[API-STAGE1 PASS] {} checks | pure/api/ternary.omni ({} w -> {} B ELF64, 0-word M3 & 0-byte M2 diff) | Pure-Omni verifier 1010..1013 + 7 goldens + frozen hashes intact",
+                    n, api_words, api_elf_bytes
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("[API-STAGE1 FAIL] {}", e);
                 1
             }
         },
@@ -24252,6 +24266,7 @@ fn main() {
                 println!("  p7-measure                        Phase 7 (P7-0) benchmark corpus, P4-5 trace ring & ternary verdict gate");
                 println!("  p7-canary                         Phase 7 (P7-0a) 5-run consensus, subsystem attribution & M2 emitter canary gate");
                 println!("  p7-heal                           Phase 7 (P7-1) self-healing taxonomy, FNV-1a64 rollback, bounded repair & fault-injection gate");
+                println!("  api-stage1                        New-Level API Stage 1: pure ternary capability surface, cap_narrow, pure verifier & goldens");
                 println!();
                 println!("Compilation, Execution & Tooling:");
                 println!("  run <file.omni|file.omni_bc> [args...]   Compile/verify and execute on VM");
@@ -24279,7 +24294,7 @@ fn main() {
             "harness" | "--harness" => {
                 std::process::exit(run_omni_harness_cli(&cli_args[2..]));
             }
-            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" | "p7-heal" => {
+            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" | "p7-heal" | "api-stage1" => {
                 std::process::exit(run_m2_cli(&cli_args[1..]));
             }
             "agent-driver" | "--agent-driver" => {
