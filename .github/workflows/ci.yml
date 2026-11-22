@@ -53,6 +53,7 @@ jobs:
           ./omni api-stage1
           ./omni api-stage2
           ./omni api-stage2-emit
+          ./omni api-stage2-5
           ./omni backend-diff --suite
           ./omni selftest
           ./omni pure-omni-diff

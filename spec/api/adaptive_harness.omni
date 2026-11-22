@@ -1,0 +1,24 @@
+// Phase 7 / New-Level API Stage 2.5 harness for `pure/api/adaptive.omni`.
+// Exposes entry points for M3/M2/M4 differential testing (main <= 4 params).
+
+#[strict]
+fn api_adaptive_judge_entry(metrics_pair: bytes, band: i64) -> i64 {
+    return p7_trit_to_i64(api_judge_better(metrics_pair, band));
+}
+
+#[strict]
+fn api_adaptive_spec_hint_entry(module_bc: bytes, subsystem_mask: i64) -> bytes {
+    return api_specialize_with_hint(module_bc, subsystem_mask);
+}
+
+#[strict]
+fn api_adaptive_step_entry(module_bc: bytes, subsystem_mask: i64, band: i64) -> bytes {
+    return api_adaptive_step(module_bc, subsystem_mask, band);
+}
+
+#[strict]
+fn main(base_w: i64, cand_w: i64, band: i64, sub_mask: i64) -> i64 {
+    let v: trit = p7_cmp_band(base_w, cand_w, band);
+    let hint: i64 = sel_trit((sub_mask & 7) <=> 0, 0, 0, 1);
+    return p7_trit_to_i64(v) * 10 + hint;
+}
