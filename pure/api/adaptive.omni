@@ -1,0 +1,96 @@
+// ==============================================================================
+// OMNI NEW-LEVEL API (STAGE 2.5) — SELF-ADAPTIVE LOOP HOOKS
+// `pure/api/adaptive.omni`
+// ==============================================================================
+//
+// Link order: `pure/m7/judge.omni`, `pure/api/reflect.omni`, this file.
+// Thin pure wrappers connecting the Stage 2 reflective host to the existing
+// Phase 7 measurement/judge engine (`pure/m7/judge.omni`) without duplicating
+// any judge or reflection logic (zero host I/O, zero recursion, zero IDIV/IMOD,
+// zero PACK5 opcodes, m2-lint <= 120 SSA / <= 12 labels / <= 1 bytes arg per CALL).
+//   - `api_judge_better(metrics_pair: bytes, band: i64) -> trit`   (#[cap(PURE)])
+//   - `api_judge_better_packed(base_insp: i64, cand_insp: i64, band: i64) -> trit`
+//   - `api_specialize_with_hint(module_bc: bytes, subsystem_mask: i64) -> bytes`
+//   - `api_adaptive_step(module_bc: bytes, subsystem_mask: i64, band: i64) -> bytes`
+// ==============================================================================
+
+// Thin wrapper around `pure/m7/judge.omni::p7_judge_metrics4`:
+// `metrics_pair` holds 8 little-endian i64s (64 bytes):
+//   [0..32):  base (bc_words, elf_bytes, vm_steps, arena_bytes)
+//   [32..64): cand (bc_words, elf_bytes, vm_steps, arena_bytes)
+// Returns +1t (better), 0t (neutral), or -1t (regression or malformed < 64 B buffer).
+#[strict]
+fn api_judge_better(metrics_pair: bytes, band: i64) -> trit {
+    let ok: i64 = sel_trit(slen(metrics_pair) <=> 64, 0, 1, 1);
+    let r: i64 = if_pos ok <=> 0 {
+        let v: trit = p7_judge_metrics4(
+            ld_u64(metrics_pair, 0),  ld_u64(metrics_pair, 32), band,
+            ld_u64(metrics_pair, 8),  ld_u64(metrics_pair, 40), band,
+            ld_u64(metrics_pair, 16), ld_u64(metrics_pair, 48), band,
+            ld_u64(metrics_pair, 24), ld_u64(metrics_pair, 56), band
+        );
+        p7_trit_to_i64(v)
+    } else {
+        -1
+    };
+    return p7_i64_to_trit(r);
+}
+
+// Compare two `api_token_inspect` packed summaries `(n_fns<<40)|(total_ins<<20)|n_words`
+// using `pure/m7/judge.omni::p7_cmp_band` + `p7_combine2`.
+// Fails closed (-1t) if either summary is invalid (< 0) or function count changed.
+#[strict]
+fn api_judge_better_packed(base_insp: i64, cand_insp: i64, band: i64) -> trit {
+    let valid_b: i64 = sel_trit(base_insp <=> 0, 0, 1, 1);
+    let valid_c: i64 = sel_trit(cand_insp <=> 0, 0, 1, 1);
+    let same_fn: i64 = sel_trit((base_insp >> 40) <=> (cand_insp >> 40), 0, 1, 0);
+    let ok: i64 = valid_b * valid_c * same_fn;
+    let r: i64 = if_pos ok <=> 0 {
+        let b_ins: i64 = (base_insp >> 20) & 1048575;
+        let c_ins: i64 = (cand_insp >> 20) & 1048575;
+        let b_w: i64 = base_insp & 1048575;
+        let c_w: i64 = cand_insp & 1048575;
+        let t_ins: trit = p7_cmp_band(b_ins, c_ins, band);
+        let t_w: trit = p7_cmp_band(b_w, c_w, band);
+        p7_trit_to_i64(p7_combine2(t_ins, t_w))
+    } else {
+        -1
+    };
+    return p7_i64_to_trit(r);
+}
+
+// Specialize a token stream using a `p7_attribute_subsystem` bitmask
+// (bit 0 = M3_FRONTEND, bit 1 = M2_EMITTER, bit 2 = M4_VM).
+// Any active subsystem bit enables NOP-stripping (`hint = 1`); `0` holds (`hint = 0`).
+#[strict]
+fn api_specialize_with_hint(module_bc: bytes, subsystem_mask: i64) -> bytes {
+    let nz: i64 = subsystem_mask & 7;
+    let hint: i64 = if_pos nz <=> 0 { 1 } else { 0 };
+    return api_token_specialize(module_bc, hint);
+}
+
+// Complete Pure-Omni generate -> measure -> adopt/reject loop step:
+//   1. Scan `module_bc` inline (without consuming the linear bytes handle) to count
+//      standalone NOPs (`[0x7F00, 0x7EE4]`) that `api_specialize_with_hint` would remove.
+//   2. Judge `(base -> cand)` savings via `pure/m7/judge.omni::p7_cmp_band` + `p7_combine2`.
+//   3. Adopt candidate ONLY on +1t (passes `subsystem_mask` to `api_specialize_with_hint`);
+//      retain baseline on 0t or -1t (passes `0` -> canonical clone).
+#[strict]
+fn api_adaptive_step(module_bc: bytes, subsystem_mask: i64, band: i64) -> bytes {
+    let nwords: i64 = slen(module_bc) >> 1;
+    let active: i64 = if_pos (subsystem_mask & 7) <=> 0 { 1 } else { 0 };
+    let nops: i64 = 0;
+    let pos: i64 = 0;
+    while pos + 1 < nwords {
+        let t0: i64 = ld_u16(module_bc, pos * 2);
+        let t1: i64 = ld_u16(module_bc, (pos + 1) * 2);
+        let is_nop: i64 = sel_trit(t0 <=> 32512, 0, 1, 0) * sel_trit(t1 <=> 32484, 0, 1, 0);
+        nops = nops + active * is_nop;
+        pos = pos + 1 + is_nop;
+    }
+    let t_ins: trit = p7_cmp_band(nops, 0, band);
+    let t_w: trit = p7_cmp_band(nops * 2, 0, band);
+    let verdict: trit = p7_combine2(t_ins, t_w);
+    let eff_mask: i64 = if_pos verdict { subsystem_mask } else { 0 };
+    return api_specialize_with_hint(module_bc, eff_mask);
+}

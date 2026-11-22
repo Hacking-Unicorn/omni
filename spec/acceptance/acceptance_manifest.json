@@ -76,5 +76,10 @@
     "positive": [
       {"id": "token_emit_golden", "file": "goldens/token_emit_golden.omni", "args": ["42"], "expected_result": "13"}
     ]
+  },
+  "pure_api_stage2_5_goldens": {
+    "positive": [
+      {"id": "judge_better_golden", "file": "goldens/judge_better_golden.omni", "args": ["100", "80", "5"], "expected_result": "80"}
+    ]
   }
 }

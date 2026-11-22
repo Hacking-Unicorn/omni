@@ -1,0 +1,16 @@
+// Stage 2.5 positive golden: exercises `judge_better` noise-band ternary verdict
+// (+1t on improvement, 0t within band, -1t on regression) and adopt-on-+1t gating.
+#[strict]
+fn cmp_band(base: i64, cand: i64, band: i64) -> i64 {
+    let diff: i64 = base - cand;
+    let is_better: i64 = sel_trit(diff <=> band, 0, 0, 1);
+    let is_worse: i64 = sel_trit((0 - diff) <=> band, 0, 0, 1);
+    return is_better - is_worse;
+}
+
+#[strict]
+fn main(base: i64, cand: i64, band: i64) -> i64 {
+    let v: i64 = cmp_band(base, cand, band);
+    let adopted: i64 = sel_trit(v <=> 0, 0, 0, 1);
+    return adopted * cand + (1 - adopted) * base;
+}

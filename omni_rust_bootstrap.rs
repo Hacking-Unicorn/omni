@@ -23397,6 +23397,10 @@ fn selftest_api_stage2_emit_count() -> Result<usize, String> {
     Ok(selftest_api_stage2_emit()?.0)
 }
 
+fn selftest_api_stage2_5_count() -> Result<usize, String> {
+    Ok(selftest_api_stage2_5()?.0)
+}
+
 /// All Milestone 2..7 + API Stage 1 foundation selftests (parallel-lane accelerated).
 pub fn run_m2_foundation_selftests() -> Result<usize, String> {
     let parallel_tasks: &[SelftestLaneTask] = &[
@@ -23432,6 +23436,7 @@ pub fn run_m2_foundation_selftests() -> Result<usize, String> {
         ("api_stage1", selftest_api_stage1_count),
         ("api_stage2", selftest_api_stage2_count),
         ("api_stage2_emit", selftest_api_stage2_emit_count),
+        ("api_stage2_5", selftest_api_stage2_5_count),
     ];
     let mut n = run_selftest_tasks_in_lanes(parallel_tasks)?;
     // Sequential: toggles global M3 lockstep state.
@@ -23886,6 +23891,19 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
             }
             Err(e) => {
                 eprintln!("[API-STAGE2-EMIT FAIL] {}", e);
+                1
+            }
+        },
+        "api-stage2-5" => match selftest_api_stage2_5() {
+            Ok((n, adp_words, adp_elf_bytes)) => {
+                println!(
+                    "[API-STAGE2.5 PASS] {} checks | pure/api/adaptive.omni ({} w -> {} B ELF64, 0-word M3 & 0-byte M2 diff) | judge_better + specialize_with_hint + adaptive_step (+1t adopt / 0t hold) + golden + frozen hashes intact",
+                    n, adp_words, adp_elf_bytes
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("[API-STAGE2.5 FAIL] {}", e);
                 1
             }
         },
@@ -24368,6 +24386,7 @@ fn main() {
                 println!("  api-stage1                        New-Level API Stage 1: pure ternary capability surface, cap_narrow, pure verifier & goldens");
                 println!("  api-stage2                        New-Level API Stage 2: pure token reflective host (inspect, specialize, trace histogram) & goldens");
                 println!("  api-stage2-emit                   New-Level API Stage 2 (Part 2): pure token_emit + re-hosted M2 ELF64 emitter & golden");
+                println!("  api-stage2-5                      New-Level API Stage 2.5: pure self-adaptive loop hooks (judge_better, specialize_with_hint, adaptive_step)");
                 println!();
                 println!("Compilation, Execution & Tooling:");
                 println!("  run <file.omni|file.omni_bc> [args...]   Compile/verify and execute on VM");
@@ -24395,7 +24414,7 @@ fn main() {
             "harness" | "--harness" => {
                 std::process::exit(run_omni_harness_cli(&cli_args[2..]));
             }
-            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" | "p7-heal" | "api-stage1" | "api-stage2" | "api-stage2-emit" => {
+            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" | "p7-heal" | "api-stage1" | "api-stage2" | "api-stage2-emit" | "api-stage2-5" => {
                 std::process::exit(run_m2_cli(&cli_args[1..]));
             }
             "agent-driver" | "--agent-driver" => {

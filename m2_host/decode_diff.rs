@@ -124,6 +124,16 @@ pub const API_STAGE2_EMIT_OMNI_SRC: &str = concat!(
     include_str!("../spec/api/emit_harness.omni"),
 );
 
+pub const API_STAGE2_5_OMNI_SRC: &str = concat!(
+    include_str!("../pure/m7/judge.omni"),
+    "\n",
+    include_str!("../pure/api/reflect.omni"),
+    "\n",
+    include_str!("../pure/api/adaptive.omni"),
+    "\n",
+    include_str!("../spec/api/adaptive_harness.omni"),
+);
+
 pub const M5_SYS_OMNI_SRC: &str = concat!(
     include_str!("../pure/m2/util.omni"),
     "\n",
@@ -5104,5 +5114,264 @@ pub fn selftest_api_stage2_emit() -> Result<(usize, usize, usize), String> {
     checks += 1;
 
     Ok((checks, emit_u16.len(), emit_elf_rust.len()))
+}
+
+/// New-Level API Stage 2.5 gate (`./omnic api-stage2-5`):
+///   1. Pure-Omni M3 (0-word diff) + Pure-Omni M2 (0-byte diff) on `pure/api/adaptive.omni`.
+///   2. `api_judge_better` on 64-byte paired metrics: +1t (better), 0t (within band), -1t (regression),
+///      and -1t fail-closed on truncated < 64 B buffer.
+///   3. `api_specialize_with_hint`: `subsystem_mask=2` (M2_EMITTER) strips NOPs; `0` (NONE) holds.
+///   4. End-to-end Pure-Omni self-adaptive loop `api_adaptive_step`:
+///      - adopts candidate on +1t (band=0) -> verified via M2 ELF64 (0-byte diff) + M4 VM (`ret=90`) + Linux native exec;
+///      - retains baseline on 0t (band=10, savings within noise band).
+///   5. Stage 2.5 golden (`judge_better_golden.omni`, M3/M2/M4 0-diff) + frozen hashes intact.
+pub fn selftest_api_stage2_5() -> Result<(usize, usize, usize), String> {
+    let mut checks = 0usize;
+
+    // 1. Compile pure/api/adaptive.omni + spec/api/adaptive_harness.omni via Rust M3, Pure-Omni M3 (0-word diff),
+    //    Rust M2-multi ELF64, and Pure-Omni M2 (0-byte diff).
+    let adp_u16 = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(API_STAGE2_5_OMNI_SRC))?;
+    let adp_m3_u16 = match m3_lockstep_compile_via_omni(API_STAGE2_5_OMNI_SRC, true)? {
+        Ok(v) => v,
+        Err((c, l, col)) => return Err(format!("API-S2.5 M3 compile failed ({}, {}:{})", c, l, col)),
+    };
+    if adp_m3_u16 != adp_u16 {
+        return Err(format!(
+            "API-S2.5 M3 0-word diff failed on pure/api/adaptive.omni: pure={}w vs rust={}w",
+            adp_m3_u16.len(),
+            adp_u16.len()
+        ));
+    }
+    let adp_elf_rust = compile_pure_u16_to_x86_64_elf_multi(&adp_u16, 100, 80, 5)?;
+    let m2_u16 = decode_bytes_to_u16_stream(
+        &std::fs::read("pure/m2/m2.omni_bc").map_err(|e| format!("API-S2.5 read m2 seed: {}", e))?,
+    );
+    let m2_mod = decode_omni_token_stream(&m2_u16)?;
+    let m2_entry = m2_entry_of(&m2_mod);
+    let mut vm_m2 = OmniBinaryVm::with_budgets(500_000_000, 128 * 1024 * 1024);
+    let adp_elf_pure = match vm_m2.execute_function(
+        &m2_mod,
+        m2_entry,
+        vec![
+            OmniValue::U16Array(adp_u16.clone()),
+            OmniValue::Int(100),
+            OmniValue::Int(80),
+            OmniValue::Int(5),
+        ],
+    ).map_err(|e| format!("API-S2.5 step1 M2: {}", e))? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("API-S2.5 Pure-Omni M2 returned {:?}", other)),
+    };
+    if adp_elf_pure != adp_elf_rust {
+        return Err(format!(
+            "API-S2.5 Pure-Omni M2 diff on pure/api/adaptive.omni: pure={}B vs rust={}B",
+            adp_elf_pure.len(),
+            adp_elf_rust.len()
+        ));
+    }
+    checks += 1;
+
+    let adp_mod = decode_omni_token_stream(&adp_u16)?;
+    let n_afns = adp_mod.functions.len();
+    // Order at end of spec/api/adaptive_harness.omni:
+    //   api_adaptive_judge_entry (-4), api_adaptive_spec_hint_entry (-3),
+    //   api_adaptive_step_entry (-2), main (-1)
+    let fn_judge = adp_mod.functions[n_afns - 4].fn_idx;
+    let fn_spec_hint = adp_mod.functions[n_afns - 3].fn_idx;
+    let fn_step = adp_mod.functions[n_afns - 2].fn_idx;
+    let mut vm = OmniBinaryVm::with_budgets(500_000_000, 128 * 1024 * 1024);
+
+    // 2. `api_judge_better`: +1t (better), 0t (neutral within band), -1t (regression), -1t (short buf).
+    let pack_pair = |base: [i64; 4], cand: [i64; 4]| -> Vec<u8> {
+        let mut b = Vec::with_capacity(64);
+        for v in base.iter().chain(cand.iter()) {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b
+    };
+    let cases: [([i64; 4], [i64; 4], i64, i64); 3] = [
+        ([100, 800, 50, 128], [90, 750, 50, 128], 5, 1),   // improved -> +1t
+        ([100, 800, 50, 128], [98, 798, 50, 128], 5, 0),   // within band -> 0t
+        ([100, 800, 50, 128], [90, 820, 50, 128], 5, -1),  // elf regressed -> -1t
+    ];
+    for (ci, &(base, cand, band, want)) in cases.iter().enumerate() {
+        let got = match vm.execute_function(
+            &adp_mod,
+            fn_judge,
+            vec![OmniValue::Bytes(pack_pair(base, cand)), OmniValue::Int(band)],
+        ).map_err(|e| format!("API-S2.5 step2 case#{}: {}", ci, e))? {
+            OmniValue::Int(v) => v,
+            other => return Err(format!("API-S2.5 judge_better case#{} returned {:?}", ci, other)),
+        };
+        if got != want {
+            return Err(format!("API-S2.5 judge_better case#{} got {} want {}", ci, got, want));
+        }
+    }
+    let bad_j = match vm.execute_function(
+        &adp_mod,
+        fn_judge,
+        vec![OmniValue::Bytes(vec![0u8; 16]), OmniValue::Int(5)],
+    ).map_err(|e| format!("API-S2.5 step2 bad buf: {}", e))? {
+        OmniValue::Int(v) => v,
+        other => return Err(format!("API-S2.5 judge_better bad buf returned {:?}", other)),
+    };
+    if bad_j != -1 {
+        return Err(format!("API-S2.5 judge_better short buf must fail closed (-1), got {}", bad_j));
+    }
+    checks += 1;
+
+    // 3. `api_specialize_with_hint`: subsystem_mask=2 (M2_EMITTER) strips NOPs; 0 (NONE) holds.
+    let (_bname0, bsrc0, bargs0, bwant0) = P7_BENCHMARK_CORPUS[0];
+    let clean_bc = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(bsrc0))?;
+    let mut bloated_bc = clean_bc.clone();
+    let pcnt0 = bloated_bc[3] as usize;
+    let icnt_idx = 4 + pcnt0 * 3 + 2;
+    bloated_bc[icnt_idx] += 2;
+    bloated_bc.splice(icnt_idx + 1..icnt_idx + 1, [0x7F00u16, 0x7EE4, 0x7F00, 0x7EE4]);
+    let bloated_bytes = encode_u16_stream_to_bytes(&bloated_bc);
+
+    let hold_bytes = match vm.execute_function(
+        &adp_mod,
+        fn_spec_hint,
+        vec![OmniValue::Bytes(bloated_bytes.clone()), OmniValue::Int(0)],
+    ).map_err(|e| format!("API-S2.5 step3 hold: {}", e))? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("API-S2.5 spec_hint(0) returned {:?}", other)),
+    };
+    if hold_bytes != bloated_bytes {
+        return Err(String::from("API-S2.5 specialize_with_hint(0) must hold baseline bytes"));
+    }
+    let hint_bytes = match vm.execute_function(
+        &adp_mod,
+        fn_spec_hint,
+        vec![OmniValue::Bytes(bloated_bytes.clone()), OmniValue::Int(2)],
+    ).map_err(|e| format!("API-S2.5 step3 mask=2: {}", e))? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("API-S2.5 spec_hint(2) returned {:?}", other)),
+    };
+    if decode_bytes_to_u16_stream(&hint_bytes) != clean_bc {
+        return Err(String::from("API-S2.5 specialize_with_hint(2) did not strip NOPs to clean bench_clamp"));
+    }
+    checks += 1;
+
+    // 4. End-to-end `api_adaptive_step`:
+    //    - band=0 -> +1t -> adopts stripped candidate -> verify via M2 ELF64 (0-byte diff) + M4 VM (ret=90) + Linux native
+    //    - band=10 -> 0t (4-word saving within noise band) -> retains baseline bloated stream.
+    let adopted_bytes = match vm.execute_function(
+        &adp_mod,
+        fn_step,
+        vec![OmniValue::Bytes(bloated_bytes.clone()), OmniValue::Int(2), OmniValue::Int(0)],
+    ).map_err(|e| format!("API-S2.5 step4 adopt: {}", e))? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("API-S2.5 adaptive_step(adopt) returned {:?}", other)),
+    };
+    let adopted_u16 = decode_bytes_to_u16_stream(&adopted_bytes);
+    if adopted_u16 != clean_bc {
+        return Err(String::from("API-S2.5 adaptive_step(band=0) did not adopt improved candidate"));
+    }
+    let retained_bytes = match vm.execute_function(
+        &adp_mod,
+        fn_step,
+        vec![OmniValue::Bytes(bloated_bytes.clone()), OmniValue::Int(2), OmniValue::Int(10)],
+    ).map_err(|e| format!("API-S2.5 step4 retain: {}", e))? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("API-S2.5 adaptive_step(retain) returned {:?}", other)),
+    };
+    if retained_bytes != bloated_bytes {
+        return Err(String::from("API-S2.5 adaptive_step(band=10) must retain baseline on 0t neutral verdict"));
+    }
+    let elf_r = compile_pure_u16_to_x86_64_elf_multi(&adopted_u16, bargs0[0], bargs0[1], bargs0[2])?;
+    let elf_p = match vm_m2.execute_function(
+        &m2_mod,
+        m2_entry,
+        vec![
+            OmniValue::U16Array(adopted_u16.clone()),
+            OmniValue::Int(bargs0[0]),
+            OmniValue::Int(bargs0[1]),
+            OmniValue::Int(bargs0[2]),
+        ],
+    ).map_err(|e| format!("API-S2.5 step4 M2(adopted): {}", e))? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("API-S2.5 M2(adopted) returned {:?}", other)),
+    };
+    if elf_p != elf_r {
+        return Err(String::from("API-S2.5 M2 0-byte diff failed on adopted candidate"));
+    }
+    let m4_u16 = decode_bytes_to_u16_stream(
+        &std::fs::read("pure/m4/m4.omni_bc").map_err(|e| format!("API-S2.5 read m4 seed: {}", e))?,
+    );
+    let m4_mod = decode_omni_token_stream(&m4_u16)?;
+    let m4_run_fn = m4_mod.functions[m4_mod.functions.len() - 2].fn_idx;
+    let st = 167_936usize;
+    let adp_arena = match vm.execute_function(
+        &m4_mod,
+        m4_run_fn,
+        vec![
+            OmniValue::Bytes(vec![0u8; 524_288]),
+            OmniValue::U16Array(adopted_u16),
+            OmniValue::Int(bargs0[0]),
+            OmniValue::Int(bargs0[1]),
+            OmniValue::Int(bargs0[2]),
+            OmniValue::Int(50_000),
+            OmniValue::Int(0),
+        ],
+    ).map_err(|e| format!("API-S2.5 step4 M4(adopted): {}", e))? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("API-S2.5 M4(adopted) returned {:?}", other)),
+    };
+    let adp_ret = i64::from_le_bytes(adp_arena[st + 32..st + 40].try_into().unwrap());
+    if adp_ret != bwant0 {
+        return Err(format!("API-S2.5 M4(adopted) ret={} want {}", adp_ret, bwant0));
+    }
+    let _ = p7_verify_native_elf_i64("api_s25_adopted", &elf_p, bwant0)?;
+    checks += 1;
+
+    // 5. Stage 2.5 golden (`judge_better_golden.omni`) M3/M2/M4 0-diff + frozen hashes intact.
+    let gpath = "spec/acceptance/goldens/judge_better_golden.omni";
+    let gsrc = std::fs::read_to_string(gpath).map_err(|e| format!("API-S2.5 read {}: {}", gpath, e))?;
+    let r_u16 = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(&gsrc))?;
+    let m3_u16_g = match m3_lockstep_compile_via_omni(&gsrc, true)? {
+        Ok(v) => v,
+        Err((c, l, col)) => return Err(format!("API-S2.5 M3 on {} errored ({}, {}:{})", gpath, c, l, col)),
+    };
+    if m3_u16_g != r_u16 {
+        return Err(format!("API-S2.5 M3 0-word diff failed on {}", gpath));
+    }
+    let g_elf_r = compile_pure_u16_to_x86_64_elf_multi(&r_u16, 100, 80, 5)?;
+    let g_elf_p = match vm_m2.execute_function(
+        &m2_mod,
+        m2_entry,
+        vec![OmniValue::U16Array(r_u16.clone()), OmniValue::Int(100), OmniValue::Int(80), OmniValue::Int(5)],
+    ).map_err(|e| format!("API-S2.5 step5 M2 golden: {}", e))? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("API-S2.5 M2 on {} returned {:?}", gpath, other)),
+    };
+    if g_elf_p != g_elf_r {
+        return Err(format!("API-S2.5 M2 0-byte diff failed on {}", gpath));
+    }
+    let g_arena = match vm.execute_function(
+        &m4_mod,
+        m4_run_fn,
+        vec![
+            OmniValue::Bytes(vec![0u8; 524_288]),
+            OmniValue::U16Array(r_u16),
+            OmniValue::Int(100),
+            OmniValue::Int(80),
+            OmniValue::Int(5),
+            OmniValue::Int(50_000),
+            OmniValue::Int(0),
+        ],
+    ).map_err(|e| format!("API-S2.5 step5 M4 golden: {}", e))? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("API-S2.5 M4 VM on {} returned {:?}", gpath, other)),
+    };
+    let gv = i64::from_le_bytes(g_arena[st + 32..st + 40].try_into().unwrap());
+    if gv != 80 {
+        return Err(format!("API-S2.5 M4 VM {} mismatch: got {} want 80", gpath, gv));
+    }
+    selftest_m2_frozen_hashes()?;
+    checks += 1;
+
+    Ok((checks, adp_u16.len(), adp_elf_rust.len()))
 }
 
