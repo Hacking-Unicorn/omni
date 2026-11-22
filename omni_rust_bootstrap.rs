@@ -25079,6 +25079,7 @@ pub fn selftest_m2_label_reference() -> Result<usize, String> {
         "L7_imm4080",
         "L7_imm5000",
         "L7_imm_minus1",
+        "L8_br_trit_2_labels", // Audit Round 2 N1: pure verifier enforces BR_TRIT min_ops=4
     ];
     for (who, got, want) in [("Stage-1", &s1_div, &want_s1[..]), ("Omni verifier", &ov_div, &want_ov[..])] {
         for w in want {
