@@ -82,7 +82,7 @@ All 5 frozen artifacts are asserted by FNV-1a64 hash and exact size in `selftest
 
 ```bash
 rustc -O omni_rust_bootstrap.rs -o omnic
-./omnic selftest              # 1,542 checks on Windows / 1,658 on Linux x86-64 (13AY diff5, 13AZ KV, 13BA ISA table, 13BF hash pin, M2/M3/P4/P5/P7/API/A1-B4/S1-S4 locks)
+./omnic selftest              # 1,542 checks on Windows / 1,663 on Linux x86-64 (13AY diff5, 13AZ KV, 13BA ISA table, 13BF hash pin, M2/M3/P4/P5/P7/API/A1-B4/S1-S4 locks)
 ./omnic a1-pure-default       # Seed-Shrink A1: Pure-Omni M3->M2/M4 default CLI path (`compile`, `compile-elf`, `run`, `self-host`; `--rust` oracle)
 ./omnic a2-pure-include       # Seed-Shrink A2: Pure-Omni O-5 include expander (`pure/m3/include.omni`, 0-byte diff vs Rust, `CIRCULAR_INCLUDE` gate)
 ./omnic a3-macro-quarantine   # Seed-Shrink A3: quarantine `macro` behind `--rust` (`ORACLE_ONLY_MACRO`) + pure replacement golden (0-diff M3/M2/M4)
@@ -137,7 +137,7 @@ python3 scripts/external_verifier_check.py # C2: independent zero-dependency Pyt
 ### 8-Crate Workspace (`cargo`)
 
 ```bash
-cargo run --release --manifest-path omni-workspace/Cargo.toml -p omni-cli -- selftest         # 666 checks on Windows / 706 on Linux x86-64
+cargo run --release --manifest-path omni-workspace/Cargo.toml -p omni-cli -- selftest         # 666 checks on Windows / 707 on Linux x86-64
 cargo run --release --manifest-path omni-workspace/Cargo.toml -p omni-cli -- acceptance-diff
 cargo run --release --manifest-path omni-workspace/Cargo.toml -p omni-cli -- pure-omni-diff
 cargo test --release --manifest-path omni-workspace/Cargo.toml --workspace
