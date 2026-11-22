@@ -1042,6 +1042,8 @@ fn apply_api_surface_rules(
 
     let nslot_p1: i64 = ws_get(w, 16);
     let uses_narrow: i64 = 0;
+    let live_lin_call: i64 = 0;
+    let is_call: i64 = is_eq(op, 32584);
     let i: i64 = 0;
     while nops - i <=> 0 {
         let p: i64 = ws_get(w, 384 + i);
@@ -1049,8 +1051,13 @@ fn apply_api_surface_rules(
         let sl: i64 = token_to_slot(op_tok(p));
         let hit: i64 = is_sl * is_gt(nslot_p1, 0) * is_eq(sl, nslot_p1 - 1);
         uses_narrow = uses_narrow + hit;
+        let rp: i64 = get_reg(w, sl);
+        let lin_hit: i64 = is_call * is_sl * is_ge(sl, 0) * sl_heap(rp) * is_eq(sl_state(rp), 1);
+        live_lin_call = live_lin_call + lin_hit;
         i = i + 1;
     }
+    let c1012: i64 = omni_verify_api_surface(3, 0, 0, 0, 0, 0, is_gt(live_lin_call, 0));
+    w = append_err_if(w, is_eq(c1012, 1012), 1012, off);
     let c1013: i64 = omni_verify_api_surface(4, cap, req, 0, ws_get(w, 17), ws_get(w, 18), 0);
     w = append_err_if(w, is_gt(uses_narrow, 0) * is_eq(c1013, 1013), 1013, off);
     return w;

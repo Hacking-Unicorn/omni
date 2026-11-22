@@ -1,0 +1,13 @@
+// Stage 2 positive golden: strips a standalone NOP (`[0x7F00, 0x7EE4]`) when `hint == 1`.
+#[strict]
+fn main(hint: i64) -> i64 {
+    let bc: bytes = anew(0);
+    bc = iset(bc, 0);
+    bc = iset(bc, 127);   // 0x7F00 (NOP)
+    bc = iset(bc, 228);
+    bc = iset(bc, 126);   // 0x7EE4 (INS_END)
+    let is_nop: i64 = sel_trit(ld_u16(bc, 0) <=> 32512, 0, 1, 0)
+        * sel_trit(ld_u16(bc, 2) <=> 32484, 0, 1, 0);
+    let drop_words: i64 = sel_trit(hint <=> 1, 0, 1, 0) * is_nop * 2;
+    return (slen(bc) >> 1) - drop_words;
+}

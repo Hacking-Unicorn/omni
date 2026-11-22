@@ -1,0 +1,13 @@
+// Stage 2 positive golden: inspects an inline minimal `.omni_bc` module header (`MOD_BEGIN=0x7EE0`).
+#[strict]
+fn main(w0: i64, w1: i64) -> i64 {
+    let bc: bytes = anew(0);
+    bc = iset(bc, w0 & 255);
+    bc = iset(bc, (w0 >> 8) & 255);
+    bc = iset(bc, w1 & 255);
+    bc = iset(bc, (w1 >> 8) & 255);
+    let nwords: i64 = slen(bc) >> 1;
+    let hdr_ok: i64 = sel_trit(ld_u16(bc, 0) <=> 32480, 0, 1, 0);
+    let res: i64 = if_pos hdr_ok <=> 0 { nwords } else { -1 };
+    return res;
+}
