@@ -28,7 +28,7 @@
     {"id": "route_db_query_golden", "file": "goldens/route_db_query_golden.omni", "locked_u16_tokens": null, "args": ["42"], "expected_result": "200000420", "expected_backend": "vm"},
     {"id": "route_db_get_miss_golden", "file": "goldens/route_db_get_miss_golden.omni", "locked_u16_tokens": null, "args": ["42"], "expected_result": "199999999", "expected_backend": "vm"},
     {"id": "route_db_query_miss_golden", "file": "goldens/route_db_query_miss_golden.omni", "locked_u16_tokens": null, "args": ["42"], "expected_result": "199999999", "expected_backend": "vm"},
-    {"id": "stdlib_macro_pipeline_golden", "file": "goldens/stdlib_macro_pipeline_golden.omni", "locked_u16_tokens": null, "args": ["45", "10", "40"], "expected_result": "100", "expected_backend": "vm"}
+    {"id": "stdlib_macro_pipeline_golden", "file": "goldens/stdlib_macro_pipeline_golden.omni", "locked_u16_tokens": null, "args": ["45", "10", "40"], "expected_result": "100", "expected_backend": "vm", "oracle_only": true, "oracle_reason": "macro (quarantined behind --rust per Seed-Shrink A3)"}
   ],
   "negative_goldens": [
     {"id": "neg_taint_on_ret", "file": "goldens/neg_taint_on_ret.omni", "strict": false, "expected_code": "TAINT_ON_RET", "expected_line": 3, "expected_col": 5},
@@ -80,6 +80,11 @@
   "pure_api_stage2_5_goldens": {
     "positive": [
       {"id": "judge_better_golden", "file": "goldens/judge_better_golden.omni", "args": ["100", "80", "5"], "expected_result": "80"}
+    ]
+  },
+  "pure_seed_shrink_goldens": {
+    "positive": [
+      {"id": "weighted_diff_pure_golden", "file": "goldens/weighted_diff_pure_golden.omni", "args": ["45", "10", "40"], "expected_result": "100"}
     ]
   }
 }

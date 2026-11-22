@@ -56,6 +56,7 @@ jobs:
           ./omni p7-learn
           ./omni a1-pure-default
           ./omni a2-pure-include
+          ./omni a3-macro-quarantine
           ./omni api-stage1
           ./omni api-stage2
           ./omni api-stage2-emit
@@ -85,3 +86,33 @@ jobs:
           cargo run --release -p omni-cli --bin omni-agent-driver -- --list-strategies
           cargo run --release -p omni-cli --bin omni-agent-driver -- --strict "fn main(a: int) -> trit { let d = a - 10; let g = egate(d); return g; }" 25
           cargo test --release --workspace
+
+  pure-default-no-rustc:
+    name: Pure-Default Self-Host & Fixed-Point (rustc/cargo off PATH — Seed-Shrink A4)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Stage-0 runner once (before stripping rustc/cargo from PATH)
+        run: |
+          rustc -O --edition 2021 omni_rust_bootstrap.rs -o ./omni
+
+      - name: Run full pure-default compile/run/self-host/fixed-point suite with rustc & cargo absent from PATH
+        run: |
+          export PATH="/usr/bin:/bin"
+          if command -v rustc >/dev/null 2>&1 || command -v cargo >/dev/null 2>&1; then
+            echo "ERROR: rustc or cargo still reachable on PATH"
+            exit 1
+          fi
+          ./omni a1-pure-default
+          ./omni a2-pure-include
+          ./omni a3-macro-quarantine
+          ./omni self-host
+          ./omni p5-sys
+          ./omni m2-fixed-point
+          ./omni m3-fixed-point
+          ./omni compile spec/acceptance/goldens/weighted_diff_pure_golden.omni /tmp/wd.omni_bc
+          OUT=$(./omni run /tmp/wd.omni_bc 45 10 40)
+          test "$OUT" = "Int(100)"
+          ./omni p7-measure
+          ./omni p7-canary
