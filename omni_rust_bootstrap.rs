@@ -23409,6 +23409,10 @@ fn selftest_p7_learn_count() -> Result<usize, String> {
     Ok(selftest_p7_learn()?.0)
 }
 
+fn selftest_a1_pure_default_count() -> Result<usize, String> {
+    selftest_a1_pure_default()
+}
+
 /// All Milestone 2..7 + API Stage 1 foundation selftests (parallel-lane accelerated).
 pub fn run_m2_foundation_selftests() -> Result<usize, String> {
     let parallel_tasks: &[SelftestLaneTask] = &[
@@ -23447,6 +23451,7 @@ pub fn run_m2_foundation_selftests() -> Result<usize, String> {
         ("api_stage2_5", selftest_api_stage2_5_count),
         ("p7_adapt", selftest_p7_adapt_count),
         ("p7_learn", selftest_p7_learn_count),
+        ("a1_pure_default", selftest_a1_pure_default_count),
     ];
     let mut n = run_selftest_tasks_in_lanes(parallel_tasks)?;
     // Sequential: toggles global M3 lockstep state.
@@ -23943,6 +23948,19 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
                 1
             }
         },
+        "a1-pure-default" => match selftest_a1_pure_default() {
+            Ok(n) => {
+                println!(
+                    "[A1-PURE-DEFAULT PASS] {} checks | Pure-Omni M3->M2/M4 default path matches --rust oracle (0-word M3, 0-byte M2, exact M4 VM, structured error spans, frozen hashes intact)",
+                    n
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("[A1-PURE-DEFAULT FAIL] {}", e);
+                1
+            }
+        },
         "p5-sys" => match selftest_p5_2_zero_shim_sys() {
             Ok((n, sz, h, native)) => {
                 println!(
@@ -24425,6 +24443,9 @@ fn main() {
                 println!("  api-stage2-5                      New-Level API Stage 2.5: pure self-adaptive loop hooks (judge_better, specialize_with_hint, adaptive_step)");
                 println!("  p7-adapt                          Phase 7 (P7-2): workload classifier, cap-bounded policy, hysteresis & closed-loop self-adaptive gate");
                 println!("  p7-learn                          Phase 7 (P7-3): tamper-checked ternary experience table, safety floor, @PACK5 export & self-learning gate");
+                println!("  a1-pure-default                   Seed-Shrink A1: Pure-Omni M3->M2/M4 default CLI path vs --rust oracle gate");
+                println!("  compile [--rust|--oracle] <in> <out>     Compile .omni to .omni_bc via Pure M3 by default");
+                println!("  self-host [--rust|--oracle]              Run Pure M3->M4->M2 self-host chain by default");
                 println!();
                 println!("Compilation, Execution & Tooling:");
                 println!("  run <file.omni|file.omni_bc> [args...]   Compile/verify and execute on VM");
@@ -24452,7 +24473,7 @@ fn main() {
             "harness" | "--harness" => {
                 std::process::exit(run_omni_harness_cli(&cli_args[2..]));
             }
-            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" | "p7-heal" | "p7-adapt" | "p7-learn" | "api-stage1" | "api-stage2" | "api-stage2-emit" | "api-stage2-5" => {
+            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" | "p7-heal" | "p7-adapt" | "p7-learn" | "a1-pure-default" | "api-stage1" | "api-stage2" | "api-stage2-emit" | "api-stage2-5" => {
                 std::process::exit(run_m2_cli(&cli_args[1..]));
             }
             "agent-driver" | "--agent-driver" => {
@@ -24580,11 +24601,63 @@ fn main() {
                 println!("[ASSEMBLE PASS] Wrote {} u16 tokens to '{}'", u16_stream.len(), cli_args[3]);
                 return;
             }
-            "compile-surface" if cli_args.len() >= 4 => {
-                let u16_stream = compile_omni_surface_file_to_u16(&cli_args[2]).expect("Surface compilation failed");
-                fs::write(&cli_args[3], encode_u16_stream_to_bytes(&u16_stream)).expect("Failed to write .omni_bc");
-                println!("[SURFACE COMPILE PASS] Wrote {} u16 tokens to '{}'", u16_stream.len(), cli_args[3]);
-                return;
+            "self-host" => {
+                let use_rust = cli_args[2..].iter().any(|a| a == "--rust" || a == "--oracle");
+                if use_rust {
+                    let s1_u16 = build_step7_stage1_compiler_stream();
+                    let s1_elf = compile_pure_u16_to_x86_64_elf_with_args(&s1_u16, 45, 40, 90).expect("Stage-1 AOT failed");
+                    println!(
+                        "[RUST-ORACLE SELF-HOST PASS] Stage-1 stream={} w -> ELF={} B (FNV-1a64=0x{:016X})",
+                        s1_u16.len(), s1_elf.len(), fnv1a_64_hash(&s1_elf)
+                    );
+                    return;
+                }
+                match selftest_p5_1_selfhost(false) {
+                    Ok((m4_words, h_bc, m4_elf_bytes, h_elf)) => {
+                        println!(
+                            "[PURE SELF-HOST PASS] M3->pure/m4/m4.omni_bc ({} w, 0x{:016X}) -> M2 ELF64 ({} B, 0x{:016X}) | zero Rust on default path",
+                            m4_words, h_bc, m4_elf_bytes, h_elf
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("[PURE SELF-HOST FAIL] {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            "compile" | "compile-surface" if cli_args.len() >= 4 => {
+                let use_rust = cli_args[2..].iter().any(|a| a == "--rust" || a == "--oracle");
+                let pos: Vec<&str> = cli_args[2..]
+                    .iter()
+                    .filter(|a| *a != "--rust" && *a != "--oracle")
+                    .map(|s| s.as_str())
+                    .collect();
+                if pos.len() < 2 {
+                    eprintln!("Usage: omni compile [--rust|--oracle] <in.omni> <out.omni_bc>");
+                    std::process::exit(2);
+                }
+                if use_rust {
+                    let u16_stream = compile_omni_surface_file_to_u16(pos[0]).expect("Rust oracle surface compilation failed");
+                    fs::write(pos[1], encode_u16_stream_to_bytes(&u16_stream)).expect("Failed to write .omni_bc");
+                    println!("[RUST-ORACLE COMPILE PASS] Wrote {} u16 tokens to '{}'", u16_stream.len(), pos[1]);
+                    return;
+                }
+                let raw_src = fs::read_to_string(pos[0]).expect("Failed to read .omni file");
+                let parent_dir = std::path::Path::new(pos[0]).parent();
+                let expanded = resolve_omni_surface_includes(&raw_src, parent_dir, None)
+                    .expect("Include resolution failed");
+                match pure_default_compile_surface_to_u16(&expanded, expanded.contains("#[strict]")) {
+                    Ok(u16_stream) => {
+                        fs::write(pos[1], encode_u16_stream_to_bytes(&u16_stream)).expect("Failed to write .omni_bc");
+                        println!("[PURE-M3 COMPILE PASS] Wrote {} u16 tokens to '{}'", u16_stream.len(), pos[1]);
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("[PURE-M3 COMPILE FAIL] {}", e);
+                        std::process::exit(1);
+                    }
+                }
             }
             "compile-stage1" if cli_args.len() >= 4 => {
                 let raw_src = fs::read_to_string(&cli_args[2]).expect("Failed to read .omni file");
@@ -24600,21 +24673,56 @@ fn main() {
                 return;
             }
             "compile-elf" if cli_args.len() >= 4 => {
-                let path = &cli_args[2];
+                let use_rust = cli_args[2..].iter().any(|a| a == "--rust" || a == "--oracle");
+                let pos: Vec<&str> = cli_args[2..]
+                    .iter()
+                    .filter(|a| *a != "--rust" && *a != "--oracle")
+                    .map(|s| s.as_str())
+                    .collect();
+                if pos.len() < 2 {
+                    eprintln!("Usage: omni compile-elf [--rust|--oracle] <in.omni|.omni_bc> <out.elf> [a0 a1 a2]");
+                    std::process::exit(2);
+                }
+                let path = pos[0];
+                let out_path = pos[1];
+                let a0 = pos.get(2).and_then(|s| s.parse::<i64>().ok()).unwrap_or(45);
+                let a1 = pos.get(3).and_then(|s| s.parse::<i64>().ok()).unwrap_or(40);
+                let a2 = pos.get(4).and_then(|s| s.parse::<i64>().ok()).unwrap_or(90);
+                if use_rust {
+                    let u16_stream = if path.ends_with(".omni") {
+                        compile_omni_surface_file_to_u16(path).expect("Rust oracle surface compilation failed")
+                    } else {
+                        let raw = fs::read(path).expect("Failed to read .omni_bc");
+                        decode_bytes_to_u16_stream(&raw)
+                    };
+                    let elf = compile_pure_u16_to_x86_64_elf_with_args(&u16_stream, a0, a1, a2)
+                        .expect("Rust oracle x86-64 ELF AOT compilation failed");
+                    fs::write(out_path, &elf).expect("Failed to write .elf");
+                    println!("[RUST-ORACLE ELF PASS] Wrote {} bytes to '{}' (FNV-1a64=0x{:016X})", elf.len(), out_path, fnv1a_64_hash(&elf));
+                    return;
+                }
                 let u16_stream = if path.ends_with(".omni") {
-                    compile_omni_surface_file_to_u16(path).expect("Surface compilation failed")
+                    let raw_src = fs::read_to_string(path).expect("Failed to read .omni file");
+                    let parent_dir = std::path::Path::new(path).parent();
+                    let expanded = resolve_omni_surface_includes(&raw_src, parent_dir, None)
+                        .expect("Include resolution failed");
+                    pure_default_compile_surface_to_u16(&expanded, expanded.contains("#[strict]"))
+                        .expect("Pure-M3 surface compilation failed")
                 } else {
                     let raw = fs::read(path).expect("Failed to read .omni_bc");
                     decode_bytes_to_u16_stream(&raw)
                 };
-                let a0 = cli_args.get(4).and_then(|s| s.parse::<i64>().ok()).unwrap_or(45);
-                let a1 = cli_args.get(5).and_then(|s| s.parse::<i64>().ok()).unwrap_or(40);
-                let a2 = cli_args.get(6).and_then(|s| s.parse::<i64>().ok()).unwrap_or(90);
-                let elf = compile_pure_u16_to_x86_64_elf_with_args(&u16_stream, a0, a1, a2)
-                    .expect("x86-64 ELF AOT compilation failed");
-                fs::write(&cli_args[3], &elf).expect("Failed to write .elf");
-                println!("[ELF AOT PASS] Wrote {} bytes to '{}' (FNV-1a64=0x{:016X})", elf.len(), cli_args[3], fnv1a_64_hash(&elf));
-                return;
+                match pure_default_compile_u16_to_elf(&u16_stream, a0, a1, a2) {
+                    Ok(elf) => {
+                        fs::write(out_path, &elf).expect("Failed to write .elf");
+                        println!("[PURE-M2 ELF PASS] Wrote {} bytes to '{}' (FNV-1a64=0x{:016X})", elf.len(), out_path, fnv1a_64_hash(&elf));
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("[PURE-M2 ELF FAIL] {}", e);
+                        std::process::exit(1);
+                    }
+                }
             }
             "compile-wasm" if cli_args.len() >= 4 => {
                 let path = &cli_args[2];
@@ -24705,8 +24813,54 @@ fn main() {
                 return;
             }
             "run" | "run-surface" if cli_args.len() >= 3 => {
-                let path = &cli_args[2];
-                let vm_args: Vec<OmniValue> = cli_args[3..].iter().map(|s| parse_cli_omni_value(s)).collect();
+                let use_rust = cli_args[2..].iter().any(|a| a == "--rust" || a == "--oracle");
+                let pos: Vec<&str> = cli_args[2..]
+                    .iter()
+                    .filter(|a| *a != "--rust" && *a != "--oracle")
+                    .map(|s| s.as_str())
+                    .collect();
+                if pos.is_empty() {
+                    eprintln!("Usage: omni run [--rust|--oracle] <file.omni|file.omni_bc> [args...]");
+                    std::process::exit(2);
+                }
+                let path = pos[0];
+                if !use_rust {
+                    let u16_stream = if path.ends_with(".omni") {
+                        let raw_src = fs::read_to_string(path).expect("Failed to read .omni file");
+                        let parent_dir = std::path::Path::new(path).parent();
+                        let expanded = match resolve_omni_surface_includes(&raw_src, parent_dir, None) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                eprintln!("[PURE-RUN FAIL] {}", e);
+                                std::process::exit(1);
+                            }
+                        };
+                        match pure_default_compile_surface_to_u16(&expanded, expanded.contains("#[strict]")) {
+                            Ok(u) => u,
+                            Err(e) => {
+                                eprintln!("[PURE-RUN FAIL] {}", e);
+                                std::process::exit(1);
+                            }
+                        }
+                    } else {
+                        let raw = fs::read(path).expect("Failed to read .omni_bc file");
+                        decode_bytes_to_u16_stream(&raw)
+                    };
+                    let a0 = pos.get(1).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                    let a1 = pos.get(2).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                    let a2 = pos.get(3).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                    match pure_default_run_u16(&u16_stream, a0, a1, a2, false) {
+                        Ok((ret, _steps)) => {
+                            println!("Int({})", ret);
+                            return;
+                        }
+                        Err(e) => {
+                            eprintln!("[PURE-RUN FAIL] {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                let vm_args: Vec<OmniValue> = pos[1..].iter().map(|s| parse_cli_omni_value(s)).collect();
                 if path.ends_with(".omni") {
                     let raw_src = fs::read_to_string(path).expect("Failed to read .omni file");
                     let parent_dir = std::path::Path::new(path).parent();

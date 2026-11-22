@@ -1048,6 +1048,7 @@ fn main() {
                 println!("  api-stage2-5                      New-Level API Stage 2.5: pure self-adaptive loop hooks (judge_better, specialize_with_hint, adaptive_step)");
                 println!("  p7-adapt                          Phase 7 (P7-2): workload classifier, cap-bounded policy, hysteresis & closed-loop self-adaptive gate");
                 println!("  p7-learn                          Phase 7 (P7-3): tamper-checked ternary experience table, safety floor, @PACK5 export & self-learning gate");
+                println!("  a1-pure-default                   Seed-Shrink A1: Pure-Omni M3->M2/M4 default CLI path vs --rust oracle gate");
                 println!();
                 println!("Compilation, Execution & Tooling:");
                 println!("  run <file.omni|file.omni_bc> [args...]   Compile/verify and execute on VM");
@@ -1114,7 +1115,7 @@ fn main() {
                     }
                 }
             }
-            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" | "p7-heal" | "p7-adapt" | "p7-learn" | "api-stage1" | "api-stage2" | "api-stage2-emit" | "api-stage2-5" => {
+            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" | "p7-heal" | "p7-adapt" | "p7-learn" | "a1-pure-default" | "api-stage1" | "api-stage2" | "api-stage2-emit" | "api-stage2-5" => {
                 std::process::exit(monolith::run_m2_cli(&args[1..]));
             }
             "selftest" => {

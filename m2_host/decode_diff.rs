@@ -5920,3 +5920,151 @@ pub fn selftest_p7_learn() -> Result<(usize, usize, usize), String> {
     Ok((checks, lrn_u16.len(), lrn_elf_rust.len()))
 }
 
+/// Seed-Shrink Phase A1: Compile `.omni` surface source using ONLY the committed Pure-Omni M3 seed
+/// (`pure/m3/m3.omni_bc`) — zero Rust frontend calls.
+pub fn pure_default_compile_surface_to_u16(src: &str, strict: bool) -> Result<Vec<u16>, String> {
+    match m3_lockstep_compile_via_omni(src, strict)? {
+        Ok(u16_stream) => Ok(u16_stream),
+        Err((code, line, col)) => Err(format!(
+            "error[M3_CODE_{}] line {}, col {}: Pure-Omni M3 frontend rejected input",
+            code, line, col
+        )),
+    }
+}
+
+/// Seed-Shrink Phase A1: Lower a `.omni_bc` u16 stream to native Linux x86-64 ELF64 using ONLY
+/// the committed Pure-Omni M2 seed (`pure/m2/m2.omni_bc`) — zero Rust emitter calls.
+pub fn pure_default_compile_u16_to_elf(u16_stream: &[u16], a0: i64, a1: i64, a2: i64) -> Result<Vec<u8>, String> {
+    let m2_raw = std::fs::read("pure/m2/m2.omni_bc")
+        .map_err(|e| format!("Pure-M2 seed read failed (pure/m2/m2.omni_bc): {}", e))?;
+    let m2_u16 = decode_bytes_to_u16_stream(&m2_raw);
+    let m2_mod = decode_omni_token_stream(&m2_u16)?;
+    let m2_entry = m2_entry_of(&m2_mod);
+    let mut vm_m2 = OmniBinaryVm::with_budgets(500_000_000, 128 * 1024 * 1024);
+    match vm_m2.execute_function(
+        &m2_mod,
+        m2_entry,
+        vec![
+            OmniValue::U16Array(u16_stream.to_vec()),
+            OmniValue::Int(a0),
+            OmniValue::Int(a1),
+            OmniValue::Int(a2),
+        ],
+    )? {
+        OmniValue::Bytes(elf) => Ok(elf),
+        other => Err(format!("Pure-M2 seed returned unexpected value: {:?}", other)),
+    }
+}
+
+/// Seed-Shrink Phase A1: Execute a `.omni_bc` u16 stream using ONLY the committed Pure-Omni M4 VM
+/// seed (`pure/m4/m4.omni_bc`), returning `(ret_i64, vm_steps)`.
+pub fn pure_default_run_u16(
+    u16_stream: &[u16],
+    a0: i64,
+    a1: i64,
+    a2: i64,
+    trace: bool,
+) -> Result<(i64, i64), String> {
+    let m4_raw = std::fs::read("pure/m4/m4.omni_bc")
+        .map_err(|e| format!("Pure-M4 seed read failed (pure/m4/m4.omni_bc): {}", e))?;
+    let m4_u16 = decode_bytes_to_u16_stream(&m4_raw);
+    let m4_mod = decode_omni_token_stream(&m4_u16)?;
+    let m4_run_fn = m4_mod.functions[m4_mod.functions.len() - 2].fn_idx;
+    let mut vm = OmniBinaryVm::with_budgets(500_000_000, 128 * 1024 * 1024);
+    let arena = match vm.execute_function(
+        &m4_mod,
+        m4_run_fn,
+        vec![
+            OmniValue::Bytes(vec![0u8; 524_288]),
+            OmniValue::U16Array(u16_stream.to_vec()),
+            OmniValue::Int(a0),
+            OmniValue::Int(a1),
+            OmniValue::Int(a2),
+            OmniValue::Int(500_000),
+            OmniValue::Int(if trace { 1 } else { 0 }),
+        ],
+    )? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("Pure-M4 VM seed returned unexpected value: {:?}", other)),
+    };
+    let st = 167_936usize;
+    let status = i64::from_le_bytes(arena[st + 24..st + 32].try_into().unwrap());
+    let ret = i64::from_le_bytes(arena[st + 32..st + 40].try_into().unwrap());
+    let steps = i64::from_le_bytes(arena[st + 40..st + 48].try_into().unwrap());
+    if status != 0 {
+        return Err(format!("Pure-M4 VM trapped with status={} after {} steps", status, steps));
+    }
+    Ok((ret, steps))
+}
+
+/// Seed-Shrink Phase A1 hard gate (`./omnic a1-pure-default`):
+///   1. Pure-default M3 (`pure/m3/m3.omni_bc`) matches `--rust` oracle with 0-word diff on goldens.
+///   2. Pure-default M3 -> Pure-default M2 (`pure/m2/m2.omni_bc`) matches `--rust` oracle with 0-byte diff.
+///   3. Pure-default M3 -> Pure-default M4 VM (`pure/m4/m4.omni_bc`) matches exact expected outputs on goldens & bench_loop_sum.
+///   4. Negative surface input rejected by Pure-default M3 with machine-readable `error[...]` and 1-based `(line, col)` span.
+///   5. All 5 frozen FNV-1a64 hashes intact.
+pub fn selftest_a1_pure_default() -> Result<usize, String> {
+    let mut checks = 0usize;
+
+    // 1. Pure-default M3 0-word diff vs Rust oracle on Stage 2 / 2.5 goldens.
+    let goldens: [(&str, [i64; 3], i64); 3] = [
+        ("spec/acceptance/goldens/token_inspect_golden.omni", [32480, 32495, 0], 2),
+        ("spec/acceptance/goldens/token_emit_golden.omni", [42, 0, 0], 13),
+        ("spec/acceptance/goldens/judge_better_golden.omni", [100, 80, 5], 80),
+    ];
+    let mut compiled: Vec<(&str, Vec<u16>, [i64; 3], i64)> = Vec::new();
+    for &(gpath, gargs, gwant) in &goldens {
+        let gsrc = std::fs::read_to_string(gpath).map_err(|e| format!("A1 read {}: {}", gpath, e))?;
+        let pure_u16 = pure_default_compile_surface_to_u16(&gsrc, gsrc.contains("#[strict]"))?;
+        let rust_u16 = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(&gsrc))?;
+        if pure_u16 != rust_u16 {
+            return Err(format!("A1 Pure-M3 vs Rust oracle word diff on {}", gpath));
+        }
+        compiled.push((gpath, pure_u16, gargs, gwant));
+    }
+    checks += 1;
+
+    // 2. Pure-default M2 ELF64 0-byte diff vs Rust oracle.
+    for &(gpath, ref u16_s, gargs, _) in &compiled {
+        let pure_elf = pure_default_compile_u16_to_elf(u16_s, gargs[0], gargs[1], gargs[2])?;
+        let rust_elf = compile_pure_u16_to_x86_64_elf_multi(u16_s, gargs[0], gargs[1], gargs[2])?;
+        if pure_elf != rust_elf {
+            return Err(format!("A1 Pure-M2 vs Rust oracle ELF diff on {}", gpath));
+        }
+    }
+    checks += 1;
+
+    // 3. Pure-default M4 VM execution parity on goldens + bench_loop_sum (100 -> 5050).
+    for &(gpath, ref u16_s, gargs, gwant) in &compiled {
+        let (got, _) = pure_default_run_u16(u16_s, gargs[0], gargs[1], gargs[2], false)?;
+        if got != gwant {
+            return Err(format!("A1 Pure-M4 VM {} got {} want {}", gpath, got, gwant));
+        }
+    }
+    let (_bname1, bsrc1, bargs1, bwant1) = P7_BENCHMARK_CORPUS[1];
+    let b1_u16 = pure_default_compile_surface_to_u16(bsrc1, true)?;
+    let (b1_got, _) = pure_default_run_u16(&b1_u16, bargs1[0], bargs1[1], bargs1[2], false)?;
+    if b1_got != bwant1 {
+        return Err(format!("A1 Pure-M4 VM bench_loop_sum got {} want {}", b1_got, bwant1));
+    }
+    checks += 1;
+
+    // 4. Negative surface input rejected by Pure-default M3 with `error[...]` + 1-based (line, col).
+    let bad_src = "#[strict]\nfn main(x: i64) -> i64 {\n    return unknown_ident_xyz;\n}\n";
+    match pure_default_compile_surface_to_u16(bad_src, true) {
+        Ok(_) => return Err(String::from("A1 Pure-M3 must reject undefined identifier")),
+        Err(msg) => {
+            if !msg.starts_with("error[") || !msg.contains("line 3,") {
+                return Err(format!("A1 Pure-M3 error format/span mismatch: {}", msg));
+            }
+        }
+    }
+    checks += 1;
+
+    // 5. All 5 frozen FNV-1a64 hashes intact.
+    selftest_m2_frozen_hashes()?;
+    checks += 1;
+
+    Ok(checks)
+}
+
