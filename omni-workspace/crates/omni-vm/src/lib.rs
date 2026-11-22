@@ -33,6 +33,7 @@ pub const OMNI_DB_GET_MISS: i64 = -1;
 /// Fixed KV key cap (Boss Lady 2026-11-14): 8192 distinct keys, the `pure/host_kv.omni` arena size
 /// (0x1B0000..0x1EFFFF at 32 B). The 8193rd new key is `BUDGET_EXCEEDED`; overwrites still succeed.
 pub const OMNI_VM_KV_MAX_KEYS: usize = 8192;
+pub const DEFAULT_VM_WALL_TIMEOUT_MS: u64 = 120_000;
 
 pub struct OmniBinaryVm {
     pub tables: HashMap<u16, Vec<BTreeMap<u16, OmniValue>>>,
@@ -45,6 +46,8 @@ pub struct OmniBinaryVm {
     pub allocated_bytes: usize,
     pub call_depth: usize,
     pub verified_fns: u64,
+    pub wall_timeout_ms: u64,
+    pub start_instant: Option<std::time::Instant>,
 }
 
 impl OmniBinaryVm {
@@ -60,6 +63,8 @@ impl OmniBinaryVm {
             allocated_bytes: 0,
             call_depth: 0,
             verified_fns: 0,
+            wall_timeout_ms: DEFAULT_VM_WALL_TIMEOUT_MS,
+            start_instant: None,
         }
     }
 
@@ -75,7 +80,13 @@ impl OmniBinaryVm {
             allocated_bytes: 0,
             call_depth: 0,
             verified_fns: 0,
+            wall_timeout_ms: DEFAULT_VM_WALL_TIMEOUT_MS,
+            start_instant: None,
         }
+    }
+
+    pub fn set_wall_timeout_ms(&mut self, timeout_ms: u64) {
+        self.wall_timeout_ms = timeout_ms;
     }
 
     pub fn clear_tables(&mut self) {
@@ -87,6 +98,7 @@ impl OmniBinaryVm {
         self.allocated_bytes = 0;
         self.call_depth = 0;
         self.verified_fns = 0;
+        self.start_instant = None;
     }
 
     #[inline]
@@ -173,6 +185,9 @@ impl OmniBinaryVm {
     ) -> Result<OmniValue, String> {
         if self.call_depth == 0 {
             self.verified_fns = 0;
+            if self.start_instant.is_none() {
+                self.start_instant = Some(std::time::Instant::now());
+            }
         }
         let func = if let Some(f) = module.functions.get(fn_idx as usize).filter(|f| f.fn_idx == fn_idx) {
             f
@@ -233,6 +248,20 @@ impl OmniBinaryVm {
                     *out_v = std::mem::replace(&mut regs[192 + p_idx], OmniValue::Void);
                 }
                 return Err(format!("error[BUDGET_EXCEEDED]: VM fuel/step budget exceeded ({} > {})", self.steps_executed, self.step_limit));
+            }
+            if (self.steps_executed & 0xFFF) == 0 {
+                if let Some(t0) = self.start_instant {
+                    let elapsed_ms = t0.elapsed().as_millis() as u64;
+                    if elapsed_ms > self.wall_timeout_ms {
+                        for &mut (p_idx, ref mut out_v) in restore_borrowed.iter_mut() {
+                            *out_v = std::mem::replace(&mut regs[192 + p_idx], OmniValue::Void);
+                        }
+                        return Err(format!(
+                            "error[BUDGET_EXCEEDED]: VM wall-clock timeout exceeded ({} ms > {} ms)",
+                            elapsed_ms, self.wall_timeout_ms
+                        ));
+                    }
+                }
             }
             let ins = &func.instructions[pc];
             let min_ops = match ins.op_tok {

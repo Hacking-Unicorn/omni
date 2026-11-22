@@ -1200,6 +1200,7 @@ pub const OMNI_DB_GET_MISS: i64 = -1;
 /// Fixed KV key cap (Boss Lady 2026-11-14): 8192 distinct keys, the `pure/host_kv.omni` arena size
 /// (0x1B0000..0x1EFFFF at 32 B). The 8193rd new key is `BUDGET_EXCEEDED`; overwrites still succeed.
 pub const OMNI_VM_KV_MAX_KEYS: usize = 8192;
+pub const DEFAULT_VM_WALL_TIMEOUT_MS: u64 = 120_000;
 
 pub struct OmniBinaryVm {
     pub tables: HashMap<u16, Vec<BTreeMap<u16, OmniValue>>>,
@@ -1212,6 +1213,8 @@ pub struct OmniBinaryVm {
     pub allocated_bytes: usize,
     pub call_depth: usize,
     pub verified_fns: u64,
+    pub wall_timeout_ms: u64,
+    pub start_instant: Option<Instant>,
 }
 
 impl OmniBinaryVm {
@@ -1227,6 +1230,8 @@ impl OmniBinaryVm {
             allocated_bytes: 0,
             call_depth: 0,
             verified_fns: 0,
+            wall_timeout_ms: DEFAULT_VM_WALL_TIMEOUT_MS,
+            start_instant: None,
         }
     }
 
@@ -1242,7 +1247,13 @@ impl OmniBinaryVm {
             allocated_bytes: 0,
             call_depth: 0,
             verified_fns: 0,
+            wall_timeout_ms: DEFAULT_VM_WALL_TIMEOUT_MS,
+            start_instant: None,
         }
+    }
+
+    pub fn set_wall_timeout_ms(&mut self, timeout_ms: u64) {
+        self.wall_timeout_ms = timeout_ms;
     }
 
     pub fn clear_tables(&mut self) {
@@ -1254,6 +1265,7 @@ impl OmniBinaryVm {
         self.allocated_bytes = 0;
         self.call_depth = 0;
         self.verified_fns = 0;
+        self.start_instant = None;
     }
 
     #[inline]
@@ -1381,6 +1393,9 @@ impl OmniBinaryVm {
     ) -> Result<OmniValue, String> {
         if self.call_depth == 0 {
             self.verified_fns = 0;
+            if self.start_instant.is_none() {
+                self.start_instant = Some(Instant::now());
+            }
         }
         if self.call_depth >= MAX_VM_CALL_DEPTH {
             return Err(format!(
@@ -1447,6 +1462,20 @@ impl OmniBinaryVm {
                     *out_v = std::mem::replace(&mut regs[192 + p_idx], OmniValue::Void);
                 }
                 return Err(format!("error[BUDGET_EXCEEDED]: VM fuel/step budget exceeded ({} > {})", self.steps_executed, self.step_limit));
+            }
+            if (self.steps_executed & 0xFFF) == 0 {
+                if let Some(t0) = self.start_instant {
+                    let elapsed_ms = t0.elapsed().as_millis() as u64;
+                    if elapsed_ms > self.wall_timeout_ms {
+                        for &mut (p_idx, ref mut out_v) in restore_borrowed.iter_mut() {
+                            *out_v = std::mem::replace(&mut regs[192 + p_idx], OmniValue::Void);
+                        }
+                        return Err(format!(
+                            "error[BUDGET_EXCEEDED]: VM wall-clock timeout exceeded ({} ms > {} ms)",
+                            elapsed_ms, self.wall_timeout_ms
+                        ));
+                    }
+                }
             }
             let ins = &func.instructions[pc];
             let min_ops = match ins.op_tok {
@@ -9014,19 +9043,36 @@ pub fn serve_omni_http_via_narrow_host<H: OmniNarrowHost>(
     let mut responses = Vec::with_capacity(num_requests);
     for _ in 0..num_requests {
         let conn_h = host.host_tcp_accept(combined_caps, listener_h)?;
-        let req_bytes = host.host_tcp_read(combined_caps, conn_h, 4096)?;
-        let req_str = String::from_utf8_lossy(&req_bytes);
-        let first_line = req_str.lines().next().unwrap_or("GET / HTTP/1.1");
-        let mut parts = first_line.split_whitespace();
-        let method = parts.next().unwrap_or("GET");
-        let req_path = parts.next().unwrap_or("/");
-        let resp = handle_omni_http_request(src, method, req_path, &mut kv_store)?;
-        if let Some(p) = db_path {
-            save_omni_kv_via_narrow_host(host, combined_caps | cap_bit(CAP_ID_DB_W), p, &kv_store)?;
-        }
+        let resp = match host.host_tcp_read(combined_caps, conn_h, 4096) {
+            Ok(req_bytes) => {
+                let req_str = String::from_utf8_lossy(&req_bytes);
+                let first_line = req_str.lines().next().unwrap_or("GET / HTTP/1.1");
+                let mut parts = first_line.split_whitespace();
+                let method = parts.next().unwrap_or("GET");
+                let req_path = parts.next().unwrap_or("/");
+                match handle_omni_http_request(src, method, req_path, &mut kv_store) {
+                    Ok(r) => {
+                        if let Some(p) = db_path {
+                            let _ = save_omni_kv_via_narrow_host(host, combined_caps | cap_bit(CAP_ID_DB_W), p, &kv_store);
+                        }
+                        r
+                    }
+                    Err(e) => OmniHttpResponse {
+                        status: 500,
+                        content_type: String::from("text/plain; charset=utf-8"),
+                        body: format!("error[HTTP_REQUEST_ERROR]: {}", e),
+                    },
+                }
+            }
+            Err(e) => OmniHttpResponse {
+                status: 400,
+                content_type: String::from("text/plain; charset=utf-8"),
+                body: format!("error[HTTP_READ_ERROR]: {}", e),
+            },
+        };
         let wire = resp.to_http11_wire_bytes();
-        let _ = host.host_tcp_write(combined_caps, conn_h, &wire)?;
-        let _ = host.host_tcp_close(combined_caps, conn_h)?;
+        let _ = host.host_tcp_write(combined_caps, conn_h, &wire);
+        let _ = host.host_tcp_close(combined_caps, conn_h);
         responses.push(resp);
     }
     let _ = host.host_tcp_close(combined_caps, listener_h)?;
@@ -9347,24 +9393,41 @@ fn serve_omni_http_batch_inner(
         let mut responses = Vec::with_capacity(num_requests);
         for _ in 0..num_requests {
             let conn_h = host.host_tcp_accept(combined_caps, listener_h)?;
-            let req_buf = host.host_tcp_read(combined_caps, conn_h, 4096)?;
-            let req_str = String::from_utf8_lossy(&req_buf);
-            let first_line = req_str.lines().next().unwrap_or("GET / HTTP/1.1");
-            let mut parts = first_line.split_whitespace();
-            let method = parts.next().unwrap_or("GET");
-            let req_path = parts.next().unwrap_or("/");
-            let resp = handle_omni_http_request(&src_owned, method, req_path, &mut kv_store)?;
-            if let Some(ref p) = db_file {
-                save_omni_kv_via_narrow_host(
-                    &mut host,
-                    combined_caps | cap_bit(CAP_ID_DB_W),
-                    &p.to_string_lossy(),
-                    &kv_store,
-                )?;
-            }
+            let resp = match host.host_tcp_read(combined_caps, conn_h, 4096) {
+                Ok(req_buf) => {
+                    let req_str = String::from_utf8_lossy(&req_buf);
+                    let first_line = req_str.lines().next().unwrap_or("GET / HTTP/1.1");
+                    let mut parts = first_line.split_whitespace();
+                    let method = parts.next().unwrap_or("GET");
+                    let req_path = parts.next().unwrap_or("/");
+                    match handle_omni_http_request(&src_owned, method, req_path, &mut kv_store) {
+                        Ok(r) => {
+                            if let Some(ref p) = db_file {
+                                let _ = save_omni_kv_via_narrow_host(
+                                    &mut host,
+                                    combined_caps | cap_bit(CAP_ID_DB_W),
+                                    &p.to_string_lossy(),
+                                    &kv_store,
+                                );
+                            }
+                            r
+                        }
+                        Err(e) => OmniHttpResponse {
+                            status: 500,
+                            content_type: String::from("text/plain; charset=utf-8"),
+                            body: format!("error[HTTP_REQUEST_ERROR]: {}", e),
+                        },
+                    }
+                }
+                Err(e) => OmniHttpResponse {
+                    status: 400,
+                    content_type: String::from("text/plain; charset=utf-8"),
+                    body: format!("error[HTTP_READ_ERROR]: {}", e),
+                },
+            };
             let wire = resp.to_http11_wire_bytes();
-            let _ = host.host_tcp_write(combined_caps, conn_h, &wire)?;
-            let _ = host.host_tcp_close(combined_caps, conn_h)?;
+            let _ = host.host_tcp_write(combined_caps, conn_h, &wire);
+            let _ = host.host_tcp_close(combined_caps, conn_h);
             responses.push(resp);
         }
         let _ = host.host_tcp_close(combined_caps, listener_h)?;
@@ -9436,9 +9499,18 @@ pub fn run_omni_serve_cli(argv: &[String]) -> i32 {
         } else if argv[i] == "--db" && i + 1 < argv.len() {
             db_path = Some(std::path::PathBuf::from(&argv[i + 1]));
             i += 2;
+        } else if argv[i] == "--bind" && i + 1 < argv.len() {
+            bind_addr = argv[i + 1].clone();
+            i += 2;
+        } else if argv[i] == "--port" && i + 1 < argv.len() {
+            bind_addr = format!("127.0.0.1:{}", argv[i + 1]);
+            i += 2;
         } else {
-            bind_addr = argv[i].clone();
-            i += 1;
+            eprintln!(
+                "error[INVALID_ARG]: unexpected serve argument '{}' (use --bind <addr> or --port <port>)",
+                argv[i]
+            );
+            return 2;
         }
     }
     let serve_res = match db_path {
@@ -13928,32 +14000,93 @@ pub fn run_host_sandbox_selftests() -> Result<usize, String> {
 
 
 
+/// Audit §2.4: Private 0700 temp directory + O_EXCL (`create_new(true)`) executable file guard.
+/// Prevents predictable `/tmp` filename/symlink races on shared hosts and cleans up on Drop.
+pub struct PrivateTempElf {
+    pub dir: std::path::PathBuf,
+    pub path: std::path::PathBuf,
+}
+
+impl PrivateTempElf {
+    pub fn new(bytes: &[u8], tag: &str) -> Result<Self, String> {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let safe_tag: String = tag
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        let dir = std::env::temp_dir().join(format!(
+            "omni_priv_{}_{}_{}_{}",
+            std::process::id(),
+            seq,
+            nanos,
+            safe_tag
+        ));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&dir)
+                .map_err(|e| format!("PrivateTempElf create_dir {}: {}", dir.display(), e))?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir(&dir)
+                .map_err(|e| format!("PrivateTempElf create_dir {}: {}", dir.display(), e))?;
+        }
+        let path = dir.join("payload.elf");
+        #[cfg(unix)]
+        let mut f = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o700)
+                .open(&path)
+                .map_err(|e| format!("PrivateTempElf open O_EXCL {}: {}", path.display(), e))?
+        };
+        #[cfg(not(unix))]
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| format!("PrivateTempElf open O_EXCL {}: {}", path.display(), e))?;
+        f.write_all(bytes)
+            .map_err(|e| format!("PrivateTempElf write {}: {}", path.display(), e))?;
+        f.sync_all()
+            .map_err(|e| format!("PrivateTempElf sync {}: {}", path.display(), e))?;
+        drop(f);
+        Ok(Self { dir, path })
+    }
+}
+
+impl Drop for PrivateTempElf {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 /// Run a freshly emitted x86-64 ELF and decode the 8-byte little-endian stdout i64.
 pub fn execute_native_elf_i64(elf: &[u8], args: &[i64]) -> Result<i64, String> {
     #[cfg(all(unix, target_arch = "x86_64"))]
     {
-        use std::os::unix::fs::PermissionsExt;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let id = N.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "omni_native_{}_{}.elf",
-            std::process::id(),
-            id
-        ));
-        std::fs::write(&path, elf).map_err(|e| e.to_string())?;
-        let mut perms = std::fs::metadata(&path).map_err(|e| e.to_string())?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).map_err(|e| e.to_string())?;
+        let tmp_elf = PrivateTempElf::new(elf, "native_i64")?;
         let arg_strs: Vec<String> = args.iter().map(|n| n.to_string()).collect();
-        let out = std::process::Command::new(&path)
+        let out = std::process::Command::new(&tmp_elf.path)
             .args(&arg_strs)
             .output()
             .map_err(|e| format!("failed to run native ELF: {e}"))?;
-        let _ = std::fs::remove_file(&path);
         if out.status.code() == Some(OMNI_OOB_EXIT_STATUS)
             && out.stdout.is_empty()
-            && out.stderr == format!("{}\n", OMNI_OOB_ERROR).as_bytes()
+            && (out.stderr.is_empty() || out.stderr == format!("{}\n", OMNI_OOB_ERROR).as_bytes())
         {
             return Err(String::from(OMNI_OOB_ERROR));
         }
@@ -14521,21 +14654,15 @@ pub fn run_native_elf_for_diff(elf: &[u8], tag: &str) -> Result<Option<NativeElf
     #[cfg(all(unix, target_arch = "x86_64"))]
     {
         use std::io::Read;
-        use std::os::unix::fs::PermissionsExt;
         use std::os::unix::process::ExitStatusExt;
         use std::process::{Command, Stdio};
-        let safe_tag: String = tag.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
-        let path = std::env::temp_dir().join(format!("omni_diff4_{}_{}.elf", std::process::id(), safe_tag));
-        std::fs::write(&path, elf).map_err(|e| format!("diff4: write {}: {e}", path.display()))?;
-        let mut perms = std::fs::metadata(&path).map_err(|e| e.to_string())?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).map_err(|e| e.to_string())?;
-        let mut child = Command::new(&path)
+        let tmp_elf = PrivateTempElf::new(elf, tag)?;
+        let mut child = Command::new(&tmp_elf.path)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| format!("diff4: spawn {}: {e}", path.display()))?;
+            .map_err(|e| format!("diff4: spawn {}: {e}", tmp_elf.path.display()))?;
         let mut so = child.stdout.take().ok_or("diff4: no stdout pipe")?;
         let reader = std::thread::spawn(move || {
             let mut buf = Vec::new();
@@ -14558,7 +14685,7 @@ pub fn run_native_elf_for_diff(elf: &[u8], tag: &str) -> Result<Option<NativeElf
             }
         };
         let stdout = reader.join().unwrap_or_default();
-        let _ = std::fs::remove_file(&path);
+        drop(tmp_elf);
         return Ok(Some(NativeElfRun { exit_code: status.code(), signal: status.signal(), stdout, timed_out }));
     }
     #[allow(unreachable_code)]
@@ -23689,6 +23816,7 @@ pub fn run_m2_foundation_selftests() -> Result<usize, String> {
         ("a2_pure_include", selftest_a2_pure_include_count),
         ("a3_macro_quarantine", selftest_a3_macro_quarantine_count),
         ("b2_pure_verifier", selftest_b2_pure_verifier_count),
+        ("s2_security", selftest_s2_security),
         ("b4_pure_launcher", selftest_b4_pure_launcher_count),
     ];
     let mut n = run_selftest_tasks_in_lanes(parallel_tasks)?;
@@ -24251,6 +24379,19 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
                 1
             }
         },
+        "s2-security" => match selftest_s2_security() {
+            Ok(n) => {
+                println!(
+                    "[S2-SECURITY PASS] {} checks | M2 standalone verifier + 412B fuel/wall-clock cap + p4-exec verify + VM_STATE layout & unified OOB + private 0700 temp ELF + serve --bind",
+                    n
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("[S2-SECURITY FAIL] {}", e);
+                1
+            }
+        },
         "p5-sys" => match selftest_p5_2_zero_shim_sys() {
             Ok((n, sz, h, native)) => {
                 println!(
@@ -24767,7 +24908,7 @@ fn main() {
             "harness" | "--harness" => {
                 std::process::exit(run_omni_harness_cli(&cli_args[2..]));
             }
-            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" | "p7-heal" | "p7-adapt" | "p7-learn" | "a1-pure-default" | "a2-pure-include" | "a3-macro-quarantine" | "b2-pure-verifier" | "b4-pure-launcher" | "api-stage1" | "api-stage2" | "api-stage2-emit" | "api-stage2-5" => {
+            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" | "p7-heal" | "p7-adapt" | "p7-learn" | "a1-pure-default" | "a2-pure-include" | "a3-macro-quarantine" | "b2-pure-verifier" | "b4-pure-launcher" | "s2-security" | "api-stage1" | "api-stage2" | "api-stage2-emit" | "api-stage2-5" => {
                 std::process::exit(run_m2_cli(&cli_args[1..]));
             }
             "agent-driver" | "--agent-driver" => {
@@ -24877,21 +25018,39 @@ fn main() {
                 }
             }
             "--debug-lens" | "debug-lens" if cli_args.len() >= 3 => {
-                let raw = fs::read(&cli_args[2]).expect("Failed to read .omni_bc file");
+                let raw = match fs::read(&cli_args[2]) {
+                    Ok(b) => b,
+                    Err(e) => { eprintln!("error[IO_ERROR]: {}: {}", cli_args[2], e); std::process::exit(1); }
+                };
                 let u16_stream = decode_bytes_to_u16_stream(&raw);
-                println!("{}", format_debug_lens(&u16_stream).expect("Failed to decode stream"));
+                match format_debug_lens(&u16_stream) {
+                    Ok(s) => println!("{}", s),
+                    Err(e) => { eprintln!("{}", e); std::process::exit(1); }
+                }
                 return;
             }
             "hex" if cli_args.len() >= 3 => {
-                let raw = fs::read(&cli_args[2]).expect("Failed to read .omni_bc file");
+                let raw = match fs::read(&cli_args[2]) {
+                    Ok(b) => b,
+                    Err(e) => { eprintln!("error[IO_ERROR]: {}: {}", cli_args[2], e); std::process::exit(1); }
+                };
                 let u16_stream = decode_bytes_to_u16_stream(&raw);
                 println!("{}", format_non_human_token_stream(&u16_stream));
                 return;
             }
             "assemble" if cli_args.len() >= 4 => {
-                let src = fs::read_to_string(&cli_args[2]).expect("Failed to read source file");
-                let u16_stream = assemble_omni_text_to_u16(&src).expect("Assembly failed");
-                fs::write(&cli_args[3], encode_u16_stream_to_bytes(&u16_stream)).expect("Failed to write .omni_bc");
+                let src = match fs::read_to_string(&cli_args[2]) {
+                    Ok(s) => s,
+                    Err(e) => { eprintln!("error[IO_ERROR]: {}: {}", cli_args[2], e); std::process::exit(1); }
+                };
+                let u16_stream = match assemble_omni_text_to_u16(&src) {
+                    Ok(u) => u,
+                    Err(e) => { eprintln!("{}", e); std::process::exit(1); }
+                };
+                if let Err(e) = fs::write(&cli_args[3], encode_u16_stream_to_bytes(&u16_stream)) {
+                    eprintln!("error[IO_ERROR]: {}: {}", cli_args[3], e);
+                    std::process::exit(1);
+                }
                 println!("[ASSEMBLE PASS] Wrote {} u16 tokens to '{}'", u16_stream.len(), cli_args[3]);
                 return;
             }
@@ -24963,15 +25122,26 @@ fn main() {
                 }
             }
             "compile-stage1" if cli_args.len() >= 4 => {
-                let raw_src = fs::read_to_string(&cli_args[2]).expect("Failed to read .omni file");
+                let raw_src = match fs::read_to_string(&cli_args[2]) {
+                    Ok(s) => s,
+                    Err(e) => { eprintln!("error[IO_ERROR]: {}: {}", cli_args[2], e); std::process::exit(1); }
+                };
                 let parent_dir = std::path::Path::new(&cli_args[2]).parent();
-                let expanded = resolve_omni_surface_includes(&raw_src, parent_dir, None).expect("Include resolution failed");
+                let expanded = match resolve_omni_surface_includes(&raw_src, parent_dir, None) {
+                    Ok(s) => s,
+                    Err(e) => { eprintln!("[STAGE-1 ELF FAIL] {}", e); std::process::exit(1); }
+                };
                 let a0 = cli_args.get(4).and_then(|s| s.parse::<i64>().ok()).unwrap_or(45);
                 let a1 = cli_args.get(5).and_then(|s| s.parse::<i64>().ok()).unwrap_or(40);
                 let a2 = cli_args.get(6).and_then(|s| s.parse::<i64>().ok()).unwrap_or(90);
-                let elf = compile_omni_surface_via_stage1_to_elf(&expanded, a0, a1, a2)
-                    .expect("Stage-1 self-compiler ELF lowering failed");
-                fs::write(&cli_args[3], &elf).expect("Failed to write .elf");
+                let elf = match compile_omni_surface_via_stage1_to_elf(&expanded, a0, a1, a2) {
+                    Ok(e) => e,
+                    Err(e) => { eprintln!("[STAGE-1 ELF FAIL] {}", e); std::process::exit(1); }
+                };
+                if let Err(e) = fs::write(&cli_args[3], &elf) {
+                    eprintln!("error[IO_ERROR]: {}: {}", cli_args[3], e);
+                    std::process::exit(1);
+                }
                 println!("[STAGE-1 ELF PASS] Wrote {} bytes to '{}' (FNV-1a64=0x{:016X})", elf.len(), cli_args[3], fnv1a_64_hash(&elf));
                 return;
             }
@@ -25060,23 +25230,41 @@ fn main() {
                     })
                     .collect();
                 if path.ends_with(".omni") {
-                    let raw_src = fs::read_to_string(path).expect("Failed to read .omni surface file");
+                    let raw_src = match fs::read_to_string(path) {
+                        Ok(s) => s,
+                        Err(e) => { eprintln!("error[IO_ERROR]: {}: {}", path, e); std::process::exit(1); }
+                    };
                     let parent_dir = std::path::Path::new(path).parent();
-                    let expanded = resolve_omni_surface_includes(&raw_src, parent_dir, None)
-                        .expect("Include resolution failed");
-                    let res = execute_omni_surface_wasm_i64(&expanded, &i64_args).expect("Wasm execution failed");
-                    println!("{}", res);
+                    let expanded = match resolve_omni_surface_includes(&raw_src, parent_dir, None) {
+                        Ok(s) => s,
+                        Err(e) => { eprintln!("[WASM FAIL] {}", e); std::process::exit(1); }
+                    };
+                    match execute_omni_surface_wasm_i64(&expanded, &i64_args) {
+                        Ok(res) => println!("{}", res),
+                        Err(e) => { eprintln!("[WASM FAIL] {}", e); std::process::exit(1); }
+                    }
                     return;
                 }
                 let wasm_bytes = if path.ends_with(".wasm") {
-                    fs::read(path).expect("Failed to read .wasm")
+                    match fs::read(path) {
+                        Ok(b) => b,
+                        Err(e) => { eprintln!("error[IO_ERROR]: {}: {}", path, e); std::process::exit(1); }
+                    }
                 } else {
-                    let raw = fs::read(path).expect("Failed to read .omni_bc");
+                    let raw = match fs::read(path) {
+                        Ok(b) => b,
+                        Err(e) => { eprintln!("error[IO_ERROR]: {}: {}", path, e); std::process::exit(1); }
+                    };
                     let u16_stream = decode_bytes_to_u16_stream(&raw);
-                    compile_pure_u16_to_wasm(&u16_stream).expect("WebAssembly AOT compilation failed")
+                    match compile_pure_u16_to_wasm(&u16_stream) {
+                        Ok(w) => w,
+                        Err(e) => { eprintln!("[WASM FAIL] {}", e); std::process::exit(1); }
+                    }
                 };
-                let res = execute_wasm_module_i64(&wasm_bytes, &i64_args).expect("Wasm execution failed");
-                println!("{}", res);
+                match execute_wasm_module_i64(&wasm_bytes, &i64_args) {
+                    Ok(res) => println!("{}", res),
+                    Err(e) => { eprintln!("[WASM FAIL] {}", e); std::process::exit(1); }
+                }
                 return;
             }
             "surface-to-asm" if cli_args.len() >= 3 => {
@@ -25212,7 +25400,10 @@ fn main() {
                         decode_bytes_to_u16_stream(&raw)
                     }
                 };
-                let module = decode_omni_token_stream(&u16_stream).expect("Decode failed");
+                let module = match decode_omni_token_stream(&u16_stream) {
+                    Ok(m) => m,
+                    Err(e) => { eprintln!("[DECODE FAIL] {}", e); std::process::exit(1); }
+                };
                 for f in &module.functions {
                     let rep = verify_binary_function(f);
                     if !rep.passed {
@@ -25223,11 +25414,16 @@ fn main() {
                 let entry_fn_idx = if module.functions.iter().any(|f| f.fn_idx == 0) {
                     0
                 } else {
-                    module.functions.last().map(|f| f.fn_idx).expect("No functions in module")
+                    match module.functions.last().map(|f| f.fn_idx) {
+                        Some(id) => id,
+                        None => { eprintln!("error[EMPTY_MODULE]: No functions in module"); std::process::exit(1); }
+                    }
                 };
                 let mut vm = OmniBinaryVm::new();
-                let res = vm.execute_function(&module, entry_fn_idx, vm_args).expect("VM execution failed");
-                println!("{:?}", res);
+                match vm.execute_function(&module, entry_fn_idx, vm_args) {
+                    Ok(res) => println!("{:?}", res),
+                    Err(e) => { eprintln!("[RUN FAIL] {}", e); std::process::exit(1); }
+                }
                 return;
             }
             _ => {}

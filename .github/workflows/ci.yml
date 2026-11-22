@@ -6,15 +6,18 @@ on:
   pull_request:
     branches: [ main, master ]
 
+permissions:
+  contents: read
+
 jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
       - name: Run standalone monolith selftest (fixed-point + M2/M3/P4/P5 gates + 4-backend diff + pure-omni-diff + acceptance-diff + harness)
         run: |
@@ -59,6 +62,7 @@ jobs:
           ./omni a3-macro-quarantine
           ./omni b2-pure-verifier
           ./omni b4-pure-launcher
+          ./omni s2-security
           ./omni api-stage1
           ./omni api-stage2
           ./omni api-stage2-emit
@@ -93,7 +97,7 @@ jobs:
     name: Zero-Rust Release Gate & Independent Verifier (Seed-Shrink A4/B4/C1/C2)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Independent External Verifier Trace Check (C2 — Python 3, zero Rust/Omni)
         run: |
