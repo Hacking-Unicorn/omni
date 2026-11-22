@@ -8,8 +8,8 @@ use omni_vm::*;
 use omni_assembler::*;
 use crate::compiler::*;
 
-pub const OMNI_ISA_TABLE_SURFACE: &str = include_str!("../../../../../pure/isa/table.omni");
-pub const OMNI_ISA_TABLE_SELFTEST_SURFACE: &str = include_str!("../../../../../pure/isa/table_selftest.omni");
+pub const OMNI_ISA_TABLE_SURFACE: &str = include_str!("../../../../../../pure/isa/table.omni");
+pub const OMNI_ISA_TABLE_SELFTEST_SURFACE: &str = include_str!("../../../../../../pure/isa/table_selftest.omni");
 const OMNI_ISA_TABLE_ASM_SCAN_SRC: &str = include_str!("../../../omni-assembler/src/lib.rs");
 
 pub const OMNI_ISA_MNEMONIC_ID_GOLDEN: [&str; 81] = [

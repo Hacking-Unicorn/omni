@@ -269,7 +269,7 @@ pub fn run_phase7_pure_omni_selftests() -> Result<usize, String> {
 
 pub const OMNI_VERIFIER_ENGINE_VERSION: &str = "omni-verifier-engine-v1.0.0";
 pub const OMNI_VERIFIER_ENGINE_SURFACE: &str =
-    include_str!("../../../../../pure/verifier_engine.omni");
+    include_str!("../../../../../../pure/verifier_engine.omni");
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OmniEngineError {

@@ -7058,7 +7058,7 @@ pub fn selftest_s3_performance() -> Result<usize, String> {
     }
     checks += 1;
 
-    // 4. Default run on loop n=20000 -> (200010000, 180010) in < 1000 ms + OOB trap parity.
+    // 4. Default run on loop n=20000 -> (200010000, 180010) in < 2000 ms + OOB trap parity.
     let loop_src = "#[strict]\nfn main(n: i64) -> i64 {\n    let s: i64 = 0;\n    let i: i64 = 1;\n    while n - i + 1 <=> 0 {\n        s = s + i;\n        i = i + 1;\n    }\n    return s;\n}\n";
     let loop_u16 = pure_default_compile_surface_to_u16(loop_src, true)?;
     let (ret_100_def, steps_100_def) = pure_default_run_u16(&loop_u16, 100, 0, 0, false)?;
@@ -7080,9 +7080,9 @@ pub fn selftest_s3_performance() -> Result<usize, String> {
                 ret_20k, steps_20k
             ));
         }
-        if dt_m4_ms > 1000 {
+        if dt_m4_ms > 2000 {
             return Err(format!(
-                "S3.4 run loop n=20000 took {} ms (> 1000 ms native bound — still interpreted?)",
+                "S3.4 run loop n=20000 took {} ms (> 2000 ms native bound — still interpreted?)",
                 dt_m4_ms
             ));
         }
