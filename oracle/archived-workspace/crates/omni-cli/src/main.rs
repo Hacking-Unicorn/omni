@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{self, BufRead, Write};
 
 #[allow(dead_code, unused_imports)]
-#[path = "../../../../omni_rust_bootstrap.rs"]
+#[path = "../../../../../omni_rust_bootstrap.rs"]
 mod monolith;
 
 use omni_aot::{
@@ -1346,7 +1346,7 @@ mod tests {
     static REPO_CWD: Mutex<()> = Mutex::new(());
 
     fn repo_root() -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..")
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../..")
     }
 
     fn with_repo_root<T>(f: impl FnOnce() -> T) -> T {

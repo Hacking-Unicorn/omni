@@ -2518,58 +2518,58 @@ impl SurfaceLowerCtx {
 pub fn lookup_omni_stdlib_module(path: &str) -> Option<&'static str> {
     match path {
         "std/prelude.omni" => Some(
-            include_str!("../../../../../std/prelude.omni")
+            include_str!("../../../../../../std/prelude.omni")
         ),
         "std/math.omni" => Some(
-            include_str!("../../../../../std/math.omni")
+            include_str!("../../../../../../std/math.omni")
         ),
         "std/trit.omni" => Some(
-            include_str!("../../../../../std/trit.omni")
+            include_str!("../../../../../../std/trit.omni")
         ),
         "std/http.omni" => Some(
-            include_str!("../../../../../std/http.omni")
+            include_str!("../../../../../../std/http.omni")
         ),
         "std/pack5.omni" => Some(
-            include_str!("../../../../../std/pack5.omni")
+            include_str!("../../../../../../std/pack5.omni")
         ),
         "std/decision.omni" => Some(
-            include_str!("../../../../../std/decision.omni")
+            include_str!("../../../../../../std/decision.omni")
         ),
         "std/resource.omni" => Some(
-            include_str!("../../../../../std/resource.omni")
+            include_str!("../../../../../../std/resource.omni")
         ),
         "pure/compiler.omni" | "spec/pure_self_host/omni_selfhost_compiler.omni" => Some(
-            include_str!("../../../../../pure/compiler.omni")
+            include_str!("../../../../../../pure/compiler.omni")
         ),
         "pure/verifier.omni" => Some(
-            include_str!("../../../../../pure/verifier.omni")
+            include_str!("../../../../../../pure/verifier.omni")
         ),
         "pure/host_runtime.omni" | "spec/pure_self_host/host_runtime.omni" => Some(
-            include_str!("../../../../../pure/host_runtime.omni")
+            include_str!("../../../../../../pure/host_runtime.omni")
         ),
         "pure/tooling.omni" => Some(
-            include_str!("../../../../../pure/tooling.omni")
+            include_str!("../../../../../../pure/tooling.omni")
         ),
         "pure/selfhost_suite.omni" => Some(
-            include_str!("../../../../../pure/selfhost_suite.omni")
+            include_str!("../../../../../../pure/selfhost_suite.omni")
         ),
         "pure/programs/ternary_neural_router.omni" => Some(
-            include_str!("../../../../../pure/programs/ternary_neural_router.omni")
+            include_str!("../../../../../../pure/programs/ternary_neural_router.omni")
         ),
         "pure/programs/arena_audit_pipeline.omni" => Some(
-            include_str!("../../../../../pure/programs/arena_audit_pipeline.omni")
+            include_str!("../../../../../../pure/programs/arena_audit_pipeline.omni")
         ),
         "pure/programs/policy_consensus_engine.omni" => Some(
-            include_str!("../../../../../pure/programs/policy_consensus_engine.omni")
+            include_str!("../../../../../../pure/programs/policy_consensus_engine.omni")
         ),
         "pure/programs/kv_ledger_service.omni" => Some(
-            include_str!("../../../../../pure/programs/kv_ledger_service.omni")
+            include_str!("../../../../../../pure/programs/kv_ledger_service.omni")
         ),
         "pure/programs/compiler_self_audit.omni" => Some(
-            include_str!("../../../../../pure/programs/compiler_self_audit.omni")
+            include_str!("../../../../../../pure/programs/compiler_self_audit.omni")
         ),
         "pure/programs/pack5_decision_controller.omni" => Some(
-            include_str!("../../../../../pure/programs/pack5_decision_controller.omni")
+            include_str!("../../../../../../pure/programs/pack5_decision_controller.omni")
         ),
         _ => None,
     }
@@ -3998,7 +3998,7 @@ pub const M3_TK_SYM: u16 = 6;
 pub const M3_TK_OP: u16 = 7;
 pub const M3_TK_HASH: u16 = 8;
 
-pub const M3_FE_LOCK_TSV: &str = include_str!("../../../../../spec/m3/corpus.tsv");
+pub const M3_FE_LOCK_TSV: &str = include_str!("../../../../../../spec/m3/corpus.tsv");
 
 pub const M3_FE_LOOKUP_CORPUS: [&str; 18] = [
     "std/prelude.omni",
@@ -4022,71 +4022,71 @@ pub const M3_FE_LOOKUP_CORPUS: [&str; 18] = [
 ];
 
 pub const M3_FE_FILE_CORPUS: &[(&str, &str)] = &[
-    ("golden/arena_lifecycle_golden.omni", include_str!("../../../../../spec/acceptance/goldens/arena_lifecycle_golden.omni")),
-    ("golden/asm_roundtrip.omni", include_str!("../../../../../spec/acceptance/goldens/asm_roundtrip.omni")),
-    ("golden/br_neg_arith_golden.omni", include_str!("../../../../../spec/acceptance/goldens/br_neg_arith_golden.omni")),
-    ("golden/br_pos_golden.omni", include_str!("../../../../../spec/acceptance/goldens/br_pos_golden.omni")),
-    ("golden/branch_loop_golden.omni", include_str!("../../../../../spec/acceptance/goldens/branch_loop_golden.omni")),
-    ("golden/byte_buf_golden.omni", include_str!("../../../../../spec/acceptance/goldens/byte_buf_golden.omni")),
-    ("golden/custom_non_seed_alu.omni", include_str!("../../../../../spec/acceptance/goldens/custom_non_seed_alu.omni")),
-    ("golden/decision_hook_golden.omni", include_str!("../../../../../spec/acceptance/goldens/decision_hook_golden.omni")),
-    ("golden/iabs_golden.omni", include_str!("../../../../../spec/acceptance/goldens/iabs_golden.omni")),
-    ("golden/idiv_zero.omni", include_str!("../../../../../spec/acceptance/goldens/idiv_zero.omni")),
-    ("golden/match_trit_golden.omni", include_str!("../../../../../spec/acceptance/goldens/match_trit_golden.omni")),
-    ("golden/multi_fn_weighted_term.omni", include_str!("../../../../../spec/acceptance/goldens/multi_fn_weighted_term.omni")),
-    ("golden/neg_ambiguous_grammar.omni", include_str!("../../../../../spec/acceptance/goldens/neg_ambiguous_grammar.omni")),
-    ("golden/neg_arity_mismatch.omni", include_str!("../../../../../spec/acceptance/goldens/neg_arity_mismatch.omni")),
-    ("golden/neg_bad_type.omni", include_str!("../../../../../spec/acceptance/goldens/neg_bad_type.omni")),
-    ("golden/neg_borrow_conflict.omni", include_str!("../../../../../spec/acceptance/goldens/neg_borrow_conflict.omni")),
-    ("golden/neg_budget_exceeded.omni", include_str!("../../../../../spec/acceptance/goldens/neg_budget_exceeded.omni")),
-    ("golden/neg_corrupt_pack5.omni", include_str!("../../../../../spec/acceptance/goldens/neg_corrupt_pack5.omni")),
-    ("golden/neg_immut_param.omni", include_str!("../../../../../spec/acceptance/goldens/neg_immut_param.omni")),
-    ("golden/neg_linear_leak.omni", include_str!("../../../../../spec/acceptance/goldens/neg_linear_leak.omni")),
-    ("golden/neg_missing_cap.omni", include_str!("../../../../../spec/acceptance/goldens/neg_missing_cap.omni")),
-    ("golden/neg_syntax_error.omni", include_str!("../../../../../spec/acceptance/goldens/neg_syntax_error.omni")),
-    ("golden/neg_taint_on_ret.omni", include_str!("../../../../../spec/acceptance/goldens/neg_taint_on_ret.omni")),
-    ("golden/neg_taint_sink.omni", include_str!("../../../../../spec/acceptance/goldens/neg_taint_sink.omni")),
-    ("golden/neg_undef_var.omni", include_str!("../../../../../spec/acceptance/goldens/neg_undef_var.omni")),
-    ("golden/neg_unknown_fn.omni", include_str!("../../../../../spec/acceptance/goldens/neg_unknown_fn.omni")),
-    ("golden/neg_unresolved_label.omni", include_str!("../../../../../spec/acceptance/goldens/neg_unresolved_label.omni")),
-    ("golden/nested_branch_golden.omni", include_str!("../../../../../spec/acceptance/goldens/nested_branch_golden.omni")),
-    ("golden/pack5_direct_aot.omni", include_str!("../../../../../spec/acceptance/goldens/pack5_direct_aot.omni")),
-    ("golden/pack5_trit_vec_golden.omni", include_str!("../../../../../spec/acceptance/goldens/pack5_trit_vec_golden.omni")),
-    ("golden/route_db_query_golden.omni", include_str!("../../../../../spec/acceptance/goldens/route_db_query_golden.omni")),
-    ("golden/route_kv_golden.omni", include_str!("../../../../../spec/acceptance/goldens/route_kv_golden.omni")),
-    ("golden/seed0_risk.omni", include_str!("../../../../../spec/acceptance/goldens/seed0_risk.omni")),
-    ("golden/seed4_consensus.omni", include_str!("../../../../../spec/acceptance/goldens/seed4_consensus.omni")),
-    ("golden/seed6_clamp.omni", include_str!("../../../../../spec/acceptance/goldens/seed6_clamp.omni")),
-    ("golden/sel_mix.omni", include_str!("../../../../../spec/acceptance/goldens/sel_mix.omni")),
-    ("golden/shl_65.omni", include_str!("../../../../../spec/acceptance/goldens/shl_65.omni")),
-    ("golden/stdlib_macro_pipeline_golden.omni", include_str!("../../../../../spec/acceptance/goldens/stdlib_macro_pipeline_golden.omni")),
-    ("golden/while_sum_even_golden.omni", include_str!("../../../../../spec/acceptance/goldens/while_sum_even_golden.omni")),
-    ("m3fix/q1_nonstrict_control.omni", include_str!("../../../../../spec/m3/fixtures/q1_nonstrict_control.omni")),
-    ("m3fix/q1_strict_substring.omni", include_str!("../../../../../spec/m3/fixtures/q1_strict_substring.omni")),
-    ("m3fix/q2_trit_text.omni", include_str!("../../../../../spec/m3/fixtures/q2_trit_text.omni")),
-    ("m3fix/q3_neg_fold.omni", include_str!("../../../../../spec/m3/fixtures/q3_neg_fold.omni")),
-    ("m3fix/q4_le_ge.omni", include_str!("../../../../../spec/m3/fixtures/q4_le_ge.omni")),
-    ("m3fix/q5_macro_after_def.omni", include_str!("../../../../../spec/m3/fixtures/q5_macro_after_def.omni")),
-    ("m3fix/q5_macro_order.omni", include_str!("../../../../../spec/m3/fixtures/q5_macro_order.omni")),
-    ("m3fix/q6_include_once.omni", include_str!("../../../../../spec/m3/fixtures/q6_include_once.omni")),
-    ("m3fix/q6_include_twice.omni", include_str!("../../../../../spec/m3/fixtures/q6_include_twice.omni")),
-    ("m3fix/q7_fn_ids.omni", include_str!("../../../../../spec/m3/fixtures/q7_fn_ids.omni")),
-    ("m3fix/q8a_ssa_limit.omni", include_str!("../../../../../spec/m3/fixtures/q8a_ssa_limit.omni")),
-    ("m3fix/q8b_label_limit.omni", include_str!("../../../../../spec/m3/fixtures/q8b_label_limit.omni")),
-    ("m3fix/q8c_label_ok.omni", include_str!("../../../../../spec/m3/fixtures/q8c_label_ok.omni")),
-    ("m3fix/q8d_label_15.omni", include_str!("../../../../../spec/m3/fixtures/q8d_label_15.omni")),
-    ("m3fix/q8e_label_17.omni", include_str!("../../../../../spec/m3/fixtures/q8e_label_17.omni")),
-    ("m3fix/neg_ambiguous_grammar.omni", include_str!("../../../../../spec/m3/fixtures/neg_ambiguous_grammar.omni")),
-    ("m3fix/neg_arity_mismatch.omni", include_str!("../../../../../spec/m3/fixtures/neg_arity_mismatch.omni")),
-    ("m3fix/neg_bad_type.omni", include_str!("../../../../../spec/m3/fixtures/neg_bad_type.omni")),
-    ("m3fix/neg_budget_exceeded.omni", include_str!("../../../../../spec/m3/fixtures/neg_budget_exceeded.omni")),
-    ("m3fix/neg_circular_include.omni", include_str!("../../../../../spec/m3/fixtures/neg_circular_include.omni")),
-    ("m3fix/neg_immut_param.omni", include_str!("../../../../../spec/m3/fixtures/neg_immut_param.omni")),
-    ("m3fix/neg_missing_cap.omni", include_str!("../../../../../spec/m3/fixtures/neg_missing_cap.omni")),
-    ("m3fix/neg_syntax_error.omni", include_str!("../../../../../spec/m3/fixtures/neg_syntax_error.omni")),
-    ("m3fix/neg_undef_var.omni", include_str!("../../../../../spec/m3/fixtures/neg_undef_var.omni")),
-    ("m3fix/neg_unknown_fn.omni", include_str!("../../../../../spec/m3/fixtures/neg_unknown_fn.omni")),
-    ("m3fix/neg_unresolved_label.omni", include_str!("../../../../../spec/m3/fixtures/neg_unresolved_label.omni")),
+    ("golden/arena_lifecycle_golden.omni", include_str!("../../../../../../spec/acceptance/goldens/arena_lifecycle_golden.omni")),
+    ("golden/asm_roundtrip.omni", include_str!("../../../../../../spec/acceptance/goldens/asm_roundtrip.omni")),
+    ("golden/br_neg_arith_golden.omni", include_str!("../../../../../../spec/acceptance/goldens/br_neg_arith_golden.omni")),
+    ("golden/br_pos_golden.omni", include_str!("../../../../../../spec/acceptance/goldens/br_pos_golden.omni")),
+    ("golden/branch_loop_golden.omni", include_str!("../../../../../../spec/acceptance/goldens/branch_loop_golden.omni")),
+    ("golden/byte_buf_golden.omni", include_str!("../../../../../../spec/acceptance/goldens/byte_buf_golden.omni")),
+    ("golden/custom_non_seed_alu.omni", include_str!("../../../../../../spec/acceptance/goldens/custom_non_seed_alu.omni")),
+    ("golden/decision_hook_golden.omni", include_str!("../../../../../../spec/acceptance/goldens/decision_hook_golden.omni")),
+    ("golden/iabs_golden.omni", include_str!("../../../../../../spec/acceptance/goldens/iabs_golden.omni")),
+    ("golden/idiv_zero.omni", include_str!("../../../../../../spec/acceptance/goldens/idiv_zero.omni")),
+    ("golden/match_trit_golden.omni", include_str!("../../../../../../spec/acceptance/goldens/match_trit_golden.omni")),
+    ("golden/multi_fn_weighted_term.omni", include_str!("../../../../../../spec/acceptance/goldens/multi_fn_weighted_term.omni")),
+    ("golden/neg_ambiguous_grammar.omni", include_str!("../../../../../../spec/acceptance/goldens/neg_ambiguous_grammar.omni")),
+    ("golden/neg_arity_mismatch.omni", include_str!("../../../../../../spec/acceptance/goldens/neg_arity_mismatch.omni")),
+    ("golden/neg_bad_type.omni", include_str!("../../../../../../spec/acceptance/goldens/neg_bad_type.omni")),
+    ("golden/neg_borrow_conflict.omni", include_str!("../../../../../../spec/acceptance/goldens/neg_borrow_conflict.omni")),
+    ("golden/neg_budget_exceeded.omni", include_str!("../../../../../../spec/acceptance/goldens/neg_budget_exceeded.omni")),
+    ("golden/neg_corrupt_pack5.omni", include_str!("../../../../../../spec/acceptance/goldens/neg_corrupt_pack5.omni")),
+    ("golden/neg_immut_param.omni", include_str!("../../../../../../spec/acceptance/goldens/neg_immut_param.omni")),
+    ("golden/neg_linear_leak.omni", include_str!("../../../../../../spec/acceptance/goldens/neg_linear_leak.omni")),
+    ("golden/neg_missing_cap.omni", include_str!("../../../../../../spec/acceptance/goldens/neg_missing_cap.omni")),
+    ("golden/neg_syntax_error.omni", include_str!("../../../../../../spec/acceptance/goldens/neg_syntax_error.omni")),
+    ("golden/neg_taint_on_ret.omni", include_str!("../../../../../../spec/acceptance/goldens/neg_taint_on_ret.omni")),
+    ("golden/neg_taint_sink.omni", include_str!("../../../../../../spec/acceptance/goldens/neg_taint_sink.omni")),
+    ("golden/neg_undef_var.omni", include_str!("../../../../../../spec/acceptance/goldens/neg_undef_var.omni")),
+    ("golden/neg_unknown_fn.omni", include_str!("../../../../../../spec/acceptance/goldens/neg_unknown_fn.omni")),
+    ("golden/neg_unresolved_label.omni", include_str!("../../../../../../spec/acceptance/goldens/neg_unresolved_label.omni")),
+    ("golden/nested_branch_golden.omni", include_str!("../../../../../../spec/acceptance/goldens/nested_branch_golden.omni")),
+    ("golden/pack5_direct_aot.omni", include_str!("../../../../../../spec/acceptance/goldens/pack5_direct_aot.omni")),
+    ("golden/pack5_trit_vec_golden.omni", include_str!("../../../../../../spec/acceptance/goldens/pack5_trit_vec_golden.omni")),
+    ("golden/route_db_query_golden.omni", include_str!("../../../../../../spec/acceptance/goldens/route_db_query_golden.omni")),
+    ("golden/route_kv_golden.omni", include_str!("../../../../../../spec/acceptance/goldens/route_kv_golden.omni")),
+    ("golden/seed0_risk.omni", include_str!("../../../../../../spec/acceptance/goldens/seed0_risk.omni")),
+    ("golden/seed4_consensus.omni", include_str!("../../../../../../spec/acceptance/goldens/seed4_consensus.omni")),
+    ("golden/seed6_clamp.omni", include_str!("../../../../../../spec/acceptance/goldens/seed6_clamp.omni")),
+    ("golden/sel_mix.omni", include_str!("../../../../../../spec/acceptance/goldens/sel_mix.omni")),
+    ("golden/shl_65.omni", include_str!("../../../../../../spec/acceptance/goldens/shl_65.omni")),
+    ("golden/stdlib_macro_pipeline_golden.omni", include_str!("../../../../../../spec/acceptance/goldens/stdlib_macro_pipeline_golden.omni")),
+    ("golden/while_sum_even_golden.omni", include_str!("../../../../../../spec/acceptance/goldens/while_sum_even_golden.omni")),
+    ("m3fix/q1_nonstrict_control.omni", include_str!("../../../../../../spec/m3/fixtures/q1_nonstrict_control.omni")),
+    ("m3fix/q1_strict_substring.omni", include_str!("../../../../../../spec/m3/fixtures/q1_strict_substring.omni")),
+    ("m3fix/q2_trit_text.omni", include_str!("../../../../../../spec/m3/fixtures/q2_trit_text.omni")),
+    ("m3fix/q3_neg_fold.omni", include_str!("../../../../../../spec/m3/fixtures/q3_neg_fold.omni")),
+    ("m3fix/q4_le_ge.omni", include_str!("../../../../../../spec/m3/fixtures/q4_le_ge.omni")),
+    ("m3fix/q5_macro_after_def.omni", include_str!("../../../../../../spec/m3/fixtures/q5_macro_after_def.omni")),
+    ("m3fix/q5_macro_order.omni", include_str!("../../../../../../spec/m3/fixtures/q5_macro_order.omni")),
+    ("m3fix/q6_include_once.omni", include_str!("../../../../../../spec/m3/fixtures/q6_include_once.omni")),
+    ("m3fix/q6_include_twice.omni", include_str!("../../../../../../spec/m3/fixtures/q6_include_twice.omni")),
+    ("m3fix/q7_fn_ids.omni", include_str!("../../../../../../spec/m3/fixtures/q7_fn_ids.omni")),
+    ("m3fix/q8a_ssa_limit.omni", include_str!("../../../../../../spec/m3/fixtures/q8a_ssa_limit.omni")),
+    ("m3fix/q8b_label_limit.omni", include_str!("../../../../../../spec/m3/fixtures/q8b_label_limit.omni")),
+    ("m3fix/q8c_label_ok.omni", include_str!("../../../../../../spec/m3/fixtures/q8c_label_ok.omni")),
+    ("m3fix/q8d_label_15.omni", include_str!("../../../../../../spec/m3/fixtures/q8d_label_15.omni")),
+    ("m3fix/q8e_label_17.omni", include_str!("../../../../../../spec/m3/fixtures/q8e_label_17.omni")),
+    ("m3fix/neg_ambiguous_grammar.omni", include_str!("../../../../../../spec/m3/fixtures/neg_ambiguous_grammar.omni")),
+    ("m3fix/neg_arity_mismatch.omni", include_str!("../../../../../../spec/m3/fixtures/neg_arity_mismatch.omni")),
+    ("m3fix/neg_bad_type.omni", include_str!("../../../../../../spec/m3/fixtures/neg_bad_type.omni")),
+    ("m3fix/neg_budget_exceeded.omni", include_str!("../../../../../../spec/m3/fixtures/neg_budget_exceeded.omni")),
+    ("m3fix/neg_circular_include.omni", include_str!("../../../../../../spec/m3/fixtures/neg_circular_include.omni")),
+    ("m3fix/neg_immut_param.omni", include_str!("../../../../../../spec/m3/fixtures/neg_immut_param.omni")),
+    ("m3fix/neg_missing_cap.omni", include_str!("../../../../../../spec/m3/fixtures/neg_missing_cap.omni")),
+    ("m3fix/neg_syntax_error.omni", include_str!("../../../../../../spec/m3/fixtures/neg_syntax_error.omni")),
+    ("m3fix/neg_undef_var.omni", include_str!("../../../../../../spec/m3/fixtures/neg_undef_var.omni")),
+    ("m3fix/neg_unknown_fn.omni", include_str!("../../../../../../spec/m3/fixtures/neg_unknown_fn.omni")),
+    ("m3fix/neg_unresolved_label.omni", include_str!("../../../../../../spec/m3/fixtures/neg_unresolved_label.omni")),
 ];
 
 fn m3_push_u32(out: &mut Vec<u16>, v: usize) -> Result<(), String> {
