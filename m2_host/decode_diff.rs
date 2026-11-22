@@ -6223,42 +6223,41 @@ pub fn pure_default_compile_surface_to_u16(src: &str, strict: bool) -> Result<Ve
         && src.len() <= 65_536
         && std::path::Path::new("pure/m3/m3_standalone.omni_bc").exists()
     {
-        if let Ok(m3_elf) = ensure_native_m3_elf() {
-            let mut u16_bytes = Vec::with_capacity(src.len() * 2);
-            for &b in src.as_bytes() {
-                u16_bytes.extend_from_slice(&(b as u16).to_le_bytes());
-            }
-            let tmp = PrivateTempDataFile::create("m3_in", &u16_bytes)?;
-            let out = std::process::Command::new(m3_elf)
-                .arg(&tmp.path)
-                .arg(if strict { "1" } else { "0" })
-                .output()
-                .map_err(|e| format!("spawn native m3.elf: {}", e))?;
-            if !out.status.success() {
-                return Err(format!(
-                    "error[M3_NATIVE_TRAP]: native m3.elf exited with {:?}",
-                    out.status.code()
-                ));
-            }
-            let out_bytes = out.stdout;
-            if out_bytes.len() == 16 && u16::from_le_bytes([out_bytes[0], out_bytes[1]]) == 0xFFFF {
-                let code = u16::from_le_bytes([out_bytes[2], out_bytes[3]]);
-                let line = u16::from_le_bytes([out_bytes[4], out_bytes[5]]);
-                let col = u16::from_le_bytes([out_bytes[6], out_bytes[7]]);
-                return Err(format!(
-                    "error[M3_CODE_{}] line {}, col {}: Pure-Omni M3 frontend rejected input",
-                    code, line, col
-                ));
-            }
-            if out_bytes.len() % 2 != 0 {
-                return Err(format!("native m3.elf returned odd byte length {}", out_bytes.len()));
-            }
-            let words: Vec<u16> = out_bytes
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                .collect();
-            return Ok(words);
+        let m3_elf = ensure_native_m3_elf()?;
+        let mut u16_bytes = Vec::with_capacity(src.len() * 2);
+        for &b in src.as_bytes() {
+            u16_bytes.extend_from_slice(&(b as u16).to_le_bytes());
         }
+        let tmp = PrivateTempDataFile::create("m3_in", &u16_bytes)?;
+        let out = std::process::Command::new(m3_elf)
+            .arg(&tmp.path)
+            .arg(if strict { "1" } else { "0" })
+            .output()
+            .map_err(|e| format!("spawn native m3.elf: {}", e))?;
+        if !out.status.success() {
+            return Err(format!(
+                "error[M3_NATIVE_TRAP]: native m3.elf exited with {:?}",
+                out.status.code()
+            ));
+        }
+        let out_bytes = out.stdout;
+        if out_bytes.len() == 16 && u16::from_le_bytes([out_bytes[0], out_bytes[1]]) == 0xFFFF {
+            let code = u16::from_le_bytes([out_bytes[2], out_bytes[3]]);
+            let line = u16::from_le_bytes([out_bytes[4], out_bytes[5]]);
+            let col = u16::from_le_bytes([out_bytes[6], out_bytes[7]]);
+            return Err(format!(
+                "error[M3_CODE_{}] line {}, col {}: Pure-Omni M3 frontend rejected input",
+                code, line, col
+            ));
+        }
+        if out_bytes.len() % 2 != 0 {
+            return Err(format!("native m3.elf returned odd byte length {}", out_bytes.len()));
+        }
+        let words: Vec<u16> = out_bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        return Ok(words);
     }
     match m3_lockstep_compile_via_omni(src, strict)? {
         Ok(u16_stream) => Ok(u16_stream),
@@ -6304,25 +6303,24 @@ pub fn pure_default_compile_u16_to_elf(u16_stream: &[u16], a0: i64, a1: i64, a2:
         && u16_stream.len() <= 65_536
         && std::path::Path::new("pure/m2/m2.omni_bc").exists()
     {
-        if let Ok(m2_elf) = ensure_native_m2_elf() {
-            let bc_bytes = encode_u16_stream_to_bytes(u16_stream);
-            let tmp = PrivateTempDataFile::create("m2_in", &bc_bytes)?;
-            let out = std::process::Command::new(m2_elf)
-                .arg(&tmp.path)
-                .arg(a0.to_string())
-                .arg(a1.to_string())
-                .arg(a2.to_string())
-                .output()
-                .map_err(|e| format!("spawn native m2.elf: {}", e))?;
-            if !out.status.success() {
-                return Err(format!(
-                    "{}: native m2.elf rejected/trapped input (exit {:?})",
-                    OMNI_OOB_ERROR,
-                    out.status.code()
-                ));
-            }
-            return Ok(out.stdout);
+        let m2_elf = ensure_native_m2_elf()?;
+        let bc_bytes = encode_u16_stream_to_bytes(u16_stream);
+        let tmp = PrivateTempDataFile::create("m2_in", &bc_bytes)?;
+        let out = std::process::Command::new(m2_elf)
+            .arg(&tmp.path)
+            .arg(a0.to_string())
+            .arg(a1.to_string())
+            .arg(a2.to_string())
+            .output()
+            .map_err(|e| format!("spawn native m2.elf: {}", e))?;
+        if !out.status.success() {
+            return Err(format!(
+                "{}: native m2.elf rejected/trapped input (exit {:?})",
+                OMNI_OOB_ERROR,
+                out.status.code()
+            ));
         }
+        return Ok(out.stdout);
     }
     pure_default_compile_u16_to_elf_interpreted(u16_stream, a0, a1, a2)
 }
@@ -6365,25 +6363,24 @@ pub fn pure_default_run_u16(
         && u16_stream.len() <= 65_536
         && std::path::Path::new("pure/m4/m4_standalone.omni_bc").exists()
     {
-        if let Ok(m4_elf) = ensure_native_m4_elf() {
-            let bc_bytes = encode_u16_stream_to_bytes(u16_stream);
-            let tmp = PrivateTempDataFile::create("m4_in", &bc_bytes)?;
-            let out = std::process::Command::new(m4_elf)
-                .arg(&tmp.path)
-                .arg(a0.to_string())
-                .arg(a1.to_string())
-                .arg(a2.to_string())
-                .output()
-                .map_err(|e| format!("spawn native m4.elf: {}", e))?;
-            if !out.status.success() {
-                return Err(format!(
-                    "{}: native m4.elf trapped with exit {:?}",
-                    OMNI_OOB_ERROR,
-                    out.status.code()
-                ));
-            }
-            return decode_m4_vm_state_64(&out.stdout);
+        let m4_elf = ensure_native_m4_elf()?;
+        let bc_bytes = encode_u16_stream_to_bytes(u16_stream);
+        let tmp = PrivateTempDataFile::create("m4_in", &bc_bytes)?;
+        let out = std::process::Command::new(m4_elf)
+            .arg(&tmp.path)
+            .arg(a0.to_string())
+            .arg(a1.to_string())
+            .arg(a2.to_string())
+            .output()
+            .map_err(|e| format!("spawn native m4.elf: {}", e))?;
+        if !out.status.success() {
+            return Err(format!(
+                "{}: native m4.elf trapped with exit {:?}",
+                OMNI_OOB_ERROR,
+                out.status.code()
+            ));
         }
+        return decode_m4_vm_state_64(&out.stdout);
     }
     let m4_mod = cached_m4_seed_module()?;
     let m4_run_fn = m4_mod.functions[m4_mod.functions.len() - 2].fn_idx;
