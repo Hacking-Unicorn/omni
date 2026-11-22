@@ -106,7 +106,7 @@ fn init_zero_buf(n: i64) -> bytes {
 
 #[strict]
 fn ws_get(ws: bytes, idx: i64) -> i64 {
-    let v: i64 = load_i64le(ws, idx * 8);
+    let v: i64 = ld_u64(ws, idx * 8);
     return v;
 }
 
@@ -977,22 +977,37 @@ fn verify_ins_body(stream: bytes, ws: bytes, ins_start: i64, ins_cnt: i64, cap: 
 }
 
 #[strict]
-fn emit_fn_result(out: bytes, ws: bytes, fn_idx: i64) -> bytes {
-    let o: bytes = out;
-    let nerr: i64 = ws_get(ws, 8);
+fn emit_fn_result(ws: bytes, fn_idx: i64) -> bytes {
+    let w: bytes = ws;
+    let nerr: i64 = ws_get(w, 8);
     let passed: i64 = is_eq(nerr, 0);
-    o = iset_i64(o, fn_idx);
-    o = iset_i64(o, passed);
-    o = iset_i64(o, nerr);
+    let cur: i64 = ws_get(w, 21);
+    let fit_hdr: i64 = is_lt(cur + 3, 7168);
+    let ch: trit = fit_hdr <=> 0;
+    w = if_pos ch {
+        let t: bytes = ws_set(w, 1024 + cur, fn_idx);
+        t = ws_set(t, 1024 + cur + 1, passed);
+        t = ws_set(t, 1024 + cur + 2, nerr);
+        ws_set(t, 21, cur + 3)
+    } else {
+        w
+    };
     let i: i64 = 0;
     while nerr - i <=> 0 {
-        let code: i64 = ws_get(ws, 256 + i * 2);
-        let off: i64 = ws_get(ws, 256 + i * 2 + 1);
-        o = iset_i64(o, code);
-        o = iset_i64(o, off);
+        let code: i64 = ws_get(w, 256 + i * 2);
+        let off: i64 = ws_get(w, 256 + i * 2 + 1);
+        let c2: i64 = ws_get(w, 21);
+        let fit_e: trit = is_lt(c2 + 2, 7168) <=> 0;
+        w = if_pos fit_e {
+            let t: bytes = ws_set(w, 1024 + c2, code);
+            t = ws_set(t, 1024 + c2 + 1, off);
+            ws_set(t, 21, c2 + 2)
+        } else {
+            w
+        };
         i = i + 1;
     }
-    return o;
+    return w;
 }
 
 #[strict]
@@ -1191,9 +1206,10 @@ fn prescan_module_fns(stream: bytes, ws: bytes, nwords: i64) -> bytes {
 fn omni_verify_module_with_mode(stream: bytes, api_mode: i64) -> bytes {
     let nbytes: i64 = slen(stream);
     let nwords: i64 = nbytes / 2;
-    let ws: bytes = init_zero_buf(960);
+    let ws: bytes = init_zero_buf(8192);
     ws = ws_set(ws, 1, nwords);
     ws = ws_set(ws, 19, api_mode);
+    ws = ws_set(ws, 21, 3);
     let empty: i64 = is_eq(nwords, 0);
     let hdr: i64 = load_u16(stream, 0);
     let bad_hdr: i64 = empty + (1 - is_eq(hdr, 32480));
@@ -1201,7 +1217,6 @@ fn omni_verify_module_with_mode(stream: bytes, api_mode: i64) -> bytes {
     ws = prescan_module_fns(stream, ws, nwords);
     let pos: i64 = 1;
     ws = ws_set(ws, 0, pos);
-    let out: bytes = anew(0);
     let nfns: i64 = 0;
     let go: i64 = (1 - is_eq(ws_get(ws, 10), 3006)) * is_gt(nwords, pos);
     while go <=> 0 {
@@ -1246,7 +1261,7 @@ fn omni_verify_module_with_mode(stream: bytes, api_mode: i64) -> bytes {
             let ins_start: i64 = pos + 2 + p_cnt * 3 + 3;
             ws = ws_set(ws, 0, ins_start);
             ws = verify_one_fn(stream, ws, fn_idx, p_cnt, p_pos, cap, ins_cnt, ins_start);
-            out = emit_fn_result(out, ws, fn_idx);
+            ws = emit_fn_result(ws, fn_idx);
             nfns = nfns + 1;
             let endpos: i64 = ws_get(ws, 0);
             endpos
@@ -1267,18 +1282,11 @@ fn omni_verify_module_with_mode(stream: bytes, api_mode: i64) -> bytes {
     let empty_mod: i64 = is_eq(status0, 0) * is_eq(nfns, 0);
     let status: i64 = empty_mod * 3007 + (1 - empty_mod) * status0;
     let dec_off: i64 = ws_get(ws, 11);
-    let hdr_out: bytes = anew(0);
-    hdr_out = iset_i64(hdr_out, status);
-    hdr_out = iset_i64(hdr_out, dec_off);
-    hdr_out = iset_i64(hdr_out, nfns);
-    let i: i64 = 0;
-    let n: i64 = slen(out) / 8;
-    while n - i <=> 0 {
-        let v: i64 = load_i64le(out, i * 8);
-        hdr_out = iset_i64(hdr_out, v);
-        i = i + 1;
-    }
-    return hdr_out;
+    ws = ws_set(ws, 1024, status);
+    ws = ws_set(ws, 1025, dec_off);
+    ws = ws_set(ws, 1026, nfns);
+    let out_words: i64 = ws_get(ws, 21);
+    return ret_slice(ws, 8192, out_words * 8);
 }
 
 #[strict]

@@ -24574,32 +24574,66 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
                 1
             }
         },
-        "s4-honesty" => match selftest_s4_honesty() {
-            Ok(n) => {
+        "s4-honesty" => {
+            if args.get(1).map(|s| s.as_str()) == Some("--print-pins") {
+                let m3_b = std::fs::read("pure/m3/m3.omni_bc").unwrap_or_default();
+                let m2_b = std::fs::read("pure/m2/m2.omni_bc").unwrap_or_default();
+                let m4_b = std::fs::read("pure/m4/m4.omni_bc").unwrap_or_default();
+                println!("| Seed | Words | FNV-1a64 |");
+                println!("|---|---:|---|");
+                println!("| `pure/m3/m3.omni_bc` | {} | `0x{:016X}` |", m3_b.len() / 2, fnv1a_64_hash(&m3_b));
+                println!("| `pure/m2/m2.omni_bc` | {} | `0x{:016X}` |", m2_b.len() / 2, fnv1a_64_hash(&m2_b));
+                println!("| `pure/m4/m4.omni_bc` | {} | `0x{:016X}` |", m4_b.len() / 2, fnv1a_64_hash(&m4_b));
+                return 0;
+            }
+            if args.get(1).map(|s| s.as_str()) == Some("--strict-readme") {
+                std::env::set_var("OMNI_STRICT_README", "1");
+            }
+            match selftest_s4_honesty() {
+                Ok(n) => {
+                    println!(
+                        "[S4-HONESTY PASS] {} checks | compile-elf 0/0/0 default args + live wc -l doc drift lock + honest 236-line classified seed vs runtime Rust + M5 181-B validator/entry stub",
+                        n
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("[S4-HONESTY FAIL] {}", e);
+                    1
+                }
+            }
+        }
+        "s3-perf" => {
+            if args.get(1).map(|s| s.as_str()) == Some("--write-verifier-seed") {
+                let ve_sa_src = verifier_standalone_source();
+                let ve_sa_u16 = with_lockstep_suspended(|| {
+                    compile_omni_surface_strict_to_u16(&ve_sa_src)
+                })
+                .expect("compile verifier_standalone_source");
+                let ve_sa_bytes = encode_u16_stream_to_bytes(&ve_sa_u16);
+                std::fs::write("pure/verifier_standalone.omni_bc", &ve_sa_bytes)
+                    .expect("write pure/verifier_standalone.omni_bc");
                 println!(
-                    "[S4-HONESTY PASS] {} checks | compile-elf 0/0/0 default args + live wc -l doc drift lock + honest 236-line classified seed vs runtime Rust + M5 181-B validator/entry stub",
-                    n
+                    "[L6 VERIFIER SEED] Wrote {} words (FNV-1a64=0x{:016X}) to pure/verifier_standalone.omni_bc",
+                    ve_sa_u16.len(),
+                    fnv1a_64_hash(&ve_sa_bytes)
                 );
-                0
+                return 0;
             }
-            Err(e) => {
-                eprintln!("[S4-HONESTY FAIL] {}", e);
-                1
+            match selftest_s3_performance() {
+                Ok(n) => {
+                    println!(
+                        "[S3-PERF PASS] {} checks | hash-pinned native m3.elf/m2.elf/m4.elf/verifier.elf default path (0-word/0-byte parity + native latency bounds + 5 frozen hashes)",
+                        n
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("[S3-PERF FAIL] {}", e);
+                    1
+                }
             }
-        },
-        "s3-perf" => match selftest_s3_performance() {
-            Ok(n) => {
-                println!(
-                    "[S3-PERF PASS] {} checks | hash-pinned native m3.elf/m2.elf/m4.elf default path (0-word/0-byte parity + native latency bounds + 5 frozen hashes)",
-                    n
-                );
-                0
-            }
-            Err(e) => {
-                eprintln!("[S3-PERF FAIL] {}", e);
-                1
-            }
-        },
+        }
         "s5-refreeze" => match selftest_s5_refreeze() {
             Ok(n) => {
                 println!(
@@ -25603,15 +25637,48 @@ fn main() {
                 return;
             }
             "run" | "run-surface" if cli_args.len() >= 3 => {
-                let use_rust = cli_args[2..].iter().any(|a| a == "--rust" || a == "--oracle");
-                let use_interp = cli_args[2..].iter().any(|a| a == "--interpreted");
-                let pos: Vec<&str> = cli_args[2..]
-                    .iter()
-                    .filter(|a| *a != "--rust" && *a != "--oracle" && *a != "--interpreted")
-                    .map(|s| s.as_str())
-                    .collect();
+                let mut use_rust = false;
+                let mut use_interp = false;
+                let mut fuel: i64 = PURE_DEFAULT_FUEL;
+                let mut pos: Vec<&str> = Vec::new();
+                let mut ai = 2usize;
+                while ai < cli_args.len() {
+                    let arg = cli_args[ai].as_str();
+                    if arg == "--rust" || arg == "--oracle" {
+                        use_rust = true;
+                    } else if arg == "--interpreted" {
+                        use_interp = true;
+                    } else if arg == "--fuel" {
+                        ai += 1;
+                        let val_s = match cli_args.get(ai) {
+                            Some(s) => s.as_str(),
+                            None => {
+                                eprintln!("error[INVALID_ARG]: --fuel requires an integer in 1..={}", PURE_MAX_FUEL);
+                                std::process::exit(2);
+                            }
+                        };
+                        fuel = match val_s.parse::<i64>() {
+                            Ok(n) if n > 0 && n <= PURE_MAX_FUEL => n,
+                            _ => {
+                                eprintln!("error[INVALID_ARG]: --fuel must be in 1..={} (got '{}')", PURE_MAX_FUEL, val_s);
+                                std::process::exit(2);
+                            }
+                        };
+                    } else if let Some(val_s) = arg.strip_prefix("--fuel=") {
+                        fuel = match val_s.parse::<i64>() {
+                            Ok(n) if n > 0 && n <= PURE_MAX_FUEL => n,
+                            _ => {
+                                eprintln!("error[INVALID_ARG]: --fuel must be in 1..={} (got '{}')", PURE_MAX_FUEL, val_s);
+                                std::process::exit(2);
+                            }
+                        };
+                    } else {
+                        pos.push(arg);
+                    }
+                    ai += 1;
+                }
                 if pos.is_empty() {
-                    eprintln!("Usage: omni run [--rust|--oracle|--interpreted] <file.omni|file.omni_bc> [args...]");
+                    eprintln!("Usage: omni run [--rust|--oracle|--interpreted] [--fuel N] <file.omni|file.omni_bc> [args...]");
                     std::process::exit(2);
                 }
                 let path = pos[0];
@@ -25652,9 +25719,9 @@ fn main() {
                         std::process::exit(1);
                     }
                     let run_res = if use_interp {
-                        with_pure_default_interpreted(|| pure_default_run_u16(&u16_stream, a0, a1, a2, false))
+                        with_pure_default_interpreted(|| pure_default_run_u16_with_fuel(&u16_stream, a0, a1, a2, fuel, false))
                     } else {
-                        pure_default_run_u16(&u16_stream, a0, a1, a2, false)
+                        pure_default_run_u16_with_fuel(&u16_stream, a0, a1, a2, fuel, false)
                     };
                     match run_res {
                         Ok((ret, _steps)) => {

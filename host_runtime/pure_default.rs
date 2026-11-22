@@ -33,6 +33,41 @@ pub const NATIVE_M3_ELF_BYTES: usize = 165_900;
 pub const NATIVE_M3_ELF_FNV: u64 = 0x54B2_48B6_9704_ED59;
 pub const NATIVE_M4_ELF_BYTES: usize = 81_763;
 pub const NATIVE_M4_ELF_FNV: u64 = 0xC935_88C4_A4D4_D962;
+pub const NATIVE_VERIFIER_ELF_BYTES: usize = 37_636;
+pub const NATIVE_VERIFIER_ELF_FNV: u64 = 0xF3F0_CC71_77A2_FA84;
+
+/// Audit Round 2 L5: Default & maximum fuel for `omni run --fuel N`, plus documented
+/// 65,536-word (128 KiB) native M2/M3/M4/verifier input-window threshold (larger inputs
+/// fall back cleanly to the interpreted seed VM).
+pub const PURE_DEFAULT_FUEL: i64 = 500_000;
+pub const PURE_MAX_FUEL: i64 = 50_000_000;
+pub const NATIVE_WINDOW_MAX_WORDS: usize = 65_536;
+
+/// Audit Round 2 L6: Derives the standalone `array`-input verifier source deterministically
+/// from `pure/verifier_engine.omni` (single source of truth; zero duplicated rules).
+pub fn verifier_standalone_source() -> String {
+    let mut s = OMNI_VERIFIER_ENGINE_SURFACE.replace("stream: bytes", "stream: array");
+    s = s.replace(
+        "fn load_u16(stream: array, idx: i64) -> i64 {\n    let off: i64 = idx * 2;\n    let lo: i64 = iget(stream, off);\n    let hi: i64 = iget(stream, off + 1);\n    let v: i64 = lo | (hi << 8);\n    return v;\n}",
+        "fn load_u16(stream: array, idx: i64) -> i64 {\n    return iget(stream, idx);\n}",
+    );
+    s = s.replace(
+        "fn load_u16(stream: array, idx: i64) -> i64 {\r\n    let off: i64 = idx * 2;\r\n    let lo: i64 = iget(stream, off);\r\n    let hi: i64 = iget(stream, off + 1);\r\n    let v: i64 = lo | (hi << 8);\r\n    return v;\r\n}",
+        "fn load_u16(stream: array, idx: i64) -> i64 {\n    return iget(stream, idx);\n}",
+    );
+    s = s.replace(
+        "    let nbytes: i64 = slen(stream);\n    let nwords: i64 = nbytes / 2;",
+        "    let nwords: i64 = slen(stream);",
+    );
+    s = s.replace(
+        "    let nbytes: i64 = slen(stream);\r\n    let nwords: i64 = nbytes / 2;",
+        "    let nwords: i64 = slen(stream);",
+    );
+    s.push_str(
+        "\n#[strict]\nfn verifier_standalone_entry(stream: array, api_mode: i64, _a1: i64, _a2: i64) -> bytes {\n    let rep: bytes = omni_verify_module_with_mode(stream, api_mode);\n    let n: i64 = ld_u64(rep, 168) * 8;\n    return ret_slice(rep, 8192, n);\n}\n",
+    );
+    s
+}
 
 fn cached_m2_seed_module() -> Result<&'static BinModule, String> {
     static M2_MOD: std::sync::OnceLock<Result<BinModule, String>> = std::sync::OnceLock::new();
@@ -385,6 +420,43 @@ fn ensure_native_m4_elf() -> Result<&'static std::path::PathBuf, String> {
         .map_err(|e| e.clone())
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn ensure_native_verifier_elf() -> Result<&'static std::path::PathBuf, String> {
+    static VERIFIER_ELF: std::sync::OnceLock<Result<std::path::PathBuf, String>> =
+        std::sync::OnceLock::new();
+    VERIFIER_ELF
+        .get_or_init(|| {
+            ensure_cached_native_elf(
+                "verifier",
+                NATIVE_VERIFIER_ELF_BYTES,
+                NATIVE_VERIFIER_ELF_FNV,
+                || {
+                    let m2_elf = ensure_native_m2_elf()?;
+                    let out = spawn_verified_native_elf(
+                        m2_elf,
+                        NATIVE_M2_ELF_BYTES,
+                        NATIVE_M2_ELF_FNV,
+                        &[
+                            std::ffi::OsStr::new("pure/verifier_standalone.omni_bc"),
+                            std::ffi::OsStr::new("0"),
+                            std::ffi::OsStr::new("0"),
+                            std::ffi::OsStr::new("0"),
+                        ],
+                    )?;
+                    if !out.status.success() {
+                        return Err(format!(
+                            "m2.elf failed building verifier.elf with status {:?}",
+                            out.status.code()
+                        ));
+                    }
+                    Ok(out.stdout)
+                },
+            )
+        })
+        .as_ref()
+        .map_err(|e| e.clone())
+}
+
 /// Seed-Shrink Phase A1/A3 + Audit §3.1: Compile `.omni` surface source using ONLY the committed
 /// Pure-Omni M3 seed (hash-pinned native `m3.elf` on Linux x86-64 when `src.len() <= 65_536` and
 /// not forced interpreted; otherwise interpreted `pure/m3/m3.omni_bc`) — zero Rust frontend calls,
@@ -535,20 +607,29 @@ fn decode_m4_vm_state_64(st_bytes: &[u8]) -> Result<(i64, i64), String> {
     Ok((ret, steps))
 }
 
-/// Seed-Shrink Phase A1 + Audit §3.1: Execute a `.omni_bc` u16 stream using ONLY the committed
-/// Pure-Omni M4 VM seed (hash-pinned native `m4.elf` on Linux x86-64 when `!trace` and not forced
-/// interpreted; otherwise interpreted `pure/m4/m4.omni_bc`), returning `(ret_i64, vm_steps)`.
-pub fn pure_default_run_u16(
+/// Seed-Shrink Phase A1 + Audit §3.1 + Audit Round 2 L5: Execute a `.omni_bc` u16 stream using ONLY
+/// the committed Pure-Omni M4 VM seed with configurable `fuel` (1..=PURE_MAX_FUEL). Uses hash-pinned
+/// native `m4.elf` on Linux x86-64 when `fuel == PURE_DEFAULT_FUEL`, `!trace`, `u16_stream.len() <= NATIVE_WINDOW_MAX_WORDS`,
+/// and not forced interpreted; otherwise executes `pure/m4/m4.omni_bc` with the requested `fuel`.
+pub fn pure_default_run_u16_with_fuel(
     u16_stream: &[u16],
     a0: i64,
     a1: i64,
     a2: i64,
+    fuel: i64,
     trace: bool,
 ) -> Result<(i64, i64), String> {
+    if fuel <= 0 || fuel > PURE_MAX_FUEL {
+        return Err(format!(
+            "error[INVALID_ARG]: --fuel must be in 1..={} (got {})",
+            PURE_MAX_FUEL, fuel
+        ));
+    }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     if !pure_default_force_interpreted()
         && !trace
-        && u16_stream.len() <= 65_536
+        && fuel == PURE_DEFAULT_FUEL
+        && u16_stream.len() <= NATIVE_WINDOW_MAX_WORDS
         && std::path::Path::new("pure/m4/m4_standalone.omni_bc").exists()
     {
         let m4_elf = ensure_native_m4_elf()?;
@@ -582,7 +663,8 @@ pub fn pure_default_run_u16(
     }
     let m4_mod = cached_m4_seed_module()?;
     let m4_run_fn = m4_mod.functions[m4_mod.functions.len() - 2].fn_idx;
-    let mut vm = OmniBinaryVm::with_budgets(500_000_000, 128 * 1024 * 1024);
+    let vm_budget = ((fuel as u64).saturating_mul(2000)).max(500_000_000);
+    let mut vm = OmniBinaryVm::with_budgets(vm_budget, 128 * 1024 * 1024);
     let arena = match vm.execute_function(
         m4_mod,
         m4_run_fn,
@@ -592,7 +674,7 @@ pub fn pure_default_run_u16(
             OmniValue::Int(a0),
             OmniValue::Int(a1),
             OmniValue::Int(a2),
-            OmniValue::Int(500_000),
+            OmniValue::Int(fuel),
             OmniValue::Int(if trace { 1 } else { 0 }),
         ],
     )? {
@@ -601,6 +683,16 @@ pub fn pure_default_run_u16(
     };
     let st = 167_936usize;
     decode_m4_vm_state_64(&arena[st..st + 64])
+}
+
+pub fn pure_default_run_u16(
+    u16_stream: &[u16],
+    a0: i64,
+    a1: i64,
+    a2: i64,
+    trace: bool,
+) -> Result<(i64, i64), String> {
+    pure_default_run_u16_with_fuel(u16_stream, a0, a1, a2, PURE_DEFAULT_FUEL, trace)
 }
 
 /// Seed-Shrink Phase A2 (O-5): Pure-Omni include expander driven by `pure/m3/include.omni`.
@@ -744,20 +836,59 @@ pub fn pure_default_expand_includes(
 /// (`pure/verifier_engine.omni`: `omni_verify_module_api` when `api_mode=true`, `omni_verify_module`
 /// otherwise) â€” ZERO calls to the frozen Rust verifier on the default hot path.
 pub fn pure_default_verify_u16(u16_stream: &[u16], api_mode: bool) -> Result<(), String> {
-    let ve_mod = cached_verifier_engine_module()?;
-    let fn_verify = if api_mode {
-        ve_mod.functions[ve_mod.functions.len() - 2].fn_idx
-    } else {
-        ve_mod.functions[ve_mod.functions.len() - 1].fn_idx
-    };
-    let mut vm = OmniBinaryVm::with_budgets(500_000_000, 64 * 1024 * 1024);
-    let rep = match vm.execute_function(
-        ve_mod,
-        fn_verify,
-        vec![OmniValue::Bytes(encode_u16_stream_to_bytes(u16_stream))],
-    )? {
-        OmniValue::Bytes(b) => b,
-        other => return Err(format!("Pure verifier returned unexpected value: {:?}", other)),
+    let rep: Vec<u8> = {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        let native_rep = if !pure_default_force_interpreted()
+            && u16_stream.len() <= NATIVE_WINDOW_MAX_WORDS
+            && std::path::Path::new("pure/verifier_standalone.omni_bc").exists()
+        {
+            let v_elf = ensure_native_verifier_elf()?;
+            let bc_bytes = encode_u16_stream_to_bytes(u16_stream);
+            let tmp = PrivateTempDataFile::create("ve_in", &bc_bytes)?;
+            let mode_s = if api_mode { "1" } else { "0" };
+            let out = spawn_verified_native_elf(
+                v_elf,
+                NATIVE_VERIFIER_ELF_BYTES,
+                NATIVE_VERIFIER_ELF_FNV,
+                &[
+                    tmp.path.as_os_str(),
+                    std::ffi::OsStr::new(mode_s),
+                    std::ffi::OsStr::new("0"),
+                    std::ffi::OsStr::new("0"),
+                ],
+            )?;
+            if !out.status.success() {
+                return Err(format!(
+                    "error[PURE_VERIFY_NATIVE_TRAP]: native verifier.elf exited with {:?}",
+                    out.status.code()
+                ));
+            }
+            Some(out.stdout)
+        } else {
+            None
+        };
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        let native_rep: Option<Vec<u8>> = None;
+
+        if let Some(b) = native_rep {
+            b
+        } else {
+            let ve_mod = cached_verifier_engine_module()?;
+            let fn_verify = if api_mode {
+                ve_mod.functions[ve_mod.functions.len() - 2].fn_idx
+            } else {
+                ve_mod.functions[ve_mod.functions.len() - 1].fn_idx
+            };
+            let mut vm = OmniBinaryVm::with_budgets(500_000_000, 64 * 1024 * 1024);
+            match vm.execute_function(
+                ve_mod,
+                fn_verify,
+                vec![OmniValue::Bytes(encode_u16_stream_to_bytes(u16_stream))],
+            )? {
+                OmniValue::Bytes(b) => b,
+                other => return Err(format!("Pure verifier returned unexpected value: {:?}", other)),
+            }
+        }
     };
     if rep.len() < 24 {
         return Err(String::from("error[PURE_VERIFY_MALFORMED]: Pure verifier report truncated"));

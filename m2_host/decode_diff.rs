@@ -7227,6 +7227,43 @@ pub fn selftest_s4_honesty() -> Result<usize, String> {
             "S4.2 README.md must qualify M5 181-byte ELF as a .omni_bc header validator/entry stub",
         ));
     }
+    // Audit Round 2 L7: lock all 5 frozen hashes in README.md unconditionally.
+    for &(label, hex) in &[
+        ("Phase D BC", "0x23B8D17257CCA9C4"),
+        ("Phase D ELF", "0x8D5AAAD22399A1EE"),
+        ("Core suite", "0x78462AE4C81DF408"),
+        ("Stage-1 BC", "0xED4C50AA79563EFF"),
+        ("Stage-1 ELF", "0x62F14B335B52BECC"),
+    ] {
+        if !main_readme.contains(hex) {
+            return Err(format!("S4.2 README.md missing frozen {} hash {}", label, hex));
+        }
+    }
+    // Optional strict README gate (`OMNI_STRICT_README=1` or `--strict-readme`): locks seed table,
+    // M4 ELF size, 5-backend wording, and archived workspace path once docs PR lands.
+    let strict_readme = matches!(
+        std::env::var("OMNI_STRICT_README").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    );
+    if strict_readme {
+        for &(label, needle) in &[
+            ("M3 seed hash", "0xC96457590C836700"),
+            ("M2 seed hash", "0x653BD567AAF5E0DB"),
+            ("M4 seed hash", "0x99567F6F5D0E8F32"),
+            ("M4 ELF size", "81,827"),
+            ("archived workspace", "oracle/archived-workspace/Cargo.toml"),
+        ] {
+            if !main_readme.contains(needle) {
+                return Err(format!("L7 strict README missing {} ('{}')", label, needle));
+            }
+        }
+        if main_readme.contains("4-backend") {
+            return Err(String::from("L7 strict README still contains stale '4-backend' claim"));
+        }
+        if main_readme.contains("omni-workspace/Cargo.toml") {
+            return Err(String::from("L7 strict README still references moved 'omni-workspace/Cargo.toml'"));
+        }
+    }
     checks += 1;
 
     // 3. §4.2: `seed0/omni_seed0.rs` header comment must match the active SEED_M2 / SEED_M4 pins.
@@ -7291,6 +7328,22 @@ pub fn selftest_s3_performance() -> Result<usize, String> {
             fnv1a_64_hash(&m4_sa_raw),
             m4_sa_ref.len(),
             fnv1a_64_hash(&m4_sa_ref)
+        ));
+    }
+    // Audit Round 2 L6: standalone verifier seed matches verifier_standalone_source() (0-word diff).
+    let ve_sa_raw = std::fs::read("pure/verifier_standalone.omni_bc")
+        .map_err(|e| format!("S3.1 missing pure/verifier_standalone.omni_bc: {}", e))?;
+    let ve_sa_src = verifier_standalone_source();
+    let ve_sa_ref = encode_u16_stream_to_bytes(&with_lockstep_suspended(|| {
+        compile_omni_surface_strict_to_u16(&ve_sa_src)
+    })?);
+    if ve_sa_raw != ve_sa_ref {
+        return Err(format!(
+            "S3.1 pure/verifier_standalone.omni_bc drift ({} B, 0x{:016X} != {} B, 0x{:016X})",
+            ve_sa_raw.len(),
+            fnv1a_64_hash(&ve_sa_raw),
+            ve_sa_ref.len(),
+            fnv1a_64_hash(&ve_sa_ref)
         ));
     }
     checks += 1;
