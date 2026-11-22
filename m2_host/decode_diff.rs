@@ -667,6 +667,8 @@ pub const M2_SELFHOST_OMNI_SRC: &str = concat!(
     "\n",
     include_str!("../pure/m2/labels.omni"),
     "\n",
+    include_str!("../pure/m2/verify/mod_check.omni"),
+    "\n",
     include_str!("../pure/m2/arena.omni"),
     "\n",
     include_str!("../pure/m2/elf.omni"),
@@ -1106,15 +1108,10 @@ pub fn selftest_m2_16_fixed_point(write_seed: bool) -> Result<(usize, usize, u64
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     let native_verified = {
-        use std::os::unix::fs::PermissionsExt;
-        let p_bc = std::env::temp_dir().join("omni_m2_seed_fp.omni_bc");
-        let p_s1 = std::env::temp_dir().join("omni_m2_s1.elf");
-        let p_s2 = std::env::temp_dir().join("omni_m2_s2.elf");
+        let tmp_s1 = PrivateTempElf::new(&s1, "m2_s1")?;
+        let p_bc = tmp_s1.dir.join("seed_fp.omni_bc");
         std::fs::write(&p_bc, &seed_bytes).map_err(|e| format!("write tmp bc: {}", e))?;
-        std::fs::write(&p_s1, &s1).map_err(|e| format!("write tmp s1: {}", e))?;
-        std::fs::set_permissions(&p_s1, std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("chmod s1: {}", e))?;
-        let out2 = std::process::Command::new(&p_s1)
+        let out2 = std::process::Command::new(&tmp_s1.path)
             .arg(&p_bc)
             .arg("45")
             .arg("40")
@@ -1131,10 +1128,8 @@ pub fn selftest_m2_16_fixed_point(write_seed: bool) -> Result<(usize, usize, u64
                 s2.len(), fnv1a_64_hash(&s2), s1.len(), fnv1a_64_hash(&s1)
             ));
         }
-        std::fs::write(&p_s2, &s2).map_err(|e| format!("write tmp s2: {}", e))?;
-        std::fs::set_permissions(&p_s2, std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("chmod s2: {}", e))?;
-        let out3 = std::process::Command::new(&p_s2)
+        let tmp_s2 = PrivateTempElf::new(&s2, "m2_s2")?;
+        let out3 = std::process::Command::new(&tmp_s2.path)
             .arg(&p_bc)
             .arg("45")
             .arg("40")
@@ -1145,9 +1140,6 @@ pub fn selftest_m2_16_fixed_point(write_seed: bool) -> Result<(usize, usize, u64
             return Err(format!("M2-16 S2 exited with {:?}", out3.status));
         }
         let s3 = out3.stdout;
-        let _ = std::fs::remove_file(&p_bc);
-        let _ = std::fs::remove_file(&p_s1);
-        let _ = std::fs::remove_file(&p_s2);
         if s3 != s2 {
             return Err(format!(
                 "M2-16 S3 != S2: S3={} B (0x{:016X}) vs S2={} B (0x{:016X})",
@@ -2818,16 +2810,9 @@ pub fn selftest_p5_2_zero_shim_sys() -> Result<(usize, usize, u64, bool), String
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     let native_ran = {
         use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
-        let tmp_path = std::env::temp_dir().join("omni_p5_zero_shim.elf");
-        std::fs::write(&tmp_path, &elf).map_err(|e| format!("P5-2 write tmp elf: {}", e))?;
-        let mut perms = std::fs::metadata(&tmp_path)
-            .map_err(|e| format!("P5-2 metadata: {}", e))?
-            .permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&tmp_path, perms).map_err(|e| format!("P5-2 chmod: {}", e))?;
+        let tmp_elf = PrivateTempElf::new(&elf, "p5_zero_shim")?;
         let payload: [u8; 12] = [0xE0, 0x7E, 0xE3, 0x7E, 0x00, 0x00, 0x42, 0x00, 0xEF, 0x7E, 0xAA, 0x55];
-        let mut child = std::process::Command::new(&tmp_path)
+        let mut child = std::process::Command::new(&tmp_elf.path)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()
@@ -2836,7 +2821,7 @@ pub fn selftest_p5_2_zero_shim_sys() -> Result<(usize, usize, u64, bool), String
             stdin.write_all(&payload).map_err(|e| format!("P5-2 stdin write: {}", e))?;
         }
         let out = child.wait_with_output().map_err(|e| format!("P5-2 wait: {}", e))?;
-        let _ = std::fs::remove_file(&tmp_path);
+        drop(tmp_elf);
         if !out.status.success() || out.stdout != payload {
             return Err(format!(
                 "P5-2 native zero-shim ELF failed: status={:?} stdout={:02X?}",
@@ -3526,19 +3511,11 @@ pub fn selftest_p7_0_measure() -> Result<(usize, Vec<P7BenchMetrics>, u8), Strin
 /// Executes a native Linux x86-64 ELF64 binary returning an 8-byte little-endian `i64` on stdout.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn p7_verify_native_elf_i64(name: &str, elf: &[u8], expected_val: i64) -> Result<bool, String> {
-    use std::os::unix::fs::PermissionsExt;
-    let path = std::env::temp_dir().join(format!(
-        "omni_p7_canary_{}_{}.elf",
-        name,
-        std::process::id()
-    ));
-    std::fs::write(&path, elf).map_err(|e| format!("P7-0a write {}: {}", name, e))?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("P7-0a chmod {}: {}", name, e))?;
-    let out = std::process::Command::new(&path)
+    let tmp_elf = PrivateTempElf::new(elf, name)?;
+    let out = std::process::Command::new(&tmp_elf.path)
         .output()
         .map_err(|e| format!("P7-0a exec {}: {}", name, e))?;
-    let _ = std::fs::remove_file(&path);
+    drop(tmp_elf);
     if !out.status.success() {
         return Err(format!("P7-0a native {} exited with {:?}", name, out.status));
     }
@@ -6047,11 +6024,17 @@ pub fn pure_default_run_u16(
         other => return Err(format!("Pure-M4 VM seed returned unexpected value: {:?}", other)),
     };
     let st = 167_936usize;
-    let status = i64::from_le_bytes(arena[st + 24..st + 32].try_into().unwrap());
+    let status = u32::from_le_bytes(arena[st + 28..st + 32].try_into().unwrap()) as i64;
     let ret = i64::from_le_bytes(arena[st + 32..st + 40].try_into().unwrap());
-    let steps = i64::from_le_bytes(arena[st + 40..st + 48].try_into().unwrap());
+    let steps = u32::from_le_bytes(arena[st + 44..st + 48].try_into().unwrap()) as i64;
     if status != 0 {
-        return Err(format!("Pure-M4 VM trapped with status={} after {} steps", status, steps));
+        let prefix = match status {
+            2 => OMNI_OOB_ERROR,
+            3 | 4 => "error[BUDGET_EXCEEDED]",
+            1 => "error[DECODE_ERROR]",
+            _ => "error[VM_TRAP]",
+        };
+        return Err(format!("{}: Pure-M4 VM trapped with status={} after {} steps", prefix, status, steps));
     }
     Ok((ret, steps))
 }
@@ -6676,11 +6659,29 @@ pub fn selftest_s1_2_call_target_arity_and_fuzz() -> Result<usize, String> {
     checks += 1;
 
     // 3. Defense-in-depth M2 trap stub: lowering unverified `missing_fn_32539` and `missing_fn_99`
-    // through Pure-Omni M2 (`m2.omni_bc`) must resolve the unknown `E8 rel32` to the `T_OOB` trap stub
-    // inside `.text` (`[120 .. elf.len())`), NEVER to `-1` (before `.text`).
+    // through Pure-Omni M2 emitter (`m2_compile_multi_x86`, bypassing standalone verifier) must resolve
+    // the unknown `E8 rel32` to the `T_OOB` trap stub inside `.text` (`[120 .. elf.len())`), NEVER to `-1`.
+    let m2_raw_s12 = std::fs::read("pure/m2/m2.omni_bc")
+        .map_err(|e| format!("S1.2 read pure/m2/m2.omni_bc: {}", e))?;
+    let m2_mod_s12 = decode_omni_token_stream(&decode_bytes_to_u16_stream(&m2_raw_s12))?;
+    let m2_emit_fn_s12 = m2_mod_s12.functions[m2_mod_s12.functions.len() - 2].fn_idx;
     for &bad_callee in &[32539u16, 99u16] {
         let unverified = build_call_stream(&[0x7EEC, bad_callee, 0x7EC0]);
-        let elf = pure_default_compile_u16_to_elf(&unverified, 7, 0, 0)?;
+        let mut vm_m2_s12 = OmniBinaryVm::with_budgets(500_000_000, 128 * 1024 * 1024);
+        let elf = match vm_m2_s12.execute_function(
+            &m2_mod_s12,
+            m2_emit_fn_s12,
+            vec![
+                OmniValue::Bytes(vec![0u8; 524_288]),
+                OmniValue::U16Array(unverified),
+                OmniValue::Int(7),
+                OmniValue::Int(0),
+                OmniValue::Int(0),
+            ],
+        )? {
+            OmniValue::Bytes(b) => b,
+            other => return Err(format!("S1.2 M2 emitter returned {:?}", other)),
+        };
         if elf.len() <= 132 || &elf[0..4] != &[0x7F, b'E', b'L', b'F'] {
             return Err(String::from("S1.2 M2 failed to emit ELF for trap-stub check"));
         }
@@ -6858,15 +6859,11 @@ pub fn selftest_b4_pure_launcher() -> Result<(usize, usize, u64, bool), String> 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     let native_ok = {
         use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
-        let lpath = std::env::temp_dir().join(format!("omni_b4_launcher_{}.elf", std::process::id()));
-        std::fs::write(&lpath, &launcher_elf).map_err(|e| format!("B4 write launcher: {}", e))?;
-        std::fs::set_permissions(&lpath, std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("B4 chmod launcher: {}", e))?;
+        let tmp_launcher = PrivateTempElf::new(&launcher_elf, "b4_launcher")?;
 
         // 3a. Valid .omni_bc seed on stdin -> exit 0.
         let m4_raw = std::fs::read("pure/m4/m4.omni_bc").map_err(|e| format!("B4 read m4 seed: {}", e))?;
-        let mut child_ok = std::process::Command::new(&lpath)
+        let mut child_ok = std::process::Command::new(&tmp_launcher.path)
             .stdin(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| format!("B4 spawn launcher (valid): {}", e))?;
@@ -6875,12 +6872,11 @@ pub fn selftest_b4_pure_launcher() -> Result<(usize, usize, u64, bool), String> 
         }
         let st_ok = child_ok.wait().map_err(|e| format!("B4 wait valid: {}", e))?;
         if st_ok.code() != Some(0) {
-            let _ = std::fs::remove_file(&lpath);
             return Err(format!("B4 native launcher rejected valid seed: exit {:?}", st_ok.code()));
         }
 
         // 3b. Corrupt input on stdin -> exit 1 (fail-closed).
-        let mut child_bad = std::process::Command::new(&lpath)
+        let mut child_bad = std::process::Command::new(&tmp_launcher.path)
             .stdin(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| format!("B4 spawn launcher (corrupt): {}", e))?;
@@ -6888,26 +6884,23 @@ pub fn selftest_b4_pure_launcher() -> Result<(usize, usize, u64, bool), String> 
             let _ = sin.write_all(&[0xFF, 0xFF, 0x00, 0x00]);
         }
         let st_bad = child_bad.wait().map_err(|e| format!("B4 wait corrupt: {}", e))?;
-        let _ = std::fs::remove_file(&lpath);
+        drop(tmp_launcher);
         if st_bad.code() != Some(1) {
             return Err(format!("B4 native launcher must fail closed (exit 1) on corrupt input, got {:?}", st_bad.code()));
         }
 
         // 4. Pure native M2 compiler ELF (emitted by Pure M2 itself, zero Rust binary) compiles
-        //    pure/m4/m4.omni_bc -> exact 80,641-B ELF64 (0x4B655C050F37CD4F).
+        //    pure/m4/m4.omni_bc -> exact 81,663-B ELF64 (0x05304F996E83AD5B).
         let m2_raw = std::fs::read("pure/m2/m2.omni_bc").map_err(|e| format!("B4 read m2 seed: {}", e))?;
         let m2_u16 = decode_bytes_to_u16_stream(&m2_raw);
         let m2_elf = pure_default_compile_u16_to_elf(&m2_u16, 0, 0, 0)?;
-        let m2path = std::env::temp_dir().join(format!("omni_b4_m2_{}.elf", std::process::id()));
-        std::fs::write(&m2path, &m2_elf).map_err(|e| format!("B4 write m2_native: {}", e))?;
-        std::fs::set_permissions(&m2path, std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("B4 chmod m2_native: {}", e))?;
-        let out_m4 = std::process::Command::new(&m2path)
+        let tmp_m2 = PrivateTempElf::new(&m2_elf, "b4_m2")?;
+        let out_m4 = std::process::Command::new(&tmp_m2.path)
             .arg("pure/m4/m4.omni_bc")
             .output()
             .map_err(|e| format!("B4 exec m2_native: {}", e))?;
-        let _ = std::fs::remove_file(&m2path);
-        if !out_m4.status.success() || out_m4.stdout.len() != 80_641 || fnv1a_64_hash(&out_m4.stdout) != 0x4B655C050F37CD4F {
+        drop(tmp_m2);
+        if !out_m4.status.success() || out_m4.stdout.len() != 81_663 || fnv1a_64_hash(&out_m4.stdout) != 0x05304F996E83AD5B {
             return Err(format!(
                 "B4 pure native m2.elf -> m4.elf mismatch: status={:?} len={} hash=0x{:016X}",
                 out_m4.status,
@@ -6927,4 +6920,208 @@ pub fn selftest_b4_pure_launcher() -> Result<(usize, usize, u64, bool), String> 
 
     Ok((checks, launcher_elf.len(), launcher_hash, native_ok))
 }
+
+/// Audit §2 Security hard gate (`./omnic s2-security`):
+///   1. §2.1: `m2.omni_bc` (`m2_standalone_entry`) and native `m2.elf` verify input via `m2_verify_module_pure`
+///      and refuse unverified/malformed `.omni_bc` streams from the S1 crash corpus (0 segfaults).
+///   2. §2.2: `pure_default_run_u16` (`trace=true` and `trace=false`) decodes `u32 err @28` and `u32 steps @44`
+///      accurately; `p4_shim_exec_bc` (`p4-exec`) verifies input before execution; 412-byte mutated stream
+///      terminates in bounded time with fuel charged in decode/label-index loops; host wall-clock cap works.
+///   3. §2.3: OOB programs report `error[OUT_OF_BOUNDS]` with real `status=2` and exact `steps` across backends.
+///   4. §2.5: `run_omni_serve_cli` rejects positional bind addresses (requires `--bind`), and per-request errors
+///      do not abort the HTTP server batch loop.
+pub fn selftest_s2_security() -> Result<usize, String> {
+    let mut checks = 0usize;
+
+    // 1. §2.3: `pure_default_run_u16` with `trace=true` on a valid program must NOT false-trap
+    //    (because `trace_cnt` is at +24 and `err_code` is at +28), and on an OOB program must report
+    //    `error[OUT_OF_BOUNDS]` with real `status=2` and small `steps` (never 8589934592 / 12884901888).
+    let ok_u16 = with_lockstep_suspended(|| {
+        compile_omni_surface_strict_to_u16("#[strict]\nfn main(x: i64) -> i64 { return x + 5; }\n")
+    })?;
+    let (ok_ret, ok_steps) = pure_default_run_u16(&ok_u16, 37, 0, 0, true)?;
+    if ok_ret != 42 || ok_steps <= 0 || ok_steps > 100 {
+        return Err(format!(
+            "S2.3 pure_default_run_u16(trace=true) failed: ret={} steps={}",
+            ok_ret, ok_steps
+        ));
+    }
+    let oob_u16 = with_lockstep_suspended(|| {
+        compile_omni_surface_strict_to_u16(
+            "#[strict]\nfn main(a: i64) -> i64 { let w: bytes = anew(0); w = iset(w, a); return ld_u32(w, 0); }\n",
+        )
+    })?;
+    match pure_default_run_u16(&oob_u16, 5, 0, 0, false) {
+        Ok((v, s)) => {
+            return Err(format!(
+                "S2.3 pure_default_run_u16 must fail on OOB ld_u32, got Ok(({}, {}))",
+                v, s
+            ))
+        }
+        Err(msg) => {
+            if !msg.contains("error[OUT_OF_BOUNDS]")
+                || !msg.contains("status=2 ")
+                || msg.contains("8589934592")
+            {
+                return Err(format!(
+                    "S2.3 OOB trap message must contain error[OUT_OF_BOUNDS] and status=2, got: {}",
+                    msg
+                ));
+            }
+        }
+    }
+    checks += 1;
+
+    // 2. §2.1: `m2.omni_bc` (`pure_default_compile_u16_to_elf`) and native `m2.elf` must refuse unverified
+    //    S1 crash corpus inputs (missing CALL target 32539, arity mismatch, missing RET, undefined branch label,
+    //    and mutated streams) — or trap cleanly with 0 segfaults.
+    let bad_call_32539: Vec<u16> = vec![
+        0x7EE0, 0x7EE3, 0, 1, 0x7EC0, 0x7F81, 0x7FC0, 0x7F81, 0x7FC0, 2, 0x7E00, 0x7F48, 0x7F81,
+        0x7FC0, 0x7EEC, 32539, 0x7EC0, 0x7EE4, 0x7F4A, 0x7E00, 0x7EE4, 0x7EE1, 0x7EEF,
+    ];
+    let missing_ret: Vec<u16> = vec![
+        0x7EE0, 0x7EE3, 0, 1, 0x7EC0, 0x7F81, 0x7FC0, 0x7F81, 0x7FC0, 1, 0x7E00, 0x7F10, 0x7F81,
+        0x7FC0, 0x7EC0, 0x7EC0, 0x7EE4, 0x7EE1, 0x7EEF,
+    ];
+    let bad_branch_lbl: Vec<u16> = vec![
+        0x7EE0, 0x7EE3, 0, 1, 0x7EC0, 0x7F81, 0x7FC0, 0x7F81, 0x7FC0, 2, 0x7F41, 0x7EF5, 0x7EE4,
+        0x7F4A, 0x7EC0, 0x7EE4, 0x7EE1, 0x7EEF,
+    ];
+    let bad_op_arity: Vec<u16> = vec![
+        0x7EE0, 0x7EE3, 0, 1, 0x7EC0, 0x7F81, 0x7FC0, 0x7F81, 0x7FC0, 2, 0x7E00, 0x7F10, 0x7F81,
+        0x7FC0, 0x7EC0, 0x7EE4, 0x7F4A, 0x7E00, 0x7EE4, 0x7EE1, 0x7EEF,
+    ];
+    for (label, case) in [
+        ("bad_call_32539", &bad_call_32539),
+        ("missing_ret", &missing_ret),
+        ("bad_branch_lbl", &bad_branch_lbl),
+        ("bad_op_arity", &bad_op_arity),
+    ] {
+        if pure_default_compile_u16_to_elf(case, 0, 0, 0).is_ok() {
+            return Err(format!(
+                "S2.1 Pure-M2 standalone seed accepted unverified S1 crash case '{}'",
+                label
+            ));
+        }
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        let m2_raw = std::fs::read("pure/m2/m2.omni_bc")
+            .map_err(|e| format!("S2.1 read pure/m2/m2.omni_bc: {}", e))?;
+        let m2_u16 = decode_bytes_to_u16_stream(&m2_raw);
+        let m2_elf = compile_pure_u16_to_x86_64_elf_multi(&m2_u16, 0, 0, 0)?;
+        let tmp_m2 = PrivateTempElf::new(&m2_elf, "s2_1_m2_native")?;
+        for (label, case) in [
+            ("bad_call_32539", &bad_call_32539),
+            ("missing_ret", &missing_ret),
+            ("bad_branch_lbl", &bad_branch_lbl),
+            ("bad_op_arity", &bad_op_arity),
+        ] {
+            let case_path = tmp_m2.dir.join(format!("{}.omni_bc", label));
+            std::fs::write(&case_path, encode_u16_stream_to_bytes(case))
+                .map_err(|e| format!("S2.1 write {}: {}", label, e))?;
+            let out = std::process::Command::new(&tmp_m2.path)
+                .arg(&case_path)
+                .output()
+                .map_err(|e| format!("S2.1 exec m2.elf on {}: {}", label, e))?;
+            if out.status.code() != Some(1) || !out.stdout.is_empty() {
+                return Err(format!(
+                    "S2.1 native m2.elf did not refuse '{}': status={:?} stdout_len={}",
+                    label,
+                    out.status,
+                    out.stdout.len()
+                ));
+            }
+        }
+    }
+    checks += 1;
+
+    // 3. §2.2: `p4_shim_exec_bc` (`p4-exec`) must verify input before executing, and a 412-byte (206-word)
+    //    mutated stream must terminate in bounded time (< 3s).
+    let mut mem_shim = MemoryThinShim::new();
+    mem_shim.files.insert(
+        String::from("bad_call.omni_bc"),
+        encode_u16_stream_to_bytes(&bad_call_32539),
+    );
+    if p4_shim_exec_bc(&mut mem_shim, "bad_call.omni_bc", None, 0, 0, 0, 100_000, 0).is_ok() {
+        return Err(String::from(
+            "S2.2 p4_shim_exec_bc (p4-exec) executed unverified bad_call.omni_bc without rejecting",
+        ));
+    }
+    // Construct a 412-byte (206-word) mutated stream with inflated ins_cnt=50000 in header.
+    let mut stream_206w = ok_u16.clone();
+    if stream_206w.len() > 9 {
+        stream_206w[9] = 50_000; // mutated ins_cnt in FN_DEF
+    }
+    while stream_206w.len() < 206 {
+        stream_206w.push(0x7F00);
+    }
+    stream_206w.truncate(206);
+    let t0 = std::time::Instant::now();
+    let (_, _, err_206, _, _) = p4_run_raw_bc_on_pure_vm(&stream_206w, 1, 0, 0, 5_000, 0)?;
+    if err_206 == 0 || t0.elapsed().as_secs() >= 5 {
+        return Err(format!(
+            "S2.2 412-byte mutated stream failed bound check: err={} elapsed={:?}",
+            err_206,
+            t0.elapsed()
+        ));
+    }
+    checks += 1;
+
+    // 4. §2.4: PrivateTempElf creates a private temp directory + O_EXCL file and cleans up on Drop.
+    let (priv_dir, priv_path) = {
+        let tmp_elf = PrivateTempElf::new(&[0x7F, b'E', b'L', b'F'], "s2_4_check")?;
+        if !tmp_elf.dir.is_dir() || !tmp_elf.path.is_file() {
+            return Err(String::from("S2.4 PrivateTempElf failed to create private dir/file"));
+        }
+        if std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_elf.path)
+            .is_ok()
+        {
+            return Err(String::from("S2.4 O_EXCL (create_new) did not reject existing file"));
+        }
+        (tmp_elf.dir.clone(), tmp_elf.path.clone())
+    };
+    if priv_path.exists() || priv_dir.exists() {
+        return Err(String::from("S2.4 PrivateTempElf Drop did not clean up temp dir/file"));
+    }
+    checks += 1;
+
+    // 5. §2.2 host wall-clock cap: an infinite loop on OmniBinaryVm with a 5ms wall timeout terminates cleanly.
+    let inf_u16 = with_lockstep_suspended(|| {
+        compile_omni_surface_strict_to_u16(
+            "#[strict]\nfn main(n: i64) -> i64 { let i: i64 = 0; while n > 0 { i = i + 1; } return i; }\n",
+        )
+    })?;
+    let inf_mod = decode_omni_token_stream(&inf_u16)?;
+    let mut timed_vm = OmniBinaryVm::with_budgets(500_000_000, 16 * 1024 * 1024);
+    timed_vm.set_wall_timeout_ms(5);
+    match timed_vm.execute_function(&inf_mod, 0, vec![OmniValue::Int(1)]) {
+        Ok(_) => return Err(String::from("S2.2 host wall-clock cap did not terminate infinite loop")),
+        Err(msg) => {
+            if !msg.contains("wall-clock timeout exceeded") {
+                return Err(format!("S2.2 expected wall-clock timeout error, got: {}", msg));
+            }
+        }
+    }
+    checks += 1;
+
+    // 6. §2.5: `run_omni_serve_cli` must reject a positional bind address and require `--bind`.
+    let code = run_omni_serve_cli(&[
+        String::from("route GET \"/\" => 1;"),
+        String::from("127.0.0.1:0"),
+    ]);
+    if code != 2 {
+        return Err(format!(
+            "S2.5 run_omni_serve_cli accepted positional bind address (exit={}, want 2)",
+            code
+        ));
+    }
+    checks += 1;
+
+    Ok(checks)
+}
+
 
