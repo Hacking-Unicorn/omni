@@ -63,6 +63,7 @@ jobs:
           ./omni b2-pure-verifier
           ./omni b4-pure-launcher
           ./omni s2-security
+          ./omni s4-honesty
           ./omni api-stage1
           ./omni api-stage2
           ./omni api-stage2-emit

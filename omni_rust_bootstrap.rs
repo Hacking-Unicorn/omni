@@ -23817,6 +23817,7 @@ pub fn run_m2_foundation_selftests() -> Result<usize, String> {
         ("a3_macro_quarantine", selftest_a3_macro_quarantine_count),
         ("b2_pure_verifier", selftest_b2_pure_verifier_count),
         ("s2_security", selftest_s2_security),
+        ("s4_honesty", selftest_s4_honesty),
         ("b4_pure_launcher", selftest_b4_pure_launcher_count),
     ];
     let mut n = run_selftest_tasks_in_lanes(parallel_tasks)?;
@@ -24392,6 +24393,19 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
                 1
             }
         },
+        "s4-honesty" => match selftest_s4_honesty() {
+            Ok(n) => {
+                println!(
+                    "[S4-HONESTY PASS] {} checks | compile-elf 0/0/0 default args + live wc -l doc drift lock + honest 236-line classified seed vs runtime Rust + M5 181-B validator/entry stub",
+                    n
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("[S4-HONESTY FAIL] {}", e);
+                1
+            }
+        },
         "p5-sys" => match selftest_p5_2_zero_shim_sys() {
             Ok((n, sz, h, native)) => {
                 println!(
@@ -24908,7 +24922,7 @@ fn main() {
             "harness" | "--harness" => {
                 std::process::exit(run_omni_harness_cli(&cli_args[2..]));
             }
-            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" | "p7-heal" | "p7-adapt" | "p7-learn" | "a1-pure-default" | "a2-pure-include" | "a3-macro-quarantine" | "b2-pure-verifier" | "b4-pure-launcher" | "s2-security" | "api-stage1" | "api-stage2" | "api-stage2-emit" | "api-stage2-5" => {
+            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" | "p7-heal" | "p7-adapt" | "p7-learn" | "a1-pure-default" | "a2-pure-include" | "a3-macro-quarantine" | "b2-pure-verifier" | "b4-pure-launcher" | "s2-security" | "s4-honesty" | "api-stage1" | "api-stage2" | "api-stage2-emit" | "api-stage2-5" => {
                 std::process::exit(run_m2_cli(&cli_args[1..]));
             }
             "agent-driver" | "--agent-driver" => {
@@ -25158,9 +25172,7 @@ fn main() {
                 }
                 let path = pos[0];
                 let out_path = pos[1];
-                let a0 = pos.get(2).and_then(|s| s.parse::<i64>().ok()).unwrap_or(45);
-                let a1 = pos.get(3).and_then(|s| s.parse::<i64>().ok()).unwrap_or(40);
-                let a2 = pos.get(4).and_then(|s| s.parse::<i64>().ok()).unwrap_or(90);
+                let (a0, a1, a2) = parse_compile_elf_args(&pos);
                 if use_rust {
                     let u16_stream = if path.ends_with(".omni") {
                         compile_omni_surface_file_to_u16(path).expect("Rust oracle surface compilation failed")

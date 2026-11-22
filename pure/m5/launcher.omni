@@ -1,13 +1,13 @@
 // ==============================================================================
-// OMNI SEED-SHRINK (PHASE B4) — PURE-OMNI M5 ZERO-SHIM LAUNCHER EMITTER
+// OMNI SEED-SHRINK (PHASE B4) — PURE-OMNI M5 181-B .omni_bc VALIDATOR / ENTRY STUB
 // `pure/m5/launcher.omni`
 // ==============================================================================
 // Link order: `pure/m2/util.omni`, `pure/isa/table.omni`, `pure/m2/decode.omni`,
 //             `pure/m2/labels.omni`, `pure/m2/arena.omni`, `pure/m2/elf.omni`,
 //             `pure/m5/elf_sys.omni`, this file.
 //
-// Emits a standalone 181-byte Linux x86-64 ELF64 zero-shim launcher binary
-// (raw Linux `0F 05` syscalls only — zero Rust, zero C, zero libc):
+// Emits a standalone 181-byte Linux x86-64 ELF64 zero-shim `.omni_bc` header
+// validator / entry stub (raw Linux `0F 05` syscalls only — chaining is done by B4):
 //   _start:
 //     sub rsp, 4096; mov rbx, rsp
 //     sys_read(0, rbx, 4096)        ; read .omni_bc seed stream from stdin
