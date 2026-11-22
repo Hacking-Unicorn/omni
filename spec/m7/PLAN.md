@@ -140,6 +140,18 @@ Pure-Omni self-healing decision & trace engine (`pure/m7/heal.omni`, 118 lines, 
 
 ---
 
+## P7-2 — Self-Adaptive (`pure/m7/adapt.omni`, `omnic p7-adapt`)
+
+Pure-Omni workload-driven self-adaptive policy, hysteresis, and ledger engine (`pure/m7/adapt.omni`, registered in `m2-lint` 22/22 with 0 findings):
+
+1. **Live Trace-Driven Workload Classifier (`p7_classify_workload`):** Reuses `pure/m7/judge.omni::p7_trace_histogram` on live P4-5 binary trace rings (`0x70000..0x7FFFF`) to classify executing programs into `WORKLOAD_IDLE (0)`, `WORKLOAD_ALU (1)`, `WORKLOAD_MEM (2)`, `WORKLOAD_CTRL (3)`, or `WORKLOAD_CALL (4)` (division-free, float-free).
+2. **Capability-Bounded Policy Selector (`p7_select_policy`):** Maps workload profiles into deterministic strategy masks (`POLICY_STRIP_NOP=1`, `POLICY_PREFETCH_LBL=2`, `POLICY_ARENA_FAST=4`, `POLICY_CALL_DAG=8`) strictly intersected with `cap_mask` (`cap_mask == 0` fails closed to `POLICY_HOLD`).
+3. **Hysteresis Anti-Thrashing State Machine (`p7_adapt_decide`):** Requires sustained `min_streak` observations + `+1t` verdict before emitting `ADAPT_COMMIT (1)`; holds (`0`) on noisy flips or `0t`; immediately emits `ADAPT_REVERT (2)` and resets streak to `0` on any `-1t` regression.
+4. **Binary Adaptation Ledger (`p7_adapt_log_push`, `p7_adapt_log_verify`):** 16-B records `[epoch:u32, profile:u32, policy:u32, verdict_action:u32]` in a 4 KiB buffer with monotonic-epoch, profile-range, and action-range integrity checks.
+5. **Hard Gate (`omnic p7-adapt`, 6 checks):** M3/M2 0-diff on `pure/m7/adapt.omni`, 5-benchmark live trace classification (`ALU`/`CTRL`/`CTRL`/`CALL`/`MEM`), capability-bounded policy selection, hysteresis anti-thrashing transitions, closed-loop self-adaptive run combining `pure/m7/adapt.omni` + `pure/api/adaptive.omni` + M2 ELF64 + M4 VM (`ret=90`) + binary ledger verification, and all 5 frozen FNV-1a64 hashes intact.
+
+---
+
 ## Hard Rules (All of Phase 7)
 
 - The verifier, determinism, and capability model are never self-modified.

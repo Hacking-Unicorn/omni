@@ -1,0 +1,34 @@
+// Phase 7 (P7-2) harness for `pure/m7/adapt.omni`.
+// Exposes entry points for M3/M2/M4 differential testing (main <= 4 params).
+
+#[strict]
+fn p7_adapt_classify_entry(trace_ring: bytes) -> i64 {
+    return p7_classify_workload(trace_ring);
+}
+
+#[strict]
+fn p7_adapt_policy_entry(profile: i64, cap_mask: i64) -> i64 {
+    return p7_select_policy(profile, cap_mask);
+}
+
+#[strict]
+fn p7_adapt_decide_entry(prev_prof: i64, cur_prof: i64, streak: i64, min_streak: i64, v_i64: i64) -> i64 {
+    return p7_adapt_decide(prev_prof, cur_prof, streak, min_streak, p7_i64_to_trit(v_i64));
+}
+
+#[strict]
+fn p7_adapt_log_push_entry(log_buf: bytes, epoch: i64, prof: i64, pol: i64, va: i64) -> bytes {
+    return p7_adapt_log_push(log_buf, epoch, prof, pol, va);
+}
+
+#[strict]
+fn p7_adapt_log_verify_entry(log_buf: bytes) -> i64 {
+    return p7_adapt_log_verify(log_buf);
+}
+
+#[strict]
+fn main(prof: i64, cap_mask: i64, streak: i64, v_i64: i64) -> i64 {
+    let pol: i64 = p7_select_policy(prof, cap_mask);
+    let dec: i64 = p7_adapt_decide(prof, prof, streak, 2, p7_i64_to_trit(v_i64));
+    return (pol << 16) | dec;
+}

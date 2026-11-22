@@ -82,10 +82,11 @@ All 5 frozen artifacts are asserted by FNV-1a64 hash and exact size in `selftest
 
 ```bash
 rustc -O omni_rust_bootstrap.rs -o omnic
-./omnic selftest              # 1,434 checks on Windows / 1,550 on Linux x86-64 (13AY diff4, 13AZ KV, 13BA ISA table, 13BF hash pin, M2/M3/P4/P5/P7/API locks)
+./omnic selftest              # 1,441 checks on Windows / 1,557 on Linux x86-64 (13AY diff4, 13AZ KV, 13BA ISA table, 13BF hash pin, M2/M3/P4/P5/P7/API locks)
 ./omnic p7-measure            # Phase 7 (P7-0): 5-benchmark corpus + P4-5 trace ring + pure/m7/judge.omni ternary (+1t/0t/-1t) + @PACK5 verdict gate
 ./omnic p7-canary             # Phase 7 (P7-0a): 5-run consensus + subsystem attribution (M3/M2/M4) + M2 emitter canary (+1t) & neutral (0t) gate
 ./omnic p7-heal               # Phase 7 (P7-1): self-healing taxonomy, FNV-1a64 rollback, bounded N-attempt repair & fault-injection gate
+./omnic p7-adapt              # Phase 7 (P7-2): live trace workload classifier, cap-bounded policy, hysteresis & closed-loop self-adaptive gate
 ./omnic api-stage1            # New-Level API Stage 1: pure/api/ternary.omni + cap_narrow + Pure-Omni verifier 1010..1013 + 7 goldens (0-diff M3/M2/M4)
 ./omnic api-stage2            # New-Level API Stage 2 (Part 1): pure/api/reflect.omni (token_inspect/specialize/inspect_trace) + LINEAR_REFLECT 1012 + 3 goldens
 ./omnic api-stage2-emit       # New-Level API Stage 2 (Part 2): pure/api/emit.omni (token_emit_const/token_emit/re-hosted M2 token_emit_elf) + golden
@@ -108,7 +109,7 @@ rustc -O omni_rust_bootstrap.rs -o omnic
 ./omnic m2-multi-pure         # Pure-Omni multi-function compiler (0-byte diff vs Rust on verifier_engine & self)
 ./omnic m2-multi              # Rust M2-09 multi-function x86-64 ELF64 reference checks
 ./omnic m2-elf                # Pure-Omni arena & ELF64 header/stub checks
-./omnic m2-lint               # lints all 21 registered pure/m2, pure/m3, pure/m4, pure/m5, pure/m7, pure/api & pure/isa modules (0 gated findings)
+./omnic m2-lint               # lints all 22 registered pure/m2, pure/m3, pure/m4, pure/m5, pure/m7, pure/api & pure/isa modules (0 gated findings)
 ./omnic backend-diff --suite  # 4-backend differential suite (0 FAIL, 0 XPASS required)
 ./omnic acceptance-diff       # 41 executable acceptance goldens
 ./omnic pure-omni-diff        # 49 Pure-Omni differential checks
