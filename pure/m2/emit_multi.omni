@@ -186,12 +186,17 @@ fn m2m_trap_rel32(arena: bytes, trap_slot: i64, pass: i64) -> bytes {
     return r;
 }
 
-// Emits a rel32 to function `fn_idx`; 0 in pass 1.
+// Emits a rel32 to function `fn_idx` (or T_OOB trap stub if `fn_idx` is out of range / undefined); 0 in pass 1.
 #[strict]
 fn m2m_fn_rel32(arena: bytes, fn_idx: i64, pass: i64) -> bytes {
     let p2: trit = m2u_eq(pass, 2) <=> 0;
     let r: bytes = if_pos p2 {
-        let tgt: i64 = ld_u64(arena, m2l_regs() + ((16 + fn_idx) << 3)) - 1;
+        let in_rng: i64 = m2u_ge(fn_idx, 0) * m2u_lt(fn_idx, 1024);
+        let raw_slot: i64 = m2u_sel(in_rng, 16 + fn_idx, m2mg_t_oob());
+        let raw_val: i64 = ld_u64(arena, m2l_regs() + (raw_slot << 3));
+        let valid: i64 = in_rng * m2u_lt(0, raw_val);
+        let t_oob_tgt: i64 = ld_u64(arena, m2l_regs() + (m2mg_t_oob() << 3));
+        let tgt: i64 = m2u_sel(valid, raw_val - 1, t_oob_tgt);
         let cur: i64 = ld_u64(arena, m2l_regs()) - 120;
         m2a_emit_u32(arena, tgt - (cur + 4))
     } else {
@@ -200,7 +205,7 @@ fn m2m_fn_rel32(arena: bytes, fn_idx: i64, pass: i64) -> bytes {
     return r;
 }
 
-// Emits a rel32 to a per-function label slot (offset by lbase in 0x20000..0x23FFF).
+// Emits a rel32 to a per-function label slot (offset by lbase in 0x20000..0x23FFF; T_OOB if undefined).
 #[strict]
 fn m2m_lbl_rel32(arena: bytes, packed_lbl: i64, pass: i64) -> bytes {
     let p2: trit = m2u_eq(pass, 2) <=> 0;
@@ -208,7 +213,9 @@ fn m2m_lbl_rel32(arena: bytes, packed_lbl: i64, pass: i64) -> bytes {
         let lbase: i64 = ld_u64(arena, m2l_regs() + 104);
         let raw_slot: i64 = m2lbl_slot_of(packed_lbl);
         let loc_slot: i64 = m2u_sel(m2u_ge(raw_slot, 4080), raw_slot - 4080, raw_slot + 16);
-        let tgt: i64 = m2lbl_lookup(arena, lbase + loc_slot);
+        let raw_tgt: i64 = m2lbl_lookup(arena, lbase + loc_slot);
+        let t_oob_tgt: i64 = ld_u64(arena, m2l_regs() + (m2mg_t_oob() << 3));
+        let tgt: i64 = m2u_sel(m2u_ge(raw_tgt, 0), raw_tgt, t_oob_tgt);
         let cur: i64 = ld_u64(arena, m2l_regs()) - 120;
         m2a_emit_u32(arena, tgt - (cur + 4))
     } else {

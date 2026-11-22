@@ -1449,6 +1449,28 @@ impl OmniBinaryVm {
                 return Err(format!("error[BUDGET_EXCEEDED]: VM fuel/step budget exceeded ({} > {})", self.steps_executed, self.step_limit));
             }
             let ins = &func.instructions[pc];
+            let min_ops = match ins.op_tok {
+                0x7F45 => 4,
+                0x7F2C | 0x7F39 => 3,
+                0x7F0E | 0x7F0F | 0x7F10..=0x7F14 | 0x7F17..=0x7F20 | 0x7F22..=0x7F27
+                | 0x7F29..=0x7F2B | 0x7F2D..=0x7F2F | 0x7F31 | 0x7F34 | 0x7F51 | 0x7F6A
+                | 0x7F7F => 2,
+                0x7F01..=0x7F04 | 0x7F06 | 0x7F08 | 0x7F09 | 0x7F15 | 0x7F16 | 0x7F21
+                | 0x7F28 | 0x7F30 | 0x7F35 | 0x7F3F | 0x7F42..=0x7F44 | 0x7F48 | 0x7F4A
+                | 0x7F50 | 0x7F55..=0x7F59 | 0x7F5D | 0x7F63 | 0x7F76 | 0x7F7D | 0x7F7E => 1,
+                _ => 0,
+            };
+            if ins.operands.len() < min_ops {
+                for &mut (p_idx, ref mut out_v) in restore_borrowed.iter_mut() {
+                    *out_v = std::mem::replace(&mut regs[192 + p_idx], OmniValue::Void);
+                }
+                return Err(format!(
+                    "error[BAD_ARITY]: opcode 0x{:04X} requires at least {} operands, got {}",
+                    ins.op_tok,
+                    min_ops,
+                    ins.operands.len()
+                ));
+            }
             match ins.op_tok {
                 0x7F00 | 0x7F40 | 0x7F46 => { pc += 1; continue; }
                 0x7F41 => {
@@ -1733,21 +1755,21 @@ impl OmniBinaryVm {
                     }
                     OmniValue::Bytes(buf)
                 }
-                0x7F10 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a.wrapping_add(b)) } else { OmniValue::Int(0) },
-                0x7F11 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a.wrapping_sub(b)) } else { OmniValue::Int(0) },
-                0x7F12 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a.wrapping_mul(b)) } else { OmniValue::Int(0) },
-                0x7F13 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(if b == 0 { 0 } else { a.wrapping_div(b) }) } else { OmniValue::Int(0) },
-                0x7F14 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(if b == 0 { 0 } else { a.wrapping_rem(b) }) } else { OmniValue::Int(0) },
-                0x7F15 => if let Some(a) = Self::eval_as_i64(&ins.operands[0], &regs) { OmniValue::Int(a.wrapping_neg()) } else { OmniValue::Int(0) },
-                0x7F16 => if let Some(a) = Self::eval_as_i64(&ins.operands[0], &regs) { OmniValue::Int(a.wrapping_abs()) } else { OmniValue::Int(0) },
-                0x7F17 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a.min(b)) } else { OmniValue::Int(0) },
-                0x7F18 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a.max(b)) } else { OmniValue::Int(0) },
-                0x7F1E => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a & b) } else { OmniValue::Int(0) },
-                0x7F1F => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a | b) } else { OmniValue::Int(0) },
-                0x7F20 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a ^ b) } else { OmniValue::Int(0) },
-                0x7F21 => if let Some(a) = Self::eval_as_i64(&ins.operands[0], &regs) { OmniValue::Int(!a) } else { OmniValue::Int(0) },
-                0x7F22 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a.wrapping_shl((b & 63) as u32)) } else { OmniValue::Int(0) },
-                0x7F23 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a.wrapping_shr((b & 63) as u32)) } else { OmniValue::Int(0) },
+                0x7F10 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0).wrapping_add(Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0))),
+                0x7F11 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0).wrapping_sub(Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0))),
+                0x7F12 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0).wrapping_mul(Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0))),
+                0x7F13 => { let a = Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0); let b = Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0); OmniValue::Int(if b == 0 { 0 } else { a.wrapping_div(b) }) }
+                0x7F14 => { let a = Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0); let b = Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0); OmniValue::Int(if b == 0 { 0 } else { a.wrapping_rem(b) }) }
+                0x7F15 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0).wrapping_neg()),
+                0x7F16 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0).wrapping_abs()),
+                0x7F17 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0).min(Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0))),
+                0x7F18 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0).max(Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0))),
+                0x7F1E => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0) & Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0)),
+                0x7F1F => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0) | Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0)),
+                0x7F20 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0) ^ Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0)),
+                0x7F21 => OmniValue::Int(!Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0)),
+                0x7F22 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0).wrapping_shl((Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0) & 63) as u32)),
+                0x7F23 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0).wrapping_shr((Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0) & 63) as u32)),
                 0x7F50 => match Self::eval_op_ref(&ins.operands[0], &regs) {
                     Some(OmniValue::Bytes(b)) => OmniValue::Int(b.len() as i64),
                     Some(OmniValue::Str(s)) => OmniValue::Int(s.len() as i64),
@@ -12470,7 +12492,13 @@ pub fn verifier_engine_error_name(code: i64) -> &'static str {
         1003 => "MISSING_CAP",
         1004 => "LINEAR_LEAK",
         1005 => "BORROW_CONFLICT",
+        1010 => "MISSING_CAP_TERNARY",
+        1011 => "TAINT_ON_CONSENSUS",
+        1012 => "LINEAR_REFLECT",
+        1013 => "CAP_NARROW_EXPAND",
         2009 => "UNRESOLVED_LABEL",
+        2010 => "BAD_CALL_TARGET",
+        2011 => "CALL_ARITY_MISMATCH",
         3001 => "UNKNOWN_OPCODE",
         3003 => "SSA_NONCANONICAL",
         3004 => "ARENA_OVERWRITE",
@@ -14589,7 +14617,7 @@ impl DiffObs {
     }
 }
 
-pub const OMNI_DIFF4_BACKENDS: [&str; 4] = ["vm", "wasm", "x86", "stage1"];
+pub const OMNI_DIFF4_BACKENDS: [&str; 5] = ["vm", "wasm", "x86", "stage1", "m4"];
 
 #[derive(Clone, Debug)]
 pub struct FourBackendReport {
@@ -14758,11 +14786,105 @@ pub fn run_four_backend_differential(src: &str, args: &[i64], tag: &str) -> Resu
     };
     obs.push(("stage1", s1_obs));
 
+    let m4_obs = match diff4_catch(|| run_u16_on_pure_m4_for_diff(&u16_stream, a3[0], a3[1], a3[2], 200_000)) {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => DiffObs::RunErr(e),
+        Err(p) => DiffObs::Panic(p),
+    };
+    obs.push(("m4", m4_obs));
+
     let stage1_elf_eq_host = match (&host_elf, &s1_elf) {
         (Ok(Ok(h)), Ok(Ok(s))) => Some(h == s),
         _ => None,
     };
     Ok(FourBackendReport { u16_len: u16_stream.len(), obs, stage1_elf_eq_host })
+}
+
+/// Runs a verified `.omni_bc` u16 stream on the Pure-Omni M4 VM (`pure/m4/vm.omni::m4_vm_run_i64`)
+/// and converts the resulting VM_STATE / heap slice into a `DiffObs` for the 5th `backend-diff` column.
+pub fn run_u16_on_pure_m4_for_diff(
+    u16_stream: &[u16],
+    a0: i64,
+    a1: i64,
+    a2: i64,
+    fuel: i64,
+) -> Result<DiffObs, String> {
+    static M4_DIFF_MOD: std::sync::OnceLock<Result<BinModule, String>> = std::sync::OnceLock::new();
+    let m4_mod = M4_DIFF_MOD
+        .get_or_init(|| {
+            let u16s = with_lockstep_suspended(|| compile_omni_surface_to_u16(M4_VM_OMNI_SRC))?;
+            decode_omni_token_stream(&u16s)
+        })
+        .as_ref()
+        .map_err(|e| e.clone())?;
+    let m4_run_fn = m4_mod.functions[m4_mod.functions.len() - 2].fn_idx;
+    let decoded = decode_omni_token_stream(u16_stream)?;
+    // Pure-Omni M4 VM supports the same opcode subset as M2-multi (no legacy @PACK5 / DROP / FGET / FSET opcodes).
+    for func in &decoded.functions {
+        for ins in &func.instructions {
+            let ok_op = matches!(
+                ins.op_tok,
+                0x7F00..=0x7F06 | 0x7F09 | 0x7F0D | 0x7F0E | 0x7F0F
+                | 0x7F10..=0x7F18 | 0x7F1E..=0x7F31 | 0x7F34 | 0x7F35 | 0x7F3F
+                | 0x7F40..=0x7F45 | 0x7F48 | 0x7F4A | 0x7F50
+            );
+            if !ok_op {
+                return Ok(DiffObs::Unsupported(format!(
+                    "Pure-M4 does not implement opcode 0x{:04X}",
+                    ins.op_tok
+                )));
+            }
+        }
+    }
+    let entry_is_bytes = decoded
+        .functions
+        .iter()
+        .find(|f| f.fn_idx == 0)
+        .or_else(|| decoded.functions.last())
+        .map(|f| f.ret_ty_tok == TY_BYTES)
+        .unwrap_or(false);
+    let mut host_vm = OmniBinaryVm::with_budgets(100_000_000, 64 * 1024 * 1024);
+    let arena = match host_vm.execute_function(
+        m4_mod,
+        m4_run_fn,
+        vec![
+            OmniValue::Bytes(vec![0u8; 524_288]),
+            OmniValue::U16Array(u16_stream.to_vec()),
+            OmniValue::Int(a0),
+            OmniValue::Int(a1),
+            OmniValue::Int(a2),
+            OmniValue::Int(fuel),
+            OmniValue::Int(0),
+        ],
+    )? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("Pure-M4 returned {:?}", other)),
+    };
+    let st = 167_936usize;
+    let err_code = u32::from_le_bytes(arena[st + 28..st + 32].try_into().unwrap());
+    let ret_val = i64::from_le_bytes(arena[st + 32..st + 40].try_into().unwrap());
+    let ret_tag = u32::from_le_bytes(arena[st + 40..st + 44].try_into().unwrap());
+    if err_code == 2 {
+        return Ok(DiffObs::RunErr(String::from(OMNI_OOB_ERROR)));
+    }
+    if err_code != 0 {
+        return Ok(DiffObs::RunErr(format!(
+            "error[M4_TRAP_{}]: Pure-Omni M4 VM trapped",
+            err_code
+        )));
+    }
+    if entry_is_bytes || ret_tag == 3 {
+        let bbase = ((ret_val as u64) >> 32) as usize;
+        let blen = ((ret_val as u64) & 0xFFFF_FFFF) as usize;
+        let heap_base = 327_680usize;
+        if heap_base.saturating_add(bbase).saturating_add(blen) > arena.len() {
+            return Ok(DiffObs::RunErr(String::from(OMNI_OOB_ERROR)));
+        }
+        let slice = arena[heap_base + bbase..heap_base + bbase + blen].to_vec();
+        Ok(DiffObs::Out { exit: 0, stdout: slice })
+    } else {
+        Ok(DiffObs::Out { exit: 0, stdout: ret_val.to_le_bytes().to_vec() })
+    }
 }
 
 /// Independently derived expectation for one run of a differential golden.
@@ -14806,7 +14928,7 @@ pub struct DiffGolden {
     pub backends: &'static [&'static str],
 }
 
-const DIFF4_ALL: &[&str] = &["vm", "wasm", "x86", "stage1"];
+const DIFF4_ALL: &[&str] = &["vm", "wasm", "x86", "stage1", "m4"];
 
 pub const OMNI_DIFF4_GOLDENS: &[DiffGolden] = &[
     // --- P1: runtime-value byte readback (acceptance test for the IGET/ISET byte-storage fix) ---
@@ -15182,6 +15304,50 @@ pub const OMNI_DIFF4_GOLDENS: &[DiffGolden] = &[
         proposal: "M2-06",
         src: "fn rslice_oob(x: i64) -> Bytes { let buf = anew(0); buf = iset(buf, 10, 20); return ret_slice(buf, 1, 5); }",
         runs: &[(&[0], DiffExpect::OobErr)],
+        backends: DIFF4_ALL,
+    },
+    // --- Audit §1.1: INT_MIN division/modulo and shift-edge goldens ---
+    DiffGolden {
+        id: "s1_int_min_div",
+        proposal: "Audit-S1.1",
+        src: "fn s1_div(a: i64, b: i64) -> i64 { return a / b; }",
+        runs: &[
+            (&[i64::MIN, 2], DiffExpect::I64(-4611686018427387904)),
+            (&[i64::MIN, -1], DiffExpect::I64(i64::MIN)),
+            (&[5, i64::MIN], DiffExpect::I64(0)),
+            (&[i64::MIN, 1], DiffExpect::I64(i64::MIN)),
+            (&[0, i64::MIN], DiffExpect::I64(0)),
+            (&[i64::MIN, i64::MIN], DiffExpect::I64(1)),
+        ],
+        backends: DIFF4_ALL,
+    },
+    DiffGolden {
+        id: "s1_int_min_mod",
+        proposal: "Audit-S1.1",
+        src: "fn s1_mod(a: i64, b: i64) -> i64 { return a % b; }",
+        runs: &[
+            (&[i64::MIN, 3], DiffExpect::I64(-2)),
+            (&[i64::MIN, -1], DiffExpect::I64(0)),
+            (&[i64::MIN, 2], DiffExpect::I64(0)),
+            (&[i64::MIN, 1], DiffExpect::I64(0)),
+            (&[5, i64::MIN], DiffExpect::I64(5)),
+            (&[-5, i64::MIN], DiffExpect::I64(-5)),
+            (&[0, i64::MIN], DiffExpect::I64(0)),
+        ],
+        backends: &["vm", "wasm", "x86", "m4"],
+    },
+    DiffGolden {
+        id: "s1_shift_edges",
+        proposal: "Audit-S1.1",
+        src: "fn s1_sh(a: i64, b: i64, dir: i64) -> i64 { let c: trit = dir <=> 0; return if_pos c { a << b } else { a >> b }; }",
+        runs: &[
+            (&[1, 63, 1], DiffExpect::I64(i64::MIN)),
+            (&[i64::MIN, 63, -1], DiffExpect::I64(-1)),
+            (&[i64::MIN, 1, -1], DiffExpect::I64(-4611686018427387904)),
+            (&[i64::MIN, 0, -1], DiffExpect::I64(i64::MIN)),
+            (&[7, 64, 1], DiffExpect::I64(7)),
+            (&[-1, -1, -1], DiffExpect::I64(-1)),
+        ],
         backends: DIFF4_ALL,
     },
 ];

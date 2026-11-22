@@ -32,9 +32,9 @@ fn main(a0: i64, a1: i64, a2: i64) -> i64 {
     let t0: i64 = m4o_trit(32557, r1, 50, 0);
     let w6: bytes = m4o_exec_anew(w5, 0, 2);
     let b0: i64 = m4f_get_slot_val(w6, 0, 2);
-    let w7: bytes = m4o_exec_iset_append(w6, 0, 2, 3, b0, 0 - 4, r1 + t0);
+    let w7: bytes = m4o_exec_iset_append(w6, 0, 2, 3, b0, 0 - 4, r1 + t0, 0);
     let b1: i64 = m4f_get_slot_val(w7, 0, 2);
-    let w8: bytes = m4o_exec_iget(w7, 0, 3, 3, b1, 0 - 4, 0);
+    let w8: bytes = m4o_exec_iget(w7, 0, 3, 3, b1, 3, 0 - 4, 0);
     let w9: bytes = m4_trace_push(w8, 2, 0, 32526, 30, m4f_get_slot_val(w8, 0, 3));
     let val: i64 = m4f_get_slot_val(w9, 0, 3);
     let tcnt: i64 = ld_u32(w9, m4s_trace_cnt());
