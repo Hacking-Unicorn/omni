@@ -203,14 +203,58 @@ fn m2x_emit_basic(arena: bytes, op: i64, d: i64, op0: i64) -> bytes {
     return r3;
 }
 
-// Emits 2-op token-region IGET (0x7F0E): load op1 -> movzx eax, word [rbp+rax*2-0x2E000] -> store.
+// Scans one function body and marks provable buffer registers (dest of ANEW 0x7F0D or ISET 0x7F0F)
+// in global bitmask slots 1900..1902 (192 bits for r0..r191).
 #[strict]
-fn m2x_emit_iget(arena: bytes, op1: i64, d: i64) -> bytes {
-    let w: bytes = m2x_load_op(arena, op1, 0);
-    w = m2x_b4(w, 15, 183, 132, 69);                        // 0F B7 84 45
-    w = m2a_emit_u32(w, 0 - 188416);                        // 00 20 FD FF (-0x2E000)
-    w = m2x_store_rax(w, d);
+fn m2x_bufreg_scan(arena: bytes, arr: array, n: i64, ins_start: i64, ins_cnt: i64) -> bytes {
+    let w: bytes = m2a_g_set(arena, 1900, 0);
+    w = m2a_g_set(w, 1901, 0);
+    w = m2a_g_set(w, 1902, 0);
+    let cur: i64 = ins_start;
+    let ii: i64 = 0;
+    while ins_cnt - ii <=> 0 {
+        let has_d: i64 = m2d_ins_has_dest(arr, n, cur);
+        let d: i64 = m2d_ins_dest(arr, n, cur);
+        let op: i64 = m2d_ins_op(arr, n, cur);
+        let is_buf: i64 = has_d * m2u_in(d, 0, 191) * (m2u_eq(op, 32525) + m2u_eq(op, 32527));
+        let rd: i64 = m2u_sel(is_buf, d, 0);
+        let slot: i64 = 1900 + (rd >> 6);
+        let bit: i64 = 1 << (rd & 63);
+        let oldv: i64 = ld_u64(w, m2l_regs() + (slot << 3));
+        w = m2a_g_set(w, slot, m2u_sel(is_buf, oldv | bit, oldv));
+        let nxt: i64 = m2d_decode_at(arr, n, cur);
+        cur = m2u_sel(m2d_is_err(nxt), n, nxt);
+        ii = ii + 1;
+    }
     return w;
+}
+
+// Emits 2-op IGET (0x7F0E): guarded ISET-heap byte readback when op0 is a provable ANEW/ISET buffer
+// register (matching Rust AOT x86_buffer_regs), else legacy token-region u16 read.
+#[strict]
+fn m2x_emit_iget(arena: bytes, op0: i64, op1: i64, d: i64) -> bytes {
+    let is_reg: i64 = m2u_eq(m2d_kind(op0), 1);
+    let ridx: i64 = m2u_sel(is_reg, m2d_uval(op0), 0);
+    let in_r: i64 = is_reg * m2u_in(ridx, 0, 191);
+    let bword: i64 = ld_u64(arena, m2l_regs() + ((1900 + (ridx >> 6)) << 3));
+    let is_buf: trit = (in_r * ((bword >> (ridx & 63)) & 1)) <=> 0;
+    let r: bytes = if_pos is_buf {
+        let w: bytes = m2x_load_op(arena, op0, 0);
+        w = m2x_load_op(w, op1, 1);
+        w = m2x_b4(w, 72, 57, 193, 115);                    // 48 39 C1 73 (cmp rcx, rax; jae)
+        w = m2x_b4(w, 15, 76, 57, 217);                     // 0F 4C 39 D9 (+15; cmp rcx, r11)
+        w = m2x_b4(w, 115, 10, 15, 182);                    // 73 0A 0F B6 (jae +10; movzx ...)
+        w = m2a_emit_u16(w, 3460);                          // 84 0D (0x0D84)
+        w = m2a_emit_u32(w, 0 - 131072);                    // 00 00 FE FF (-0x20000)
+        w = m2x_b4(w, 235, 2, 49, 192);                     // EB 02 31 C0 (jmp +2; xor eax, eax)
+        m2x_store_rax(w, d)
+    } else {
+        let w: bytes = m2x_load_op(arena, op1, 0);
+        w = m2x_b4(w, 15, 183, 132, 69);                    // 0F B7 84 45
+        w = m2a_emit_u32(w, 0 - 188416);                    // 00 20 FD FF (-0x2E000)
+        m2x_store_rax(w, d)
+    };
+    return r;
 }
 
 // Stores r11 into dest register `d` if d >= 0 (keeps m2x_emit_iset <= 12 labels).

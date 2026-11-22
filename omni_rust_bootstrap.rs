@@ -1514,13 +1514,13 @@ impl OmniBinaryVm {
             }
             let ins = &func.instructions[pc];
             let min_ops = match ins.op_tok {
-                0x7F45 => 4,
+                0x7F42 | 0x7F45 => 4,
                 0x7F2C | 0x7F39 => 3,
                 0x7F0E | 0x7F0F | 0x7F10..=0x7F14 | 0x7F17..=0x7F20 | 0x7F22..=0x7F27
-                | 0x7F29..=0x7F2B | 0x7F2D..=0x7F2F | 0x7F31 | 0x7F34 | 0x7F51 | 0x7F6A
-                | 0x7F7F => 2,
+                | 0x7F29..=0x7F2B | 0x7F2D..=0x7F2F | 0x7F31 | 0x7F34 | 0x7F43 | 0x7F44
+                | 0x7F51 | 0x7F6A | 0x7F7F => 2,
                 0x7F01..=0x7F04 | 0x7F06 | 0x7F08 | 0x7F09 | 0x7F15 | 0x7F16 | 0x7F21
-                | 0x7F28 | 0x7F30 | 0x7F35 | 0x7F3F | 0x7F42..=0x7F44 | 0x7F48 | 0x7F4A
+                | 0x7F28 | 0x7F30 | 0x7F35 | 0x7F3F | 0x7F48 | 0x7F4A
                 | 0x7F50 | 0x7F55..=0x7F59 | 0x7F5D | 0x7F63 | 0x7F76 | 0x7F7D | 0x7F7E => 1,
                 _ => 0,
             };
@@ -18664,6 +18664,12 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
 
         let mut label_offsets: Vec<(u16, usize)> = Vec::new();
         let mut relocs: Vec<RelocPatch> = Vec::new();
+        let multi_buffer_regs: std::collections::BTreeSet<u16> = func
+            .instructions
+            .iter()
+            .filter(|i| matches!(i.op_tok, 0x7F0D | 0x7F0F))
+            .filter_map(|i| i.dest_reg)
+            .collect();
 
         for ins in &func.instructions {
             match ins.op_tok {
@@ -18719,6 +18725,20 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
                             4 => code.extend_from_slice(&[0x8B, 0x04, 0x0B]),
                             _ => code.extend_from_slice(&[0x48, 0x8B, 0x04, 0x0B]),
                         }
+                        if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                    } else if let Some(BinOperand::Reg(r_arr)) = ins.operands.first().filter(|o| {
+                        matches!(o, BinOperand::Reg(r) if multi_buffer_regs.contains(r))
+                    }) {
+                        let _ = r_arr;
+                        // Guarded arena-heap byte readback for provable ANEW/ISET buffer registers.
+                        emit_load_op(&mut code, &ins.operands[0], false); // rax = len
+                        emit_load_op(&mut code, &ins.operands[1], true);  // rcx = idx
+                        code.extend_from_slice(&[
+                            0x48, 0x39, 0xC1, 0x73, 0x0B, // cmp rcx, rax; jae +11
+                            0x4C, 0x39, 0xD9, 0x73, 0x06, // cmp rcx, r11; jae +6
+                            0x0F, 0xB6, 0x04, 0x0B,       // movzx eax, byte [rbx+rcx]
+                            0xEB, 0x02, 0x31, 0xC0,       // jmp +2; xor eax, eax
+                        ]);
                         if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
                     } else {
                         // Bounded 2-op input-window u16 read: idx >= nwords (unsigned) -> 0
@@ -19427,6 +19447,29 @@ fn compile_wasm_single_func_body(
     }
 
     let num_params = func.params.len();
+    // Audit Round 2 L3: arity-check every instruction before Wasm lowering so crafted streams
+    // (e.g. 1-operand 0x7F17 or 2-operand 0x7F2C TMAJ) return Err(BAD_ARITY) instead of panicking.
+    for ins in &func.instructions {
+        let min_ops = match ins.op_tok {
+            0x7F42 | 0x7F45 => 4,
+            0x7F2C | 0x7F39 => 3,
+            0x7F0E | 0x7F0F | 0x7F10..=0x7F14 | 0x7F17..=0x7F20 | 0x7F22..=0x7F27
+            | 0x7F29..=0x7F2B | 0x7F2D..=0x7F2F | 0x7F31 | 0x7F34 | 0x7F43 | 0x7F44
+            | 0x7F51 | 0x7F6A | 0x7F7F => 2,
+            0x7F01..=0x7F04 | 0x7F06 | 0x7F08 | 0x7F09 | 0x7F15 | 0x7F16 | 0x7F21
+            | 0x7F28 | 0x7F30 | 0x7F35 | 0x7F3F | 0x7F48 | 0x7F4A
+            | 0x7F50 | 0x7F55..=0x7F59 | 0x7F5D | 0x7F63 | 0x7F76 | 0x7F7D | 0x7F7E => 1,
+            _ => 0,
+        };
+        if ins.operands.len() < min_ops {
+            return Err(format!(
+                "error[BAD_ARITY]: Wasm AOT opcode 0x{:04X} requires at least {} operands, got {}",
+                ins.op_tok,
+                min_ops,
+                ins.operands.len()
+            ));
+        }
+    }
     let max_reg_used = func
         .instructions
         .iter()
@@ -24531,32 +24574,66 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
                 1
             }
         },
-        "s4-honesty" => match selftest_s4_honesty() {
-            Ok(n) => {
+        "s4-honesty" => {
+            if args.get(1).map(|s| s.as_str()) == Some("--print-pins") {
+                let m3_b = std::fs::read("pure/m3/m3.omni_bc").unwrap_or_default();
+                let m2_b = std::fs::read("pure/m2/m2.omni_bc").unwrap_or_default();
+                let m4_b = std::fs::read("pure/m4/m4.omni_bc").unwrap_or_default();
+                println!("| Seed | Words | FNV-1a64 |");
+                println!("|---|---:|---|");
+                println!("| `pure/m3/m3.omni_bc` | {} | `0x{:016X}` |", m3_b.len() / 2, fnv1a_64_hash(&m3_b));
+                println!("| `pure/m2/m2.omni_bc` | {} | `0x{:016X}` |", m2_b.len() / 2, fnv1a_64_hash(&m2_b));
+                println!("| `pure/m4/m4.omni_bc` | {} | `0x{:016X}` |", m4_b.len() / 2, fnv1a_64_hash(&m4_b));
+                return 0;
+            }
+            if args.get(1).map(|s| s.as_str()) == Some("--strict-readme") {
+                std::env::set_var("OMNI_STRICT_README", "1");
+            }
+            match selftest_s4_honesty() {
+                Ok(n) => {
+                    println!(
+                        "[S4-HONESTY PASS] {} checks | compile-elf 0/0/0 default args + live wc -l doc drift lock + honest 236-line classified seed vs runtime Rust + M5 181-B validator/entry stub",
+                        n
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("[S4-HONESTY FAIL] {}", e);
+                    1
+                }
+            }
+        }
+        "s3-perf" => {
+            if args.get(1).map(|s| s.as_str()) == Some("--write-verifier-seed") {
+                let ve_sa_src = verifier_standalone_source();
+                let ve_sa_u16 = with_lockstep_suspended(|| {
+                    compile_omni_surface_strict_to_u16(&ve_sa_src)
+                })
+                .expect("compile verifier_standalone_source");
+                let ve_sa_bytes = encode_u16_stream_to_bytes(&ve_sa_u16);
+                std::fs::write("pure/verifier_standalone.omni_bc", &ve_sa_bytes)
+                    .expect("write pure/verifier_standalone.omni_bc");
                 println!(
-                    "[S4-HONESTY PASS] {} checks | compile-elf 0/0/0 default args + live wc -l doc drift lock + honest 236-line classified seed vs runtime Rust + M5 181-B validator/entry stub",
-                    n
+                    "[L6 VERIFIER SEED] Wrote {} words (FNV-1a64=0x{:016X}) to pure/verifier_standalone.omni_bc",
+                    ve_sa_u16.len(),
+                    fnv1a_64_hash(&ve_sa_bytes)
                 );
-                0
+                return 0;
             }
-            Err(e) => {
-                eprintln!("[S4-HONESTY FAIL] {}", e);
-                1
+            match selftest_s3_performance() {
+                Ok(n) => {
+                    println!(
+                        "[S3-PERF PASS] {} checks | hash-pinned native m3.elf/m2.elf/m4.elf/verifier.elf default path (0-word/0-byte parity + native latency bounds + 5 frozen hashes)",
+                        n
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("[S3-PERF FAIL] {}", e);
+                    1
+                }
             }
-        },
-        "s3-perf" => match selftest_s3_performance() {
-            Ok(n) => {
-                println!(
-                    "[S3-PERF PASS] {} checks | hash-pinned native m3.elf/m2.elf/m4.elf default path (0-word/0-byte parity + native latency bounds + 5 frozen hashes)",
-                    n
-                );
-                0
-            }
-            Err(e) => {
-                eprintln!("[S3-PERF FAIL] {}", e);
-                1
-            }
-        },
+        }
         "s5-refreeze" => match selftest_s5_refreeze() {
             Ok(n) => {
                 println!(
@@ -25002,6 +25079,7 @@ pub fn selftest_m2_label_reference() -> Result<usize, String> {
         "L7_imm4080",
         "L7_imm5000",
         "L7_imm_minus1",
+        "L8_br_trit_2_labels", // Audit Round 2 N1: pure verifier enforces BR_TRIT min_ops=4
     ];
     for (who, got, want) in [("Stage-1", &s1_div, &want_s1[..]), ("Omni verifier", &ov_div, &want_ov[..])] {
         for w in want {
@@ -25361,19 +25439,45 @@ fn main() {
                 let (a0, a1, a2) = parse_compile_elf_args(&pos);
                 if use_rust {
                     let u16_stream = if path.ends_with(".omni") {
-                        compile_omni_surface_file_to_u16(path).expect("Rust oracle surface compilation failed")
+                        match compile_omni_surface_file_to_u16(path) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                eprintln!("[RUST-ORACLE ELF FAIL] {}", e);
+                                std::process::exit(1);
+                            }
+                        }
                     } else {
-                        let raw = fs::read(path).expect("Failed to read .omni_bc");
+                        let raw = match fs::read(path) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                eprintln!("[RUST-ORACLE ELF FAIL] error[IO_ERROR]: failed to read '{}': {}", path, e);
+                                std::process::exit(1);
+                            }
+                        };
                         decode_bytes_to_u16_stream(&raw)
                     };
-                    let elf = compile_pure_u16_to_x86_64_elf_with_args(&u16_stream, a0, a1, a2)
-                        .expect("Rust oracle x86-64 ELF AOT compilation failed");
-                    fs::write(out_path, &elf).expect("Failed to write .elf");
+                    let elf = match compile_pure_u16_to_x86_64_elf_with_args(&u16_stream, a0, a1, a2) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            eprintln!("[RUST-ORACLE ELF FAIL] {}", e);
+                            std::process::exit(1);
+                        }
+                    };
+                    if let Err(e) = fs::write(out_path, &elf) {
+                        eprintln!("[RUST-ORACLE ELF FAIL] error[IO_ERROR]: failed to write '{}': {}", out_path, e);
+                        std::process::exit(1);
+                    }
                     println!("[RUST-ORACLE ELF PASS] Wrote {} bytes to '{}' (FNV-1a64=0x{:016X})", elf.len(), out_path, fnv1a_64_hash(&elf));
                     return;
                 }
                 let u16_stream = if path.ends_with(".omni") {
-                    let raw_src = fs::read_to_string(path).expect("Failed to read .omni file");
+                    let raw_src = match fs::read_to_string(path) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[PURE-M2 ELF FAIL] error[IO_ERROR]: failed to read '{}': {}", path, e);
+                            std::process::exit(1);
+                        }
+                    };
                     let parent_dir = std::path::Path::new(path).parent();
                     let expanded = match pure_default_expand_includes(&raw_src, parent_dir, None) {
                         Ok(s) => s,
@@ -25389,9 +25493,21 @@ fn main() {
                     } else {
                         pure_default_compile_surface_to_u16(&expanded, expanded.contains("#[strict]"))
                     };
-                    c_res.expect("Pure-M3 surface compilation failed")
+                    match c_res {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[PURE-M2 ELF FAIL] {}", e);
+                            std::process::exit(1);
+                        }
+                    }
                 } else {
-                    let raw = fs::read(path).expect("Failed to read .omni_bc");
+                    let raw = match fs::read(path) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            eprintln!("[PURE-M2 ELF FAIL] error[IO_ERROR]: failed to read '{}': {}", path, e);
+                            std::process::exit(1);
+                        }
+                    };
                     decode_bytes_to_u16_stream(&raw)
                 };
                 if let Err(ve) = pure_default_verify_u16(&u16_stream, true) {
@@ -25522,15 +25638,48 @@ fn main() {
                 return;
             }
             "run" | "run-surface" if cli_args.len() >= 3 => {
-                let use_rust = cli_args[2..].iter().any(|a| a == "--rust" || a == "--oracle");
-                let use_interp = cli_args[2..].iter().any(|a| a == "--interpreted");
-                let pos: Vec<&str> = cli_args[2..]
-                    .iter()
-                    .filter(|a| *a != "--rust" && *a != "--oracle" && *a != "--interpreted")
-                    .map(|s| s.as_str())
-                    .collect();
+                let mut use_rust = false;
+                let mut use_interp = false;
+                let mut fuel: i64 = PURE_DEFAULT_FUEL;
+                let mut pos: Vec<&str> = Vec::new();
+                let mut ai = 2usize;
+                while ai < cli_args.len() {
+                    let arg = cli_args[ai].as_str();
+                    if arg == "--rust" || arg == "--oracle" {
+                        use_rust = true;
+                    } else if arg == "--interpreted" {
+                        use_interp = true;
+                    } else if arg == "--fuel" {
+                        ai += 1;
+                        let val_s = match cli_args.get(ai) {
+                            Some(s) => s.as_str(),
+                            None => {
+                                eprintln!("error[INVALID_ARG]: --fuel requires an integer in 1..={}", PURE_MAX_FUEL);
+                                std::process::exit(2);
+                            }
+                        };
+                        fuel = match val_s.parse::<i64>() {
+                            Ok(n) if n > 0 && n <= PURE_MAX_FUEL => n,
+                            _ => {
+                                eprintln!("error[INVALID_ARG]: --fuel must be in 1..={} (got '{}')", PURE_MAX_FUEL, val_s);
+                                std::process::exit(2);
+                            }
+                        };
+                    } else if let Some(val_s) = arg.strip_prefix("--fuel=") {
+                        fuel = match val_s.parse::<i64>() {
+                            Ok(n) if n > 0 && n <= PURE_MAX_FUEL => n,
+                            _ => {
+                                eprintln!("error[INVALID_ARG]: --fuel must be in 1..={} (got '{}')", PURE_MAX_FUEL, val_s);
+                                std::process::exit(2);
+                            }
+                        };
+                    } else {
+                        pos.push(arg);
+                    }
+                    ai += 1;
+                }
                 if pos.is_empty() {
-                    eprintln!("Usage: omni run [--rust|--oracle|--interpreted] <file.omni|file.omni_bc> [args...]");
+                    eprintln!("Usage: omni run [--rust|--oracle|--interpreted] [--fuel N] <file.omni|file.omni_bc> [args...]");
                     std::process::exit(2);
                 }
                 let path = pos[0];
@@ -25571,9 +25720,9 @@ fn main() {
                         std::process::exit(1);
                     }
                     let run_res = if use_interp {
-                        with_pure_default_interpreted(|| pure_default_run_u16(&u16_stream, a0, a1, a2, false))
+                        with_pure_default_interpreted(|| pure_default_run_u16_with_fuel(&u16_stream, a0, a1, a2, fuel, false))
                     } else {
-                        pure_default_run_u16(&u16_stream, a0, a1, a2, false)
+                        pure_default_run_u16_with_fuel(&u16_stream, a0, a1, a2, fuel, false)
                     };
                     match run_res {
                         Ok((ret, _steps)) => {

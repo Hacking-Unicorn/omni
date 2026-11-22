@@ -33,10 +33,11 @@ suite:pure/programs/compiler_self_audit.omni	multi_fn_module	1
 suite:pure/programs/pack5_decision_controller.omni	param_ge4	1
 suite:pure/programs/pack5_decision_controller.omni	div_nonimm_divisor	1
 suite:pure/programs/pack5_decision_controller.omni	multi_fn_module	1
+pure/verifier_engine.omni	ret_3op	1
 pure/verifier_engine.omni	param_ge4	24
 pure/verifier_engine.omni	multi_fn_module	1
 stage1_compiler_stream	label_imm_ge83	5
-TOTAL	ret_3op	0
+TOTAL	ret_3op	1
 TOTAL	iget_imm_neg	0
 TOTAL	iget_imm_on_anew	0
 TOTAL	param_ge4	40

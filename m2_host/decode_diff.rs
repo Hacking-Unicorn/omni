@@ -1068,6 +1068,70 @@ pub fn selftest_m2_15_pure_multi_compiler() -> Result<usize, String> {
     }
     checks += 1;
 
+    // 7. Audit Round 2 N2: Pure-M2 2-op IGET on provable ANEW/ISET bytes buffer must read ISET heap
+    //    (not token region) in BOTH multi-mode (`emit_multi.omni`) and single-mode (`emit_x86.omni`).
+    let n2_src = "#[strict]\nfn main(a: i64, b: i64, c: i64) -> i64 {\n    let w: bytes = anew(0);\n    w = iset_i32(w, a);\n    return iget(w, b) + c;\n}\n";
+    let n2_u16 = compile_omni_surface_strict_to_u16(n2_src)?;
+    let n2_multi_pure = compile_in_omni(&n2_u16, 300, 0, 0)?;
+    let n2_multi_rust = compile_pure_u16_to_x86_64_elf_multi(&n2_u16, 300, 0, 0)?;
+    if n2_multi_pure != n2_multi_rust {
+        return Err(String::from("N2 multi-mode Pure-M2 != Rust-M2-multi on 2-op IGET buffer repro"));
+    }
+    let single_mod = m2_compile_decoder(M2_COMPILER_OMNI_SRC)?;
+    let single_entry = m2_entry_of(&single_mod);
+    let mut single_vm = OmniBinaryVm::with_budgets(500_000_000, 32 * 1024 * 1024);
+    let n2_single_pure = match single_vm.execute_function(
+        &single_mod,
+        single_entry,
+        vec![
+            OmniValue::Bytes(vec![0u8; 524_288]),
+            OmniValue::U16Array(n2_u16.clone()),
+            OmniValue::Int(300),
+            OmniValue::Int(0),
+            OmniValue::Int(0),
+        ],
+    )? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("N2 single-mode compiler returned {:?}", other)),
+    };
+    let n2_single_rust = compile_pure_u16_to_x86_64_elf_with_args(&n2_u16, 300, 0, 0)?;
+    if n2_single_pure != n2_single_rust {
+        return Err(String::from("N2 single-mode Pure-M2 != Rust-AOT on 2-op IGET buffer repro"));
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        for &(tag, elf) in &[
+            ("multi-mode", &n2_multi_pure),
+            ("single-mode", &n2_single_pure),
+        ] {
+            let tmp = PrivateTempElf::new(elf, &format!("n2_iget_{}", tag))?;
+            let out = std::process::Command::new(&tmp.path)
+                .output()
+                .map_err(|e| format!("N2 exec {}: {}", tag, e))?;
+            if !out.status.success() || out.stdout.len() != 8 {
+                return Err(format!("N2 {} exited {:?} stdout={}B", tag, out.status, out.stdout.len()));
+            }
+            let got = i64::from_le_bytes(out.stdout[..8].try_into().unwrap());
+            if got != 44 {
+                return Err(format!("N2 {} 2-op IGET buffer repro returned {}, want 44", tag, got));
+            }
+        }
+        // OOB index b=10 must return 0 (lenient 2-op IGET contract).
+        let n2_oob_elf = compile_in_omni(&n2_u16, 300, 10, 0)?;
+        let tmp_oob = PrivateTempElf::new(&n2_oob_elf, "n2_iget_oob")?;
+        let out_oob = std::process::Command::new(&tmp_oob.path)
+            .output()
+            .map_err(|e| format!("N2 exec oob: {}", e))?;
+        if !out_oob.status.success() || out_oob.stdout.len() != 8 {
+            return Err(format!("N2 oob exited {:?} stdout={}B", out_oob.status, out_oob.stdout.len()));
+        }
+        let got_oob = i64::from_le_bytes(out_oob.stdout[..8].try_into().unwrap());
+        if got_oob != 0 {
+            return Err(format!("N2 multi-mode 2-op IGET OOB returned {}, want 0", got_oob));
+        }
+    }
+    checks += 1;
+
     Ok(checks)
 }
 
@@ -1837,6 +1901,7 @@ pub fn selftest_m3_10_lower_diff() -> Result<usize, String> {
         ("label_goto", "#[strict]\nfn main(x: i64) -> i64 { goto 2; label 1; return 99; label 2; return x + 1; }\n", false),
         ("nested_calls", "#[strict]\nfn add(a: i64, b: i64) -> i64 { return a + b; }\n#[strict]\nfn mul(a: i64, b: i64) -> i64 { return a * b; }\n#[strict]\nfn main(x: i64) -> i64 { return add(x, mul(add(x, 1), 3)); }\n", false),
         ("mem_and_ret_slice", "#[strict]\nfn main(x: i64) -> bytes { let b: bytes = anew(0); b = iset_i64(b, x); b = st_u32(b, 0, x + 1); let v: i64 = ld_u32(b, 0); b = iset_patch_i64(b, 0, v); return ret_slice(b, 0, 8); }\n", false),
+        ("l1_st_u64_lower", "#[strict]\nfn main(x: i64) -> i64 { let b: bytes = anew(0); b = iset_i64(b, 0); b = st_u64(b, 0, x + 7); return ld_u64(b, 0); }\n", true),
         ("if_pos_nested_join", "#[strict]\nfn main(x: i64) -> i64 { let c: trit = x <=> 0; let r: i64 = if_pos c { let d: trit = (x - 5) <=> 0; if_neg d { let a: i64 = x + 10; a } else { x - 10 } } else { let b: i64 = x * 2; b + 1 }; return r; }\n", false),
         ("match_trit_3arm", "#[strict]\nfn main(x: i64) -> i64 { let t: trit = x <=> 0; let r: i64 = match_trit t { neg => { let a: i64 = x - 1; a * 2 }, zero => 0, pos => { x + 1 } }; return r; }\n", false),
         ("str_lit_cstr", "#[strict]\nfn main(x: i64) -> str { let s: str = \"hello_omni\"; return s; }\n", false),
@@ -6274,8 +6339,154 @@ pub fn selftest_b2_pure_verifier() -> Result<usize, String> {
     // 5. Audit §1.2: CALL-target and arity validation in Pure verifier + M2 trap stub + fuzz corpus.
     checks += selftest_s1_2_call_target_arity_and_fuzz()?;
 
-    // 6. Frozen hashes intact.
+    // 6. Audit Round 2 N1: per-opcode minimum operand arity + EMPTY_MODULE + reconciled 0x7F42 (BR_TRIT min=4).
+    checks += selftest_n1_op_arity_and_empty_module()?;
+
+    // 7. Frozen hashes intact.
     selftest_m2_frozen_hashes()?;
+    checks += 1;
+
+    Ok(checks)
+}
+
+/// Audit Round 2 N1 gate:
+///   1. Rejects TMAJ (0x7F2C) with 2 operands (`PURE_VERIFY_2012`).
+///   2. Rejects 0x7F17 with 1 operand (`PURE_VERIFY_2012`).
+///   3. Rejects header-only zero-function module `[0x7EE0, 0x7EEF]` (`PURE_VERIFY_EMPTY_MODULE`),
+///      while keeping 0-word `[]` rejected as `PURE_VERIFY_DECODE_3006`.
+///   4. Rejects `vok_crash_128` (`0x7F42` BR_TRIT with 1 operand — reconciled min=4) in BOTH
+///      `pure_default_verify_u16` (`PURE_VERIFY_2012`) and Rust `OmniBinaryVm` (`BAD_ARITY`).
+pub fn selftest_n1_op_arity_and_empty_module() -> Result<usize, String> {
+    let mut checks = 0usize;
+
+    let build_dest_op_stream = |op: u16, ops: &[u16]| -> Vec<u16> {
+        let mut s = vec![
+            0x7EE0, // TOK_MOD_BEGIN
+            0x7EE3, 0, 1, 0x7EC0, 0x7F81, 0x7FC0, 0x7F81, 0, 2, // fn#0(p0: i64) -> i64, 2 ins
+            0x7E00, op, 0x7F81, 0x7FC0, // r0: i64 = op ...
+        ];
+        s.extend_from_slice(ops);
+        s.extend_from_slice(&[
+            0x7EE4, // INS_END
+            0x7F4A, 0x7E00, 0x7EE4, // RET r0
+            0x7EEF, // TOK_MOD_END
+        ]);
+        s
+    };
+
+    // 1. TMAJ (0x7F2C) with 2 operands (requires 3).
+    let tmaj_2op = build_dest_op_stream(0x7F2C, &[0x7EC0, 0x7EC0]);
+    match pure_default_verify_u16(&tmaj_2op, false) {
+        Ok(()) => return Err(String::from("N1 Pure verifier accepted TMAJ (0x7F2C) with 2 operands")),
+        Err(msg) => {
+            if !msg.contains("PURE_VERIFY_2012") {
+                return Err(format!("N1 tmaj_2op expected PURE_VERIFY_2012, got: {}", msg));
+            }
+        }
+    }
+    checks += 1;
+
+    // 2. 0x7F17 with 1 operand (requires 2).
+    let op_7f17_1op = build_dest_op_stream(0x7F17, &[0x7EC0]);
+    match pure_default_verify_u16(&op_7f17_1op, false) {
+        Ok(()) => return Err(String::from("N1 Pure verifier accepted 0x7F17 with 1 operand")),
+        Err(msg) => {
+            if !msg.contains("PURE_VERIFY_2012") {
+                return Err(format!("N1 op_7f17_1op expected PURE_VERIFY_2012, got: {}", msg));
+            }
+        }
+    }
+    checks += 1;
+
+    // 3. Header-only zero-function module `[0x7EE0, 0x7EEF]` (EMPTY_MODULE) + 0-word `[]` (DECODE_3006).
+    let empty_hdr_only: Vec<u16> = vec![0x7EE0, 0x7EEF];
+    match pure_default_verify_u16(&empty_hdr_only, false) {
+        Ok(()) => return Err(String::from("N1 Pure verifier accepted header-only zero-function module")),
+        Err(msg) => {
+            if !msg.contains("PURE_VERIFY_EMPTY_MODULE") && !msg.contains("3007") {
+                return Err(format!("N1 empty_module expected PURE_VERIFY_EMPTY_MODULE, got: {}", msg));
+            }
+        }
+    }
+    match pure_default_verify_u16(&[], false) {
+        Ok(()) => return Err(String::from("N1 Pure verifier accepted 0-word empty stream")),
+        Err(msg) => {
+            if !msg.contains("PURE_VERIFY_DECODE_3006") {
+                return Err(format!("N1 0-word stream expected PURE_VERIFY_DECODE_3006, got: {}", msg));
+            }
+        }
+    }
+    checks += 1;
+
+    // 4. `vok_crash_128`: BR_TRIT (0x7F42) with 1 operand (reconciled min=4 across Pure verifier, mod_check, and Rust VM).
+    let br_trit_1op: Vec<u16> = vec![
+        0x7EE0,
+        0x7EE3, 0, 1, 0x7EC0, 0x7F81, 0x7FC0, 0x7F81, 0, 2,
+        0x7F42, 0x7EC0, 0x7EE4, // BR_TRIT with only 1 operand (missing l_neg, l_zero, l_pos)
+        0x7F4A, 0x7EC0, 0x7EE4, // RET p0
+        0x7EEF,
+    ];
+    match pure_default_verify_u16(&br_trit_1op, false) {
+        Ok(()) => return Err(String::from("N1 Pure verifier accepted BR_TRIT (0x7F42) with 1 operand")),
+        Err(msg) => {
+            if !msg.contains("PURE_VERIFY_2012") {
+                return Err(format!("N1 vok_crash_128 expected PURE_VERIFY_2012, got: {}", msg));
+            }
+        }
+    }
+    let decoded_br = decode_omni_token_stream(&br_trit_1op)?;
+    let mut rust_vm = OmniBinaryVm::new();
+    match rust_vm.execute_function(&decoded_br, 0, vec![OmniValue::Int(1)]) {
+        Ok(v) => return Err(format!("N1 Rust VM accepted BR_TRIT (0x7F42) with 1 operand (returned {:?})", v)),
+        Err(msg) => {
+            if !msg.contains("BAD_ARITY") && !msg.contains("Missing branch target label") {
+                return Err(format!("N1 Rust VM expected BAD_ARITY/UNRESOLVED_LABEL on 0x7F42 1-op, got: {}", msg));
+            }
+        }
+    }
+    checks += 1;
+
+    // 5. Drift-lock: `pure/verifier_engine.omni::op_min_ops` agrees with `pure/m2/verify/mod_check.omni::m2v_ins_min_ops`
+    //    for every opcode known to `mod_check.omni` across 0x7F00..=0x7F7F.
+    let ve_mod = cached_verifier_engine_module()?;
+    let m2_mod = cached_m2_seed_module()?;
+    let find_fn_idx = |src: &str, name: &str| -> Result<u16, String> {
+        let needle = format!("fn {}(", name);
+        let mut idx: u16 = 0;
+        for line in src.lines() {
+            let t = line.trim_start();
+            if t.starts_with("fn ") {
+                if t.starts_with(&needle) {
+                    return Ok(idx);
+                }
+                idx += 1;
+            }
+        }
+        Err(format!("N1 could not locate '{}' in source", name))
+    };
+    let ve_min_pos = find_fn_idx(OMNI_VERIFIER_ENGINE_SURFACE, "op_min_ops")? as usize;
+    let m2_min_pos = find_fn_idx(M2_SELFHOST_OMNI_SRC, "m2v_ins_min_ops")? as usize;
+    let ve_min_fn = ve_mod.functions.get(ve_min_pos).ok_or("N1 ve_min_pos OOB")?.fn_idx;
+    let m2_min_fn = m2_mod.functions.get(m2_min_pos).ok_or("N1 m2_min_pos OOB")?.fn_idx;
+    let mut parity_vm = OmniBinaryVm::with_budgets(50_000_000, 16 * 1024 * 1024);
+    for op in 0x7F00i64..=0x7F7Fi64 {
+        let m2_v = match parity_vm.execute_function(m2_mod, m2_min_fn, vec![OmniValue::Int(op)])? {
+            OmniValue::Int(v) => v,
+            other => return Err(format!("N1 m2v_ins_min_ops(0x{:04X}) returned {:?}", op, other)),
+        };
+        if m2_v >= 0 {
+            let ve_v = match parity_vm.execute_function(ve_mod, ve_min_fn, vec![OmniValue::Int(op)])? {
+                OmniValue::Int(v) => v,
+                other => return Err(format!("N1 op_min_ops(0x{:04X}) returned {:?}", op, other)),
+            };
+            if ve_v != m2_v {
+                return Err(format!(
+                    "N1 opcode arity drift at 0x{:04X}: verifier_engine={} != mod_check={}",
+                    op, ve_v, m2_v
+                ));
+            }
+        }
+    }
     checks += 1;
 
     Ok(checks)
@@ -6851,6 +7062,95 @@ pub fn selftest_s2_security() -> Result<usize, String> {
     }
     checks += 1;
 
+    // 7. Audit Round 2 N4: Native cache hardening (reject pre-created loose dir, mkdtemp unset-HOME fallback).
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let prev_xdg = std::env::var_os("XDG_CACHE_HOME");
+        let prev_home = std::env::var_os("HOME");
+        let loose_root = std::env::temp_dir().join(format!("omni_n4_loose_{}", std::process::id()));
+        let loose_cache = loose_root.join("omni").join("native-v1");
+        let _ = std::fs::remove_dir_all(&loose_root);
+        std::fs::create_dir_all(&loose_cache).map_err(|e| format!("N4 mkdir loose: {}", e))?;
+        std::fs::set_permissions(&loose_cache, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("N4 chmod loose: {}", e))?;
+        std::env::set_var("XDG_CACHE_HOME", &loose_root);
+        let loose_res = native_toolchain_cache_dir();
+        let _ = std::fs::remove_dir_all(&loose_root);
+
+        std::env::remove_var("XDG_CACHE_HOME");
+        std::env::remove_var("HOME");
+        let fallback_res = native_toolchain_cache_dir();
+
+        match prev_xdg {
+            Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+
+        if loose_res.is_ok() {
+            return Err(String::from("N4 native_toolchain_cache_dir accepted pre-created 0755 loose dir"));
+        }
+        let fb_dir = fallback_res.map_err(|e| format!("N4 unset-HOME fallback failed: {}", e))?;
+        let predictable = std::env::temp_dir().join(format!("omni-native-cache-{}", std::process::id()));
+        if fb_dir == predictable {
+            return Err(format!("N4 unset-HOME fallback used predictable PID path: {}", fb_dir.display()));
+        }
+        let fb_meta = std::fs::symlink_metadata(&fb_dir).map_err(|e| format!("N4 lstat fallback: {}", e))?;
+        if (fb_meta.mode() & 0o077) != 0 {
+            return Err(format!("N4 unset-HOME fallback dir has loose mode {:o}", fb_meta.mode()));
+        }
+        // Re-verify before spawn: wrong FNV pin must fail closed before exec.
+        let fake_elf = PrivateTempElf::new(&[0x7F, b'E', b'L', b'F'], "n4_tamper")?;
+        match spawn_verified_native_elf(&fake_elf.path, 4, 0xDEAD_BEEF_CAFE_BABE, &[]) {
+            Ok(_) => return Err(String::from("N4 spawn_verified_native_elf spawned ELF with mismatched pin")),
+            Err(msg) => {
+                if !msg.contains("NATIVE_ELF_PIN_MISMATCH") {
+                    return Err(format!("N4 expected NATIVE_ELF_PIN_MISMATCH, got: {}", msg));
+                }
+            }
+        }
+    }
+    checks += 1;
+
+    // 8. Audit Round 2 L3 & L4: Wasm AOT arity check on crafted 1-op 0x7F17 (`idxpanic_5`) and 2-op 0x7F2C (TMAJ)
+    //    must return Err(BAD_ARITY) without panicking, and native m2.elf rejection must not mislabel as OUT_OF_BOUNDS.
+    for &(label, bad_op, ops) in &[
+        ("idxpanic_5_0x7f17", 0x7F17u16, &[0x7EC0u16][..]),
+        ("tmaj_2op_0x7f2c", 0x7F2Cu16, &[0x7EC0u16, 0x7EC0u16][..]),
+    ] {
+        let mut s = vec![
+            0x7EE0,
+            0x7EE3, 0, 1, 0x7EC0, 0x7F81, 0x7FC0, 0x7F81, 0, 2,
+            0x7E00, bad_op, 0x7F81, 0x7FC0,
+        ];
+        s.extend_from_slice(ops);
+        s.extend_from_slice(&[0x7EE4, 0x7F4A, 0x7E00, 0x7EE4, 0x7EEF]);
+        match compile_pure_u16_to_wasm(&s) {
+            Ok(_) => return Err(format!("L3 Wasm AOT accepted under-arity '{}' without BAD_ARITY", label)),
+            Err(msg) => {
+                if !msg.contains("BAD_ARITY") {
+                    return Err(format!("L3 '{}' expected BAD_ARITY, got: {}", label, msg));
+                }
+            }
+        }
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        match pure_default_compile_u16_to_elf(&bad_call_32539, 0, 0, 0) {
+            Ok(_) => return Err(String::from("L4 native m2.elf accepted bad_call_32539")),
+            Err(msg) => {
+                if msg.starts_with(OMNI_OOB_ERROR) {
+                    return Err(format!("L4 native m2.elf rejection mislabeled as OUT_OF_BOUNDS: {}", msg));
+                }
+            }
+        }
+    }
+    checks += 1;
+
     Ok(checks)
 }
 
@@ -6927,12 +7227,50 @@ pub fn selftest_s4_honesty() -> Result<usize, String> {
             "S4.2 README.md must qualify M5 181-byte ELF as a .omni_bc header validator/entry stub",
         ));
     }
+    // Audit Round 2 L7: lock all 5 frozen hashes in README.md unconditionally.
+    for &(label, hex) in &[
+        ("Phase D BC", "0x23B8D17257CCA9C4"),
+        ("Phase D ELF", "0x8D5AAAD22399A1EE"),
+        ("Core suite", "0x78462AE4C81DF408"),
+        ("Stage-1 BC", "0xED4C50AA79563EFF"),
+        ("Stage-1 ELF", "0x62F14B335B52BECC"),
+    ] {
+        if !main_readme.contains(hex) {
+            return Err(format!("S4.2 README.md missing frozen {} hash {}", label, hex));
+        }
+    }
+    // Optional strict README gate (`OMNI_STRICT_README=1` or `--strict-readme`): locks seed table,
+    // M4 ELF size, 5-backend wording, and archived workspace path once docs PR lands.
+    let strict_readme = matches!(
+        std::env::var("OMNI_STRICT_README").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    );
+    if strict_readme {
+        for &(label, needle) in &[
+            ("M3 seed hash", "0xC96457590C836700"),
+            ("M2 seed hash", "0x653BD567AAF5E0DB"),
+            ("M4 seed hash", "0x99567F6F5D0E8F32"),
+            ("M4 ELF size", "81,827"),
+            ("archived workspace", "oracle/archived-workspace/Cargo.toml"),
+        ] {
+            if !main_readme.contains(needle) {
+                return Err(format!("L7 strict README missing {} ('{}')", label, needle));
+            }
+        }
+        if main_readme.contains("4-backend") {
+            return Err(String::from("L7 strict README still contains stale '4-backend' claim"));
+        }
+        if main_readme.contains("omni-workspace/Cargo.toml") {
+            return Err(String::from("L7 strict README still references moved 'omni-workspace/Cargo.toml'"));
+        }
+    }
     checks += 1;
 
     // 3. §4.2: `seed0/omni_seed0.rs` header comment must match the active SEED_M2 / SEED_M4 pins.
     let seed0_src = std::fs::read_to_string("seed0/omni_seed0.rs")
         .map_err(|e| format!("S4 read seed0/omni_seed0.rs: {}", e))?;
-    if !seed0_src.contains("39,312 words, 0x2E5294F301EB4E90")
+    if !seed0_src.contains("59,540 words, 0xC96457590C836700")
+        || !seed0_src.contains("40,234 words, 0x653BD567AAF5E0DB")
         || !seed0_src.contains("27,819 words, 0x99567F6F5D0E8F32")
     {
         return Err(String::from(
@@ -6990,6 +7328,22 @@ pub fn selftest_s3_performance() -> Result<usize, String> {
             fnv1a_64_hash(&m4_sa_raw),
             m4_sa_ref.len(),
             fnv1a_64_hash(&m4_sa_ref)
+        ));
+    }
+    // Audit Round 2 L6: standalone verifier seed matches verifier_standalone_source() (0-word diff).
+    let ve_sa_raw = std::fs::read("pure/verifier_standalone.omni_bc")
+        .map_err(|e| format!("S3.1 missing pure/verifier_standalone.omni_bc: {}", e))?;
+    let ve_sa_src = verifier_standalone_source();
+    let ve_sa_ref = encode_u16_stream_to_bytes(&with_lockstep_suspended(|| {
+        compile_omni_surface_strict_to_u16(&ve_sa_src)
+    })?);
+    if ve_sa_raw != ve_sa_ref {
+        return Err(format!(
+            "S3.1 pure/verifier_standalone.omni_bc drift ({} B, 0x{:016X} != {} B, 0x{:016X})",
+            ve_sa_raw.len(),
+            fnv1a_64_hash(&ve_sa_raw),
+            ve_sa_ref.len(),
+            fnv1a_64_hash(&ve_sa_ref)
         ));
     }
     checks += 1;
