@@ -23421,6 +23421,14 @@ fn selftest_a3_macro_quarantine_count() -> Result<usize, String> {
     selftest_a3_macro_quarantine()
 }
 
+fn selftest_b2_pure_verifier_count() -> Result<usize, String> {
+    selftest_b2_pure_verifier()
+}
+
+fn selftest_b4_pure_launcher_count() -> Result<usize, String> {
+    Ok(selftest_b4_pure_launcher()?.0)
+}
+
 /// All Milestone 2..7 + API Stage 1 foundation selftests (parallel-lane accelerated).
 pub fn run_m2_foundation_selftests() -> Result<usize, String> {
     let parallel_tasks: &[SelftestLaneTask] = &[
@@ -23462,6 +23470,8 @@ pub fn run_m2_foundation_selftests() -> Result<usize, String> {
         ("a1_pure_default", selftest_a1_pure_default_count),
         ("a2_pure_include", selftest_a2_pure_include_count),
         ("a3_macro_quarantine", selftest_a3_macro_quarantine_count),
+        ("b2_pure_verifier", selftest_b2_pure_verifier_count),
+        ("b4_pure_launcher", selftest_b4_pure_launcher_count),
     ];
     let mut n = run_selftest_tasks_in_lanes(parallel_tasks)?;
     // Sequential: toggles global M3 lockstep state.
@@ -23997,6 +24007,32 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
                 1
             }
         },
+        "b2-pure-verifier" => match selftest_b2_pure_verifier() {
+            Ok(n) => {
+                println!(
+                    "[B2-PURE-VERIFIER PASS] {} checks | Pure-Omni verifier_engine.omni active on default hot path (valid goldens + 1012 LINEAR_REFLECT + TAINT_SINK + oracle parity + frozen hashes intact)",
+                    n
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("[B2-PURE-VERIFIER FAIL] {}", e);
+                1
+            }
+        },
+        "b4-pure-launcher" => match selftest_b4_pure_launcher() {
+            Ok((n, sz, h, native)) => {
+                println!(
+                    "[B4-PURE-LAUNCHER PASS] {} checks | pure/m5/launcher.omni -> {} B zero-shim ELF64 (FNV-1a64=0x{:016X}, raw 0F 05 syscalls | native={}) + frozen hashes intact",
+                    n, sz, h, if native { "VERIFIED (launcher + native M2->M4)" } else { "SKIPPED on non-Linux-x86-64" }
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("[B4-PURE-LAUNCHER FAIL] {}", e);
+                1
+            }
+        },
         "p5-sys" => match selftest_p5_2_zero_shim_sys() {
             Ok((n, sz, h, native)) => {
                 println!(
@@ -24482,6 +24518,8 @@ fn main() {
                 println!("  a1-pure-default                   Seed-Shrink A1: Pure-Omni M3->M2/M4 default CLI path vs --rust oracle gate");
                 println!("  a2-pure-include                   Seed-Shrink A2: Pure-Omni O-5 include expander (pure/m3/include.omni) & cycle gate");
                 println!("  a3-macro-quarantine               Seed-Shrink A3: quarantine macros behind --rust oracle & verify pure replacement golden");
+                println!("  b2-pure-verifier                  Seed-Shrink B2: Pure-Omni verifier_engine.omni on default hot path gate");
+                println!("  b4-pure-launcher                  Seed-Shrink B4: Pure-Omni M5 181-B zero-shim launcher ELF64 & native chain gate");
                 println!("  compile [--rust|--oracle] <in> <out>     Compile .omni to .omni_bc via Pure M3 by default");
                 println!("  self-host [--rust|--oracle]              Run Pure M3->M4->M2 self-host chain by default");
                 println!();
@@ -24511,7 +24549,7 @@ fn main() {
             "harness" | "--harness" => {
                 std::process::exit(run_omni_harness_cli(&cli_args[2..]));
             }
-            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" | "p7-heal" | "p7-adapt" | "p7-learn" | "a1-pure-default" | "a2-pure-include" | "a3-macro-quarantine" | "api-stage1" | "api-stage2" | "api-stage2-emit" | "api-stage2-5" => {
+            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" | "p7-heal" | "p7-adapt" | "p7-learn" | "a1-pure-default" | "a2-pure-include" | "a3-macro-quarantine" | "b2-pure-verifier" | "b4-pure-launcher" | "api-stage1" | "api-stage2" | "api-stage2-emit" | "api-stage2-5" => {
                 std::process::exit(run_m2_cli(&cli_args[1..]));
             }
             "agent-driver" | "--agent-driver" => {
@@ -24687,8 +24725,12 @@ fn main() {
                     .expect("Pure include expansion failed");
                 match pure_default_compile_surface_to_u16(&expanded, expanded.contains("#[strict]")) {
                     Ok(u16_stream) => {
+                        if let Err(ve) = pure_default_verify_u16(&u16_stream, true) {
+                            eprintln!("[PURE-VERIFY FAIL] {}", ve);
+                            std::process::exit(1);
+                        }
                         fs::write(pos[1], encode_u16_stream_to_bytes(&u16_stream)).expect("Failed to write .omni_bc");
-                        println!("[PURE-M3 COMPILE PASS] Wrote {} u16 tokens to '{}'", u16_stream.len(), pos[1]);
+                        println!("[PURE-M3 COMPILE PASS] Wrote {} u16 tokens to '{}' (Pure-Omni verified)", u16_stream.len(), pos[1]);
                         return;
                     }
                     Err(e) => {
@@ -24750,6 +24792,10 @@ fn main() {
                     let raw = fs::read(path).expect("Failed to read .omni_bc");
                     decode_bytes_to_u16_stream(&raw)
                 };
+                if let Err(ve) = pure_default_verify_u16(&u16_stream, true) {
+                    eprintln!("[PURE-VERIFY FAIL] {}", ve);
+                    std::process::exit(1);
+                }
                 match pure_default_compile_u16_to_elf(&u16_stream, a0, a1, a2) {
                     Ok(elf) => {
                         fs::write(out_path, &elf).expect("Failed to write .elf");
@@ -24887,6 +24933,10 @@ fn main() {
                     let a0 = pos.get(1).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
                     let a1 = pos.get(2).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
                     let a2 = pos.get(3).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                    if let Err(ve) = pure_default_verify_u16(&u16_stream, true) {
+                        eprintln!("[PURE-VERIFY FAIL] {}", ve);
+                        std::process::exit(1);
+                    }
                     match pure_default_run_u16(&u16_stream, a0, a1, a2, false) {
                         Ok((ret, _steps)) => {
                             println!("Int({})", ret);

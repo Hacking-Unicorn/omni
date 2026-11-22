@@ -82,10 +82,12 @@ All 5 frozen artifacts are asserted by FNV-1a64 hash and exact size in `selftest
 
 ```bash
 rustc -O omni_rust_bootstrap.rs -o omnic
-./omnic selftest              # 1,463 checks on Windows / 1,579 on Linux x86-64 (13AY diff4, 13AZ KV, 13BA ISA table, 13BF hash pin, M2/M3/P4/P5/P7/API/A1-A3 locks)
+./omnic selftest              # 1,474 checks on Windows / 1,590 on Linux x86-64 (13AY diff4, 13AZ KV, 13BA ISA table, 13BF hash pin, M2/M3/P4/P5/P7/API/A1-B4 locks)
 ./omnic a1-pure-default       # Seed-Shrink A1: Pure-Omni M3->M2/M4 default CLI path (`compile`, `compile-elf`, `run`, `self-host`; `--rust` oracle)
 ./omnic a2-pure-include       # Seed-Shrink A2: Pure-Omni O-5 include expander (`pure/m3/include.omni`, 0-byte diff vs Rust, `CIRCULAR_INCLUDE` gate)
 ./omnic a3-macro-quarantine   # Seed-Shrink A3: quarantine `macro` behind `--rust` (`ORACLE_ONLY_MACRO`) + pure replacement golden (0-diff M3/M2/M4)
+./omnic b2-pure-verifier      # Seed-Shrink B2: Pure-Omni `verifier_engine.omni` on default hot path (Rust verifier oracle-only)
+./omnic b4-pure-launcher      # Seed-Shrink B4: Pure-Omni M5 181-B zero-shim launcher ELF64 (`0x87E30A9BB58BB3C4`) & native M2->M4 chain gate
 ./omnic p7-measure            # Phase 7 (P7-0): 5-benchmark corpus + P4-5 trace ring + pure/m7/judge.omni ternary (+1t/0t/-1t) + @PACK5 verdict gate
 ./omnic p7-canary             # Phase 7 (P7-0a): 5-run consensus + subsystem attribution (M3/M2/M4) + M2 emitter canary (+1t) & neutral (0t) gate
 ./omnic p7-heal               # Phase 7 (P7-1): self-healing taxonomy, FNV-1a64 rollback, bounded N-attempt repair & fault-injection gate
@@ -113,12 +115,21 @@ rustc -O omni_rust_bootstrap.rs -o omnic
 ./omnic m2-multi-pure         # Pure-Omni multi-function compiler (0-byte diff vs Rust on verifier_engine & self)
 ./omnic m2-multi              # Rust M2-09 multi-function x86-64 ELF64 reference checks
 ./omnic m2-elf                # Pure-Omni arena & ELF64 header/stub checks
-./omnic m2-lint               # lints all 24 registered pure/m2, pure/m3, pure/m4, pure/m5, pure/m7, pure/api & pure/isa modules (0 gated findings)
+./omnic m2-lint               # lints all 25 registered pure/m2, pure/m3, pure/m4, pure/m5, pure/m7, pure/api & pure/isa modules (0 gated findings)
 ./omnic backend-diff --suite  # 4-backend differential suite (0 FAIL, 0 XPASS required)
 ./omnic acceptance-diff       # 41 executable acceptance goldens
 ./omnic pure-omni-diff        # 49 Pure-Omni differential checks
 ./omnic pure-bootstrap        # Phase D & 18-module suite FNV-1a64 hashes
 ./omnic fixed-point           # Stage-1 == Stage-2 fixed-point ELF64 check (cross-platform)
+```
+
+### Zero-Rust Rebuild & Seed-Shrink Verification (Phase C1–C3)
+
+Mandatory Stage-0 Rust is **`236` lines** (`seed0/omni_seed0.rs` 134 lines + `p4_shim/mod.rs` 102 lines — a **99.51% reduction** from the 48,590-line baseline; see `oracle/README.md`). Reproduce the full zero-Rust rebuild with `rustc`/`cargo` absent from `PATH` and run the independent Python 3 verifier trace checker:
+
+```bash
+bash scripts/zero_rust_rebuild.sh          # C1: strips rustc/cargo from PATH, verifies all 3 seeds, 181-B M5 launcher (0x87E30A9BB58BB3C4), native m2.elf->m4.elf (78,020 B, 0xF66A7081E2B43319), M2/M3 fixed points & P7 gates
+python3 scripts/external_verifier_check.py # C2: independent zero-dependency Python 3 checker over spec/verifier_traces/pure_verifier_golden_traces.json
 ```
 
 ### 8-Crate Workspace (`cargo`)

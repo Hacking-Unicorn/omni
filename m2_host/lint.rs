@@ -575,6 +575,7 @@ pub const M2_PURE_MODULES: &[(&str, &str)] = &[
     ("pure/m7/judge.omni+pure/m7/adapt.omni+spec/m7/adapt_harness.omni", P7_ADAPT_OMNI_SRC),
     ("pure/m7/judge.omni+pure/m7/learn.omni+spec/m7/learn_harness.omni", P7_LEARN_OMNI_SRC),
     ("pure/m3/include.omni+spec/m3/include_harness.omni", M3_INCLUDE_OMNI_SRC),
+    ("pure/m2/util.omni+pure/isa/table.omni+pure/m2/decode.omni+pure/m2/labels.omni+pure/m2/arena.omni+pure/m2/elf.omni+pure/m5/elf_sys.omni+pure/m5/launcher.omni+spec/m5/launcher_harness.omni", M5_LAUNCHER_OMNI_SRC),
 ];
 
 /// Lint fixtures: (name, source, the exact comma-separated rule set it must trip; "" = clean).

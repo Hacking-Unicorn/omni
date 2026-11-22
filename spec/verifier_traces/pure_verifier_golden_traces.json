@@ -1,0 +1,68 @@
+{
+  "schema": "omni-verifier-traces-v1",
+  "generated_from": "pure/verifier_engine.omni (omni_verify_module_api)",
+  "cases": [
+    {
+      "id": "synth_const_42",
+      "description": "Valid 13-word Pure-Omni synthesized module (`fn main() -> i64 { return 42; }`)",
+      "u16_words": [32480, 32483, 0, 0, 32641, 0, 1, 32586, 32486, 0, 42, 32484, 32495],
+      "expected_pass": true,
+      "expected_code": null
+    },
+    {
+      "id": "valid_add_params",
+      "description": "Valid 1-fn pure ALU module (`fn main(a: i64, b: i64) -> i64 { return a + b; }`)",
+      "u16_words": [
+        32480, 32483, 0, 2,
+        32448, 32641, 32656,
+        32449, 32641, 32656,
+        32641, 0, 2,
+        32256, 32641, 32656, 32528, 32448, 32449, 32484,
+        32586, 32256, 32484,
+        32495
+      ],
+      "expected_pass": true,
+      "expected_code": null
+    },
+    {
+      "id": "neg_bad_header",
+      "description": "Corrupt header (missing TOK_MOD_BEGIN=0x7EE0)",
+      "u16_words": [65535, 32495],
+      "expected_pass": false,
+      "expected_code": "DECODE_ERROR"
+    },
+    {
+      "id": "neg_missing_mod_end",
+      "description": "Truncated module (missing TOK_MOD_END=0x7EEF)",
+      "u16_words": [32480, 32483, 0, 0, 32641, 0, 0],
+      "expected_pass": false,
+      "expected_code": "DECODE_ERROR"
+    },
+    {
+      "id": "neg_linear_reflect_1012",
+      "description": "Live heap arena passed to CALL -> Pure verifier rule 1012 (LINEAR_REFLECT)",
+      "u16_words": [
+        32480, 32483, 0, 0, 32641, 0, 3,
+        32256, 32646, 32656, 32513, 32485, 64, 32484,
+        32257, 32641, 32656, 32584, 32492, 0, 32256, 32484,
+        32586, 32257, 32484,
+        32495
+      ],
+      "expected_pass": false,
+      "expected_code": "LINEAR_REFLECT"
+    },
+    {
+      "id": "neg_taint_on_ret",
+      "description": "Untrusted parameter flows directly to safe sink RET -> TAINT_SINK",
+      "u16_words": [
+        32480, 32483, 0, 1,
+        32448, 32641, 32657,
+        32641, 0, 1,
+        32586, 32448, 32484,
+        32495
+      ],
+      "expected_pass": false,
+      "expected_code": "TAINT_SINK"
+    }
+  ]
+}
