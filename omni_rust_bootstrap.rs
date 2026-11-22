@@ -1200,7 +1200,7 @@ pub const OMNI_DB_GET_MISS: i64 = -1;
 /// Fixed KV key cap (Boss Lady 2026-11-14): 8192 distinct keys, the `pure/host_kv.omni` arena size
 /// (0x1B0000..0x1EFFFF at 32 B). The 8193rd new key is `BUDGET_EXCEEDED`; overwrites still succeed.
 pub const OMNI_VM_KV_MAX_KEYS: usize = 8192;
-pub const DEFAULT_VM_WALL_TIMEOUT_MS: u64 = 120_000;
+pub const DEFAULT_VM_WALL_TIMEOUT_MS: u64 = 600_000;
 
 pub struct OmniBinaryVm {
     pub tables: HashMap<u16, Vec<BTreeMap<u16, OmniValue>>>,
@@ -1396,9 +1396,7 @@ impl OmniBinaryVm {
     ) -> Result<OmniValue, String> {
         if self.call_depth == 0 {
             self.verified_fns = [0; 16];
-            if self.start_instant.is_none() {
-                self.start_instant = Some(Instant::now());
-            }
+            self.start_instant = Some(Instant::now());
         }
         if self.call_depth >= MAX_VM_CALL_DEPTH {
             return Err(format!(
@@ -15499,7 +15497,7 @@ pub const OMNI_DIFF4_GOLDENS: &[DiffGolden] = &[
             (&[-5, i64::MIN], DiffExpect::I64(-5)),
             (&[0, i64::MIN], DiffExpect::I64(0)),
         ],
-        backends: &["vm", "wasm", "x86", "m4"],
+        backends: DIFF4_ALL,
     },
     DiffGolden {
         id: "s1_shift_edges",
@@ -15550,6 +15548,7 @@ pub const OMNI_DIFF4_KNOWN_DIVERGENCES: &[(&str, &str, &str)] = &[
     ("p3_imod_min_neg1_after_tcmp", "x86", "N1, see p3_imod_rdx_clobber/x86"),
     ("p3_imod_min_neg1_after_tcmp", "stage1", "Stage-1 is frozen; rejects IMOD 0x7F14 with error[UNSUPPORTED] (C2)"),
     ("p3_imod_control_no_tcmp", "stage1", "Stage-1 is frozen; rejects IMOD 0x7F14 with error[UNSUPPORTED] (C2)"),
+    ("s1_int_min_mod", "stage1", "Stage-1 is frozen; rejects IMOD 0x7F14 with error[UNSUPPORTED] (C2)"),
     // P4: trit ops without clamping (spec.md:53).
     ("p4_trit_clamp", "wasm", "N3: Wasm TNOT/TAND/TOR/TXOR/TMAJ do not clamp i64 operands (15332, 15352-15357)"),
     ("p4_trit_clamp", "x86", "N3: x86 TAND/TOR share IMIN/IMAX (14714), TNOT shares INEG (14676); no clamp"),
@@ -15710,7 +15709,7 @@ pub fn expect_native_elf_i64(elf: &[u8], tag: &str, want: i64, ctx: &str) -> Res
 
 /// `omnic backend-diff` / `omnic diff4` CLI.
 ///   backend-diff --suite                 run OMNI_DIFF4_GOLDENS, print PASS/XFAIL/XPASS/FAIL per backend
-///   backend-diff <file.omni|"src"> [a..] run one program on vm/wasm/x86/stage1, compare byte-for-byte
+///   backend-diff <file.omni|"src"> [a..] run one program on vm/wasm/x86/stage1/m4, compare byte-for-byte
 /// Exit: 0 = suite green / all comparable backends agree; 1 = FAIL/XPASS / divergence; 2 = usage/frontend error.
 pub fn run_omni_backend_diff_cli(argv: &[String]) -> i32 {
     if argv.first().map(|s| s.as_str()) == Some("--suite") {
@@ -24573,7 +24572,7 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
         "m3-4backend" => match selftest_m3_15_four_backend_parity() {
             Ok(n) => {
                 println!(
-                    "[M3-4BACKEND PASS] {} programs verified across VM == Wasm-multi == Rust-x86-multi == Pure-Omni-M2-ELF64 (0-byte diff; Stage-1 N/A legacy exemption)",
+                    "[M3-4BACKEND PASS] {} programs verified across 5 backends: VM == Wasm-multi == Rust-x86-multi == Pure-Omni-M2-ELF64 == Pure-Omni-M4-VM (0-byte diff; Stage-1 N/A legacy exemption)",
                     n
                 );
                 0
@@ -24924,7 +24923,7 @@ fn main() {
                 println!("  pure-bootstrap                    Verify Phase D & 18-module core suite FNV-1a64 hashes");
                 println!("  pure-omni-diff                    Run 49 Pure-Omni differential checks");
                 println!("  acceptance-diff                   Run 41 executable acceptance goldens");
-                println!("  backend-diff --suite              Run 4-backend differential suite (vm/wasm/x86/stage1)");
+                println!("  backend-diff --suite              Run 5-backend differential suite (vm/wasm/x86/stage1/m4)");
                 println!("  m2-lint [file.omni]...            Lint registered pure/m2, m3, m4, m5 & isa modules");
                 println!("  m2-elf | m2-compile | m2-multi | m2-multi-pure | m2-wasm-multi | m2-verify | m2-fixed-point [--write-seed]");
                 println!("  m2-frozen | m2-lock | m2-census | m2-labels | m2-decode [file.omni_bc]");

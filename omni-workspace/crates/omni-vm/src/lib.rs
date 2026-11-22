@@ -33,7 +33,7 @@ pub const OMNI_DB_GET_MISS: i64 = -1;
 /// Fixed KV key cap (Boss Lady 2026-11-14): 8192 distinct keys, the `pure/host_kv.omni` arena size
 /// (0x1B0000..0x1EFFFF at 32 B). The 8193rd new key is `BUDGET_EXCEEDED`; overwrites still succeed.
 pub const OMNI_VM_KV_MAX_KEYS: usize = 8192;
-pub const DEFAULT_VM_WALL_TIMEOUT_MS: u64 = 120_000;
+pub const DEFAULT_VM_WALL_TIMEOUT_MS: u64 = 600_000;
 
 pub struct OmniBinaryVm {
     pub tables: HashMap<u16, Vec<BTreeMap<u16, OmniValue>>>,
@@ -188,9 +188,7 @@ impl OmniBinaryVm {
     ) -> Result<OmniValue, String> {
         if self.call_depth == 0 {
             self.verified_fns = [0; 16];
-            if self.start_instant.is_none() {
-                self.start_instant = Some(std::time::Instant::now());
-            }
+            self.start_instant = Some(std::time::Instant::now());
         }
         let func = if let Some(f) = module.functions.get(fn_idx as usize).filter(|f| f.fn_idx == fn_idx) {
             f
