@@ -35,6 +35,7 @@ suite:pure/programs/pack5_decision_controller.omni	div_nonimm_divisor	1
 suite:pure/programs/pack5_decision_controller.omni	multi_fn_module	1
 pure/verifier_engine.omni	param_ge4	24
 pure/verifier_engine.omni	multi_fn_module	1
+stage1_compiler_stream	label_imm_ge83	5
 TOTAL	ret_3op	0
 TOTAL	iget_imm_neg	0
 TOTAL	iget_imm_on_anew	0
@@ -45,7 +46,7 @@ TOTAL	div_imm_zero_or_m1	1
 TOTAL	sel_trit_bytes_operand	0
 TOTAL	label_mixed_forms_fn	0
 TOTAL	label_duplicate_def	0
-TOTAL	label_imm_ge83	0
+TOTAL	label_imm_ge83	5
 TOTAL	label_out_of_m2_domain	0
 TOTAL	br_trit_lt3_labels	0
 TOTAL	branch_without_label	0

@@ -861,15 +861,15 @@ pub fn selftest_m2_11_arena_elf() -> Result<usize, String> {
     }
     checks += 1;
 
-    // 3. 120-byte ELF64 header byte-exact vs Rust reference (compile_pure_u16_to_x86_64_elf_with_args)
+    // 3. 176-byte ELF64 header (PT_LOAD + PT_GNU_STACK) byte-exact vs Rust reference
     let ref_u16 = compile_omni_surface_strict_to_u16("#[strict]\nfn f(x: i64) -> i64 { return x + 1; }\n")?;
     let ref_elf = compile_pure_u16_to_x86_64_elf_with_args(&ref_u16, 0, 0, 0)?;
     let omni_hdr = run_h(1, ref_elf.len() as i64, 0)?;
-    if omni_hdr.len() != 120 || omni_hdr.as_slice() != &ref_elf[..120] {
+    if omni_hdr.len() != 176 || omni_hdr.as_slice() != &ref_elf[..176] {
         return Err(format!(
-            "M2-11 ELF64 header mismatch: len={} (want 120), first diff at {:?}",
+            "M2-11 ELF64 header mismatch: len={} (want 176), first diff at {:?}",
             omni_hdr.len(),
-            omni_hdr.iter().zip(ref_elf[..120].iter()).position(|(a, b)| a != b)
+            omni_hdr.iter().zip(ref_elf[..176].iter()).position(|(a, b)| a != b)
         ));
     }
     checks += 1;
@@ -968,7 +968,7 @@ pub fn selftest_m2_13_stage1_anchor() -> Result<usize, String> {
             want_elf.get(diff..diff.saturating_add(16).min(want_elf.len()))
         ));
     }
-    if got_elf.len() != 106_242 || fnv1a_64_hash(&got_elf) != 0xEAFC81F46B482FF8 {
+    if got_elf.len() != 112_180 || fnv1a_64_hash(&got_elf) != 0x62F14B335B52BECC {
         return Err(format!(
             "M2-13 Stage-1 anchor hash/len mismatch: {} B / 0x{:016X}",
             got_elf.len(),
@@ -2807,21 +2807,21 @@ pub fn selftest_p5_2_zero_shim_sys() -> Result<(usize, usize, u64, bool), String
         OmniValue::Bytes(b) => b,
         other => return Err(format!("P5-2 returned {:?}, expected ELF64 Bytes", other)),
     };
-    if elf.len() != 177 {
-        return Err(format!("P5-2 zero-shim ELF expected 177 B, got {} B", elf.len()));
+    if elf.len() != 233 {
+        return Err(format!("P5-2 zero-shim ELF expected 233 B, got {} B", elf.len()));
     }
     if &elf[0..4] != b"\x7fELF" {
         return Err(String::from("P5-2 ELF64 magic mismatch"));
     }
     let p_filesz = u64::from_le_bytes(elf[96..104].try_into().unwrap());
     let p_memsz = u64::from_le_bytes(elf[104..112].try_into().unwrap());
-    if p_filesz != 177 || p_memsz != 177 {
+    if p_filesz != 233 || p_memsz != 233 {
         return Err(format!("P5-2 ELF64 p_filesz/p_memsz mismatch ({}/{})", p_filesz, p_memsz));
     }
     // Verify stack-arena prologue (48 81 EC 00 00 01 00 48 89 E3) and all 3 raw `0F 05` syscalls
     let want_entry: [u8; 10] = [0x48, 0x81, 0xEC, 0x00, 0x00, 0x01, 0x00, 0x48, 0x89, 0xE3];
-    if &elf[120..130] != &want_entry {
-        return Err(format!("P5-2 arena entry stub mismatch: {:02X?}", &elf[120..130]));
+    if &elf[176..186] != &want_entry {
+        return Err(format!("P5-2 arena entry stub mismatch: {:02X?}", &elf[176..186]));
     }
     let syscall_count = elf[120..].windows(2).filter(|w| *w == [0x0F, 0x05]).count();
     if syscall_count != 3 {
@@ -5980,12 +5980,12 @@ pub fn pure_default_reject_macros(src: &str) -> Result<(), String> {
 // + Audit §3.3: Per-process decoded seed module caches (`OnceLock`).
 // ==============================================================================
 
-pub const NATIVE_M2_ELF_BYTES: usize = 105_722;
-pub const NATIVE_M2_ELF_FNV: u64 = 0x7C76_51D8_126F_C127;
-pub const NATIVE_M3_ELF_BYTES: usize = 159_913;
-pub const NATIVE_M3_ELF_FNV: u64 = 0x347D_EAE5_0D5F_109F;
-pub const NATIVE_M4_ELF_BYTES: usize = 81_599;
-pub const NATIVE_M4_ELF_FNV: u64 = 0x0C1B_F0B3_526B_EBDC;
+pub const NATIVE_M2_ELF_BYTES: usize = 106_755;
+pub const NATIVE_M2_ELF_FNV: u64 = 0xEBF3_886F_6A26_8FE5;
+pub const NATIVE_M3_ELF_BYTES: usize = 165_849;
+pub const NATIVE_M3_ELF_FNV: u64 = 0x2D65_8F17_30E2_D23B;
+pub const NATIVE_M4_ELF_BYTES: usize = 81_763;
+pub const NATIVE_M4_ELF_FNV: u64 = 0xC935_88C4_A4D4_D962;
 
 fn cached_m2_seed_module() -> Result<&'static BinModule, String> {
     static M2_MOD: std::sync::OnceLock<Result<BinModule, String>> = std::sync::OnceLock::new();
@@ -7210,7 +7210,7 @@ pub fn selftest_b4_pure_launcher() -> Result<(usize, usize, u64, bool), String> 
         OmniValue::Bytes(b) => b,
         other => return Err(format!("B4 launcher emitter returned {:?}", other)),
     };
-    if launcher_elf.len() != 181 || &launcher_elf[0..4] != b"\x7fELF" {
+    if launcher_elf.len() != 237 || &launcher_elf[0..4] != b"\x7fELF" {
         return Err(format!("B4 launcher ELF invalid: {} bytes", launcher_elf.len()));
     }
     let has_syscall = launcher_elf.windows(2).any(|w| w == [0x0F, 0x05]);
@@ -7265,7 +7265,7 @@ pub fn selftest_b4_pure_launcher() -> Result<(usize, usize, u64, bool), String> 
             .output()
             .map_err(|e| format!("B4 exec m2_native: {}", e))?;
         drop(tmp_m2);
-        if !out_m4.status.success() || out_m4.stdout.len() != 81_663 || fnv1a_64_hash(&out_m4.stdout) != 0x05304F996E83AD5B {
+        if !out_m4.status.success() || out_m4.stdout.len() != 81_827 || fnv1a_64_hash(&out_m4.stdout) != 0x1EA1507B0BBFDBAD {
             return Err(format!(
                 "B4 pure native m2.elf -> m4.elf mismatch: status={:?} len={} hash=0x{:016X}",
                 out_m4.status,
@@ -7565,8 +7565,8 @@ pub fn selftest_s4_honesty() -> Result<usize, String> {
     // 3. §4.2: `seed0/omni_seed0.rs` header comment must match the active SEED_M2 / SEED_M4 pins.
     let seed0_src = std::fs::read_to_string("seed0/omni_seed0.rs")
         .map_err(|e| format!("S4 read seed0/omni_seed0.rs: {}", e))?;
-    if !seed0_src.contains("39,049 words, 0xE2A6C5F117FDF5FE")
-        || !seed0_src.contains("27,876 words, 0xF6613357C0B93634")
+    if !seed0_src.contains("39,312 words, 0x2E5294F301EB4E90")
+        || !seed0_src.contains("27,819 words, 0x99567F6F5D0E8F32")
     {
         return Err(String::from(
             "S4.2 seed0/omni_seed0.rs header comment drifted from SEED_M2/SEED_M4 constants",
@@ -7703,9 +7703,9 @@ pub fn selftest_s3_performance() -> Result<usize, String> {
     let m4_elf = pure_default_compile_u16_to_elf(&m4_u16, 0, 0, 0)?;
     let dt_m2_ms = t1.elapsed().as_millis();
     let h_m4_elf = fnv1a_64_hash(&m4_elf);
-    if m4_elf.len() != 81_663 || h_m4_elf != 0x0530_4F99_6E83_AD5B {
+    if m4_elf.len() != 81_827 || h_m4_elf != 0x1EA1_507B_0BBF_DBAD {
         return Err(format!(
-            "S3.3 default compile-elf m4.omni_bc mismatch: {} B (0x{:016X}) != 81663 B (0x05304F996E83AD5B)",
+            "S3.3 default compile-elf m4.omni_bc mismatch: {} B (0x{:016X}) != 81827 B (0x1EA1507B0BBFDBAD)",
             m4_elf.len(),
             h_m4_elf
         ));
@@ -7763,6 +7763,122 @@ pub fn selftest_s3_performance() -> Result<usize, String> {
     checks += 1;
 
     // 5. All 5 frozen FNV-1a64 hashes intact.
+    selftest_m2_frozen_hashes()?;
+    checks += 1;
+
+    Ok(checks)
+}
+
+/// Helper: verify an ELF64 binary has `e_phnum == 2`, `e_entry == 0x4000B0`,
+/// `PT_LOAD` (`p_type=1`, `p_flags=5`) at offset 64, and non-executable
+/// `PT_GNU_STACK` (`p_type=0x6474E551`, `p_flags=6` = `PF_R | PF_W`) at offset 120.
+pub fn verify_elf64_pt_gnu_stack(elf: &[u8], label: &str) -> Result<(), String> {
+    if elf.len() < 176 || &elf[0..4] != b"\x7fELF" {
+        return Err(format!("S5.2 {}: invalid or truncated ELF64 ({} B)", label, elf.len()));
+    }
+    let e_entry = u64::from_le_bytes(elf[24..32].try_into().unwrap());
+    let e_phnum = u16::from_le_bytes(elf[56..58].try_into().unwrap());
+    let pt_load_type = u32::from_le_bytes(elf[64..68].try_into().unwrap());
+    let pt_load_flags = u32::from_le_bytes(elf[68..72].try_into().unwrap());
+    let pt_stack_type = u32::from_le_bytes(elf[120..124].try_into().unwrap());
+    let pt_stack_flags = u32::from_le_bytes(elf[124..128].try_into().unwrap());
+    if e_phnum != 2 || e_entry != 0x0040_00B0 {
+        return Err(format!(
+            "S5.2 {}: expected e_phnum=2 e_entry=0x4000B0, got e_phnum={} e_entry=0x{:X}",
+            label, e_phnum, e_entry
+        ));
+    }
+    if pt_load_type != 1 || pt_load_flags != 5 {
+        return Err(format!(
+            "S5.2 {}: bad PT_LOAD (type={}, flags={})",
+            label, pt_load_type, pt_load_flags
+        ));
+    }
+    if pt_stack_type != 0x6474_E551 || pt_stack_flags != 6 {
+        return Err(format!(
+            "S5.2 {}: missing non-exec PT_GNU_STACK (type=0x{:X}, flags={}; want 0x6474E551, 6)",
+            label, pt_stack_type, pt_stack_flags
+        ));
+    }
+    Ok(())
+}
+
+/// Audit §5 Single Re-Freeze gate (`./omni s5-refreeze`):
+///   1. §1.3 strict bounds on 4-op `ISET -9` (`iset_patch_i64` OOB -> `error[OUT_OF_BOUNDS]`,
+///      never silent no-op) on both Rust `OmniBinaryVm` and Pure-M4 VM.
+///   2. `PT_GNU_STACK` (`PF_R | PF_W`, non-executable stack) present on all generated ELFs
+///      (single-fn Rust x86-64, multi-fn Rust x86-64, Pure-M2 ELF, and Stage-1 ELF).
+///   3. Burned-down `backend-diff` xfails (IMOD rdx clobber, trit clamp, non-trit BR_POS/BR_NEG)
+///      are removed from `BACKEND_DIFF_XFAILS` and pass natively.
+///   4. All 5 re-frozen FNV-1a64 hashes intact.
+pub fn selftest_s5_refreeze() -> Result<usize, String> {
+    let mut checks = 0usize;
+
+    // 1. §1.3: 4-op ISET -9 (`iset_patch_i64`) OOB must trap with `error[OUT_OF_BOUNDS]`.
+    let oob_m9_src = "#[strict]\nfn main(x: i64) -> i64 {\n    let b: bytes = anew(0);\n    b = iset_i64(b, x);\n    b = iset_patch_i64(b, 4, 42);\n    return slen(b);\n}\n";
+    let oob_m9_u16 = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(oob_m9_src))?;
+    let oob_m9_mod = decode_omni_token_stream(&oob_m9_u16)?;
+    let mut vm = OmniBinaryVm::new();
+    match vm.execute_function(&oob_m9_mod, 0, vec![OmniValue::Int(7)]) {
+        Ok(v) => {
+            return Err(format!(
+                "S5.1 Rust VM ISET -9 OOB must return error[OUT_OF_BOUNDS], got Ok({:?})",
+                v
+            ));
+        }
+        Err(e) if !e.contains("OUT_OF_BOUNDS") => {
+            return Err(format!("S5.1 Rust VM ISET -9 OOB wrong error: {}", e));
+        }
+        Err(_) => {}
+    }
+    match pure_default_run_u16(&oob_m9_u16, 7, 0, 0, false) {
+        Ok(v) => {
+            return Err(format!(
+                "S5.1 Pure-M4 VM ISET -9 OOB must return error[OUT_OF_BOUNDS], got Ok({:?})",
+                v
+            ));
+        }
+        Err(e) if !e.contains("OUT_OF_BOUNDS") => {
+            return Err(format!("S5.1 Pure-M4 VM ISET -9 OOB wrong error: {}", e));
+        }
+        Err(_) => {}
+    }
+    checks += 1;
+
+    // 2. PT_GNU_STACK non-executable stack header on single-fn, multi-fn, and Pure-M2 ELFs.
+    let tiny_src = "#[strict]\nfn main(x: i64) -> i64 { return x + 1; }\n";
+    let tiny_u16 = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(tiny_src))?;
+    let elf_single = compile_pure_u16_to_x86_64_elf_with_args(&tiny_u16, 0, 0, 0)?;
+    verify_elf64_pt_gnu_stack(&elf_single, "rust_single_elf")?;
+    let elf_multi = compile_pure_u16_to_x86_64_elf_multi(&tiny_u16, 0, 0, 0)?;
+    verify_elf64_pt_gnu_stack(&elf_multi, "rust_multi_elf")?;
+    let elf_pure_m2 = pure_default_compile_u16_to_elf(&tiny_u16, 0, 0, 0)?;
+    verify_elf64_pt_gnu_stack(&elf_pure_m2, "pure_m2_elf")?;
+    checks += 1;
+
+    // 3. Burned-down xfails must no longer appear in BACKEND_DIFF_XFAILS.
+    let removed_xfails: &[(&str, &str)] = &[
+        ("p3_imod_rdx_clobber", "x86"),
+        ("p3_imod_zero_after_tcmp", "x86"),
+        ("p3_imod_min_neg1_after_tcmp", "x86"),
+        ("p4_trit_clamp", "x86"),
+        ("p4_trit_clamp", "wasm"),
+        ("p5_if_pos_nontrit", "x86"),
+        ("p5_if_pos_nontrit", "wasm"),
+        ("p5_if_neg_nontrit", "x86"),
+        ("p5_if_neg_nontrit", "wasm"),
+    ];
+    for &(cid, be) in removed_xfails {
+        if OMNI_DIFF4_KNOWN_DIVERGENCES.iter().any(|&(id, b, _)| id == cid && b == be) {
+            return Err(format!(
+                "S5.3 burned-down xfail ({}, {}) is still listed in OMNI_DIFF4_KNOWN_DIVERGENCES",
+                cid, be
+            ));
+        }
+    }
+    checks += 1;
+
+    // 4. All 5 re-frozen FNV-1a64 hashes intact.
     selftest_m2_frozen_hashes()?;
     checks += 1;
 

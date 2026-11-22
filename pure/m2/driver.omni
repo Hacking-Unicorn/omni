@@ -81,7 +81,7 @@ fn m2_compile_single_x86(arena: bytes, arr: array, arg0: i64, arg1: i64, arg2: i
     let ins_start: i64 = sig_pos + 3;
     let w: bytes = m2a_init(arena, n, 0, is_bytes);
     // Pass 1: emit placeholder header + prologue + body, recording every LABEL byte offset.
-    w = m2e_emit_elf64_hdr(w, 120);
+    w = m2e_emit_elf64_hdr(w, 176);
     w = m2x_single_prologue(w, is_bytes, arg0, arg1, arg2);
     w = m2_run_pass(w, arr, n, ins_start, ins_cnt, 1, is_bytes);
     let total_size: i64 = ld_u64(w, m2l_regs());

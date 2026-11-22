@@ -564,25 +564,21 @@ impl OmniBinaryVm {
                         if let Some(v) = Self::eval_as_i64(&ins.operands[2], &regs) {
                             buf.extend_from_slice(&v.to_le_bytes());
                         }
-                    } else if ins.operands.len() == 4 && ins.operands[1] == BinOperand::ImmInt(-9) {
-                        if let (Some(off), Some(v)) = (
-                            Self::eval_as_i64(&ins.operands[2], &regs),
-                            Self::eval_as_i64(&ins.operands[3], &regs),
-                        ) {
-                            if off >= 0 {
-                                let u_off = off as usize;
-                                if u_off.checked_add(8).map(|end| end <= buf.len()).unwrap_or(false) {
-                                    buf[u_off..u_off + 8].copy_from_slice(&(v as u64).to_le_bytes());
-                                }
-                            }
-                        }
                     } else if ins.operands.len() == 4
-                        && (ins.operands[1] == BinOperand::ImmInt(-2) || ins.operands[1] == BinOperand::ImmInt(-4))
+                        && (ins.operands[1] == BinOperand::ImmInt(-2)
+                            || ins.operands[1] == BinOperand::ImmInt(-4)
+                            || ins.operands[1] == BinOperand::ImmInt(-9))
                     {
-                        // ISA-B 4-op ISET buf, mode, off, val: LE patch of 2/4 bytes. Strict bounds
+                        // ISA-B 4-op ISET buf, mode, off, val: LE patch of 2/4/8 bytes (-2/-4/-9). Strict bounds
                         // (0 <= off && off + width <= len, checked add); out of bounds is a
                         // deterministic runtime error[OUT_OF_BOUNDS] (never a silent no-op).
-                        let width = if ins.operands[1] == BinOperand::ImmInt(-2) { 2usize } else { 4usize };
+                        let width = if ins.operands[1] == BinOperand::ImmInt(-2) {
+                            2usize
+                        } else if ins.operands[1] == BinOperand::ImmInt(-4) {
+                            4usize
+                        } else {
+                            8usize
+                        };
                         if let (Some(off), Some(v)) = (
                             Self::eval_as_i64(&ins.operands[2], &regs),
                             Self::eval_as_i64(&ins.operands[3], &regs),
@@ -594,6 +590,8 @@ impl OmniBinaryVm {
                             }
                             let o = off as usize;
                             buf[o..o + width].copy_from_slice(&(v as u64).to_le_bytes()[..width]);
+                        } else {
+                            return Err(String::from(OMNI_OOB_ERROR));
                         }
                     } else {
                         self.charge_memory(ins.operands.len().saturating_sub(1))?;
