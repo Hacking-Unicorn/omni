@@ -403,9 +403,40 @@ fn m2m_emit_basic(arena: bytes, op: i64, d: i64, op0: i64) -> bytes {
     return r3;
 }
 
-// Emits multi-mode IGET (3-op ISA-B ld_u8/16/32/64 from [rbx+rcx], or 2-op bounded input window).
+// Emits multi-mode 2-op IGET: guarded arena-heap byte readback when p0 is a provable ANEW/ISET
+// buffer register, else bounded input-window u16 read.
 #[strict]
-fn m2m_emit_iget(arena: bytes, nops: i64, p1: i64, p2: i64, d: i64, pass: i64) -> bytes {
+fn m2m_emit_iget_2op(arena: bytes, p0: i64, p1: i64, d: i64) -> bytes {
+    let is_reg: i64 = m2u_eq(m2d_kind(p0), 1);
+    let ridx: i64 = m2u_sel(is_reg, m2d_uval(p0), 0);
+    let in_r: i64 = is_reg * m2u_in(ridx, 0, 191);
+    let bword: i64 = ld_u64(arena, m2l_regs() + ((1900 + (ridx >> 6)) << 3));
+    let is_buf: trit = (in_r * ((bword >> (ridx & 63)) & 1)) <=> 0;
+    let r: bytes = if_pos is_buf {
+        let w: bytes = m2m_load_op(arena, p0, 0);
+        w = m2m_load_op(w, p1, 1);
+        w = m2x_b4(w, 72, 57, 193, 115);                    // 48 39 C1 73 (cmp rcx, rax; jae)
+        w = m2x_b4(w, 11, 76, 57, 217);                     // 0B 4C 39 D9 (+11; cmp rcx, r11)
+        w = m2x_b4(w, 115, 6, 15, 182);                     // 73 06 0F B6 (jae +6; movzx eax, byte [rbx+rcx])
+        w = m2a_emit_u16(w, 2820);                          // 04 0B (0x0B04)
+        w = m2x_b4(w, 235, 2, 49, 192);                     // EB 02 31 C0 (jmp +2; xor eax, eax)
+        m2m_store_rax(w, d)
+    } else {
+        let w: bytes = m2m_load_op(arena, p1, 0);
+        w = m2x_b3(w, 72, 59, 131);                         // 48 3B 83
+        w = m2a_emit_u32(w, 1179648);                       // 00 00 12 00
+        w = m2a_emit_u16(w, 2675);                          // 73 0A (0x0A73)
+        w = m2x_b4(w, 15, 183, 132, 67);                    // 0F B7 84 43
+        w = m2a_emit_u32(w, 1048576);                       // 00 00 10 00
+        w = m2x_b4(w, 235, 2, 49, 192);                     // EB 02 31 C0
+        m2m_store_rax(w, d)
+    };
+    return r;
+}
+
+// Emits multi-mode IGET (3-op ISA-B ld_u8/16/32/64 from [rbx+rcx], or 2-op buffer/window read).
+#[strict]
+fn m2m_emit_iget(arena: bytes, nops: i64, p0: i64, p1: i64, p2: i64, d: i64, pass: i64) -> bytes {
     let is_3op: trit = m2u_eq(nops, 3) <=> 0;
     let r: bytes = if_pos is_3op {
         let mv: i64 = m2d_ival(p1);
@@ -422,14 +453,7 @@ fn m2m_emit_iget(arena: bytes, nops: i64, p1: i64, p2: i64, d: i64, pass: i64) -
         let w4: bytes = if_pos c8 { m2x_b4(w3, 72, 139, 4, 11) } else { w3 };
         m2m_store_rax(w4, d)
     } else {
-        let w: bytes = m2m_load_op(arena, p1, 0);
-        w = m2x_b3(w, 72, 59, 131);                         // 48 3B 83
-        w = m2a_emit_u32(w, 1179648);                       // 00 00 12 00
-        w = m2a_emit_u16(w, 2675);                          // 73 0A (0x0A73)
-        w = m2x_b4(w, 15, 183, 132, 67);                    // 0F B7 84 43
-        w = m2a_emit_u32(w, 1048576);                       // 00 00 10 00
-        w = m2x_b4(w, 235, 2, 49, 192);                     // EB 02 31 C0
-        m2m_store_rax(w, d)
+        m2m_emit_iget_2op(arena, p0, p1, d)
     };
     return r;
 }
@@ -934,7 +958,7 @@ fn m2m_emit_one_ins(arena: bytes, arr: array, n: i64, cur: i64, pass: i64, is_by
     let c_alu: trit = (m2u_in(op, 32528, 32557) + m2u_eq(op, 32565) + m2u_eq(op, 32575)) <=> 0;
     let c_ctl: trit = m2u_in(op, 32576, 32586) <=> 0;
     let r1: bytes = if_pos c_basic { m2m_emit_basic(arena, op, d, p0) } else { arena };
-    let r2: bytes = if_pos c_iget { m2m_emit_iget(r1, nops, p1, p2, d, pass) } else { r1 };
+    let r2: bytes = if_pos c_iget { m2m_emit_iget(r1, nops, p0, p1, p2, d, pass) } else { r1 };
     let r3: bytes = if_pos c_iset { m2m_emit_iset(r2, arr, n, ops_start, nops, d, pass) } else { r2 };
     let r4: bytes = if_pos c_alu { m2m_emit_alu_group(r3, op, d, p0, p1, p2) } else { r3 };
     let r5: bytes = if_pos c_ctl { m2m_emit_ctl_group(r4, arr, n, ops_start, nops, op, d, p0, p1, p2, p3, pass, is_bytes) } else { r4 };
@@ -1033,6 +1057,7 @@ fn m2m_run_all_fns(arena: bytes, arr: array, n: i64, first_fn: i64, pass: i64) -
         let fn_off: i64 = ld_u64(w, m2l_regs()) - 176;
         w = m2a_g_set(w, 16 + fid, fn_off + 1);
         w = m2a_g_set(w, m2mg_arr_mask(), m2m_param_arr_mask(arr, n, pos, p_cnt));
+        w = m2x_bufreg_scan(w, arr, n, ins_start, ins_cnt);
         w = m2m_emit_fn_prologue(w, frame_bytes);
         let cur: i64 = ins_start;
         let ii: i64 = 0;

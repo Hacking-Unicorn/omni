@@ -27,8 +27,8 @@ pub fn pure_default_reject_macros(src: &str) -> Result<(), String> {
 // + Audit §3.3: Per-process decoded seed module caches (`OnceLock`).
 // ==============================================================================
 
-pub const NATIVE_M2_ELF_BYTES: usize = 106_755;
-pub const NATIVE_M2_ELF_FNV: u64 = 0xEBF3_886F_6A26_8FE5;
+pub const NATIVE_M2_ELF_BYTES: usize = 109_076;
+pub const NATIVE_M2_ELF_FNV: u64 = 0xE2BF_E6BF_AD8E_0D3E;
 pub const NATIVE_M3_ELF_BYTES: usize = 165_849;
 pub const NATIVE_M3_ELF_FNV: u64 = 0x2D65_8F17_30E2_D23B;
 pub const NATIVE_M4_ELF_BYTES: usize = 81_763;

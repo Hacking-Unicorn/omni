@@ -1068,6 +1068,70 @@ pub fn selftest_m2_15_pure_multi_compiler() -> Result<usize, String> {
     }
     checks += 1;
 
+    // 7. Audit Round 2 N2: Pure-M2 2-op IGET on provable ANEW/ISET bytes buffer must read ISET heap
+    //    (not token region) in BOTH multi-mode (`emit_multi.omni`) and single-mode (`emit_x86.omni`).
+    let n2_src = "#[strict]\nfn main(a: i64, b: i64, c: i64) -> i64 {\n    let w: bytes = anew(0);\n    w = iset_i32(w, a);\n    return iget(w, b) + c;\n}\n";
+    let n2_u16 = compile_omni_surface_strict_to_u16(n2_src)?;
+    let n2_multi_pure = compile_in_omni(&n2_u16, 300, 0, 0)?;
+    let n2_multi_rust = compile_pure_u16_to_x86_64_elf_multi(&n2_u16, 300, 0, 0)?;
+    if n2_multi_pure != n2_multi_rust {
+        return Err(String::from("N2 multi-mode Pure-M2 != Rust-M2-multi on 2-op IGET buffer repro"));
+    }
+    let single_mod = m2_compile_decoder(M2_COMPILER_OMNI_SRC)?;
+    let single_entry = m2_entry_of(&single_mod);
+    let mut single_vm = OmniBinaryVm::with_budgets(500_000_000, 32 * 1024 * 1024);
+    let n2_single_pure = match single_vm.execute_function(
+        &single_mod,
+        single_entry,
+        vec![
+            OmniValue::Bytes(vec![0u8; 524_288]),
+            OmniValue::U16Array(n2_u16.clone()),
+            OmniValue::Int(300),
+            OmniValue::Int(0),
+            OmniValue::Int(0),
+        ],
+    )? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("N2 single-mode compiler returned {:?}", other)),
+    };
+    let n2_single_rust = compile_pure_u16_to_x86_64_elf_with_args(&n2_u16, 300, 0, 0)?;
+    if n2_single_pure != n2_single_rust {
+        return Err(String::from("N2 single-mode Pure-M2 != Rust-AOT on 2-op IGET buffer repro"));
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        for &(tag, elf) in &[
+            ("multi-mode", &n2_multi_pure),
+            ("single-mode", &n2_single_pure),
+        ] {
+            let tmp = PrivateTempElf::new(elf, &format!("n2_iget_{}", tag))?;
+            let out = std::process::Command::new(&tmp.path)
+                .output()
+                .map_err(|e| format!("N2 exec {}: {}", tag, e))?;
+            if !out.status.success() || out.stdout.len() != 8 {
+                return Err(format!("N2 {} exited {:?} stdout={}B", tag, out.status, out.stdout.len()));
+            }
+            let got = i64::from_le_bytes(out.stdout[..8].try_into().unwrap());
+            if got != 44 {
+                return Err(format!("N2 {} 2-op IGET buffer repro returned {}, want 44", tag, got));
+            }
+        }
+        // OOB index b=10 must return 0 (lenient 2-op IGET contract).
+        let n2_oob_elf = compile_in_omni(&n2_u16, 300, 10, 0)?;
+        let tmp_oob = PrivateTempElf::new(&n2_oob_elf, "n2_iget_oob")?;
+        let out_oob = std::process::Command::new(&tmp_oob.path)
+            .output()
+            .map_err(|e| format!("N2 exec oob: {}", e))?;
+        if !out_oob.status.success() || out_oob.stdout.len() != 8 {
+            return Err(format!("N2 oob exited {:?} stdout={}B", out_oob.status, out_oob.stdout.len()));
+        }
+        let got_oob = i64::from_le_bytes(out_oob.stdout[..8].try_into().unwrap());
+        if got_oob != 0 {
+            return Err(format!("N2 multi-mode 2-op IGET OOB returned {}, want 0", got_oob));
+        }
+    }
+    checks += 1;
+
     Ok(checks)
 }
 
@@ -7078,7 +7142,7 @@ pub fn selftest_s4_honesty() -> Result<usize, String> {
     // 3. §4.2: `seed0/omni_seed0.rs` header comment must match the active SEED_M2 / SEED_M4 pins.
     let seed0_src = std::fs::read_to_string("seed0/omni_seed0.rs")
         .map_err(|e| format!("S4 read seed0/omni_seed0.rs: {}", e))?;
-    if !seed0_src.contains("39,312 words, 0x2E5294F301EB4E90")
+    if !seed0_src.contains("40,234 words, 0x653BD567AAF5E0DB")
         || !seed0_src.contains("27,819 words, 0x99567F6F5D0E8F32")
     {
         return Err(String::from(

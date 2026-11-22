@@ -18664,6 +18664,12 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
 
         let mut label_offsets: Vec<(u16, usize)> = Vec::new();
         let mut relocs: Vec<RelocPatch> = Vec::new();
+        let multi_buffer_regs: std::collections::BTreeSet<u16> = func
+            .instructions
+            .iter()
+            .filter(|i| matches!(i.op_tok, 0x7F0D | 0x7F0F))
+            .filter_map(|i| i.dest_reg)
+            .collect();
 
         for ins in &func.instructions {
             match ins.op_tok {
@@ -18719,6 +18725,20 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
                             4 => code.extend_from_slice(&[0x8B, 0x04, 0x0B]),
                             _ => code.extend_from_slice(&[0x48, 0x8B, 0x04, 0x0B]),
                         }
+                        if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                    } else if let Some(BinOperand::Reg(r_arr)) = ins.operands.first().filter(|o| {
+                        matches!(o, BinOperand::Reg(r) if multi_buffer_regs.contains(r))
+                    }) {
+                        let _ = r_arr;
+                        // Guarded arena-heap byte readback for provable ANEW/ISET buffer registers.
+                        emit_load_op(&mut code, &ins.operands[0], false); // rax = len
+                        emit_load_op(&mut code, &ins.operands[1], true);  // rcx = idx
+                        code.extend_from_slice(&[
+                            0x48, 0x39, 0xC1, 0x73, 0x0B, // cmp rcx, rax; jae +11
+                            0x4C, 0x39, 0xD9, 0x73, 0x06, // cmp rcx, r11; jae +6
+                            0x0F, 0xB6, 0x04, 0x0B,       // movzx eax, byte [rbx+rcx]
+                            0xEB, 0x02, 0x31, 0xC0,       // jmp +2; xor eax, eax
+                        ]);
                         if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
                     } else {
                         // Bounded 2-op input-window u16 read: idx >= nwords (unsigned) -> 0
