@@ -215,7 +215,7 @@ pure/verifier_engine.omni	wasm	89	0xED536F43A04128DA
 stage1_compiler_stream	u16	20443	0xED4C50AA79563EFF
 stage1_compiler_stream	x86_000	112180	0x737B95FB048CE737
 stage1_compiler_stream	x86_454090	112180	0x62F14B335B52BECC
-stage1_compiler_stream	wasm	150739	0x47AAE1F02052863A
+stage1_compiler_stream	wasm	150781	0x94B1E5883B1569AA
 phase_d_gen1_stream	u16	159	0x23B8D17257CCA9C4
 phase_d_gen1_stream	x86_000	880	0xF2031002FA9867AE
 phase_d_gen1_stream	x86_454090	880	0xDF6CEA5905EBF197
