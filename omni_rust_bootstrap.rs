@@ -23417,6 +23417,10 @@ fn selftest_a2_pure_include_count() -> Result<usize, String> {
     Ok(selftest_a2_pure_include()?.0)
 }
 
+fn selftest_a3_macro_quarantine_count() -> Result<usize, String> {
+    selftest_a3_macro_quarantine()
+}
+
 /// All Milestone 2..7 + API Stage 1 foundation selftests (parallel-lane accelerated).
 pub fn run_m2_foundation_selftests() -> Result<usize, String> {
     let parallel_tasks: &[SelftestLaneTask] = &[
@@ -23457,6 +23461,7 @@ pub fn run_m2_foundation_selftests() -> Result<usize, String> {
         ("p7_learn", selftest_p7_learn_count),
         ("a1_pure_default", selftest_a1_pure_default_count),
         ("a2_pure_include", selftest_a2_pure_include_count),
+        ("a3_macro_quarantine", selftest_a3_macro_quarantine_count),
     ];
     let mut n = run_selftest_tasks_in_lanes(parallel_tasks)?;
     // Sequential: toggles global M3 lockstep state.
@@ -23979,6 +23984,19 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
                 1
             }
         },
+        "a3-macro-quarantine" => match selftest_a3_macro_quarantine() {
+            Ok(n) => {
+                println!(
+                    "[A3-MACRO-QUARANTINE PASS] {} checks | macro rejected on pure default path (ORACLE_ONLY_MACRO) + --rust oracle intact + weighted_diff_pure_golden 0-diff M3/M2/M4 + frozen hashes intact",
+                    n
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("[A3-MACRO-QUARANTINE FAIL] {}", e);
+                1
+            }
+        },
         "p5-sys" => match selftest_p5_2_zero_shim_sys() {
             Ok((n, sz, h, native)) => {
                 println!(
@@ -24463,6 +24481,7 @@ fn main() {
                 println!("  p7-learn                          Phase 7 (P7-3): tamper-checked ternary experience table, safety floor, @PACK5 export & self-learning gate");
                 println!("  a1-pure-default                   Seed-Shrink A1: Pure-Omni M3->M2/M4 default CLI path vs --rust oracle gate");
                 println!("  a2-pure-include                   Seed-Shrink A2: Pure-Omni O-5 include expander (pure/m3/include.omni) & cycle gate");
+                println!("  a3-macro-quarantine               Seed-Shrink A3: quarantine macros behind --rust oracle & verify pure replacement golden");
                 println!("  compile [--rust|--oracle] <in> <out>     Compile .omni to .omni_bc via Pure M3 by default");
                 println!("  self-host [--rust|--oracle]              Run Pure M3->M4->M2 self-host chain by default");
                 println!();
@@ -24492,7 +24511,7 @@ fn main() {
             "harness" | "--harness" => {
                 std::process::exit(run_omni_harness_cli(&cli_args[2..]));
             }
-            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" | "p7-heal" | "p7-adapt" | "p7-learn" | "a1-pure-default" | "a2-pure-include" | "api-stage1" | "api-stage2" | "api-stage2-emit" | "api-stage2-5" => {
+            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" | "p7-heal" | "p7-adapt" | "p7-learn" | "a1-pure-default" | "a2-pure-include" | "a3-macro-quarantine" | "api-stage1" | "api-stage2" | "api-stage2-emit" | "api-stage2-5" => {
                 std::process::exit(run_m2_cli(&cli_args[1..]));
             }
             "agent-driver" | "--agent-driver" => {

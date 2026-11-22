@@ -1,0 +1,20 @@
+// Seed-Shrink A3 pure library replacement for macro-using `stdlib_macro_pipeline_golden.omni`.
+// Zero macros, zero Rust-only intrinsics -> 100% Pure-Omni M3 -> M2 -> M4 clean.
+#[strict]
+fn pure_clamp(x: i64, lo: i64, hi: i64) -> i64 {
+    let a: i64 = if_pos (x - lo) <=> 0 { x } else { lo };
+    return if_pos (hi - a) <=> 0 { a } else { hi };
+}
+
+#[strict]
+fn weighted_diff(lhs: i64, rhs: i64, scale: i64) -> i64 {
+    return (lhs - rhs) * scale;
+}
+
+#[strict]
+fn main(x: i64, lo: i64, hi: i64) -> i64 {
+    let c: i64 = pure_clamp(x, lo, hi);
+    let d: i64 = weighted_diff(c, lo, 3);
+    let bonus: i64 = sel_trit((d - 50) <=> 0, -10, 0, 10);
+    return d + bonus;
+}

@@ -5926,9 +5926,20 @@ pub fn selftest_p7_learn() -> Result<(usize, usize, usize), String> {
     Ok((checks, lrn_u16.len(), lrn_elf_rust.len()))
 }
 
-/// Seed-Shrink Phase A1: Compile `.omni` surface source using ONLY the committed Pure-Omni M3 seed
-/// (`pure/m3/m3.omni_bc`) — zero Rust frontend calls.
+/// Seed-Shrink Phase A1/A3: Compile `.omni` surface source using ONLY the committed Pure-Omni M3 seed
+/// (`pure/m3/m3.omni_bc`) — zero Rust frontend calls, and hard-rejects Rust-only `macro` directives
+/// with `error[ORACLE_ONLY_MACRO]` (Seed-Shrink A3 quarantine).
 pub fn pure_default_compile_surface_to_u16(src: &str, strict: bool) -> Result<Vec<u16>, String> {
+    for (idx, raw_line) in src.lines().enumerate() {
+        let trimmed = raw_line.trim_start();
+        if trimmed.starts_with("macro ") || trimmed.starts_with("macro\t") {
+            let col = raw_line.len().saturating_sub(trimmed.len()) + 1;
+            return Err(format!(
+                "error[ORACLE_ONLY_MACRO] line {}, col {}: 'macro' is quarantined behind --rust/--oracle; rewrite as a pure fn for the default pure path",
+                idx + 1, col
+            ));
+        }
+    }
     match m3_lockstep_compile_via_omni(src, strict)? {
         Ok(u16_stream) => Ok(u16_stream),
         Err((code, line, col)) => Err(format!(
@@ -6304,5 +6315,73 @@ pub fn selftest_a2_pure_include() -> Result<(usize, usize, usize), String> {
     checks += 1;
 
     Ok((checks, inc_u16.len(), inc_elf_pure.len()))
+}
+
+/// Seed-Shrink Phase A3 hard gate (`./omnic a3-macro-quarantine`):
+///   1. Pure-default M3 rejects macro-using `stdlib_macro_pipeline_golden.omni` with `error[ORACLE_ONLY_MACRO]` at line 2, col 1.
+///   2. `--rust` oracle still compiles & executes `stdlib_macro_pipeline_golden.omni` (45, 10, 40 -> 100).
+///   3. Pure library replacement `weighted_diff_pure_golden.omni` passes Pure-M3 (0-word diff), Pure-M2 (0-byte diff),
+///      and Pure-M4 VM (45, 10, 40 -> 100).
+///   4. Manifest tags `stdlib_macro_pipeline_golden` as `"oracle_only": true` + all 5 frozen hashes intact.
+pub fn selftest_a3_macro_quarantine() -> Result<usize, String> {
+    let mut checks = 0usize;
+
+    // 1. Pure-default path rejects `macro` with structured `error[ORACLE_ONLY_MACRO]` + 1-based span.
+    let macro_path = "spec/acceptance/goldens/stdlib_macro_pipeline_golden.omni";
+    let macro_src = std::fs::read_to_string(macro_path).map_err(|e| format!("A3 read {}: {}", macro_path, e))?;
+    match pure_default_compile_surface_to_u16(&macro_src, true) {
+        Ok(_) => return Err(String::from("A3 pure default path must reject macro-using fixture")),
+        Err(msg) => {
+            if !msg.starts_with("error[ORACLE_ONLY_MACRO]") || !msg.contains("line 2, col 1") {
+                return Err(format!("A3 macro quarantine error mismatch: {}", msg));
+            }
+        }
+    }
+    checks += 1;
+
+    // 2. `--rust` oracle still handles the quarantined macro fixture (45, 10, 40 -> 100).
+    let oracle_u16 = with_lockstep_suspended(|| compile_omni_surface_file_to_u16(macro_path))?;
+    let oracle_mod = decode_omni_token_stream(&oracle_u16)?;
+    let mut vm = OmniBinaryVm::new();
+    let oracle_res = vm.execute_function(
+        &oracle_mod,
+        0,
+        vec![OmniValue::Int(45), OmniValue::Int(10), OmniValue::Int(40)],
+    )?;
+    if oracle_res != OmniValue::Int(100) {
+        return Err(format!("A3 rust oracle macro fixture got {:?} want Int(100)", oracle_res));
+    }
+    checks += 1;
+
+    // 3. Pure library replacement `weighted_diff_pure_golden.omni` passes Pure-M3/M2/M4 (45, 10, 40 -> 100).
+    let pure_path = "spec/acceptance/goldens/weighted_diff_pure_golden.omni";
+    let pure_src = std::fs::read_to_string(pure_path).map_err(|e| format!("A3 read {}: {}", pure_path, e))?;
+    let pure_u16 = pure_default_compile_surface_to_u16(&pure_src, true)?;
+    let rust_u16 = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(&pure_src))?;
+    if pure_u16 != rust_u16 {
+        return Err(String::from("A3 Pure-M3 vs Rust oracle word diff on weighted_diff_pure_golden.omni"));
+    }
+    let pure_elf = pure_default_compile_u16_to_elf(&pure_u16, 45, 10, 40)?;
+    let rust_elf = compile_pure_u16_to_x86_64_elf_multi(&pure_u16, 45, 10, 40)?;
+    if pure_elf != rust_elf {
+        return Err(String::from("A3 Pure-M2 vs Rust oracle byte diff on weighted_diff_pure_golden.omni"));
+    }
+    let (m4_ret, _) = pure_default_run_u16(&pure_u16, 45, 10, 40, false)?;
+    if m4_ret != 100 {
+        return Err(format!("A3 Pure-M4 VM on weighted_diff_pure_golden.omni got {} want 100", m4_ret));
+    }
+    let _ = p7_verify_native_elf_i64("a3_weighted_diff_pure", &pure_elf, 100)?;
+    checks += 1;
+
+    // 4. Manifest explicitly marks macro fixture `oracle_only: true` + frozen hashes intact.
+    let manifest = std::fs::read_to_string("spec/acceptance/acceptance_manifest.json")
+        .map_err(|e| format!("A3 read manifest: {}", e))?;
+    if !manifest.contains("\"stdlib_macro_pipeline_golden\"") || !manifest.contains("\"oracle_only\": true") {
+        return Err(String::from("A3 manifest must mark stdlib_macro_pipeline_golden as oracle_only: true"));
+    }
+    selftest_m2_frozen_hashes()?;
+    checks += 1;
+
+    Ok(checks)
 }
 
