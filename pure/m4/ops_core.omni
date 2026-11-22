@@ -296,13 +296,7 @@ fn m4o_exec_iset_patch(w: bytes, sp: i64, dslot: i64, v0: i64, mode: i64, off: i
         let w2: bytes = m4f_set_slot_val(w1, sp, dslot, v0);
         m4f_set_slot_tag(w2, sp, dslot, 3)
     } else {
-        let w_err: bytes = if_pos is_i64 <=> 0 {
-            let w2: bytes = m4f_set_slot_val(w, sp, dslot, v0);
-            m4f_set_slot_tag(w2, sp, dslot, 3)
-        } else {
-            m4_set_err(w, 2)
-        };
-        w_err
+        m4_set_err(w, 2)
     };
     return out;
 }

@@ -178,7 +178,7 @@ fn m2m_trap_rel32(arena: bytes, trap_slot: i64, pass: i64) -> bytes {
     let p2: trit = m2u_eq(pass, 2) <=> 0;
     let r: bytes = if_pos p2 {
         let tgt: i64 = ld_u64(arena, m2l_regs() + (trap_slot << 3));
-        let cur: i64 = ld_u64(arena, m2l_regs()) - 120;
+        let cur: i64 = ld_u64(arena, m2l_regs()) - 176;
         m2a_emit_u32(arena, tgt - (cur + 4))
     } else {
         m2a_emit_u32(arena, 0)
@@ -197,7 +197,7 @@ fn m2m_fn_rel32(arena: bytes, fn_idx: i64, pass: i64) -> bytes {
         let valid: i64 = in_rng * m2u_lt(0, raw_val);
         let t_oob_tgt: i64 = ld_u64(arena, m2l_regs() + (m2mg_t_oob() << 3));
         let tgt: i64 = m2u_sel(valid, raw_val - 1, t_oob_tgt);
-        let cur: i64 = ld_u64(arena, m2l_regs()) - 120;
+        let cur: i64 = ld_u64(arena, m2l_regs()) - 176;
         m2a_emit_u32(arena, tgt - (cur + 4))
     } else {
         m2a_emit_u32(arena, 0)
@@ -216,7 +216,7 @@ fn m2m_lbl_rel32(arena: bytes, packed_lbl: i64, pass: i64) -> bytes {
         let raw_tgt: i64 = m2lbl_lookup(arena, lbase + loc_slot);
         let t_oob_tgt: i64 = ld_u64(arena, m2l_regs() + (m2mg_t_oob() << 3));
         let tgt: i64 = m2u_sel(m2u_ge(raw_tgt, 0), raw_tgt, t_oob_tgt);
-        let cur: i64 = ld_u64(arena, m2l_regs()) - 120;
+        let cur: i64 = ld_u64(arena, m2l_regs()) - 176;
         m2a_emit_u32(arena, tgt - (cur + 4))
     } else {
         m2a_emit_u32(arena, 0)
@@ -327,13 +327,13 @@ fn m2m_emit_entry_stub(arena: bytes, is_bytes: i64, entry_fn: i64, arg0: i64, ar
         t = m2a_emit_u32(t, 60);
         m2a_emit_u16(t, 1295)
     };
-    let off_trunc: i64 = ld_u64(w4, m2l_regs()) - 120;
+    let off_trunc: i64 = ld_u64(w4, m2l_regs()) - 176;
     let w5: bytes = m2a_g_set(w4, m2mg_t_trunc(), off_trunc);
     w5 = m2e_emit_trap_stub(w5, 2);
-    let off_oob: i64 = ld_u64(w5, m2l_regs()) - 120;
+    let off_oob: i64 = ld_u64(w5, m2l_regs()) - 176;
     w5 = m2a_g_set(w5, m2mg_t_oob(), off_oob);
     w5 = m2e_emit_trap_stub(w5, 1);
-    let off_cap: i64 = ld_u64(w5, m2l_regs()) - 120;
+    let off_cap: i64 = ld_u64(w5, m2l_regs()) - 176;
     w5 = m2a_g_set(w5, m2mg_t_cap(), off_cap);
     w5 = m2e_emit_trap_stub(w5, 3);
     return w5;
@@ -434,30 +434,24 @@ fn m2m_emit_iget(arena: bytes, nops: i64, p1: i64, p2: i64, d: i64, pass: i64) -
     return r;
 }
 
-// Emits multi-mode 4-op ISET (-9 patch no-op on OOB, or -2/-4 ISA-B st_u16/st_u32).
+// Emits multi-mode 4-op ISET (-2 st_u16, -4 st_u32, -9 iset_patch_i64; all strict OOB -> T_OOB).
 #[strict]
 fn m2m_emit_iset_patch(arena: bytes, mv: i64, p2: i64, p3: i64, pass: i64) -> bytes {
-    let is_m9: trit = m2u_eq(mv, 0 - 9) <=> 0;
-    let r: bytes = if_pos is_m9 {
-        let t: bytes = m2m_load_op(arena, p2, 1);
-        t = m2m_load_op(t, p3, 0);
-        t = m2x_b3(t, 72, 133, 201);                        // 48 85 C9
-        t = m2a_emit_u16(t, 3448);                          // 78 0D (0x0D78)
-        t = m2x_b4(t, 72, 141, 113, 8);                     // 48 8D 71 08
-        t = m2x_b3(t, 76, 57, 222);                         // 4C 39 DE
-        t = m2a_emit_u16(t, 1143);                          // 77 04 (0x0477)
-        m2x_b4(t, 72, 137, 4, 11)                           // 48 89 04 0B
+    let is_m9: i64 = m2u_eq(mv, 0 - 9);
+    let width: i64 = m2u_sel(is_m9, 8, 0 - mv);
+    let t: bytes = m2m_load_op(arena, p3, 0);
+    t = m2x_b3(t, 72, 137, 194);                            // 48 89 C2
+    t = m2m_load_op(t, p2, 1);
+    t = m2m_oob_check(t, width, pass);
+    let c2: trit = m2u_eq(width, 2) <=> 0;
+    let c4: trit = m2u_eq(width, 4) <=> 0;
+    let r: bytes = if_pos c2 {
+        m2x_b4(t, 102, 137, 20, 11)                         // 66 89 14 0B
     } else {
-        let width: i64 = 0 - mv;
-        let t: bytes = m2m_load_op(arena, p3, 0);
-        t = m2x_b3(t, 72, 137, 194);                        // 48 89 C2
-        t = m2m_load_op(t, p2, 1);
-        t = m2m_oob_check(t, width, pass);
-        let c2: trit = m2u_eq(width, 2) <=> 0;
-        if_pos c2 {
-            m2x_b4(t, 102, 137, 20, 11)                     // 66 89 14 0B
-        } else {
+        if_pos c4 {
             m2x_b3(t, 137, 20, 11)                          // 89 14 0B
+        } else {
+            m2x_b4(t, 72, 137, 20, 11)                      // 48 89 14 0B
         }
     };
     return r;
@@ -858,7 +852,7 @@ fn m2m_emit_branch(arena: bytes, op: i64, op0: i64, op1: i64, op2: i64, op3: i64
         let lbase: i64 = ld_u64(arena, m2l_regs() + 104);
         let raw_slot: i64 = m2lbl_slot_of(op0);
         let loc_slot: i64 = m2u_sel(m2u_ge(raw_slot, 4080), raw_slot - 4080, raw_slot + 16);
-        let code_off: i64 = ld_u64(arena, m2l_regs()) - 120;
+        let code_off: i64 = ld_u64(arena, m2l_regs()) - 176;
         m2lbl_define(arena, lbase + loc_slot, code_off)
     } else {
         arena
@@ -1036,7 +1030,7 @@ fn m2m_run_all_fns(arena: bytes, arr: array, n: i64, first_fn: i64, pass: i64) -
         let meta: i64 = m2m_scan_fn_meta(arr, n, ins_start, ins_cnt);
         let max_r: i64 = meta >> 24;
         let frame_bytes: i64 = ((8 * (max_r + 1)) + 15) & (0 - 16);
-        let fn_off: i64 = ld_u64(w, m2l_regs()) - 120;
+        let fn_off: i64 = ld_u64(w, m2l_regs()) - 176;
         w = m2a_g_set(w, 16 + fid, fn_off + 1);
         w = m2a_g_set(w, m2mg_arr_mask(), m2m_param_arr_mask(arr, n, pos, p_cnt));
         w = m2m_emit_fn_prologue(w, frame_bytes);
@@ -1065,7 +1059,7 @@ fn m2_compile_multi_x86_into(arena: bytes, arr: array, arg0: i64, arg1: i64, arg
     let entry_b: i64 = einfo >> 16;
     let w: bytes = m2a_init(arena, n, 1, entry_b);
     // Pass 1: emit placeholder header + entry stub + trap stubs + all functions (records fn_offsets & labels).
-    w = m2e_emit_elf64_hdr(w, 120);
+    w = m2e_emit_elf64_hdr(w, 176);
     w = m2m_emit_entry_stub(w, entry_b, entry_fn, arg0, arg1, arg2, 1);
     w = m2m_run_all_fns(w, arr, n, first_fn, 1);
     let total_size: i64 = ld_u64(w, m2l_regs());

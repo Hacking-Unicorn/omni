@@ -1713,6 +1713,8 @@ impl OmniBinaryVm {
                     }
                 }
                 0x7F0E => {
+                    // Legacy 2-op IGET (arr[i] / buf[i]): explicitly lenient (returns Int(0) on OOB)
+                    // across Rust VM, Pure-M4 VM, Wasm, and x86 emitters (ISA-B 3-op IGET above is strict).
                     let idx_opt = Self::eval_as_i64(&ins.operands[1], &regs);
                     match (Self::eval_op_ref(&ins.operands[0], &regs), idx_opt) {
                         (Some(OmniValue::U16Array(arr)), Some(i)) if i >= 0 && (i as usize) < arr.len() => {
@@ -1777,25 +1779,21 @@ impl OmniBinaryVm {
                         if let Some(v) = Self::eval_as_i64(&ins.operands[2], &regs) {
                             buf.extend_from_slice(&v.to_le_bytes());
                         }
-                    } else if ins.operands.len() == 4 && ins.operands[1] == BinOperand::ImmInt(-9) {
-                        if let (Some(off), Some(v)) = (
-                            Self::eval_as_i64(&ins.operands[2], &regs),
-                            Self::eval_as_i64(&ins.operands[3], &regs),
-                        ) {
-                            if off >= 0 {
-                                let u_off = off as usize;
-                                if u_off.checked_add(8).map(|end| end <= buf.len()).unwrap_or(false) {
-                                    buf[u_off..u_off + 8].copy_from_slice(&(v as u64).to_le_bytes());
-                                }
-                            }
-                        }
                     } else if ins.operands.len() == 4
-                        && (ins.operands[1] == BinOperand::ImmInt(-2) || ins.operands[1] == BinOperand::ImmInt(-4))
+                        && (ins.operands[1] == BinOperand::ImmInt(-2)
+                            || ins.operands[1] == BinOperand::ImmInt(-4)
+                            || ins.operands[1] == BinOperand::ImmInt(-9))
                     {
-                        // ISA-B 4-op ISET buf, mode, off, val: LE patch of 2/4 bytes. Strict bounds
+                        // ISA-B 4-op ISET buf, mode, off, val: LE patch of 2/4/8 bytes (-2/-4/-9). Strict bounds
                         // (0 <= off && off + width <= len, checked add); out of bounds is a
                         // deterministic runtime error[OUT_OF_BOUNDS] (never a silent no-op).
-                        let width = if ins.operands[1] == BinOperand::ImmInt(-2) { 2usize } else { 4usize };
+                        let width = if ins.operands[1] == BinOperand::ImmInt(-2) {
+                            2usize
+                        } else if ins.operands[1] == BinOperand::ImmInt(-4) {
+                            4usize
+                        } else {
+                            8usize
+                        };
                         if let (Some(off), Some(v)) = (
                             Self::eval_as_i64(&ins.operands[2], &regs),
                             Self::eval_as_i64(&ins.operands[3], &regs),
@@ -1807,6 +1805,8 @@ impl OmniBinaryVm {
                             }
                             let o = off as usize;
                             buf[o..o + width].copy_from_slice(&(v as u64).to_le_bytes()[..width]);
+                        } else {
+                            return Err(String::from(OMNI_OOB_ERROR));
                         }
                     } else {
                         for op_b in &ins.operands[1..] {
@@ -12102,7 +12102,7 @@ pub fn run_pure_core_phase4_selfhost_fixed_point_selftests() -> Result<usize, St
     // 3. Verify Phase D ELF64 fixed point and Stage-1 compiler stream remain bit-exact alongside the expanded suite
     let (g1_u16, g2_u16, g1_elf, g2_elf) = run_phase_d_pure_omni_selfhost_bootstrap()?;
     let s1_u16 = build_step7_stage1_compiler_stream();
-    if g1_u16.len() != 159 || g1_u16 != g2_u16 || g1_elf.len() != 824 || g1_elf != g2_elf || s1_u16.len() != 19731 {
+    if g1_u16.len() != FROZEN_PHASE_D_BC_WORDS || g1_u16 != g2_u16 || g1_elf.len() != FROZEN_PHASE_D_ELF_BYTES || g1_elf != g2_elf || s1_u16.len() != FROZEN_STAGE1_BC_WORDS {
         return Err(format!(
             "Phase 4 Stage-1 or Phase-D fixed-point regression detected: g1={}, g2={}, elf={}, s1={}",
             g1_u16.len(),
@@ -15437,15 +15437,13 @@ pub const OMNI_DIFF4_GOLDENS: &[DiffGolden] = &[
         runs: &[(&[3], DiffExpect::OobErr), (&[-3], DiffExpect::OobErr)],
         backends: DIFF4_ALL,
     },
-    // --- P9: iset_patch_i64 with a negative offset (-8..-1) is a silent no-op on the VM ---
-    // Decided in HANDOFF.md 6.4 (no-op, not panic, not error): buf keeps its 8 bytes, slen = 8.
-    // AOT behaviour for this input is unspecified, so only the VM is asserted.
+    // --- P9 / Audit §1.3 & §5: iset_patch_i64 (-9) with a negative offset traps with OUT_OF_BOUNDS ---
     DiffGolden {
         id: "p9_vm_patch_negative_offset",
         proposal: "P9",
         src: "fn patchn(x: i64) -> i64 { let buf = anew(0); buf = iset_i64(buf, 5); let off = 0 - 3; buf = iset_patch_i64(buf, off, 77); let n = slen(buf); return n; }",
-        runs: &[(&[7], DiffExpect::I64(8))],
-        backends: &["vm"],
+        runs: &[(&[7], DiffExpect::OobErr)],
+        backends: &["vm", "m4"],
     },
     // --- M2-06 (D-1): 3-op RET buf, off, len / ret_slice(buf, off, len) ---
     DiffGolden {
@@ -15540,26 +15538,13 @@ pub const OMNI_DIFF4_KNOWN_DIVERGENCES: &[(&str, &str, &str)] = &[
     ("p11_pack5_direct_aot", "stage1", "Stage-1 is frozen; rejects TPACK5/TUNPACK5/TDOT/EGATE with error[UNSUPPORTED] (C2)"),
     ("p11_pack5_trit_vec", "stage1", "Stage-1 is frozen; rejects TPACK5/TDOT/EGATE with error[UNSUPPORTED] (C2)"),
     ("p11_decision_hook", "stage1", "Stage-1 is frozen; rejects EGATE 0x7F35 with error[UNSUPPORTED] (C2)"),
-    // P3: IMOD stale rdx / C2 up-front rejection on Stage-1.
-    ("p3_imod_rdx_clobber", "x86", "N1: IMOD guard (14667-14675) jumps over cqo/idiv for b==0 and MIN/-1, then mov rax,rdx copies a stale rdx (TCMP leaves rdx=trit)"),
+    // P3: C2 up-front rejection on Stage-1 (x86 IMOD stale rdx fixed in Audit §5).
     ("p3_imod_rdx_clobber", "stage1", "Stage-1 is frozen; rejects IMOD 0x7F14 with error[UNSUPPORTED] (C2)"),
-    ("p3_imod_zero_after_tcmp", "x86", "N1, see p3_imod_rdx_clobber/x86"),
     ("p3_imod_zero_after_tcmp", "stage1", "Stage-1 is frozen; rejects IMOD 0x7F14 with error[UNSUPPORTED] (C2)"),
-    ("p3_imod_min_neg1_after_tcmp", "x86", "N1, see p3_imod_rdx_clobber/x86"),
     ("p3_imod_min_neg1_after_tcmp", "stage1", "Stage-1 is frozen; rejects IMOD 0x7F14 with error[UNSUPPORTED] (C2)"),
     ("p3_imod_control_no_tcmp", "stage1", "Stage-1 is frozen; rejects IMOD 0x7F14 with error[UNSUPPORTED] (C2)"),
     ("s1_int_min_mod", "stage1", "Stage-1 is frozen; rejects IMOD 0x7F14 with error[UNSUPPORTED] (C2)"),
-    // P4: trit ops without clamping (spec.md:53).
-    ("p4_trit_clamp", "wasm", "N3: Wasm TNOT/TAND/TOR/TXOR/TMAJ do not clamp i64 operands (15332, 15352-15357)"),
-    ("p4_trit_clamp", "x86", "N3: x86 TAND/TOR share IMIN/IMAX (14714), TNOT shares INEG (14676); no clamp"),
-    ("p4_trit_clamp", "stage1", "N3: Stage-1 shares the same arms (16293, 16310); no clamp"),
-    // P5: BR_POS/BR_NEG compare == +-1 instead of clamping.
-    ("p5_if_pos_nontrit", "wasm", "N2: Wasm BR_POS compares == 1 (15451-15460); VM clamps via eval_as_trit (1115, 1213-1218)"),
-    ("p5_if_pos_nontrit", "x86", "N2: x86 BR_POS emits cmp rax,1; je (14793-14800)"),
-    ("p5_if_pos_nontrit", "stage1", "N2: Stage-1 BR_POS (lbl_br_pos 16504+) emits the same cmp rax,1"),
-    ("p5_if_neg_nontrit", "wasm", "N2: Wasm BR_NEG compares == -1 (15451-15460)"),
-    ("p5_if_neg_nontrit", "x86", "N2: x86 BR_NEG emits cmp rax,-1; je (14793-14800)"),
-    ("p5_if_neg_nontrit", "stage1", "N2: Stage-1 BR_NEG (lbl_br_neg 16513+) mirrors x86"),
+    // (P4 trit clamping and P5 BR_POS/BR_NEG fixed on x86, Wasm, and Stage-1 in Audit §5.)
     // ISA-B shapes on Stage-1: Stage-1 is frozen and rejects ISA-B up front with error[UNSUPPORTED].
     ("isab_ld_u8_unsigned", "stage1", "Stage-1 is frozen; rejects ISA-B 3-op IGET with error[UNSUPPORTED]"),
     ("isab_oob_ld_u8_past_end", "stage1", "Stage-1 is frozen; rejects ISA-B 3-op IGET with error[UNSUPPORTED]"),
@@ -16477,14 +16462,15 @@ fn main(x: i64, y: i64) -> i64 {
 
 pub const FROZEN_PHASE_D_BC_WORDS: usize = 159;
 pub const FROZEN_PHASE_D_BC_FNV1A64: u64 = 0x23B8D17257CCA9C4;
-pub const FROZEN_PHASE_D_ELF_BYTES: usize = 824;
-pub const FROZEN_PHASE_D_ELF_FNV1A64: u64 = 0xE221085777B8AC47;
+// Re-frozen in Audit §5 (single deliberate re-freeze: PT_GNU_STACK + strict ISET -9 + IMOD/trit-clamp/BR_POS/BR_NEG).
+pub const FROZEN_PHASE_D_ELF_BYTES: usize = 880;
+pub const FROZEN_PHASE_D_ELF_FNV1A64: u64 = 0x8D5AAAD22399A1EE;
 pub const FROZEN_CORE_SUITE_WORDS: usize = 14_559;
 pub const FROZEN_CORE_SUITE_FNV1A64: u64 = 0x78462AE4C81DF408;
-pub const FROZEN_STAGE1_ELF_BYTES: usize = 106_242;
-pub const FROZEN_STAGE1_ELF_FNV1A64: u64 = 0xEAFC81F46B482FF8;
-pub const FROZEN_STAGE1_BC_WORDS: usize = 19_731;
-pub const FROZEN_STAGE1_BC_FNV1A64: u64 = 0x677F57AE71D28FED;
+pub const FROZEN_STAGE1_ELF_BYTES: usize = 112_180;
+pub const FROZEN_STAGE1_ELF_FNV1A64: u64 = 0x62F14B335B52BECC;
+pub const FROZEN_STAGE1_BC_WORDS: usize = 20_443;
+pub const FROZEN_STAGE1_BC_FNV1A64: u64 = 0xED4C50AA79563EFF;
 
 /// 13BF. C1: Pin the 5 frozen FNV-1a64 hashes and exact sizes (`HANDOFF.md` §3).
 pub fn run_frozen_hash_pin_selftests() -> Result<usize, String> {
@@ -18138,18 +18124,28 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
                 }
                 if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
             }
-            0x7F13 | 0x7F14 => {
+            0x7F13 => {
                 emit_load_op(&mut code, &ins.operands[0], false);
                 emit_load_op(&mut code, &ins.operands[1], true);
                 code.extend_from_slice(&[0x49, 0x89, 0xC0, 0x48, 0x85, 0xC9, 0x74, 0x1E, 0x48, 0x83, 0xF9, 0xFF, 0x75, 0x11, 0x49, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x4D, 0x39, 0xC8, 0x75, 0x02, 0xEB, 0x0A, 0x48, 0x99, 0x48, 0xF7, 0xF9, 0xEB, 0x03, 0x48, 0x31, 0xC0]);
-                if ins.op_tok == 0x7F14 {
-                    code.extend_from_slice(&[0x48, 0x89, 0xD0]);
-                }
                 if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
             }
-            0x7F15 | 0x7F28 => {
+            0x7F14 => {
+                // Audit §5: IMOD guard lands on `xor rax, rax` for b==0 and INT_MIN%-1; `mov rax, rdx` runs only after idiv.
+                emit_load_op(&mut code, &ins.operands[0], false);
+                emit_load_op(&mut code, &ins.operands[1], true);
+                code.extend_from_slice(&[0x49, 0x89, 0xC0, 0x48, 0x85, 0xC9, 0x74, 0x21, 0x48, 0x83, 0xF9, 0xFF, 0x75, 0x11, 0x49, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x4D, 0x39, 0xC8, 0x75, 0x02, 0xEB, 0x0A, 0x48, 0x99, 0x48, 0xF7, 0xF9, 0x48, 0x89, 0xD0, 0xEB, 0x03, 0x48, 0x31, 0xC0]);
+                if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+            }
+            0x7F15 => {
                 emit_load_op(&mut code, &ins.operands[0], false);
                 code.extend_from_slice(&[0x48, 0xF7, 0xD8]);
+                if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+            }
+            0x7F28 => {
+                // Audit §5: TNOT clamps operand to [-1, 1] before negating.
+                emit_load_op(&mut code, &ins.operands[0], false);
+                code.extend_from_slice(&[0x48, 0x83, 0xF8, 0x00, 0x0F, 0x9F, 0xC0, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC0, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD0, 0x48, 0xF7, 0xD8]);
                 if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
             }
             0x7F16 => {
@@ -18185,29 +18181,54 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
                 ]);
                 if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
             }
-            0x7F29 | 0x7F17 => {
+            0x7F17 => {
                 emit_load_op(&mut code, &ins.operands[0], false);
                 emit_load_op(&mut code, &ins.operands[1], true);
                 code.extend_from_slice(&[0x48, 0x39, 0xC8, 0x48, 0x0F, 0x4F, 0xC1]);
                 if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
             }
-            0x7F2A | 0x7F18 => {
+            0x7F29 => {
+                // Audit §5: TAND clamps both operands to [-1, 1].
+                emit_load_op(&mut code, &ins.operands[0], false);
+                emit_load_op(&mut code, &ins.operands[1], true);
+                code.extend_from_slice(&[0x48, 0x83, 0xF8, 0x00, 0x0F, 0x9F, 0xC0, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC0, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD0]);
+                code.extend_from_slice(&[0x48, 0x83, 0xF9, 0x00, 0x0F, 0x9F, 0xC1, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC9, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD1]);
+                code.extend_from_slice(&[0x48, 0x39, 0xC8, 0x48, 0x0F, 0x4F, 0xC1]);
+                if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+            }
+            0x7F18 => {
                 emit_load_op(&mut code, &ins.operands[0], false);
                 emit_load_op(&mut code, &ins.operands[1], true);
                 code.extend_from_slice(&[0x48, 0x39, 0xC8, 0x48, 0x0F, 0x4C, 0xC1]);
                 if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
             }
-            0x7F2B => {
+            0x7F2A => {
+                // Audit §5: TOR clamps both operands to [-1, 1].
                 emit_load_op(&mut code, &ins.operands[0], false);
                 emit_load_op(&mut code, &ins.operands[1], true);
+                code.extend_from_slice(&[0x48, 0x83, 0xF8, 0x00, 0x0F, 0x9F, 0xC0, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC0, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD0]);
+                code.extend_from_slice(&[0x48, 0x83, 0xF9, 0x00, 0x0F, 0x9F, 0xC1, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC9, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD1]);
+                code.extend_from_slice(&[0x48, 0x39, 0xC8, 0x48, 0x0F, 0x4C, 0xC1]);
+                if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+            }
+            0x7F2B => {
+                // Audit §5: TXOR clamps both operands to [-1, 1].
+                emit_load_op(&mut code, &ins.operands[0], false);
+                emit_load_op(&mut code, &ins.operands[1], true);
+                code.extend_from_slice(&[0x48, 0x83, 0xF8, 0x00, 0x0F, 0x9F, 0xC0, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC0, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD0]);
+                code.extend_from_slice(&[0x48, 0x83, 0xF9, 0x00, 0x0F, 0x9F, 0xC1, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC9, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD1]);
                 code.extend_from_slice(&[0x48, 0x0F, 0xAF, 0xC1, 0x48, 0xF7, 0xD8]);
                 if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
             }
             0x7F2C => {
+                // Audit §5: TMAJ clamps all 3 operands to [-1, 1].
                 emit_load_op(&mut code, &ins.operands[0], false);
                 emit_load_op(&mut code, &ins.operands[1], true);
+                code.extend_from_slice(&[0x48, 0x83, 0xF8, 0x00, 0x0F, 0x9F, 0xC0, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC0, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD0]);
+                code.extend_from_slice(&[0x48, 0x83, 0xF9, 0x00, 0x0F, 0x9F, 0xC1, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC9, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD1]);
                 code.extend_from_slice(&[0x48, 0x01, 0xC8]);
                 emit_load_op(&mut code, &ins.operands[2], true);
+                code.extend_from_slice(&[0x48, 0x83, 0xF9, 0x00, 0x0F, 0x9F, 0xC1, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC9, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD1]);
                 code.extend_from_slice(&[
                     0x48, 0x01, 0xC8,
                     0x48, 0x83, 0xF8, 0x00,
@@ -18265,10 +18286,11 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
                 }
             }
             0x7F43 | 0x7F44 => {
+                // Audit §5: BR_POS compares > 0 (`jg`), BR_NEG compares < 0 (`jl`) to match VM trit clamping.
                 if let Some(lbl) = ins.operands.get(1).and_then(extract_label_id) {
                     emit_load_op(&mut code, &ins.operands[0], false);
-                    code.extend_from_slice(&[0x48, 0x83, 0xF8, if ins.op_tok == 0x7F43 { 0x01 } else { 0xFF }]);
-                    code.extend_from_slice(&[0x0F, 0x84]);
+                    code.extend_from_slice(&[0x48, 0x83, 0xF8, 0x00]);
+                    code.extend_from_slice(&[0x0F, if ins.op_tok == 0x7F43 { 0x8F } else { 0x8C }]);
                     relocs.push(RelocPatch { patch_offset: code.len(), target_label: lbl });
                     code.extend_from_slice(&[0, 0, 0, 0]);
                 }
@@ -18359,10 +18381,10 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
     }
 
     let base_vaddr: u64 = 0x400000;
-    let entry_vaddr: u64 = base_vaddr + 120;
-    let total_size: u64 = 120 + (code.len() as u64);
+    let entry_vaddr: u64 = base_vaddr + 176;
+    let total_size: u64 = 176 + (code.len() as u64);
 
-    let mut elf = vec![0u8; 120];
+    let mut elf = vec![0u8; 176];
     elf[0..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
     elf[4] = 2;
     elf[5] = 1;
@@ -18374,7 +18396,7 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
     elf[32..40].copy_from_slice(&64u64.to_le_bytes());
     elf[52..54].copy_from_slice(&64u16.to_le_bytes());
     elf[54..56].copy_from_slice(&56u16.to_le_bytes());
-    elf[56..58].copy_from_slice(&1u16.to_le_bytes());
+    elf[56..58].copy_from_slice(&2u16.to_le_bytes());
 
     elf[64..68].copy_from_slice(&1u32.to_le_bytes());
     elf[68..72].copy_from_slice(&5u32.to_le_bytes());
@@ -18383,6 +18405,10 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
     elf[96..104].copy_from_slice(&total_size.to_le_bytes());
     elf[104..112].copy_from_slice(&total_size.to_le_bytes());
     elf[112..120].copy_from_slice(&0x1000u64.to_le_bytes());
+    // PT_GNU_STACK (non-executable stack: PF_R | PF_W)
+    elf[120..124].copy_from_slice(&0x6474_E551u32.to_le_bytes());
+    elf[124..128].copy_from_slice(&6u32.to_le_bytes());
+    elf[168..176].copy_from_slice(&16u64.to_le_bytes());
 
     elf.extend_from_slice(&code);
     Ok(elf)
@@ -18723,19 +18749,18 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
                         emit_cap_guard(&mut code, &mut trap_relocs, 8);
                         emit_load_op(&mut code, &ins.operands[2], false);
                         code.extend_from_slice(&[0x4A, 0x89, 0x04, 0x1B, 0x49, 0x83, 0xC3, 0x08]);
-                    } else if ins.operands.len() == 4 && ins.operands[1] == BinOperand::ImmInt(-9) {
-                        emit_load_op(&mut code, &ins.operands[2], true);
-                        emit_load_op(&mut code, &ins.operands[3], false);
-                        code.extend_from_slice(&[
-                            0x48, 0x85, 0xC9, 0x78, 0x0D,       // test rcx, rcx; js +13 (no-op)
-                            0x48, 0x8D, 0x71, 0x08,             // lea rsi, [rcx+8]
-                            0x4C, 0x39, 0xDE, 0x77, 0x04,       // cmp rsi, r11; ja +4 (no-op)
-                            0x48, 0x89, 0x04, 0x0B,             // mov [rbx+rcx], rax
-                        ]);
                     } else if ins.operands.len() == 4
-                        && (ins.operands[1] == BinOperand::ImmInt(-2) || ins.operands[1] == BinOperand::ImmInt(-4))
+                        && (ins.operands[1] == BinOperand::ImmInt(-2)
+                            || ins.operands[1] == BinOperand::ImmInt(-4)
+                            || ins.operands[1] == BinOperand::ImmInt(-9))
                     {
-                        let width: u8 = if ins.operands[1] == BinOperand::ImmInt(-2) { 2 } else { 4 };
+                        let width: u8 = if ins.operands[1] == BinOperand::ImmInt(-2) {
+                            2
+                        } else if ins.operands[1] == BinOperand::ImmInt(-4) {
+                            4
+                        } else {
+                            8
+                        };
                         emit_load_op(&mut code, &ins.operands[3], false);
                         code.extend_from_slice(&[0x48, 0x89, 0xC2]); // mov rdx, rax
                         emit_load_op(&mut code, &ins.operands[2], true); // rcx = off
@@ -18751,8 +18776,10 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
                         code.extend_from_slice(&[0, 0, 0, 0]);
                         if width == 2 {
                             code.extend_from_slice(&[0x66, 0x89, 0x14, 0x0B]); // mov [rbx+rcx], dx
-                        } else {
+                        } else if width == 4 {
                             code.extend_from_slice(&[0x89, 0x14, 0x0B]);       // mov [rbx+rcx], edx
+                        } else {
+                            code.extend_from_slice(&[0x48, 0x89, 0x14, 0x0B]); // mov [rbx+rcx], rdx
                         }
                     } else {
                         let k = ins.operands.len().saturating_sub(1) as u32;
@@ -19061,10 +19088,10 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
     }
 
     let base_vaddr: u64 = 0x400000;
-    let entry_vaddr: u64 = base_vaddr + 120;
-    let total_size: u64 = 120 + (code.len() as u64);
+    let entry_vaddr: u64 = base_vaddr + 176;
+    let total_size: u64 = 176 + (code.len() as u64);
 
-    let mut elf = vec![0u8; 120];
+    let mut elf = vec![0u8; 176];
     elf[0..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
     elf[4] = 2;
     elf[5] = 1;
@@ -19076,7 +19103,7 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
     elf[32..40].copy_from_slice(&64u64.to_le_bytes());
     elf[52..54].copy_from_slice(&64u16.to_le_bytes());
     elf[54..56].copy_from_slice(&56u16.to_le_bytes());
-    elf[56..58].copy_from_slice(&1u16.to_le_bytes());
+    elf[56..58].copy_from_slice(&2u16.to_le_bytes());
     elf[64..68].copy_from_slice(&1u32.to_le_bytes());
     elf[68..72].copy_from_slice(&5u32.to_le_bytes());
     elf[80..88].copy_from_slice(&base_vaddr.to_le_bytes());
@@ -19084,6 +19111,10 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
     elf[96..104].copy_from_slice(&total_size.to_le_bytes());
     elf[104..112].copy_from_slice(&total_size.to_le_bytes());
     elf[112..120].copy_from_slice(&0x1000u64.to_le_bytes());
+    // PT_GNU_STACK (non-executable stack: PF_R | PF_W)
+    elf[120..124].copy_from_slice(&0x6474_E551u32.to_le_bytes());
+    elf[124..128].copy_from_slice(&6u32.to_le_bytes());
+    elf[168..176].copy_from_slice(&16u64.to_le_bytes());
 
     elf.extend_from_slice(&code);
     Ok(elf)
@@ -19828,10 +19859,19 @@ fn compile_wasm_single_func_body(
                 }
                 emit_wasm_set_dest(b, ins.dest_reg);
             }
-            0x7F15 | 0x7F28 => {
+            0x7F15 => {
                 b.extend_from_slice(&[0x42, 0x00]);
                 emit_wasm_op(b, &ins.operands[0]);
                 b.push(0x7D);
+                emit_wasm_set_dest(b, ins.dest_reg);
+            }
+            0x7F28 => {
+                // Audit §5: TNOT clamps operand to [-1, 1] via (x < 0) - (x > 0).
+                emit_wasm_op(b, &ins.operands[0]);
+                b.push(0x22); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x53, 0xAD]);
+                b.push(0x20); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x55, 0xAD, 0x7D]);
                 emit_wasm_set_dest(b, ins.dest_reg);
             }
             0x7F16 => {
@@ -19848,19 +19888,50 @@ fn compile_wasm_single_func_body(
                 b.extend_from_slice(&[0x42, 0x7F, 0x85]);
                 emit_wasm_set_dest(b, ins.dest_reg);
             }
-            0x7F17 | 0x7F29 | 0x7F18 | 0x7F2A => {
+            0x7F17 | 0x7F18 => {
                 emit_wasm_op(b, &ins.operands[0]);
                 emit_wasm_op(b, &ins.operands[1]);
                 emit_wasm_op(b, &ins.operands[0]);
                 emit_wasm_op(b, &ins.operands[1]);
-                b.push(if matches!(ins.op_tok, 0x7F17 | 0x7F29) { 0x53 } else { 0x55 });
+                b.push(if ins.op_tok == 0x7F17 { 0x53 } else { 0x55 });
+                b.push(0x1B);
+                emit_wasm_set_dest(b, ins.dest_reg);
+            }
+            0x7F29 | 0x7F2A => {
+                // Audit §5: TAND/TOR clamp both operands to [-1, 1] before min/max.
+                emit_wasm_op(b, &ins.operands[0]);
+                b.push(0x22); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x55, 0xAD]);
+                b.push(0x20); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x53, 0xAD, 0x7D]);
+                b.push(0x21); b.extend(encode_uleb128(scratch0));
+                emit_wasm_op(b, &ins.operands[1]);
+                b.push(0x22); b.extend(encode_uleb128(scratch1));
+                b.extend_from_slice(&[0x42, 0x00, 0x55, 0xAD]);
+                b.push(0x20); b.extend(encode_uleb128(scratch1));
+                b.extend_from_slice(&[0x42, 0x00, 0x53, 0xAD, 0x7D]);
+                b.push(0x21); b.extend(encode_uleb128(scratch1));
+                b.push(0x20); b.extend(encode_uleb128(scratch0));
+                b.push(0x20); b.extend(encode_uleb128(scratch1));
+                b.push(0x20); b.extend(encode_uleb128(scratch0));
+                b.push(0x20); b.extend(encode_uleb128(scratch1));
+                b.push(if ins.op_tok == 0x7F29 { 0x53 } else { 0x55 });
                 b.push(0x1B);
                 emit_wasm_set_dest(b, ins.dest_reg);
             }
             0x7F2B => {
+                // Audit §5: TXOR clamps both operands to [-1, 1] before -(a*b).
                 b.extend_from_slice(&[0x42, 0x00]);
                 emit_wasm_op(b, &ins.operands[0]);
+                b.push(0x22); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x55, 0xAD]);
+                b.push(0x20); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x53, 0xAD, 0x7D]);
                 emit_wasm_op(b, &ins.operands[1]);
+                b.push(0x22); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x55, 0xAD]);
+                b.push(0x20); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x53, 0xAD, 0x7D]);
                 b.extend_from_slice(&[0x7E, 0x7D]);
                 emit_wasm_set_dest(b, ins.dest_reg);
             }
@@ -19877,10 +19948,23 @@ fn compile_wasm_single_func_body(
                 emit_wasm_set_dest(b, ins.dest_reg);
             }
             0x7F2C => {
+                // Audit §5: TMAJ clamps all 3 operands to [-1, 1] before summing.
                 emit_wasm_op(b, &ins.operands[0]);
+                b.push(0x22); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x55, 0xAD]);
+                b.push(0x20); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x53, 0xAD, 0x7D]);
                 emit_wasm_op(b, &ins.operands[1]);
+                b.push(0x22); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x55, 0xAD]);
+                b.push(0x20); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x53, 0xAD, 0x7D]);
                 b.push(0x7C);
                 emit_wasm_op(b, &ins.operands[2]);
+                b.push(0x22); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x55, 0xAD]);
+                b.push(0x20); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x53, 0xAD, 0x7D]);
                 b.push(0x7C);
                 b.push(0x22); b.extend(encode_uleb128(scratch0));
                 b.extend_from_slice(&[0x42, 0x00, 0x55, 0xAD]);
@@ -20027,8 +20111,8 @@ fn compile_wasm_single_func_body(
                     body.extend(encode_sleb128((ins_idx + 1) as i64));
                     emit_wasm_op(&mut body, &ins.operands[0]);
                     body.push(0x42);
-                    body.extend(encode_sleb128(if ins.op_tok == 0x7F43 { 1 } else { -1 }));
-                    body.extend_from_slice(&[0x51, 0x1B]);
+                    body.push(0x00);
+                    body.extend_from_slice(&[if ins.op_tok == 0x7F43 { 0x55 } else { 0x53 }, 0x1B]);
                     body.push(0x21);
                     body.extend(encode_uleb128(pc_local));
                     body.extend_from_slice(&[0x0C, 0x01]);
@@ -20706,7 +20790,7 @@ pub fn build_step7_stage1_compiler_stream() -> Vec<u16> {
     let r_loff     = alloc_ssa_ins(&mut ins, &mut next_reg, tc_safe, 0x7F06, TY_I64,   vec![TOK_IMM_I16, 0]);
     let r_retty    = alloc_ssa_ins(&mut ins, &mut next_reg, tc_safe, 0x7F06, TY_I64,   vec![TOK_IMM_I16, 0]);
 
-    const MAX_LABELS: usize = 83;
+    const MAX_LABELS: usize = 85;
     let mut r_lbl = [0u16; MAX_LABELS];
     for k in 0..MAX_LABELS {
         r_lbl[k] = alloc_ssa_ins(&mut ins, &mut next_reg, tc_safe, 0x7F06, TY_I64, vec![TOK_IMM_I16, 0]);
@@ -20740,15 +20824,18 @@ pub fn build_step7_stage1_compiler_stream() -> Vec<u16> {
     set_ssa_reg(&mut ins, tc_safe, r_retty, 0x7F0E, TY_I64, vec![0x7EC0, r_tmp2]);
     set_ssa_reg(&mut ins, tc_safe, r_pos,   0x7F10, TY_I64, vec![r_tmp2, TOK_IMM_I16, 3]);
 
-    let mut elf_hdr = [0u8; 120];
+    let mut elf_hdr = [0u8; 176];
     elf_hdr[0..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
     elf_hdr[4] = 2; elf_hdr[5] = 1; elf_hdr[6] = 1;
     elf_hdr[16] = 2; elf_hdr[18] = 0x3E; elf_hdr[20] = 1;
-    elf_hdr[24] = 0x78; elf_hdr[25] = 0x00; elf_hdr[26] = 0x40;
-    elf_hdr[32] = 64; elf_hdr[52] = 64; elf_hdr[54] = 56; elf_hdr[56] = 1;
+    elf_hdr[24] = 0xB0; elf_hdr[25] = 0x00; elf_hdr[26] = 0x40;
+    elf_hdr[32] = 64; elf_hdr[52] = 64; elf_hdr[54] = 56; elf_hdr[56] = 2;
     elf_hdr[64] = 1; elf_hdr[68] = 5;
     elf_hdr[82] = 0x40; elf_hdr[90] = 0x40;
     elf_hdr[113] = 0x10;
+    elf_hdr[120..124].copy_from_slice(&0x6474_E551u32.to_le_bytes());
+    elf_hdr[124..128].copy_from_slice(&6u32.to_le_bytes());
+    elf_hdr[168..176].copy_from_slice(&16u64.to_le_bytes());
     emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &elf_hdr);
 
     emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x55, 0x48, 0x89, 0xE5, 0x48, 0x81, 0xEC, 0x00, 0x00, 0x03, 0x00]);
@@ -20976,15 +21063,18 @@ pub fn build_step7_stage1_compiler_stream() -> Vec<u16> {
         (0x7F1F, 0x09, 0xC8),
         (0x7F20, 0x31, 0xC8),
         (0x7F15, 0xF7, 0xD8),
-        (0x7F28, 0xF7, 0xD8),
         (0x7F21, 0xF7, 0xD0),
         (0x7F22, 0xD3, 0xE0),
         (0x7F23, 0xD3, 0xF8),
     ];
+    let lbl_tnot = next_lbl; next_lbl += 1;
+    let lbl_tand_tor = next_lbl; next_lbl += 1;
     for &(op_c, _, _) in ops_3b {
         set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, op_c]);
         emit_br_pos_ins(&mut ins, r_cond, lbl_emit_3b);
     }
+    set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, 0x7F28]);
+    emit_br_pos_ins(&mut ins, r_cond, lbl_tnot);
     set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, 0x7F12]);
     emit_br_pos_ins(&mut ins, r_cond, lbl_imul);
     set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, 0x7F13]);
@@ -20993,9 +21083,13 @@ pub fn build_step7_stage1_compiler_stream() -> Vec<u16> {
     emit_br_pos_ins(&mut ins, r_cond, lbl_imod);
     set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, 0x7F16]);
     emit_br_pos_ins(&mut ins, r_cond, lbl_iabs);
-    for op_mm in [0x7F17u16, 0x7F29, 0x7F18, 0x7F2A] {
+    for op_mm in [0x7F17u16, 0x7F18] {
         set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, op_mm]);
         emit_br_pos_ins(&mut ins, r_cond, lbl_imin_imax);
+    }
+    for op_mm in [0x7F29u16, 0x7F2A] {
+        set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, op_mm]);
+        emit_br_pos_ins(&mut ins, r_cond, lbl_tand_tor);
     }
     set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, 0x7F2B]);
     emit_br_pos_ins(&mut ins, r_cond, lbl_txor);
@@ -21005,6 +21099,10 @@ pub fn build_step7_stage1_compiler_stream() -> Vec<u16> {
     }
     set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, 0x7F2D]);
     emit_br_pos_ins(&mut ins, r_cond, lbl_tcmp);
+    emit_jmp_ins(&mut ins, lbl_store_dst);
+
+    emit_lbl_ins(&mut ins, lbl_tnot);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x83, 0xF8, 0x00, 0x0F, 0x9F, 0xC0, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC0, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD0, 0x48, 0xF7, 0xD8]);
     emit_jmp_ins(&mut ins, lbl_store_dst);
 
     emit_lbl_ins(&mut ins, lbl_emit_3b);
@@ -21027,12 +21125,15 @@ pub fn build_step7_stage1_compiler_stream() -> Vec<u16> {
     emit_jmp_ins(&mut ins, lbl_store_dst);
 
     emit_lbl_ins(&mut ins, lbl_imod);
-    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x49, 0x89, 0xC0, 0x48, 0x85, 0xC9, 0x74, 0x1E, 0x48, 0x83, 0xF9, 0xFF, 0x75, 0x11, 0x49, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x4D, 0x39, 0xC8, 0x75, 0x02, 0xEB, 0x0A, 0x48, 0x99, 0x48, 0xF7, 0xF9, 0xEB, 0x03, 0x48, 0x31, 0xC0, 0x48, 0x89, 0xD0]);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x49, 0x89, 0xC0, 0x48, 0x85, 0xC9, 0x74, 0x21, 0x48, 0x83, 0xF9, 0xFF, 0x75, 0x11, 0x49, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x4D, 0x39, 0xC8, 0x75, 0x02, 0xEB, 0x0A, 0x48, 0x99, 0x48, 0xF7, 0xF9, 0x48, 0x89, 0xD0, 0xEB, 0x03, 0x48, 0x31, 0xC0]);
     emit_jmp_ins(&mut ins, lbl_store_dst);
 
     emit_lbl_ins(&mut ins, lbl_iabs);
     emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x89, 0xC2, 0x48, 0xF7, 0xD8, 0x48, 0x0F, 0x48, 0xC2]);
     emit_jmp_ins(&mut ins, lbl_store_dst);
+
+    emit_lbl_ins(&mut ins, lbl_tand_tor);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x83, 0xF8, 0x00, 0x0F, 0x9F, 0xC0, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC0, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD0, 0x48, 0x83, 0xF9, 0x00, 0x0F, 0x9F, 0xC1, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC9, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD1]);
 
     emit_lbl_ins(&mut ins, lbl_imin_imax);
     set_ssa_reg(&mut ins, tc_safe, r_tmp,  0x7F06, TY_I64,  vec![TOK_IMM_I16, 0x4F]);
@@ -21044,7 +21145,7 @@ pub fn build_step7_stage1_compiler_stream() -> Vec<u16> {
     emit_jmp_ins(&mut ins, lbl_store_dst);
 
     emit_lbl_ins(&mut ins, lbl_txor);
-    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x0F, 0xAF, 0xC1, 0x48, 0xF7, 0xD8]);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x83, 0xF8, 0x00, 0x0F, 0x9F, 0xC0, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC0, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD0, 0x48, 0x83, 0xF9, 0x00, 0x0F, 0x9F, 0xC1, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC9, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD1, 0x48, 0x0F, 0xAF, 0xC1, 0x48, 0xF7, 0xD8]);
     emit_jmp_ins(&mut ins, lbl_store_dst);
 
     emit_lbl_ins(&mut ins, lbl_cmp4);
@@ -21067,9 +21168,10 @@ pub fn build_step7_stage1_compiler_stream() -> Vec<u16> {
     emit_jmp_ins(&mut ins, lbl_store_dst);
 
     emit_lbl_ins(&mut ins, lbl_tmaj);
-    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x01, 0xC8]);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x83, 0xF8, 0x00, 0x0F, 0x9F, 0xC0, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC0, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD0, 0x48, 0x83, 0xF9, 0x00, 0x0F, 0x9F, 0xC1, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC9, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD1, 0x48, 0x01, 0xC8]);
     emit_decode_operand(&mut ins, &mut next_lbl, true);
     emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[
+        0x48, 0x83, 0xF9, 0x00, 0x0F, 0x9F, 0xC1, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC9, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD1,
         0x48, 0x01, 0xC8, 0x48, 0x83, 0xF8, 0x00,
         0x0F, 0x9F, 0xC0, 0x0F, 0x9C, 0xC2,
         0x0F, 0xB6, 0xC0, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD0,
@@ -21190,7 +21292,7 @@ pub fn build_step7_stage1_compiler_stream() -> Vec<u16> {
     emit_lbl_ins(&mut ins, lbl_br_pos);
     set_ssa_reg(&mut ins, tc_safe, r_cur, 0x7F10, TY_I64, vec![r_pos, TOK_IMM_I16, 1]);
     emit_decode_operand(&mut ins, &mut next_lbl, false);
-    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x83, 0xF8, 0x01, 0x0F, 0x84]);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x83, 0xF8, 0x00, 0x0F, 0x8F]);
     emit_read_label_id(&mut ins);
     emit_rel32_for_lid(&mut ins);
     set_ssa_reg(&mut ins, tc_safe, r_pos, 0x7F10, TY_I64, vec![r_cur, TOK_IMM_I16, 1]);
@@ -21199,7 +21301,7 @@ pub fn build_step7_stage1_compiler_stream() -> Vec<u16> {
     emit_lbl_ins(&mut ins, lbl_br_neg);
     set_ssa_reg(&mut ins, tc_safe, r_cur, 0x7F10, TY_I64, vec![r_pos, TOK_IMM_I16, 1]);
     emit_decode_operand(&mut ins, &mut next_lbl, false);
-    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x83, 0xF8, 0xFF, 0x0F, 0x84]);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x83, 0xF8, 0x00, 0x0F, 0x8C]);
     emit_read_label_id(&mut ins);
     emit_rel32_for_lid(&mut ins);
     set_ssa_reg(&mut ins, tc_safe, r_pos, 0x7F10, TY_I64, vec![r_cur, TOK_IMM_I16, 1]);
@@ -23292,9 +23394,9 @@ fn print_artifact_manifest(paths: &[&str]) {
 /// Lengths are in u16 words for streams and in bytes for ELF images.
 pub const M2_FROZEN_HASHES: [(&str, usize, u64); 4] = [
     ("phase_d_omni_bc_words", 159, 0x23B8D17257CCA9C4),
-    ("phase_d_elf_bytes", 824, 0xE221085777B8AC47),
+    ("phase_d_elf_bytes", 880, 0x8D5AAAD22399A1EE),
     ("pure_core_suite_words", 14559, 0x78462AE4C81DF408),
-    ("stage1_elf_bytes", 106242, 0xEAFC81F46B482FF8),
+    ("stage1_elf_bytes", 112180, 0x62F14B335B52BECC),
 ];
 
 /// Committed single-mode byte-lock manifest (regenerate with `m2-lock`, review the diff).
@@ -23856,6 +23958,7 @@ pub fn run_m2_foundation_selftests() -> Result<usize, String> {
         ("s2_security", selftest_s2_security),
         ("s4_honesty", selftest_s4_honesty),
         ("s3_perf", selftest_s3_performance),
+        ("s5_refreeze", selftest_s5_refreeze),
         ("b4_pure_launcher", selftest_b4_pure_launcher_count),
     ];
     let mut n = run_selftest_tasks_in_lanes(parallel_tasks)?;
@@ -24129,7 +24232,7 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
         },
         "m2-compile" => match selftest_m2_13_stage1_anchor() {
             Ok(n) => {
-                println!("[M2-COMPILE PASS] {} checks passed (including 19,731-word Stage-1 anchor -> 106,242 B, FNV-1a64=0xEAFC81F46B482FF8, 0-byte diff!)", n);
+                println!("[M2-COMPILE PASS] {} checks passed (including 20,443-word Stage-1 anchor -> 112,180 B, FNV-1a64=0x62F14B335B52BECC, 0-byte diff!)", n);
                 0
             }
             Err(e) => {
@@ -24454,6 +24557,19 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
             }
             Err(e) => {
                 eprintln!("[S3-PERF FAIL] {}", e);
+                1
+            }
+        },
+        "s5-refreeze" => match selftest_s5_refreeze() {
+            Ok(n) => {
+                println!(
+                    "[S5-REFREEZE PASS] {} checks | strict ISET -9 OOB + PT_GNU_STACK non-exec stack + 9 burned-down backend-diff xfails + 5 re-frozen hashes",
+                    n
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("[S5-REFREEZE FAIL] {}", e);
                 1
             }
         },
@@ -24853,7 +24969,6 @@ pub fn selftest_m2_label_reference() -> Result<usize, String> {
         "L3_mixed_imm_def_lbl_use",
         "L4_alias_imm7EF1_def_lbl_use",
         "L5_duplicate_def",
-        "L6_imm83",
         "L6_imm254",
         "L6_imm255",
         "L6_imm256",
@@ -24973,7 +25088,7 @@ fn main() {
             "harness" | "--harness" => {
                 std::process::exit(run_omni_harness_cli(&cli_args[2..]));
             }
-            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" | "p7-heal" | "p7-adapt" | "p7-learn" | "a1-pure-default" | "a2-pure-include" | "a3-macro-quarantine" | "b2-pure-verifier" | "b4-pure-launcher" | "s2-security" | "s4-honesty" | "s3-perf" | "api-stage1" | "api-stage2" | "api-stage2-emit" | "api-stage2-5" => {
+            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" | "p7-heal" | "p7-adapt" | "p7-learn" | "a1-pure-default" | "a2-pure-include" | "a3-macro-quarantine" | "b2-pure-verifier" | "b4-pure-launcher" | "s2-security" | "s4-honesty" | "s3-perf" | "s5-refreeze" | "api-stage1" | "api-stage2" | "api-stage2-emit" | "api-stage2-5" => {
                 std::process::exit(run_m2_cli(&cli_args[1..]));
             }
             "agent-driver" | "--agent-driver" => {
