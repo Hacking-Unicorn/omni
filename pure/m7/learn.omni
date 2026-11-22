@@ -1,0 +1,170 @@
+// ==============================================================================
+// OMNI PHASE 7 (P7-3) — PURE-OMNI SELF-LEARNING TERNARY EXPERIENCE ENGINE
+// `pure/m7/learn.omni`
+// ==============================================================================
+//
+// Link order: `pure/m7/judge.omni`, this file.
+// Persistent, deterministic, balanced-ternary experience table & policy-ranking
+// engine (5 workload profiles x 4 candidate policies = 20 cells, 16 B/cell).
+// Zero floats, zero randomness, zero host I/O, zero recursion, zero IDIV/IMOD,
+// zero PACK5 opcodes, m2-lint clean (<= 120 SSA, <= 12 labels, <= 1 ANEW, LINEAR_BYTES).
+// ==============================================================================
+//
+// Binary layout (512 B minimum buffer):
+//   [0..4)   magic         = 1330465847 (0x4F4D4C37 = "OML7")
+//   [4..8)   version       = 1
+//   [8..12)  total_updates = u32
+//   [12..16) checksum      = u32 rolling checksum over [0..12) + cells [16..336)
+//   [16 + idx*16 .. +16) for idx = profile * 4 + pol_slot (0..19):
+//     +0: wins (u32), +4: losses (u32), +8: neutral (u32), +12: score (u32, bias 32768)
+
+// Compute deterministic 31-bit rolling checksum over [0..12) + 20 cells [16..336)
+// and stamp it at offset 12, returning the linear `bytes` handle.
+#[strict]
+fn p7_learn_stamp_checksum(tbl: bytes) -> bytes {
+    let h: i64 = 1073741827;
+    let i: i64 = 0;
+    while i < 3 {
+        let v: i64 = ld_u32(tbl, i * 4);
+        h = ((h ^ v) * 16777619) & 2147483647;
+        i = i + 1;
+    }
+    let c: i64 = 0;
+    while c < 80 {
+        let v: i64 = ld_u32(tbl, 16 + c * 4);
+        h = ((h ^ v) * 16777619) & 2147483647;
+        c = c + 1;
+    }
+    return st_u32(tbl, 12, h);
+}
+
+// Initialize a 512+ byte buffer as a fresh verified P7-3 experience table.
+#[strict]
+fn p7_learn_init(tbl: bytes) -> bytes {
+    let w: bytes = st_u32(tbl, 0, 1330465847);
+    w = st_u32(w, 4, 1);
+    w = st_u32(w, 8, 0);
+    let idx: i64 = 0;
+    while idx < 20 {
+        let off: i64 = 16 + idx * 16;
+        w = st_u32(w, off, 0);
+        w = st_u32(w, off + 4, 0);
+        w = st_u32(w, off + 8, 0);
+        w = st_u32(w, off + 12, 32768);
+        idx = idx + 1;
+    }
+    return p7_learn_stamp_checksum(w);
+}
+
+// Verify table integrity: returns total_updates (>= 0) on valid table, or -1 on tamper/corrupt.
+#[strict]
+fn p7_learn_verify(tbl: bytes) -> i64 {
+    let sz_ok: i64 = sel_trit(slen(tbl) <=> 512, 0, 1, 1);
+    let res: i64 = if_pos sz_ok <=> 0 {
+        let m_ok: i64 = sel_trit(ld_u32(tbl, 0) <=> 1330465847, 0, 1, 0);
+        let v_ok: i64 = sel_trit(ld_u32(tbl, 4) <=> 1, 0, 1, 0);
+        let updates: i64 = ld_u32(tbl, 8);
+        let got_c: i64 = ld_u32(tbl, 12);
+        let h: i64 = 1073741827;
+        let i: i64 = 0;
+        while i < 3 {
+            let v: i64 = ld_u32(tbl, i * 4);
+            h = ((h ^ v) * 16777619) & 2147483647;
+            i = i + 1;
+        }
+        let c: i64 = 0;
+        while c < 80 {
+            let v: i64 = ld_u32(tbl, 16 + c * 4);
+            h = ((h ^ v) * 16777619) & 2147483647;
+            c = c + 1;
+        }
+        let c_ok: i64 = sel_trit(got_c <=> h, 0, 1, 0);
+        let ok: i64 = m_ok * v_ok * c_ok;
+        if_pos ok <=> 0 { updates } else { -1 }
+    } else {
+        -1
+    };
+    return res;
+}
+
+// Asymmetric ternary reinforcement update:
+//   +1t -> wins += 1, score += 2 (clamped <= 65535)
+//    0t -> neutral += 1, score unchanged
+//   -1t -> losses += 1, score -= 3 (clamped >= 0; safety bias penalizes regressions)
+// Fails closed (returns unchanged buffer) if table header/size is invalid or indices out of bounds.
+#[strict]
+fn p7_learn_update(tbl: bytes, profile: i64, pol_slot: i64, verdict: trit) -> bytes {
+    let p_ok: i64 = sel_trit(profile <=> 0, 0, 1, 1) * sel_trit(profile <=> 4, 1, 1, 0);
+    let s_ok: i64 = sel_trit(pol_slot <=> 0, 0, 1, 1) * sel_trit(pol_slot <=> 3, 1, 1, 0);
+    let sz_ok: i64 = sel_trit(slen(tbl) <=> 512, 0, 1, 1);
+    let hdr_ok: i64 = if_pos sz_ok <=> 0 {
+        sel_trit(ld_u32(tbl, 0) <=> 1330465847, 0, 1, 0) * sel_trit(ld_u32(tbl, 4) <=> 1, 0, 1, 0)
+    } else {
+        0
+    };
+    let ok: i64 = p_ok * s_ok * hdr_ok;
+    let out: bytes = if_pos ok <=> 0 {
+        let off: i64 = 16 + (profile * 4 + pol_slot) * 16;
+        let wins: i64 = ld_u32(tbl, off);
+        let losses: i64 = ld_u32(tbl, off + 4);
+        let neut: i64 = ld_u32(tbl, off + 8);
+        let score: i64 = ld_u32(tbl, off + 12);
+        let is_w: i64 = sel_trit(verdict, 0, 0, 1);
+        let is_l: i64 = sel_trit(verdict, 1, 0, 0);
+        let is_n: i64 = sel_trit(verdict, 0, 1, 0);
+        let raw_sc: i64 = score + is_w * 2 - is_l * 3;
+        let sc1: i64 = if_pos raw_sc <=> 0 { raw_sc } else { 0 };
+        let sc2: i64 = if_pos (65535 - sc1) <=> 0 { sc1 } else { 65535 };
+        let w: bytes = st_u32(tbl, off, wins + is_w);
+        w = st_u32(w, off + 4, losses + is_l);
+        w = st_u32(w, off + 8, neut + is_n);
+        w = st_u32(w, off + 12, sc2);
+        w = st_u32(w, 8, ld_u32(w, 8) + 1);
+        p7_learn_stamp_checksum(w)
+    } else {
+        tbl
+    };
+    return out;
+}
+
+// Rank the 4 candidate policy slots (bits 1, 2, 4, 8) for `profile`, strictly bounded
+// by `cap_mask`, tamper checksum verification, and safety floor (`score >= 32768`).
+// Returns winning policy bit, or 0 (POLICY_HOLD) on tamper or no safe candidate.
+#[strict]
+fn p7_learn_rank_best(tbl: bytes, profile: i64, cap_mask: i64) -> i64 {
+    let p_ok: i64 = sel_trit(profile <=> 0, 0, 1, 1) * sel_trit(profile <=> 4, 1, 1, 0);
+    let cap_ok: i64 = sel_trit((cap_mask & 15) <=> 0, 0, 0, 1);
+    let sz_ok: i64 = sel_trit(slen(tbl) <=> 512, 0, 1, 1);
+    let ok: i64 = p_ok * cap_ok * sz_ok;
+    let best_bit: i64 = 0;
+    let best_sc: i64 = 32767;
+    let s: i64 = 0;
+    while s < 4 {
+        let bit: i64 = 1 << s;
+        let allowed: i64 = ok * sel_trit((cap_mask & bit) <=> 0, 0, 0, 1);
+        let sc: i64 = if_pos allowed <=> 0 {
+            ld_u32(tbl, 16 + (profile * 4 + s) * 16 + 12)
+        } else {
+            0
+        };
+        let beats: i64 = allowed * sel_trit(sc <=> best_sc, 0, 0, 1);
+        best_sc = beats * sc + (1 - beats) * best_sc;
+        best_bit = beats * bit + (1 - beats) * best_bit;
+        s = s + 1;
+    }
+    let valid: i64 = sel_trit(p7_learn_verify(tbl) <=> 0, 0, 1, 1);
+    return valid * best_bit;
+}
+
+// Export the learned ternary preference (+1t / 0t / -1t vs neutral 32768) across
+// all 5 workload profiles (0..4) for `pol_slot` into 1 `@PACK5` radix-3 byte (0..=242).
+#[strict]
+fn p7_learn_export_pack5(tbl: bytes, pol_slot: i64) -> i64 {
+    let s: i64 = pol_slot & 3;
+    let t0: trit = ld_u32(tbl, 16 + (0 * 4 + s) * 16 + 12) <=> 32768;
+    let t1: trit = ld_u32(tbl, 16 + (1 * 4 + s) * 16 + 12) <=> 32768;
+    let t2: trit = ld_u32(tbl, 16 + (2 * 4 + s) * 16 + 12) <=> 32768;
+    let t3: trit = ld_u32(tbl, 16 + (3 * 4 + s) * 16 + 12) <=> 32768;
+    let t4: trit = ld_u32(tbl, 16 + (4 * 4 + s) * 16 + 12) <=> 32768;
+    return p7_pack5_byte(t0, t1, t2, t3, t4);
+}

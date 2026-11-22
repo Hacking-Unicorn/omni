@@ -1,0 +1,40 @@
+// Phase 7 (P7-3) harness for `pure/m7/learn.omni`.
+// Exposes entry points for M3/M2/M4 differential testing (main <= 4 params).
+
+#[strict]
+fn p7_learn_init_entry(tbl: bytes) -> bytes {
+    return p7_learn_init(tbl);
+}
+
+#[strict]
+fn p7_learn_verify_entry(tbl: bytes) -> i64 {
+    return p7_learn_verify(tbl);
+}
+
+#[strict]
+fn p7_learn_update_entry(tbl: bytes, profile: i64, pol_slot: i64, v_i64: i64) -> bytes {
+    return p7_learn_update(tbl, profile, pol_slot, p7_i64_to_trit(v_i64));
+}
+
+#[strict]
+fn p7_learn_rank_entry(tbl: bytes, profile: i64, cap_mask: i64) -> i64 {
+    return p7_learn_rank_best(tbl, profile, cap_mask);
+}
+
+#[strict]
+fn p7_learn_pack5_entry(tbl: bytes, pol_slot: i64) -> i64 {
+    return p7_learn_export_pack5(tbl, pol_slot);
+}
+
+#[strict]
+fn main(profile: i64, pol_slot: i64, v_i64: i64, cap_mask: i64) -> i64 {
+    let t: bytes = anew(0);
+    let i: i64 = 0;
+    while i < 64 {
+        t = iset_i64(t, 0);
+        i = i + 1;
+    }
+    t = p7_learn_init(t);
+    t = p7_learn_update(t, profile, pol_slot, p7_i64_to_trit(v_i64));
+    return p7_learn_rank_best(t, profile, cap_mask);
+}
