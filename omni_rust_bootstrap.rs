@@ -24721,8 +24721,13 @@ fn main() {
                 }
                 let raw_src = fs::read_to_string(pos[0]).expect("Failed to read .omni file");
                 let parent_dir = std::path::Path::new(pos[0]).parent();
-                let expanded = pure_default_expand_includes(&raw_src, parent_dir, None)
-                    .expect("Pure include expansion failed");
+                let expanded = match pure_default_expand_includes(&raw_src, parent_dir, None) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[PURE-M3 COMPILE FAIL] {}", e);
+                        std::process::exit(1);
+                    }
+                };
                 match pure_default_compile_surface_to_u16(&expanded, expanded.contains("#[strict]")) {
                     Ok(u16_stream) => {
                         if let Err(ve) = pure_default_verify_u16(&u16_stream, true) {
@@ -24784,8 +24789,13 @@ fn main() {
                 let u16_stream = if path.ends_with(".omni") {
                     let raw_src = fs::read_to_string(path).expect("Failed to read .omni file");
                     let parent_dir = std::path::Path::new(path).parent();
-                    let expanded = pure_default_expand_includes(&raw_src, parent_dir, None)
-                        .expect("Pure include expansion failed");
+                    let expanded = match pure_default_expand_includes(&raw_src, parent_dir, None) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[PURE-M2 ELF FAIL] {}", e);
+                            std::process::exit(1);
+                        }
+                    };
                     pure_default_compile_surface_to_u16(&expanded, expanded.contains("#[strict]"))
                         .expect("Pure-M3 surface compilation failed")
                 } else {

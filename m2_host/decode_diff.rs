@@ -5946,10 +5946,9 @@ pub fn selftest_p7_learn() -> Result<(usize, usize, usize), String> {
     Ok((checks, lrn_u16.len(), lrn_elf_rust.len()))
 }
 
-/// Seed-Shrink Phase A1/A3: Compile `.omni` surface source using ONLY the committed Pure-Omni M3 seed
-/// (`pure/m3/m3.omni_bc`) â€” zero Rust frontend calls, and hard-rejects Rust-only `macro` directives
-/// with `error[ORACLE_ONLY_MACRO]` (Seed-Shrink A3 quarantine).
-pub fn pure_default_compile_surface_to_u16(src: &str, strict: bool) -> Result<Vec<u16>, String> {
+/// Seed-Shrink Phase A3: Pre-scan raw source for quarantined `macro` directives BEFORE include
+/// expansion so the reported 1-based `(line, col)` span always points at the user's source file.
+pub fn pure_default_reject_macros(src: &str) -> Result<(), String> {
     for (idx, raw_line) in src.lines().enumerate() {
         let trimmed = raw_line.trim_start();
         if trimmed.starts_with("macro ") || trimmed.starts_with("macro\t") {
@@ -5960,6 +5959,14 @@ pub fn pure_default_compile_surface_to_u16(src: &str, strict: bool) -> Result<Ve
             ));
         }
     }
+    Ok(())
+}
+
+/// Seed-Shrink Phase A1/A3: Compile `.omni` surface source using ONLY the committed Pure-Omni M3 seed
+/// (`pure/m3/m3.omni_bc`) — zero Rust frontend calls, and hard-rejects Rust-only `macro` directives
+/// with `error[ORACLE_ONLY_MACRO]` (Seed-Shrink A3 quarantine).
+pub fn pure_default_compile_surface_to_u16(src: &str, strict: bool) -> Result<Vec<u16>, String> {
+    pure_default_reject_macros(src)?;
     match m3_lockstep_compile_via_omni(src, strict)? {
         Ok(u16_stream) => Ok(u16_stream),
         Err((code, line, col)) => Err(format!(
@@ -6113,6 +6120,9 @@ pub fn pure_default_expand_includes(
     base_dir: Option<&std::path::Path>,
     vfs: Option<&std::collections::BTreeMap<String, String>>,
 ) -> Result<String, String> {
+    // Reject quarantined `macro` directives on the user's raw source BEFORE include expansion
+    // so reported `(line, col)` spans refer to the user's file, not post-expansion line numbers.
+    pure_default_reject_macros(src)?;
     if !src.contains("include") && !src.contains("mod ") && !src.contains("mod\"") {
         return Ok(String::from(src));
     }
@@ -6346,7 +6356,8 @@ pub fn selftest_a2_pure_include() -> Result<(usize, usize, usize), String> {
 pub fn selftest_a3_macro_quarantine() -> Result<usize, String> {
     let mut checks = 0usize;
 
-    // 1. Pure-default path rejects `macro` with structured `error[ORACLE_ONLY_MACRO]` + 1-based span.
+    // 1. Pure-default path rejects `macro` with structured `error[ORACLE_ONLY_MACRO]` + 1-based span
+    //    on BOTH direct raw source AND the full CLI expand-then-compile path (line 2, col 1 — never post-expansion).
     let macro_path = "spec/acceptance/goldens/stdlib_macro_pipeline_golden.omni";
     let macro_src = std::fs::read_to_string(macro_path).map_err(|e| format!("A3 read {}: {}", macro_path, e))?;
     match pure_default_compile_surface_to_u16(&macro_src, true) {
@@ -6354,6 +6365,17 @@ pub fn selftest_a3_macro_quarantine() -> Result<usize, String> {
         Err(msg) => {
             if !msg.starts_with("error[ORACLE_ONLY_MACRO]") || !msg.contains("line 2, col 1") {
                 return Err(format!("A3 macro quarantine error mismatch: {}", msg));
+            }
+        }
+    }
+    let macro_dir = std::path::Path::new(macro_path).parent();
+    match pure_default_expand_includes(&macro_src, macro_dir, None)
+        .and_then(|exp| pure_default_compile_surface_to_u16(&exp, exp.contains("#[strict]")))
+    {
+        Ok(_) => return Err(String::from("A3 CLI expand-then-compile path must reject macro-using fixture")),
+        Err(msg) => {
+            if !msg.starts_with("error[ORACLE_ONLY_MACRO]") || !msg.contains("line 2, col 1") {
+                return Err(format!("A3 CLI macro quarantine span mismatch (expected line 2, col 1): {}", msg));
             }
         }
     }
