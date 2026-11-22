@@ -435,11 +435,13 @@ fn parse_operand_raw(stream: bytes, pos: i64, nwords: i64) -> i64 {
     let imm_pos: i64 = is_i16 * (pos + 2) + is_i32 * (pos + 3);
     let imm_tok: i64 = is_i16 * i16_val + is_i32 * i32_val;
     let sym_ok: i64 = is_sym * need_sym;
+    let sym_val: i64 = load_u16(stream, pos + 1) * sym_ok;
+    let sym_fl: i64 = 8 + is_fn * 64;
     let known_fixed: i64 = have * (is_simple + imm_ok + sym_ok);
     let fixed: i64 = is_simple * pack_op(pos + 1, simple_flags, simple_tok)
         + is_i16 * need_i16 * pack_op(imm_pos, 8, imm_tok)
         + is_i32 * need_i32 * pack_op(imm_pos, 8, imm_tok)
-        + sym_ok * pack_op(pos + 2, 8, 0);
+        + sym_ok * pack_op(pos + 2, sym_fl, sym_val);
     let c_eng: trit = is_eng <=> 0;
     let eng_p: i64 = if_pos c_eng {
         parse_eng(stream, pos, nwords)
@@ -860,6 +862,42 @@ fn scan_labels(stream: bytes, ws: bytes, ins_start: i64, ins_cnt: i64) -> bytes 
 }
 
 #[strict]
+fn check_call_target_arity(ws: bytes, op: i64, off: i64) -> bytes {
+    let w: bytes = ws;
+    let is_call: i64 = is_eq(op, 32584);
+    let c_call: trit = is_call <=> 0;
+    let out: bytes = if_pos c_call {
+        let nops: i64 = ws_get(w, 14);
+        let has_op0: i64 = is_gt(nops, 0);
+        let p0: i64 = ws_get(w, 384) * has_op0;
+        let is_fref: i64 = has_op0 * is_gt(op_flags(p0) & 64, 0);
+        let target_id: i64 = op_tok(p0);
+        let mcnt: i64 = ws_get(w, 20);
+        let k: i64 = 0;
+        let found: i64 = 0;
+        let want_arity: i64 = 0;
+        let go: i64 = is_fref * is_gt(mcnt, 0);
+        while go <=> 0 {
+            let entry: i64 = ws_get(w, 448 + k);
+            let fid: i64 = entry >> 16;
+            let pcnt: i64 = entry & 65535;
+            let hit: i64 = is_eq(fid, target_id);
+            found = found + hit * (1 - found);
+            want_arity = hit * pcnt + (1 - hit) * want_arity;
+            k = k + 1;
+            go = (1 - hit) * is_lt(k, mcnt);
+        }
+        let bad_tgt: i64 = 1 - (is_fref * found);
+        let w1: bytes = append_err_if(w, bad_tgt, 2010, off);
+        let bad_ar: i64 = is_fref * found * (1 - is_eq(nops - 1, want_arity));
+        append_err_if(w1, bad_ar, 2011, off)
+    } else {
+        w
+    };
+    return out;
+}
+
+#[strict]
 fn verify_ins_body(stream: bytes, ws: bytes, ins_start: i64, ins_cnt: i64, cap: i64) -> bytes {
     let w: bytes = ws;
     let nwords: i64 = ws_get(w, 1);
@@ -907,6 +945,7 @@ fn verify_ins_body(stream: bytes, ws: bytes, ins_start: i64, ins_cnt: i64, cap: 
         } else {
             w
         };
+        w = check_call_target_arity(w, op, ins_off);
         left = left - 1;
         go = left * (1 - is_eq(ws_get(w, 10), 3006));
     }
@@ -1064,16 +1103,78 @@ fn apply_api_surface_rules(
 }
 
 #[strict]
+fn prescan_module_fns(stream: bytes, ws: bytes, nwords: i64) -> bytes {
+    let w: bytes = ws;
+    let pos: i64 = 1;
+    let mcnt: i64 = 0;
+    let go: i64 = (1 - is_eq(ws_get(w, 10), 3006)) * is_gt(nwords, pos);
+    while go <=> 0 {
+        let tag: i64 = load_u16(stream, pos);
+        let is_end: i64 = is_eq(tag, 32495);
+        let is_sch: i64 = is_eq(tag, 32481);
+        let is_ex: i64 = is_eq(tag, 32482);
+        let is_fn: i64 = is_eq(tag, 32483);
+        let known: i64 = is_end + is_sch + is_ex + is_fn;
+        w = set_decode_err_if(w, 1 - known, pos);
+        pos = pos + 1;
+        let csch: trit = is_sch <=> 0;
+        pos = if_pos csch {
+            let have: i64 = is_ge(nwords, pos + 2);
+            w = set_decode_err_if(w, 1 - have, pos);
+            let fcnt: i64 = load_u16(stream, pos + 1);
+            pos + 2 + fcnt * 2
+        } else {
+            pos
+        };
+        let cex: trit = is_ex <=> 0;
+        pos = if_pos cex {
+            pos + 4
+        } else {
+            pos
+        };
+        let cfn: trit = is_fn <=> 0;
+        pos = if_pos cfn {
+            let have: i64 = is_ge(nwords, pos + 2);
+            w = set_decode_err_if(w, 1 - have, pos);
+            let fn_idx: i64 = load_u16(stream, pos);
+            let p_cnt: i64 = load_u16(stream, pos + 1);
+            let sig: i64 = pos + 2 + p_cnt * 3 + 3;
+            w = set_decode_err_if(w, 1 - is_ge(nwords, sig), pos);
+            let ins_cnt: i64 = load_u16(stream, pos + 2 + p_cnt * 3 + 2);
+            let ins_start: i64 = pos + 2 + p_cnt * 3 + 3;
+            let room: i64 = is_lt(mcnt, 512);
+            w = if_pos room <=> 0 {
+                let w1: bytes = ws_set(w, 448 + mcnt, (fn_idx << 16) | (p_cnt & 65535));
+                ws_set(w1, 20, mcnt + 1)
+            } else {
+                w
+            };
+            mcnt = mcnt + room;
+            w = ws_set(w, 0, ins_start);
+            w = scan_labels(stream, w, ins_start, ins_cnt);
+            ws_get(w, 0)
+        } else {
+            pos
+        };
+        let cend: trit = is_end <=> 0;
+        pos = if_pos cend { nwords } else { pos };
+        go = (1 - is_eq(ws_get(w, 10), 3006)) * is_gt(nwords, pos);
+    }
+    return w;
+}
+
+#[strict]
 fn omni_verify_module_with_mode(stream: bytes, api_mode: i64) -> bytes {
     let nbytes: i64 = slen(stream);
     let nwords: i64 = nbytes / 2;
-    let ws: bytes = init_zero_buf(448);
+    let ws: bytes = init_zero_buf(960);
     ws = ws_set(ws, 1, nwords);
     ws = ws_set(ws, 19, api_mode);
     let empty: i64 = is_eq(nwords, 0);
     let hdr: i64 = load_u16(stream, 0);
     let bad_hdr: i64 = empty + (1 - is_eq(hdr, 32480));
     ws = set_decode_err_if(ws, bad_hdr, 0);
+    ws = prescan_module_fns(stream, ws, nwords);
     let pos: i64 = 1;
     ws = ws_set(ws, 0, pos);
     let out: bytes = anew(0);

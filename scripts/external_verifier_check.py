@@ -48,6 +48,39 @@ def verify_stream(words):
     n = len(words)
     if n < 2 or words[0] != TOK_MOD_BEGIN:
         return False, "DECODE_ERROR"
+    # Pre-scan module function table: fn_idx -> param_cnt
+    fn_arities = {}
+    p_scan = 1
+    while p_scan < n:
+        tag = words[p_scan]
+        if tag == TOK_MOD_END:
+            break
+        if tag != TOK_FN_DEF or p_scan + 3 > n:
+            return False, "DECODE_ERROR"
+        fid = words[p_scan + 1]
+        pcnt = words[p_scan + 2]
+        hdr_end = p_scan + 3 + pcnt * 3 + 3
+        if hdr_end > n:
+            return False, "DECODE_ERROR"
+        fn_arities[fid] = pcnt
+        icnt = words[hdr_end - 1]
+        c = hdr_end
+        for _ in range(icnt):
+            if c >= n:
+                return False, "DECODE_ERROR"
+            if REG_BASE <= words[c] <= REG_MAX:
+                if c + 4 > n:
+                    return False, "DECODE_ERROR"
+                c += 4
+            else:
+                c += 1
+            while c < n and words[c] != TOK_INS_END:
+                c = skip_operand(words, c)
+            if c >= n or words[c] != TOK_INS_END:
+                return False, "DECODE_ERROR"
+            c += 1
+        p_scan = c
+
     pos = 1
     saw_end = False
     while pos < n:
@@ -89,7 +122,9 @@ def verify_stream(words):
             if not (OP_BASE <= op <= OP_MAX):
                 return False, "DECODE_ERROR"
             ops = []
+            op_positions = []
             while cur < n and words[cur] != TOK_INS_END:
+                op_positions.append(cur)
                 ops.append(words[cur])
                 cur = skip_operand(words, cur)
             if cur >= n or words[cur] != TOK_INS_END:
@@ -101,6 +136,13 @@ def verify_stream(words):
                 for o in ops:
                     if o in live_heap:
                         return False, "LINEAR_REFLECT"
+                if not ops or ops[0] != TOK_SYM_FN or op_positions[0] + 1 >= n:
+                    return False, "BAD_CALL_TARGET"
+                callee_id = words[op_positions[0] + 1]
+                if callee_id not in fn_arities:
+                    return False, "BAD_CALL_TARGET"
+                if (len(ops) - 1) != fn_arities[callee_id]:
+                    return False, "CALL_ARITY_MISMATCH"
             if op == OP_RET:
                 for o in ops:
                     if o in tainted:

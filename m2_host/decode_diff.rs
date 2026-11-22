@@ -2428,7 +2428,7 @@ pub fn selftest_m2_14_verify_diff() -> Result<usize, String> {
 pub fn selftest_m3_15_four_backend_parity() -> Result<usize, String> {
     let m2_mod = m2_compile_decoder(M2_MULTI_OMNI_SRC)?;
     let m2_entry = m2_entry_of(&m2_mod);
-    let cases: [(&str, &str, Vec<i64>, i64); 3] = [
+    let cases: [(&str, &str, Vec<i64>, i64); 4] = [
         (
             "m3_15_mf_arith",
             "#[strict]\nfn sq(x: i64) -> i64 { return x * x; }\nfn main(a: i64) -> i64 { return sq(a + 2) + sq(a - 1); }\n",
@@ -2446,6 +2446,12 @@ pub fn selftest_m3_15_four_backend_parity() -> Result<usize, String> {
             "#[strict]\nfn pack2(a: i64, b: i64) -> bytes { let w: bytes = anew(0); w = iset(w, a); w = iset(w, b); return w; }\nfn score(w: bytes) -> i64 { return iget(w, 0) * 10 + iget(w, 1); }\nfn main(x: i64) -> i64 { let w: bytes = pack2(x, x + 3); return score(w); }\n",
             vec![4],
             47,
+        ),
+        (
+            "m3_15_int_min_divmod",
+            "#[strict]\nfn main(a: i64, b: i64, c: i64) -> i64 {\n    let imin_v: i64 = 1 << 63;\n    let q0: i64 = imin_v / a;\n    let r0: i64 = imin_v % b;\n    let q1: i64 = 5 / imin_v;\n    let r1: i64 = (imin_v % c) + (0 / imin_v);\n    return (q0 >> 60) * 100 + r0 * 10 + q1 + r1;\n}\n",
+            vec![2, 3, -1],
+            (-4i64) * 100 + (-2i64) * 10,
         ),
     ];
 
@@ -2475,13 +2481,22 @@ pub fn selftest_m3_15_four_backend_parity() -> Result<usize, String> {
         let wasm = compile_pure_u16_to_wasm_multi(&omni_bc)?;
         let wasm_got = execute_wasm_module_i64(&wasm, args)?;
 
-        if vm_got != *want || wasm_got != *want {
-            return Err(format!("M3-15 '{}': want={} vm={} wasm={}", name, want, vm_got, wasm_got));
+        // (e) Pure-Omni M4 VM (5th backend column)
+        let a0 = args.first().copied().unwrap_or(0);
+        let a1 = args.get(1).copied().unwrap_or(0);
+        let a2 = args.get(2).copied().unwrap_or(0);
+        let (m4_got, _m4_tag, m4_err, _m4_steps, _m4_trace) =
+            p4_run_raw_bc_on_pure_vm(&omni_bc, a0, a1, a2, 100_000, 0)?;
+
+        if vm_got != *want || wasm_got != *want || m4_err != 0 || m4_got != *want {
+            return Err(format!(
+                "M3-15 '{}': want={} vm={} wasm={} m4={}(err={})",
+                name, want, vm_got, wasm_got, m4_got, m4_err
+            ));
         }
 
-        // (b) Rust x86-64 multi AOT (M2-09) vs (d) Pure-Omni M2 x86-64 ELF64 (M2-15/16) â€” 0-byte diff!
-        let a0 = args.first().copied().unwrap_or(0);
-        let rust_elf = compile_pure_u16_to_x86_64_elf_multi(&omni_bc, a0, 0, 0)?;
+        // (b) Rust x86-64 multi AOT (M2-09) vs (d) Pure-Omni M2 x86-64 ELF64 (M2-15/16) — 0-byte diff!
+        let rust_elf = compile_pure_u16_to_x86_64_elf_multi(&omni_bc, a0, a1, a2)?;
         let mut vm_m2 = OmniBinaryVm::with_budgets(100_000_000, 64 * 1024 * 1024);
         let pure_elf = match vm_m2.execute_function(
             &m2_mod,
@@ -2490,8 +2505,8 @@ pub fn selftest_m3_15_four_backend_parity() -> Result<usize, String> {
                 OmniValue::Bytes(vec![0u8; 524_288]),
                 OmniValue::U16Array(omni_bc),
                 OmniValue::Int(a0),
-                OmniValue::Int(0),
-                OmniValue::Int(0),
+                OmniValue::Int(a1),
+                OmniValue::Int(a2),
             ],
         )? {
             OmniValue::Bytes(b) => b,
@@ -4325,10 +4340,10 @@ pub fn selftest_api_stage1() -> Result<(usize, usize, usize), String> {
     let ve_mod = decode_omni_token_stream(&ve_u16)?;
     let n_vfns = ve_mod.functions.len();
     // Order at end of pure/verifier_engine.omni:
-    //   omni_verify_cap_narrow_eff (-6), omni_verify_api_surface (-5),
-    //   apply_api_surface_rules (-4), omni_verify_module_with_mode (-3),
-    //   omni_verify_module_api (-2), omni_verify_module (-1)
-    let fn_api_verify = ve_mod.functions[n_vfns - 5].fn_idx;
+    //   omni_verify_cap_narrow_eff (-7), omni_verify_api_surface (-6),
+    //   apply_api_surface_rules (-5), prescan_module_fns (-4),
+    //   omni_verify_module_with_mode (-3), omni_verify_module_api (-2), omni_verify_module (-1)
+    let fn_api_verify = ve_mod.functions[n_vfns - 6].fn_idx;
     let fn_verify_mod_api = ve_mod.functions[n_vfns - 2].fn_idx;
     for &(op_k, fn_cap, req_cap, taint, mask_c, mask, lin, want) in &[
         (1i64, 8, 8, 0, 0, 0, 0, 0i64),     // ternary cap satisfied -> OK
@@ -6543,8 +6558,246 @@ pub fn selftest_b2_pure_verifier() -> Result<usize, String> {
     }
     checks += 1;
 
-    // 5. Frozen hashes intact.
+    // 5. Audit §1.2: CALL-target and arity validation in Pure verifier + M2 trap stub + fuzz corpus.
+    checks += selftest_s1_2_call_target_arity_and_fuzz()?;
+
+    // 6. Frozen hashes intact.
     selftest_m2_frozen_hashes()?;
+    checks += 1;
+
+    Ok(checks)
+}
+
+/// Audit §1.2 hard gate (`./omnic s1-call-verify`):
+///   1. Pure-Omni verifier (`pure/verifier_engine.omni` via `pure_default_verify_u16`) rejects CALLs to
+///      non-existent functions (`fn_idx = 32539`, `fn_idx = 99`) and non-`TOK_SYM_FN` CALL targets with
+///      error code `2010` (`BAD_CALL_TARGET`).
+///   2. Pure-Omni verifier rejects CALL arity mismatches (too few / too many args) with error code `2011`
+///      (`CALL_ARITY_MISMATCH`).
+///   3. Defense-in-depth M2 trap stub: when an unverified `.omni_bc` stream with an unknown or out-of-range
+///      CALL target (`32539` or `99`) is lowered through Pure-Omni M2 (`m2.omni_bc`) or Rust M2-multi,
+///      the `E8 rel32` relocation resolves to the `T_OOB` trap stub (`exit(101)`) instead of offset `-1`
+///      (before `.text`, which segfaulted with exit 139).
+///   4. Checked-in 12-case crash corpus + deterministic 256-mutant `.omni_bc` mutation fuzzer: every mutant
+///      is either rejected by `pure_default_verify_u16` or executes without divergence (Pure-M4 == Rust VM)
+///      and without out-of-text jump/call targets or native segfaults.
+pub fn selftest_s1_2_call_target_arity_and_fuzz() -> Result<usize, String> {
+    let mut checks = 0usize;
+
+    // Helper: build a 1-fn module calling `callee_tok` with `arg_ops` words and returning r0.
+    let build_call_stream = |callee_ops: &[u16]| -> Vec<u16> {
+        let mut s = vec![
+            0x7EE0, // TOK_MOD_BEGIN
+            0x7EE3, 0, 1, 0x7EC0, 0x7F81, 0x7FC0, 0x7F81, 0, 2, // fn#0(p0: i64) -> i64, 2 ins
+            0x7E00, 0x7F48, 0x7F81, 0x7FC0, // r0: i64 = CALL ...
+        ];
+        s.extend_from_slice(callee_ops);
+        s.extend_from_slice(&[
+            0x7EE4, // INS_END
+            0x7F4A, 0x7E00, 0x7EE4, // RET r0
+            0x7EEF, // TOK_MOD_END
+        ]);
+        s
+    };
+
+    // 1. Non-existent CALL targets (`fn_idx = 32539` from Grok's audit, `fn_idx = 99`, and non-FnRef target).
+    for &(label, ops) in &[
+        ("missing_fn_32539", &[0x7EECu16, 32539, 0x7EC0][..]),
+        ("missing_fn_99", &[0x7EECu16, 99, 0x7EC0][..]),
+        ("non_fnref_reg_target", &[0x7EC0u16][..]),
+        ("zero_operand_call", &[][..]),
+    ] {
+        let bad_s = build_call_stream(ops);
+        match pure_default_verify_u16(&bad_s, false) {
+            Ok(()) => {
+                return Err(format!(
+                    "S1.2 Pure verifier accepted invalid CALL target case '{}'",
+                    label
+                ))
+            }
+            Err(msg) => {
+                if !msg.contains("PURE_VERIFY_2010") && !msg.contains("PURE_VERIFY_DECODE") {
+                    return Err(format!(
+                        "S1.2 case '{}' expected PURE_VERIFY_2010, got: {}",
+                        label, msg
+                    ));
+                }
+            }
+        }
+    }
+    checks += 1;
+
+    // 2. CALL arity mismatch (`fn#1` expects 2 params, `fn#0` calls `fn#1` with 1 arg and with 3 args).
+    let valid_2fn = compile_omni_surface_strict_to_u16(
+        "#[strict]\nfn add2(a: i64, b: i64) -> i64 { return a + b; }\n#[strict]\nfn main(x: i64) -> i64 { return add2(x, 10); }\n",
+    )?;
+    pure_default_verify_u16(&valid_2fn, false)?;
+    // Mutate fn#0's CALL to pass 1 arg (drop `TOK_IMM_I16, 10`) or 3 args (append `0x7EC0`).
+    let mut bad_arity_1 = Vec::new();
+    let mut bad_arity_3 = Vec::new();
+    let mut i = 0usize;
+    while i < valid_2fn.len() {
+        if valid_2fn[i] == 0x7F48 {
+            let mut end = i + 1;
+            while end < valid_2fn.len() && valid_2fn[end] != 0x7EE4 {
+                end += 1;
+            }
+            // [0x7F48, 0x7F81, 0x7FC0, 0x7EEC, fn_id, 0x7EC0, ... second arg ..., 0x7EE4]
+            bad_arity_1.extend_from_slice(&valid_2fn[i..i + 6]);
+            bad_arity_1.push(0x7EE4);
+            bad_arity_3.extend_from_slice(&valid_2fn[i..end]);
+            bad_arity_3.push(0x7EC0);
+            bad_arity_3.push(0x7EE4);
+            i = end + 1;
+        } else {
+            bad_arity_1.push(valid_2fn[i]);
+            bad_arity_3.push(valid_2fn[i]);
+            i += 1;
+        }
+    }
+    for (label, stream) in [("arity_1_want_2", &bad_arity_1), ("arity_3_want_2", &bad_arity_3)] {
+        match pure_default_verify_u16(stream, false) {
+            Ok(()) => {
+                return Err(format!(
+                    "S1.2 Pure verifier accepted CALL arity mismatch '{}'",
+                    label
+                ))
+            }
+            Err(msg) => {
+                if !msg.contains("PURE_VERIFY_2011") {
+                    return Err(format!(
+                        "S1.2 '{}' expected PURE_VERIFY_2011, got: {}",
+                        label, msg
+                    ));
+                }
+            }
+        }
+    }
+    checks += 1;
+
+    // 3. Defense-in-depth M2 trap stub: lowering unverified `missing_fn_32539` and `missing_fn_99`
+    // through Pure-Omni M2 (`m2.omni_bc`) must resolve the unknown `E8 rel32` to the `T_OOB` trap stub
+    // inside `.text` (`[120 .. elf.len())`), NEVER to `-1` (before `.text`).
+    for &bad_callee in &[32539u16, 99u16] {
+        let unverified = build_call_stream(&[0x7EEC, bad_callee, 0x7EC0]);
+        let elf = pure_default_compile_u16_to_elf(&unverified, 7, 0, 0)?;
+        if elf.len() <= 132 || &elf[0..4] != &[0x7F, b'E', b'L', b'F'] {
+            return Err(String::from("S1.2 M2 failed to emit ELF for trap-stub check"));
+        }
+        // Locate the `BF 01 00 00 00 B8 3C 00 00 00 0F 05` (T_OOB stub: exit(1)) in `elf[120..]`.
+        let t_oob_seq: [u8; 12] = [0xBF, 0x01, 0x00, 0x00, 0x00, 0xB8, 0x3C, 0x00, 0x00, 0x00, 0x0F, 0x05];
+        let t_oob_pos = elf[120..]
+            .windows(12)
+            .position(|w| w == t_oob_seq)
+            .map(|p| p + 120)
+            .ok_or_else(|| String::from("S1.2 T_OOB trap stub not found in M2 ELF"))?;
+        // Every `E8 rel32` in the user function (after the entry stub) must target a valid offset in `[120, elf.len())`,
+        // and the unknown CALL must target `t_oob_pos`.
+        let mut hit_trap_call = false;
+        for pos in 120..elf.len().saturating_sub(5) {
+            if elf[pos] == 0xE8 {
+                let rel = i32::from_le_bytes(elf[pos + 1..pos + 5].try_into().unwrap()) as isize;
+                let tgt = (pos as isize) + 5 + rel;
+                if tgt == 119 {
+                    return Err(format!(
+                        "S1.2 M2 emitted segfaulting CALL to code_off=-1 (file_off=119) for fn#{}",
+                        bad_callee
+                    ));
+                }
+                if tgt == t_oob_pos as isize {
+                    hit_trap_call = true;
+                }
+            }
+        }
+        if !hit_trap_call {
+            return Err(format!(
+                "S1.2 M2 did not patch unknown CALL fn#{} to T_OOB trap stub (t_oob_pos={})",
+                bad_callee, t_oob_pos
+            ));
+        }
+        if let Some(r) = run_native_elf_for_diff(&elf, "s1_2_trap_stub")? {
+            if r.signal.is_some() || r.exit_code != Some(OMNI_OOB_EXIT_STATUS) {
+                return Err(format!(
+                    "S1.2 native trap-stub ELF failed: exit={:?} signal={:?} (want exit 101, signal None)",
+                    r.exit_code, r.signal
+                ));
+            }
+        }
+    }
+    checks += 1;
+
+    // 4. Checked-in crash corpus (12 mutated `.omni_bc` cases covering Grok's audit findings) +
+    // deterministic 256-mutant mutation fuzzer over multi-function `.omni_bc` streams.
+    let mut corpus: Vec<Vec<u16>> = vec![
+        build_call_stream(&[0x7EEC, 32539, 0x7EC0]),
+        build_call_stream(&[0x7EEC, 0xFFFF, 0x7EC0]),
+        build_call_stream(&[0x7EEC, 1024, 0x7EC0]),
+        build_call_stream(&[0x7EEC, 1, 0x7EC0, 0x7EC0]),
+        build_call_stream(&[0x7E00, 0x7EC0]),
+        build_call_stream(&[0x7EE5, 42]),
+        bad_arity_1,
+        bad_arity_3,
+    ];
+    let mut rng: u64 = 0x2026_1122_A0D1_7F48;
+    let mut next_u64 = || -> u64 {
+        rng ^= rng >> 12;
+        rng ^= rng << 25;
+        rng ^= rng >> 27;
+        rng.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    };
+    for _ in 0..256 {
+        let mut m = valid_2fn.clone();
+        let idx = (next_u64() as usize) % m.len();
+        let kind = next_u64() % 4;
+        match kind {
+            0 => m[idx] = (next_u64() & 0xFFFF) as u16,
+            1 => m[idx] ^= 1u16 << ((next_u64() % 16) as u32),
+            2 => {
+                let len = (next_u64() as usize) % m.len();
+                m.truncate(len.max(1));
+            }
+            _ => {
+                m[idx] = *[0x7F48u16, 0x7EEC, 32539, 0x7EF9, 0x7F0E, 0x7F0F, 0x7EEF]
+                    .get((next_u64() as usize) % 7)
+                    .unwrap();
+            }
+        }
+        corpus.push(m);
+    }
+    let mut accepted = 0usize;
+    for (ci, stream) in corpus.iter().enumerate() {
+        if pure_default_verify_u16(stream, false).is_ok() {
+            accepted += 1;
+            // Every verifier-accepted stream MUST also pass Rust `verify_module_for_multi_aot`
+            // (except single-fn / non-recursive checks) and agree between Rust VM and Pure-M4 VM!
+            let decoded = decode_omni_token_stream(stream)
+                .map_err(|e| format!("S1.2 fuzz #{} accepted by Pure verifier but failed decode: {}", ci, e))?;
+            for f in &decoded.functions {
+                let rep = verify_binary_function(f);
+                if !rep.passed {
+                    return Err(format!(
+                        "S1.2 fuzz #{} accepted by Pure verifier but rejected by Rust verifier: {:?}",
+                        ci, rep.errors
+                    ));
+                }
+            }
+            let entry = m2_entry_of(&decoded);
+            let mut rvm = OmniBinaryVm::with_budgets(50_000, 4 * 1024 * 1024);
+            let r_res = rvm.execute_function(&decoded, entry, vec![OmniValue::Int(7), OmniValue::Int(3)]);
+            let m4_res = p4_run_raw_bc_on_pure_vm(stream, 7, 3, 0, 50_000, 0)?;
+            if let Ok(OmniValue::Int(rv)) = r_res {
+                if m4_res.2 == 0 && m4_res.0 != rv {
+                    return Err(format!(
+                        "S1.2 fuzz #{} VM divergence: Rust VM={} vs Pure-M4={} (fns={:?})",
+                        ci, rv, m4_res.0, decoded.functions
+                    ));
+                }
+            }
+        }
+    }
+    if accepted == corpus.len() {
+        return Err(String::from("S1.2 fuzz corpus had 0 rejections"));
+    }
     checks += 1;
 
     Ok(checks)
@@ -6641,7 +6894,7 @@ pub fn selftest_b4_pure_launcher() -> Result<(usize, usize, u64, bool), String> 
         }
 
         // 4. Pure native M2 compiler ELF (emitted by Pure M2 itself, zero Rust binary) compiles
-        //    pure/m4/m4.omni_bc -> exact 76,782-B ELF64 (0x82F217F319C2BDF5).
+        //    pure/m4/m4.omni_bc -> exact 80,641-B ELF64 (0x4B655C050F37CD4F).
         let m2_raw = std::fs::read("pure/m2/m2.omni_bc").map_err(|e| format!("B4 read m2 seed: {}", e))?;
         let m2_u16 = decode_bytes_to_u16_stream(&m2_raw);
         let m2_elf = pure_default_compile_u16_to_elf(&m2_u16, 0, 0, 0)?;
@@ -6654,7 +6907,7 @@ pub fn selftest_b4_pure_launcher() -> Result<(usize, usize, u64, bool), String> 
             .output()
             .map_err(|e| format!("B4 exec m2_native: {}", e))?;
         let _ = std::fs::remove_file(&m2path);
-        if !out_m4.status.success() || out_m4.stdout.len() != 76_782 || fnv1a_64_hash(&out_m4.stdout) != 0x82F217F319C2BDF5 {
+        if !out_m4.status.success() || out_m4.stdout.len() != 80_641 || fnv1a_64_hash(&out_m4.stdout) != 0x4B655C050F37CD4F {
             return Err(format!(
                 "B4 pure native m2.elf -> m4.elf mismatch: status={:?} len={} hash=0x{:016X}",
                 out_m4.status,

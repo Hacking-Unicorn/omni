@@ -142,7 +142,7 @@ fn m4v_find_label_off(arr: array, n: i64, ins_start: i64, ins_cnt: i64, target_s
 // m4o_arith, m4o_bit_cmp, and m4o_trit all at once on every ALU/MOV/CMP/TRIT instruction).
 #[strict]
 fn m4v_exec_pure_val(op: i64, v0: i64, v1: i64, v2: i64, v3: i64) -> i64 {
-    let is_mov: i64 = m2u_eq(op, 32516) + m2u_eq(op, 32518) + m2u_eq(op, 32521);
+    let is_mov: i64 = m2u_in(op, 32513, 32516) + m2u_eq(op, 32518) + m2u_eq(op, 32521);
     let res: i64 = if_pos is_mov <=> 0 {
         v0
     } else {
@@ -161,7 +161,12 @@ fn m4v_exec_pure_val(op: i64, v0: i64, v1: i64, v2: i64, v3: i64) -> i64 {
                     let is_sel: i64 = m2u_eq(op, 32581);
                     let sel_r: i64 = m2u_sel(m2u_lt(v0, 0), v1, m2u_sel(m2u_eq(v0, 0), v2, v3));
                     let is_slen: i64 = m2u_eq(op, 32592);
-                    is_sel * sel_r + is_slen * (v0 & m4a_mask32())
+                    let is_tp5: i64 = m2u_eq(op, 32560);
+                    let is_tup5: i64 = m2u_eq(op, 32561);
+                    let bbase_hi: i64 = (v0 >> 32) << 32;
+                    let tp5_r: i64 = bbase_hi | m4o_divmod((v0 & m4a_mask32()) + 4, 5, 0);
+                    let tup5_r: i64 = bbase_hi | (v1 & m4a_mask32());
+                    is_sel * sel_r + is_slen * (v0 & m4a_mask32()) + is_tp5 * tp5_r + is_tup5 * tup5_r
                 };
                 r3
             };
@@ -206,15 +211,21 @@ fn m4v_exec_alu_mem(w: bytes, arr: array, n: i64, sp: i64, off: i64, op: i64, no
     let v1: i64 = m4v_opt_eval(w, sp, nops, 1, p1);
     let v2: i64 = m4v_opt_eval(w, sp, nops, 2, p2);
     let v3: i64 = m4v_opt_eval(w, sp, nops, 3, p3);
-    let is_mem: i64 = m2u_eq(op, 32525) + m2u_eq(op, 32526) + m2u_eq(op, 32527);
+    let t0: i64 = if_pos m2u_lt(0, nops) <=> 0 { m4o_eval_tag(w, sp, p0) } else { 1 };
+    let is_p5v: i64 = m2u_eq(op, 32564) + (m2u_eq(op, 32565) + m2u_eq(op, 32575)) * m2u_ge(t0, 3);
+    let is_mem: i64 = m2u_eq(op, 32525) + m2u_eq(op, 32526) + m2u_eq(op, 32527) + is_p5v;
     let out: bytes = if_pos is_mem <=> 0 {
-        m4v_dispatch_mem(w, sp, dslot, op, nops, v0, v1, v2, v3)
+        m4v_dispatch_mem(w, sp, dslot, op, nops, v0, t0, v1, v2, v3)
     } else {
         let w2: bytes = if_pos m2u_ge(dslot, 0) <=> 0 {
             let rv: i64 = m4v_exec_pure_val(op, v0, v1, v2, v3);
-            let t0: i64 = if_pos m2u_eq(op, 32516) <=> 0 { m4o_eval_tag(w, sp, p0) } else { 1 };
+            let rtag: i64 = m2u_sel(
+                m2u_in(op, 32513, 32516),
+                t0,
+                m2u_sel(m2u_eq(op, 32560), 3, m2u_sel(m2u_eq(op, 32561), 4, 1))
+            );
             let wa: bytes = m4f_set_slot_val(w, sp, dslot, rv);
-            m4f_set_slot_tag(wa, sp, dslot, t0)
+            m4f_set_slot_tag(wa, sp, dslot, rtag)
         } else {
             w
         };
@@ -224,17 +235,22 @@ fn m4v_exec_alu_mem(w: bytes, arr: array, n: i64, sp: i64, off: i64, op: i64, no
 }
 
 #[strict]
-fn m4v_dispatch_mem(w: bytes, sp: i64, dslot: i64, op: i64, nops: i64, v0: i64, v1: i64, v2: i64, v3: i64) -> bytes {
+fn m4v_dispatch_mem(w: bytes, sp: i64, dslot: i64, op: i64, nops: i64, v0: i64, t0: i64, v1: i64, v2: i64, v3: i64) -> bytes {
     let out: bytes = if_pos m2u_eq(op, 32525) <=> 0 {
         m4o_exec_anew(w, sp, dslot)
     } else {
         let w2: bytes = if_pos m2u_eq(op, 32526) <=> 0 {
-            m4o_exec_iget(w, sp, dslot, nops, v0, v1, v2)
+            m4o_exec_iget(w, sp, dslot, nops, v0, t0, v1, v2)
         } else {
-            let w3: bytes = if_pos m2u_eq(nops, 4) <=> 0 {
-                m4o_exec_iset_patch(w, sp, dslot, v0, v1, v2, v3)
+            let w3: bytes = if_pos m2u_eq(op, 32527) <=> 0 {
+                let is_patch: i64 = m2u_eq(nops, 4) * (m2u_eq(v1, 0 - 2) + m2u_eq(v1, 0 - 4) + m2u_eq(v1, 0 - 9));
+                if_pos is_patch <=> 0 {
+                    m4o_exec_iset_patch(w, sp, dslot, v0, v1, v2, v3)
+                } else {
+                    m4o_exec_iset_append(w, sp, dslot, nops, v0, v1, v2, v3)
+                }
             } else {
-                m4o_exec_iset_append(w, sp, dslot, nops, v0, v1, v2)
+                m4o_exec_pack5_vec(w, sp, dslot, op, v0, t0, v1)
             };
             w3
         };
@@ -280,7 +296,7 @@ fn m4v_branch_next_off(w: bytes, arr: array, n: i64, sp: i64, off: i64, op: i64,
             let chosen: i64 = m2u_sel(m2u_lt(cond, 0), p1, m2u_sel(m2u_eq(cond, 0), p2, p3));
             m2lbl_slot_of(chosen)
         } else {
-            let take: i64 = m2u_eq(op, 32579) * m2u_eq(cond, 1) + m2u_eq(op, 32580) * m2u_eq(cond, 0 - 1);
+            let take: i64 = m2u_eq(op, 32579) * m2u_lt(0, cond) + m2u_eq(op, 32580) * m2u_lt(cond, 0);
             m2u_sel(take, m2lbl_slot_of(p1), 0 - 1)
         };
         ts
@@ -402,7 +418,8 @@ fn m4v_exec_ret(w: bytes, arr: array, n: i64, sp: i64, off: i64, nops: i64) -> b
     } else {
         m2u_eq(k0, m2k_imm()) * 1 + m2u_eq(k0, m2k_trit()) * 2
     };
-    let rval: i64 = if_pos m2u_eq(nops, 3) <=> 0 {
+    let is3: i64 = m2u_eq(nops, 3);
+    let rval: i64 = if_pos is3 <=> 0 {
         let p1: i64 = m2d_operand(arr, n, m2d_next(p0));
         let p2: i64 = m2d_operand(arr, n, m2d_next(p1));
         let sl1: i64 = m4_tok_to_slot(m2d_kind(p1), m2d_uval(p1));
@@ -410,17 +427,24 @@ fn m4v_exec_ret(w: bytes, arr: array, n: i64, sp: i64, off: i64, nops: i64) -> b
         let soff: i64 = if_pos m2u_ge(sl1, 0) <=> 0 { ld_u64(w, fbase + sl1 * 8) } else { m2d_ival(p1) };
         let slen_v: i64 = if_pos m2u_ge(sl2, 0) <=> 0 { ld_u64(w, fbase + sl2 * 8) } else { m2d_ival(p2) };
         let bbase: i64 = (v0 >> 32) & m4a_mask32();
-        ((bbase + soff) << 32) | (slen_v & m4a_mask32())
+        let blen: i64 = v0 & m4a_mask32();
+        let ok_sl: i64 = m2u_ge(soff, 0) * m2u_ge(slen_v, 0) * m2u_ge(blen, soff + slen_v);
+        m2u_sel(ok_sl, ((bbase + soff) << 32) | (slen_v & m4a_mask32()), 0 - 1)
     } else {
         v0
     };
-    let rtag: i64 = m2u_sel(m2u_eq(nops, 3), 3, t0);
-    return m4v_ret_apply(w, sp, rval, rtag);
+    let rtag: i64 = m2u_sel(is3, 3, t0);
+    let out: bytes = if_pos is3 * m2u_lt(rval, 0) <=> 0 {
+        m4_set_err(w, 2)
+    } else {
+        m4v_ret_apply(w, sp, rval, rtag)
+    };
+    return out;
 }
 
 #[strict]
 fn m4v_step_noncall(w0: bytes, arr: array, n: i64, sp: i64, off: i64, op: i64, fall: i64, fb: i64, nops: i64) -> bytes {
-    let is_skip: i64 = m2u_eq(op, 32576) + m2u_eq(op, 32512);
+    let is_skip: i64 = m2u_eq(op, 32576) + m2u_eq(op, 32512) + m2u_eq(op, 32517);
     let out: bytes = if_pos is_skip <=> 0 {
         st_u32(w0, fb + 4, fall)
     } else {
@@ -486,7 +510,7 @@ fn m4v_setup_entry(w1: bytes, a0: i64, a1: i64, a2: i64) -> bytes {
         i = i + 1;
         go = (1 - hit) * m2u_lt(i, fn_cnt);
     }
-    let eslot: i64 = m2u_sel(m2u_ge(eslot_raw, 0), eslot_raw, 0);
+    let eslot: i64 = m2u_sel(m2u_ge(eslot_raw, 0), eslot_raw, fn_cnt - 1);
     let ft: i64 = m4a_fn_tbl() + eslot * 16;
     let e_start: i64 = ld_u32(w1, ft + 8);
     let e_cnt: i64 = ld_u32(w1, ft + 12);

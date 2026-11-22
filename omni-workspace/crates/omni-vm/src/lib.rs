@@ -235,6 +235,28 @@ impl OmniBinaryVm {
                 return Err(format!("error[BUDGET_EXCEEDED]: VM fuel/step budget exceeded ({} > {})", self.steps_executed, self.step_limit));
             }
             let ins = &func.instructions[pc];
+            let min_ops = match ins.op_tok {
+                0x7F45 => 4,
+                0x7F2C | 0x7F39 => 3,
+                0x7F0E | 0x7F0F | 0x7F10..=0x7F14 | 0x7F17..=0x7F20 | 0x7F22..=0x7F27
+                | 0x7F29..=0x7F2B | 0x7F2D..=0x7F2F | 0x7F31 | 0x7F34 | 0x7F51 | 0x7F6A
+                | 0x7F7F => 2,
+                0x7F01..=0x7F04 | 0x7F06 | 0x7F08 | 0x7F09 | 0x7F15 | 0x7F16 | 0x7F21
+                | 0x7F28 | 0x7F30 | 0x7F35 | 0x7F3F | 0x7F42..=0x7F44 | 0x7F48 | 0x7F4A
+                | 0x7F50 | 0x7F55..=0x7F59 | 0x7F5D | 0x7F63 | 0x7F76 | 0x7F7D | 0x7F7E => 1,
+                _ => 0,
+            };
+            if ins.operands.len() < min_ops {
+                for &mut (p_idx, ref mut out_v) in restore_borrowed.iter_mut() {
+                    *out_v = std::mem::replace(&mut regs[192 + p_idx], OmniValue::Void);
+                }
+                return Err(format!(
+                    "error[BAD_ARITY]: opcode 0x{:04X} requires at least {} operands, got {}",
+                    ins.op_tok,
+                    min_ops,
+                    ins.operands.len()
+                ));
+            }
             match ins.op_tok {
                 0x7F00 | 0x7F40 | 0x7F46 => { pc += 1; continue; }
                 0x7F41 => {
@@ -518,21 +540,21 @@ impl OmniBinaryVm {
                     }
                     OmniValue::Bytes(buf)
                 }
-                0x7F10 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a.wrapping_add(b)) } else { OmniValue::Int(0) },
-                0x7F11 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a.wrapping_sub(b)) } else { OmniValue::Int(0) },
-                0x7F12 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a.wrapping_mul(b)) } else { OmniValue::Int(0) },
-                0x7F13 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(if b == 0 { 0 } else { a.wrapping_div(b) }) } else { OmniValue::Int(0) },
-                0x7F14 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(if b == 0 { 0 } else { a.wrapping_rem(b) }) } else { OmniValue::Int(0) },
-                0x7F15 => if let Some(a) = Self::eval_as_i64(&ins.operands[0], &regs) { OmniValue::Int(a.wrapping_neg()) } else { OmniValue::Int(0) },
-                0x7F16 => if let Some(a) = Self::eval_as_i64(&ins.operands[0], &regs) { OmniValue::Int(a.wrapping_abs()) } else { OmniValue::Int(0) },
-                0x7F17 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a.min(b)) } else { OmniValue::Int(0) },
-                0x7F18 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a.max(b)) } else { OmniValue::Int(0) },
-                0x7F1E => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a & b) } else { OmniValue::Int(0) },
-                0x7F1F => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a | b) } else { OmniValue::Int(0) },
-                0x7F20 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a ^ b) } else { OmniValue::Int(0) },
-                0x7F21 => if let Some(a) = Self::eval_as_i64(&ins.operands[0], &regs) { OmniValue::Int(!a) } else { OmniValue::Int(0) },
-                0x7F22 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a.wrapping_shl((b & 63) as u32)) } else { OmniValue::Int(0) },
-                0x7F23 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a.wrapping_shr((b & 63) as u32)) } else { OmniValue::Int(0) },
+                0x7F10 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0).wrapping_add(Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0))),
+                0x7F11 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0).wrapping_sub(Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0))),
+                0x7F12 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0).wrapping_mul(Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0))),
+                0x7F13 => { let a = Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0); let b = Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0); OmniValue::Int(if b == 0 { 0 } else { a.wrapping_div(b) }) }
+                0x7F14 => { let a = Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0); let b = Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0); OmniValue::Int(if b == 0 { 0 } else { a.wrapping_rem(b) }) }
+                0x7F15 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0).wrapping_neg()),
+                0x7F16 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0).wrapping_abs()),
+                0x7F17 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0).min(Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0))),
+                0x7F18 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0).max(Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0))),
+                0x7F1E => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0) & Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0)),
+                0x7F1F => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0) | Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0)),
+                0x7F20 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0) ^ Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0)),
+                0x7F21 => OmniValue::Int(!Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0)),
+                0x7F22 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0).wrapping_shl((Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0) & 63) as u32)),
+                0x7F23 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0).wrapping_shr((Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0) & 63) as u32)),
                 0x7F50 => match Self::eval_op_ref(&ins.operands[0], &regs) {
                     Some(OmniValue::Bytes(b)) => OmniValue::Int(b.len() as i64),
                     Some(OmniValue::Str(s)) => OmniValue::Int(s.len() as i64),
