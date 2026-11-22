@@ -90,38 +90,21 @@ jobs:
           cargo test --release --workspace
 
   pure-default-no-rustc:
-    name: Pure-Default Self-Host & Fixed-Point (rustc/cargo off PATH — Seed-Shrink A4)
+    name: Zero-Rust Release Gate & Independent Verifier (Seed-Shrink A4/B4/C1/C2)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build Stage-0 runner once (before stripping rustc/cargo from PATH)
+      - name: Independent External Verifier Trace Check (C2 — Python 3, zero Rust/Omni)
+        run: |
+          python3 scripts/external_verifier_check.py
+
+      - name: Build Stage-0 seed & runner binaries once (before stripping rustc/cargo from PATH)
         run: |
           rustc -O --edition 2021 omni_rust_bootstrap.rs -o ./omni
           rustc -O --edition 2021 seed0/omni_seed0.rs -o ./omni-seed0
           rustc -O --edition 2021 omni_dev_host.rs -o ./omni-dev-host
 
-      - name: Run full pure-default compile/run/self-host/fixed-point suite with rustc & cargo absent from PATH
+      - name: Run mandatory Zero-Rust Fixed-Point Release Gate (C1 — rustc/cargo absent from PATH)
         run: |
-          export PATH="/usr/bin:/bin"
-          if command -v rustc >/dev/null 2>&1 || command -v cargo >/dev/null 2>&1; then
-            echo "ERROR: rustc or cargo still reachable on PATH"
-            exit 1
-          fi
-          ./omni-seed0 verify-seeds
-          ./omni-seed0 line-audit
-          ./omni-dev-host --version
-          ./omni a1-pure-default
-          ./omni a2-pure-include
-          ./omni a3-macro-quarantine
-          ./omni b2-pure-verifier
-          ./omni b4-pure-launcher
-          ./omni self-host
-          ./omni p5-sys
-          ./omni m2-fixed-point
-          ./omni m3-fixed-point
-          ./omni compile spec/acceptance/goldens/weighted_diff_pure_golden.omni /tmp/wd.omni_bc
-          OUT=$(./omni run /tmp/wd.omni_bc 45 10 40)
-          test "$OUT" = "Int(100)"
-          ./omni p7-measure
-          ./omni p7-canary
+          bash scripts/zero_rust_rebuild.sh

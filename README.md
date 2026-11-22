@@ -123,6 +123,15 @@ rustc -O omni_rust_bootstrap.rs -o omnic
 ./omnic fixed-point           # Stage-1 == Stage-2 fixed-point ELF64 check (cross-platform)
 ```
 
+### Zero-Rust Rebuild & Seed-Shrink Verification (Phase C1–C3)
+
+Mandatory Stage-0 Rust is **`236` lines** (`seed0/omni_seed0.rs` 134 lines + `p4_shim/mod.rs` 102 lines — a **99.51% reduction** from the 48,590-line baseline; see `oracle/README.md`). Reproduce the full zero-Rust rebuild with `rustc`/`cargo` absent from `PATH` and run the independent Python 3 verifier trace checker:
+
+```bash
+bash scripts/zero_rust_rebuild.sh          # C1: strips rustc/cargo from PATH, verifies all 3 seeds, 181-B M5 launcher (0x87E30A9BB58BB3C4), native m2.elf->m4.elf (78,020 B, 0xF66A7081E2B43319), M2/M3 fixed points & P7 gates
+python3 scripts/external_verifier_check.py # C2: independent zero-dependency Python 3 checker over spec/verifier_traces/pure_verifier_golden_traces.json
+```
+
 ### 8-Crate Workspace (`cargo`)
 
 ```bash
