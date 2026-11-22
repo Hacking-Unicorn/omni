@@ -32,7 +32,7 @@ Frozen values the guard checks on every commit:
 | O-10 | M2's input window | **128 KiB** (M2 D-7), which fits the measured 34.5k-57.5k-word M3 image. |
 | O-3 | Linear-scan symtab with fnv32 compare keys vs "no hash maps"? | **Yes — linear-scan.** Verified in code (`pure/m3/skim.omni` uses FNV-1a hash keys with linear dispatch, no hash-map structure). Decided 2026-11-20. |
 | O-4 | Source input encoding | **The §3 split: `Bytes` on the VM, NUL-padded u16 natively.** Already implemented; proven by the M3-17/18 E2E chain. Decided 2026-11-20. |
-| O-5 | When to port include resolution to Omni? | **Deferred — host expands includes (status quo).** The M3 fixed point passes with this arrangement. Decided 2026-11-20. |
+| O-5 | When to port include resolution to Omni? | **Implemented in Pure-Omni (`pure/m3/include.omni`, Seed-Shrink A2).** Pure-Omni scans `include`/`mod` directives, strips include lines, hashes paths, and detects `CIRCULAR_INCLUDE` on the default pure path (`a2-pure-include`), matching Rust `resolve_omni_surface_includes` with 0-byte diff. Updated 2026-11-21. |
 | O-6 | New M3 capacity limits Rust doesn't have (512 nesting frames, 1024 fns, 128 macros, 32 KiB pool, 1024 AST nodes/fn) | **Accepted as documented errors.** Already baked into the arena layout and passing. Decided by Caleb 2026-11-20. |
 | O-7 | Error parity: `(class, line, col)` only, or exact message text too? | **`(class, line, col)` only** (M3-01 locks this). m3-lex holds 47/47 files at 100% token/error parity. Decided 2026-11-20. |
 | O-8 | Port `emit_asm` text mode to Omni? | **No — keep as Rust tooling** (PLAN §2). M3 is complete without porting it. Decided 2026-11-20. |
