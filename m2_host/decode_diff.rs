@@ -102,6 +102,28 @@ pub const API_STAGE2_OMNI_SRC: &str = concat!(
     include_str!("../spec/api/reflect_harness.omni"),
 );
 
+pub const API_STAGE2_EMIT_OMNI_SRC: &str = concat!(
+    include_str!("../pure/m2/util.omni"),
+    "\n",
+    include_str!("../pure/isa/table.omni"),
+    "\n",
+    include_str!("../pure/m2/decode.omni"),
+    "\n",
+    include_str!("../pure/m2/labels.omni"),
+    "\n",
+    include_str!("../pure/m2/arena.omni"),
+    "\n",
+    include_str!("../pure/m2/elf.omni"),
+    "\n",
+    include_str!("../pure/m2/emit_x86.omni"),
+    "\n",
+    include_str!("../pure/m2/emit_multi.omni"),
+    "\n",
+    include_str!("../pure/api/emit.omni"),
+    "\n",
+    include_str!("../spec/api/emit_harness.omni"),
+);
+
 pub const M5_SYS_OMNI_SRC: &str = concat!(
     include_str!("../pure/m2/util.omni"),
     "\n",
@@ -4754,5 +4776,333 @@ pub fn selftest_api_stage2() -> Result<(usize, usize, usize), String> {
     checks += 1;
 
     Ok((checks, ref_u16.len(), ref_elf_rust.len()))
+}
+
+/// New-Level API Stage 2 (Part 2) gate (`./omnic api-stage2-emit`):
+///   1. Pure-Omni M3 (0-word diff) + Pure-Omni M2 (0-byte diff) on `pure/api/emit.omni`.
+///   2. `api_token_emit_const(42)` -> `api_token_inspect` (1 fn, 1 ins, 13 w) -> Pure-Omni
+///      `omni_verify_module_api` (0 errors) -> `api_token_emit` canonical + fail-closed.
+///   3. Re-hosted M2 emitter `api_token_emit_elf` on synthesized stream -> 0-byte diff vs Rust
+///      M2 ELF64 + Pure-Omni M4 VM (`ret == 42`) + native Linux x86-64 execution when available.
+///   4. End-to-end reflective loop: `api_token_specialize(bloated_bench_clamp, 1)` ->
+///      `api_token_emit` -> `api_token_emit_elf` -> 0-byte diff vs Rust M2 + M4 VM (`ret == 90`)
+///      + fail-closed empty slice on corrupt `U16Array`.
+///   5. Stage 2 Part 2 golden (`token_emit_golden.omni`, M3/M2/M4 0-diff) + frozen hashes intact.
+pub fn selftest_api_stage2_emit() -> Result<(usize, usize, usize), String> {
+    let mut checks = 0usize;
+
+    // 1. Compile pure/api/emit.omni + spec/api/emit_harness.omni via Rust M3, Pure-Omni M3 (0-word diff),
+    //    Rust M2-multi ELF64, and Pure-Omni M2 (0-byte diff).
+    let emit_u16 = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(API_STAGE2_EMIT_OMNI_SRC))?;
+    let emit_m3_u16 = match m3_lockstep_compile_via_omni(API_STAGE2_EMIT_OMNI_SRC, true)? {
+        Ok(v) => v,
+        Err((c, l, col)) => return Err(format!("API-S2E M3 compile failed ({}, {}:{})", c, l, col)),
+    };
+    if emit_m3_u16 != emit_u16 {
+        return Err(format!(
+            "API-S2E M3 0-word diff failed on pure/api/emit.omni: pure={}w vs rust={}w",
+            emit_m3_u16.len(),
+            emit_u16.len()
+        ));
+    }
+    let emit_elf_rust = compile_pure_u16_to_x86_64_elf_multi(&emit_u16, 1, 2, 3)?;
+    let m2_u16 = decode_bytes_to_u16_stream(
+        &std::fs::read("pure/m2/m2.omni_bc").map_err(|e| format!("API-S2E read m2 seed: {}", e))?,
+    );
+    let m2_mod = decode_omni_token_stream(&m2_u16)?;
+    let m2_entry = m2_entry_of(&m2_mod);
+    let mut vm_m2 = OmniBinaryVm::with_budgets(500_000_000, 128 * 1024 * 1024);
+    let emit_elf_pure = match vm_m2.execute_function(
+        &m2_mod,
+        m2_entry,
+        vec![
+            OmniValue::U16Array(emit_u16.clone()),
+            OmniValue::Int(1),
+            OmniValue::Int(2),
+            OmniValue::Int(3),
+        ],
+    ).map_err(|e| format!("API-S2E step1 M2: {}", e))? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("API-S2E Pure-Omni M2 returned {:?}", other)),
+    };
+    if emit_elf_pure != emit_elf_rust {
+        return Err(format!(
+            "API-S2E Pure-Omni M2 diff on pure/api/emit.omni: pure={}B vs rust={}B",
+            emit_elf_pure.len(),
+            emit_elf_rust.len()
+        ));
+    }
+    checks += 1;
+
+    let emit_mod = decode_omni_token_stream(&emit_u16)?;
+    let n_efns = emit_mod.functions.len();
+    // Order at end of spec/api/emit_harness.omni:
+    //   api_emit_const_entry (-4), api_emit_bc_entry (-3), api_emit_elf_entry (-2), main (-1)
+    let fn_emit_const = emit_mod.functions[n_efns - 4].fn_idx;
+    let fn_emit_bc = emit_mod.functions[n_efns - 3].fn_idx;
+    let fn_emit_elf = emit_mod.functions[n_efns - 2].fn_idx;
+
+    let ref_u16 = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(API_STAGE2_OMNI_SRC))?;
+    let ref_mod = decode_omni_token_stream(&ref_u16)?;
+    let n_rfns = ref_mod.functions.len();
+    let fn_inspect = ref_mod.functions[n_rfns - 5].fn_idx;
+    let fn_specialize = ref_mod.functions[n_rfns - 4].fn_idx;
+
+    let m4_u16 = decode_bytes_to_u16_stream(
+        &std::fs::read("pure/m4/m4.omni_bc").map_err(|e| format!("API-S2E read m4 seed: {}", e))?,
+    );
+    let m4_mod = decode_omni_token_stream(&m4_u16)?;
+    let m4_run_fn = m4_mod.functions[m4_mod.functions.len() - 2].fn_idx;
+    let mut vm = OmniBinaryVm::with_budgets(500_000_000, 128 * 1024 * 1024);
+
+    // 2. Synthesize 13-word module via `api_token_emit_const(42)`, inspect via `api_token_inspect`,
+    //    verify via Pure-Omni `omni_verify_module_api`, canonicalize via `api_token_emit`, and prove fail-closed.
+    let synth_bytes = match vm.execute_function(
+        &emit_mod,
+        fn_emit_const,
+        vec![OmniValue::Int(42)],
+    ).map_err(|e| format!("API-S2E step2 emit_const: {}", e))? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("API-S2E emit_const returned {:?}", other)),
+    };
+    let synth_packed = match vm.execute_function(
+        &ref_mod,
+        fn_inspect,
+        vec![OmniValue::Bytes(synth_bytes.clone())],
+    ).map_err(|e| format!("API-S2E step2 inspect: {}", e))? {
+        OmniValue::Int(v) => v,
+        other => return Err(format!("API-S2E inspect(synth) returned {:?}", other)),
+    };
+    if (synth_packed >> 40) != 1 || ((synth_packed >> 20) & 0xFFFFF) != 1 || (synth_packed & 0xFFFFF) != 13 {
+        return Err(format!("API-S2E inspect(synth) mismatch: packed={}", synth_packed));
+    }
+    let ve_u16 = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(OMNI_VERIFIER_ENGINE_SURFACE))?;
+    let ve_mod = decode_omni_token_stream(&ve_u16)?;
+    let fn_verify_mod_api = ve_mod.functions[ve_mod.functions.len() - 2].fn_idx;
+    let vrep = match vm.execute_function(
+        &ve_mod,
+        fn_verify_mod_api,
+        vec![OmniValue::Bytes(synth_bytes.clone())],
+    ).map_err(|e| format!("API-S2E step2 verify_api: {}", e))? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("API-S2E verify_api(synth) returned {:?}", other)),
+    };
+    let v_status = i64::from_le_bytes(vrep[0..8].try_into().unwrap());
+    let v_nfns = i64::from_le_bytes(vrep[16..24].try_into().unwrap());
+    let v_passed = i64::from_le_bytes(vrep[32..40].try_into().unwrap());
+    let v_nerr = i64::from_le_bytes(vrep[40..48].try_into().unwrap());
+    if v_status != 0 || v_nfns != 1 || v_passed != 1 || v_nerr != 0 {
+        return Err(format!(
+            "API-S2E synthesized stream failed Pure-Omni verifier (status={}, nfns={}, passed={}, nerr={})",
+            v_status, v_nfns, v_passed, v_nerr
+        ));
+    }
+    let canon_bytes = match vm.execute_function(
+        &emit_mod,
+        fn_emit_bc,
+        vec![OmniValue::Bytes(synth_bytes.clone())],
+    ).map_err(|e| format!("API-S2E step2 emit_bc: {}", e))? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("API-S2E emit_bc returned {:?}", other)),
+    };
+    if canon_bytes != synth_bytes {
+        return Err(String::from("API-S2E token_emit did not preserve canonical synthesized stream"));
+    }
+    for bad in &[vec![0xFFu8, 0xFF, 0x00, 0x00], vec![0xE0u8, 0x7E, 0xE3, 0x7E]] {
+        let bres = match vm.execute_function(&emit_mod, fn_emit_bc, vec![OmniValue::Bytes(bad.clone())])
+            .map_err(|e| format!("API-S2E step2 bad emit_bc: {}", e))?
+        {
+            OmniValue::Bytes(b) => b,
+            other => return Err(format!("API-S2E bad emit_bc returned {:?}", other)),
+        };
+        if !bres.is_empty() {
+            return Err(format!("API-S2E token_emit must fail closed on corrupt stream, got {} B", bres.len()));
+        }
+    }
+    checks += 1;
+
+    // 3. Re-hosted M2 emitter `api_token_emit_elf` on synthesized stream -> 0-byte diff vs Rust M2 + M4 VM (ret=42).
+    let synth_u16 = decode_bytes_to_u16_stream(&canon_bytes);
+    let synth_elf_rust = compile_pure_u16_to_x86_64_elf_multi(&synth_u16, 0, 0, 0)?;
+    let synth_elf_pure = match vm.execute_function(
+        &emit_mod,
+        fn_emit_elf,
+        vec![
+            OmniValue::U16Array(synth_u16.clone()),
+            OmniValue::Int(0),
+            OmniValue::Int(0),
+            OmniValue::Int(0),
+        ],
+    ).map_err(|e| format!("API-S2E step3 emit_elf(synth): {}", e))? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("API-S2E emit_elf(synth) returned {:?}", other)),
+    };
+    if synth_elf_pure != synth_elf_rust {
+        return Err(format!(
+            "API-S2E emit_elf(synth) 0-byte diff failed: pure={}B vs rust={}B",
+            synth_elf_pure.len(),
+            synth_elf_rust.len()
+        ));
+    }
+    let st = 167_936usize;
+    let synth_arena = match vm.execute_function(
+        &m4_mod,
+        m4_run_fn,
+        vec![
+            OmniValue::Bytes(vec![0u8; 524_288]),
+            OmniValue::U16Array(synth_u16),
+            OmniValue::Int(0),
+            OmniValue::Int(0),
+            OmniValue::Int(0),
+            OmniValue::Int(50_000),
+            OmniValue::Int(0),
+        ],
+    ).map_err(|e| format!("API-S2E step3 M4(synth): {}", e))? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("API-S2E M4(synth) returned {:?}", other)),
+    };
+    let synth_ret = i64::from_le_bytes(synth_arena[st + 32..st + 40].try_into().unwrap());
+    if synth_ret != 42 {
+        return Err(format!("API-S2E M4(synth) ret={} want 42", synth_ret));
+    }
+    let _ = p7_verify_native_elf_i64("api_s2e_synth", &synth_elf_pure, 42)?;
+    checks += 1;
+
+    // 4. Full reflective loop: specialize(bloated_bench_clamp, 1) -> token_emit -> token_emit_elf ->
+    //    0-byte diff vs Rust M2 + M4 VM (ret=90) + fail-closed on corrupt U16Array.
+    let (_bname0, bsrc0, bargs0, bwant0) = P7_BENCHMARK_CORPUS[0];
+    let clean_bc = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(bsrc0))?;
+    let mut bloated_bc = clean_bc.clone();
+    let pcnt0 = bloated_bc[3] as usize;
+    let icnt_idx = 4 + pcnt0 * 3 + 2;
+    bloated_bc[icnt_idx] += 2;
+    bloated_bc.splice(icnt_idx + 1..icnt_idx + 1, [0x7F00u16, 0x7EE4, 0x7F00, 0x7EE4]);
+    let spec_bytes = match vm.execute_function(
+        &ref_mod,
+        fn_specialize,
+        vec![OmniValue::Bytes(encode_u16_stream_to_bytes(&bloated_bc)), OmniValue::Int(1)],
+    ).map_err(|e| format!("API-S2E step4 specialize: {}", e))? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("API-S2E specialize returned {:?}", other)),
+    };
+    let emitted_bc = match vm.execute_function(
+        &emit_mod,
+        fn_emit_bc,
+        vec![OmniValue::Bytes(spec_bytes)],
+    ).map_err(|e| format!("API-S2E step4 emit_bc: {}", e))? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("API-S2E emit_bc(spec) returned {:?}", other)),
+    };
+    let emitted_u16 = decode_bytes_to_u16_stream(&emitted_bc);
+    if emitted_u16 != clean_bc {
+        return Err(String::from("API-S2E specialize->token_emit mismatch vs clean bench_clamp"));
+    }
+    let clamp_elf_rust = compile_pure_u16_to_x86_64_elf_multi(&clean_bc, bargs0[0], bargs0[1], bargs0[2])?;
+    let clamp_elf_pure = match vm.execute_function(
+        &emit_mod,
+        fn_emit_elf,
+        vec![
+            OmniValue::U16Array(emitted_u16.clone()),
+            OmniValue::Int(bargs0[0]),
+            OmniValue::Int(bargs0[1]),
+            OmniValue::Int(bargs0[2]),
+        ],
+    ).map_err(|e| format!("API-S2E step4 emit_elf(clamp): {}", e))? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("API-S2E emit_elf(clamp) returned {:?}", other)),
+    };
+    if clamp_elf_pure != clamp_elf_rust {
+        return Err(format!(
+            "API-S2E emit_elf(clamp) 0-byte diff failed: pure={}B vs rust={}B",
+            clamp_elf_pure.len(),
+            clamp_elf_rust.len()
+        ));
+    }
+    let clamp_arena = match vm.execute_function(
+        &m4_mod,
+        m4_run_fn,
+        vec![
+            OmniValue::Bytes(vec![0u8; 524_288]),
+            OmniValue::U16Array(emitted_u16),
+            OmniValue::Int(bargs0[0]),
+            OmniValue::Int(bargs0[1]),
+            OmniValue::Int(bargs0[2]),
+            OmniValue::Int(50_000),
+            OmniValue::Int(0),
+        ],
+    ).map_err(|e| format!("API-S2E step4 M4(clamp): {}", e))? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("API-S2E M4(clamp) returned {:?}", other)),
+    };
+    let clamp_ret = i64::from_le_bytes(clamp_arena[st + 32..st + 40].try_into().unwrap());
+    if clamp_ret != bwant0 {
+        return Err(format!("API-S2E M4(clamp) ret={} want {}", clamp_ret, bwant0));
+    }
+    let _ = p7_verify_native_elf_i64("api_s2e_clamp", &clamp_elf_pure, bwant0)?;
+    let bad_elf = match vm.execute_function(
+        &emit_mod,
+        fn_emit_elf,
+        vec![
+            OmniValue::U16Array(vec![0xFFFF, 0x0000]),
+            OmniValue::Int(0),
+            OmniValue::Int(0),
+            OmniValue::Int(0),
+        ],
+    ).map_err(|e| format!("API-S2E step4 bad emit_elf: {}", e))? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("API-S2E bad emit_elf returned {:?}", other)),
+    };
+    if !bad_elf.is_empty() {
+        return Err(format!("API-S2E emit_elf must fail closed on corrupt header, got {} B", bad_elf.len()));
+    }
+    checks += 1;
+
+    // 5. Stage 2 Part 2 golden (`token_emit_golden.omni`) M3/M2/M4 0-diff + frozen hashes intact.
+    let gpath = "spec/acceptance/goldens/token_emit_golden.omni";
+    let gsrc = std::fs::read_to_string(gpath).map_err(|e| format!("API-S2E read {}: {}", gpath, e))?;
+    let r_u16 = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(&gsrc))?;
+    let m3_u16_g = match m3_lockstep_compile_via_omni(&gsrc, true)? {
+        Ok(v) => v,
+        Err((c, l, col)) => return Err(format!("API-S2E M3 on {} errored ({}, {}:{})", gpath, c, l, col)),
+    };
+    if m3_u16_g != r_u16 {
+        return Err(format!("API-S2E M3 0-word diff failed on {}", gpath));
+    }
+    let elf_r = compile_pure_u16_to_x86_64_elf_multi(&r_u16, 42, 0, 0)?;
+    let elf_p = match vm_m2.execute_function(
+        &m2_mod,
+        m2_entry,
+        vec![OmniValue::U16Array(r_u16.clone()), OmniValue::Int(42), OmniValue::Int(0), OmniValue::Int(0)],
+    ).map_err(|e| format!("API-S2E step5 M2 golden: {}", e))? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("API-S2E M2 on {} returned {:?}", gpath, other)),
+    };
+    if elf_p != elf_r {
+        return Err(format!("API-S2E M2 0-byte diff failed on {}", gpath));
+    }
+    let g_arena = match vm.execute_function(
+        &m4_mod,
+        m4_run_fn,
+        vec![
+            OmniValue::Bytes(vec![0u8; 524_288]),
+            OmniValue::U16Array(r_u16),
+            OmniValue::Int(42),
+            OmniValue::Int(0),
+            OmniValue::Int(0),
+            OmniValue::Int(50_000),
+            OmniValue::Int(0),
+        ],
+    ).map_err(|e| format!("API-S2E step5 M4 golden: {}", e))? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("API-S2E M4 VM on {} returned {:?}", gpath, other)),
+    };
+    let gv = i64::from_le_bytes(g_arena[st + 32..st + 40].try_into().unwrap());
+    if gv != 13 {
+        return Err(format!("API-S2E M4 VM {} mismatch: got {} want 13", gpath, gv));
+    }
+    selftest_m2_frozen_hashes()?;
+    checks += 1;
+
+    Ok((checks, emit_u16.len(), emit_elf_rust.len()))
 }
 

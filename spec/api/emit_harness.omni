@@ -1,0 +1,22 @@
+// Phase 7 / New-Level API Stage 2 (Part 2) harness for `pure/api/emit.omni`.
+// Exposes entry points for M3/M2/M4 differential testing (main <= 4 params).
+
+#[strict]
+fn api_emit_const_entry(ret_val: i64) -> bytes {
+    return api_token_emit_const(ret_val);
+}
+
+#[strict]
+fn api_emit_bc_entry(module_bc: bytes) -> bytes {
+    return api_token_emit(module_bc);
+}
+
+#[strict]
+fn api_emit_elf_entry(module_u16: array, arg0: i64, arg1: i64, arg2: i64) -> bytes {
+    return api_token_emit_elf(module_u16, arg0, arg1, arg2);
+}
+
+#[strict]
+fn main(arr: array, a: i64, b: i64, c: i64) -> bytes {
+    return api_token_emit_elf(arr, a, b, c);
+}
