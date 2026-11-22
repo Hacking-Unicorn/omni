@@ -5,7 +5,7 @@
 // Zero external crates, zero HTTP/KV, zero Rust frontend, zero Rust verifier,
 // zero Rust AOT. Its ONLY responsibilities are:
 //   1. Embed & verify exact FNV-1a64 hashes of the 3 committed Pure-Omni seeds:
-//      - `pure/m3/m3.omni_bc` (59,474 words, 0x0668919FB4378D88)
+//      - `pure/m3/m3.omni_bc` (59,522 words, 0x9A5A59A3BDCF2D5E)
 //      - `pure/m2/m2.omni_bc` (39,049 words, 0xE2A6C5F117FDF5FE)
 //      - `pure/m4/m4.omni_bc` (27,876 words, 0xF6613357C0B93634)
 //   2. Extract seeds to disk (`emit-seeds <out_dir>`).
@@ -19,11 +19,11 @@ const SEED_M3_BYTES: &[u8] = include_bytes!("../pure/m3/m3.omni_bc");
 const SEED_M2_BYTES: &[u8] = include_bytes!("../pure/m2/m2.omni_bc");
 const SEED_M4_BYTES: &[u8] = include_bytes!("../pure/m4/m4.omni_bc");
 
-const SEED_M3_FNV: u64 = 0x0668919FB4378D88;
+const SEED_M3_FNV: u64 = 0x9A5A59A3BDCF2D5E;
 const SEED_M2_FNV: u64 = 0xE2A6C5F117FDF5FE;
 const SEED_M4_FNV: u64 = 0xF6613357C0B93634;
 
-const SEED_M3_WORDS: usize = 59_474;
+const SEED_M3_WORDS: usize = 59_522;
 const SEED_M2_WORDS: usize = 39_049;
 const SEED_M4_WORDS: usize = 27_876;
 

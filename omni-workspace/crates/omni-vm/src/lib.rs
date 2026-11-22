@@ -33,7 +33,7 @@ pub const OMNI_DB_GET_MISS: i64 = -1;
 /// Fixed KV key cap (Boss Lady 2026-11-14): 8192 distinct keys, the `pure/host_kv.omni` arena size
 /// (0x1B0000..0x1EFFFF at 32 B). The 8193rd new key is `BUDGET_EXCEEDED`; overwrites still succeed.
 pub const OMNI_VM_KV_MAX_KEYS: usize = 8192;
-pub const DEFAULT_VM_WALL_TIMEOUT_MS: u64 = 120_000;
+pub const DEFAULT_VM_WALL_TIMEOUT_MS: u64 = 600_000;
 
 pub struct OmniBinaryVm {
     pub tables: HashMap<u16, Vec<BTreeMap<u16, OmniValue>>>,
@@ -45,9 +45,10 @@ pub struct OmniBinaryVm {
     pub memory_budget_bytes: usize,
     pub allocated_bytes: usize,
     pub call_depth: usize,
-    pub verified_fns: u64,
+    pub verified_fns: [u64; 16],
     pub wall_timeout_ms: u64,
     pub start_instant: Option<std::time::Instant>,
+    frame_pool: Vec<Box<[OmniValue; 224]>>,
 }
 
 impl OmniBinaryVm {
@@ -62,9 +63,10 @@ impl OmniBinaryVm {
             memory_budget_bytes: DEFAULT_VM_MEMORY_BUDGET_BYTES,
             allocated_bytes: 0,
             call_depth: 0,
-            verified_fns: 0,
+            verified_fns: [0; 16],
             wall_timeout_ms: DEFAULT_VM_WALL_TIMEOUT_MS,
             start_instant: None,
+            frame_pool: Vec::new(),
         }
     }
 
@@ -79,9 +81,10 @@ impl OmniBinaryVm {
             memory_budget_bytes,
             allocated_bytes: 0,
             call_depth: 0,
-            verified_fns: 0,
+            verified_fns: [0; 16],
             wall_timeout_ms: DEFAULT_VM_WALL_TIMEOUT_MS,
             start_instant: None,
+            frame_pool: Vec::new(),
         }
     }
 
@@ -97,7 +100,7 @@ impl OmniBinaryVm {
         self.steps_executed = 0;
         self.allocated_bytes = 0;
         self.call_depth = 0;
-        self.verified_fns = 0;
+        self.verified_fns = [0; 16];
         self.start_instant = None;
     }
 
@@ -184,10 +187,8 @@ impl OmniBinaryVm {
         restore_borrowed: &mut [(usize, OmniValue)],
     ) -> Result<OmniValue, String> {
         if self.call_depth == 0 {
-            self.verified_fns = 0;
-            if self.start_instant.is_none() {
-                self.start_instant = Some(std::time::Instant::now());
-            }
+            self.verified_fns = [0; 16];
+            self.start_instant = Some(std::time::Instant::now());
         }
         let func = if let Some(f) = module.functions.get(fn_idx as usize).filter(|f| f.fn_idx == fn_idx) {
             f
@@ -199,21 +200,55 @@ impl OmniBinaryVm {
                 .ok_or_else(|| format!("Function index {} not found", fn_idx))?
         };
 
-        let fn_bit = if (fn_idx as usize) < 64 { 1u64 << fn_idx } else { 0 };
-        if fn_bit == 0 || (self.verified_fns & fn_bit) == 0 {
+        let word_idx = (fn_idx as usize) >> 6;
+        let bit_mask = 1u64 << ((fn_idx as usize) & 63);
+        let already_verified = word_idx < self.verified_fns.len() && (self.verified_fns[word_idx] & bit_mask) != 0;
+        if !already_verified {
             let rep = verify_binary_function(func);
             if !rep.passed {
                 return Err(format!("Binary verification failed: {:?}", rep.errors));
             }
-            self.verified_fns |= fn_bit;
+            if word_idx < self.verified_fns.len() {
+                self.verified_fns[word_idx] |= bit_mask;
+            }
         }
 
-        let mut regs: [OmniValue; 224] = std::array::from_fn(|_| OmniValue::Void);
+        let mut regs: Box<[OmniValue; 224]> = self
+            .frame_pool
+            .pop()
+            .unwrap_or_else(|| Box::new(std::array::from_fn(|_| OmniValue::Void)));
+        let mut dirty: [u64; 4] = [0; 4];
         for (&(par_tok, _, _), val) in func.params.iter().zip(args.into_iter()) {
             if let Some(slot) = token_to_slot(par_tok) {
                 regs[slot] = val;
+                dirty[slot >> 6] |= 1u64 << (slot & 63);
             }
         }
+        let res = self.execute_function_body(module, func, owned_params, restore_borrowed, &mut regs, &mut dirty);
+        for (wi, &word) in dirty.iter().enumerate() {
+            let mut m = word;
+            while m != 0 {
+                let tz = m.trailing_zeros() as usize;
+                let slot = (wi << 6) + tz;
+                if slot < 224 {
+                    regs[slot] = OmniValue::Void;
+                }
+                m &= m - 1;
+            }
+        }
+        self.frame_pool.push(regs);
+        res
+    }
+
+    fn execute_function_body(
+        &mut self,
+        module: &BinModule,
+        func: &BinFunction,
+        owned_params: u32,
+        restore_borrowed: &mut [(usize, OmniValue)],
+        regs: &mut [OmniValue; 224],
+        dirty: &mut [u64; 4],
+    ) -> Result<OmniValue, String> {
 
         let mut label_pcs: Option<[usize; 256]> = None;
         let resolve_lbl = |lbl: u16, lp: &mut Option<[usize; 256]>| -> Option<usize> {
@@ -969,6 +1004,7 @@ impl OmniBinaryVm {
             if let Some(d_tok) = ins.dest_reg {
                 if let Some(slot) = token_to_slot(d_tok) {
                     regs[slot] = out_val;
+                    dirty[slot >> 6] |= 1u64 << (slot & 63);
                 }
             }
             pc += 1;

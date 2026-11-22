@@ -1200,7 +1200,7 @@ pub const OMNI_DB_GET_MISS: i64 = -1;
 /// Fixed KV key cap (Boss Lady 2026-11-14): 8192 distinct keys, the `pure/host_kv.omni` arena size
 /// (0x1B0000..0x1EFFFF at 32 B). The 8193rd new key is `BUDGET_EXCEEDED`; overwrites still succeed.
 pub const OMNI_VM_KV_MAX_KEYS: usize = 8192;
-pub const DEFAULT_VM_WALL_TIMEOUT_MS: u64 = 120_000;
+pub const DEFAULT_VM_WALL_TIMEOUT_MS: u64 = 600_000;
 
 pub struct OmniBinaryVm {
     pub tables: HashMap<u16, Vec<BTreeMap<u16, OmniValue>>>,
@@ -1212,9 +1212,10 @@ pub struct OmniBinaryVm {
     pub memory_budget_bytes: usize,
     pub allocated_bytes: usize,
     pub call_depth: usize,
-    pub verified_fns: u64,
+    pub verified_fns: [u64; 16],
     pub wall_timeout_ms: u64,
     pub start_instant: Option<Instant>,
+    frame_pool: Vec<Box<[OmniValue; 224]>>,
 }
 
 impl OmniBinaryVm {
@@ -1229,9 +1230,10 @@ impl OmniBinaryVm {
             memory_budget_bytes: DEFAULT_VM_MEMORY_BUDGET_BYTES,
             allocated_bytes: 0,
             call_depth: 0,
-            verified_fns: 0,
+            verified_fns: [0; 16],
             wall_timeout_ms: DEFAULT_VM_WALL_TIMEOUT_MS,
             start_instant: None,
+            frame_pool: Vec::new(),
         }
     }
 
@@ -1246,9 +1248,10 @@ impl OmniBinaryVm {
             memory_budget_bytes,
             allocated_bytes: 0,
             call_depth: 0,
-            verified_fns: 0,
+            verified_fns: [0; 16],
             wall_timeout_ms: DEFAULT_VM_WALL_TIMEOUT_MS,
             start_instant: None,
+            frame_pool: Vec::new(),
         }
     }
 
@@ -1264,7 +1267,7 @@ impl OmniBinaryVm {
         self.steps_executed = 0;
         self.allocated_bytes = 0;
         self.call_depth = 0;
-        self.verified_fns = 0;
+        self.verified_fns = [0; 16];
         self.start_instant = None;
     }
 
@@ -1392,10 +1395,8 @@ impl OmniBinaryVm {
         restore_borrowed: &mut [(usize, OmniValue)],
     ) -> Result<OmniValue, String> {
         if self.call_depth == 0 {
-            self.verified_fns = 0;
-            if self.start_instant.is_none() {
-                self.start_instant = Some(Instant::now());
-            }
+            self.verified_fns = [0; 16];
+            self.start_instant = Some(Instant::now());
         }
         if self.call_depth >= MAX_VM_CALL_DEPTH {
             return Err(format!(
@@ -1413,21 +1414,55 @@ impl OmniBinaryVm {
                 .ok_or_else(|| format!("Function index {} not found", fn_idx))?
         };
 
-        let fn_bit = if (fn_idx as usize) < 64 { 1u64 << fn_idx } else { 0 };
-        if fn_bit == 0 || (self.verified_fns & fn_bit) == 0 {
+        let word_idx = (fn_idx as usize) >> 6;
+        let bit_mask = 1u64 << ((fn_idx as usize) & 63);
+        let already_verified = word_idx < self.verified_fns.len() && (self.verified_fns[word_idx] & bit_mask) != 0;
+        if !already_verified {
             let rep = verify_binary_function(func);
             if !rep.passed {
                 return Err(format!("Binary verification failed: {:?}", rep.errors));
             }
-            self.verified_fns |= fn_bit;
+            if word_idx < self.verified_fns.len() {
+                self.verified_fns[word_idx] |= bit_mask;
+            }
         }
 
-        let mut regs: [OmniValue; 224] = std::array::from_fn(|_| OmniValue::Void);
+        let mut regs: Box<[OmniValue; 224]> = self
+            .frame_pool
+            .pop()
+            .unwrap_or_else(|| Box::new(std::array::from_fn(|_| OmniValue::Void)));
+        let mut dirty: [u64; 4] = [0; 4];
         for (&(par_tok, _, _), val) in func.params.iter().zip(args.into_iter()) {
             if let Some(slot) = token_to_slot(par_tok) {
                 regs[slot] = val;
+                dirty[slot >> 6] |= 1u64 << (slot & 63);
             }
         }
+        let res = self.execute_function_body(module, func, owned_params, restore_borrowed, &mut regs, &mut dirty);
+        for (wi, &word) in dirty.iter().enumerate() {
+            let mut m = word;
+            while m != 0 {
+                let tz = m.trailing_zeros() as usize;
+                let slot = (wi << 6) + tz;
+                if slot < 224 {
+                    regs[slot] = OmniValue::Void;
+                }
+                m &= m - 1;
+            }
+        }
+        self.frame_pool.push(regs);
+        res
+    }
+
+    fn execute_function_body(
+        &mut self,
+        module: &BinModule,
+        func: &BinFunction,
+        owned_params: u32,
+        restore_borrowed: &mut [(usize, OmniValue)],
+        regs: &mut [OmniValue; 224],
+        dirty: &mut [u64; 4],
+    ) -> Result<OmniValue, String> {
 
         let mut label_pcs: Option<[usize; 256]> = None;
         let resolve_lbl = |lbl: u16, lp: &mut Option<[usize; 256]>| -> Option<usize> {
@@ -2177,6 +2212,7 @@ impl OmniBinaryVm {
             if let Some(d_tok) = ins.dest_reg {
                 if let Some(slot) = token_to_slot(d_tok) {
                     regs[slot] = out_val;
+                    dirty[slot >> 6] |= 1u64 << (slot & 63);
                 }
             }
             pc += 1;
@@ -15461,7 +15497,7 @@ pub const OMNI_DIFF4_GOLDENS: &[DiffGolden] = &[
             (&[-5, i64::MIN], DiffExpect::I64(-5)),
             (&[0, i64::MIN], DiffExpect::I64(0)),
         ],
-        backends: &["vm", "wasm", "x86", "m4"],
+        backends: DIFF4_ALL,
     },
     DiffGolden {
         id: "s1_shift_edges",
@@ -15512,6 +15548,7 @@ pub const OMNI_DIFF4_KNOWN_DIVERGENCES: &[(&str, &str, &str)] = &[
     ("p3_imod_min_neg1_after_tcmp", "x86", "N1, see p3_imod_rdx_clobber/x86"),
     ("p3_imod_min_neg1_after_tcmp", "stage1", "Stage-1 is frozen; rejects IMOD 0x7F14 with error[UNSUPPORTED] (C2)"),
     ("p3_imod_control_no_tcmp", "stage1", "Stage-1 is frozen; rejects IMOD 0x7F14 with error[UNSUPPORTED] (C2)"),
+    ("s1_int_min_mod", "stage1", "Stage-1 is frozen; rejects IMOD 0x7F14 with error[UNSUPPORTED] (C2)"),
     // P4: trit ops without clamping (spec.md:53).
     ("p4_trit_clamp", "wasm", "N3: Wasm TNOT/TAND/TOR/TXOR/TMAJ do not clamp i64 operands (15332, 15352-15357)"),
     ("p4_trit_clamp", "x86", "N3: x86 TAND/TOR share IMIN/IMAX (14714), TNOT shares INEG (14676); no clamp"),
@@ -15672,7 +15709,7 @@ pub fn expect_native_elf_i64(elf: &[u8], tag: &str, want: i64, ctx: &str) -> Res
 
 /// `omnic backend-diff` / `omnic diff4` CLI.
 ///   backend-diff --suite                 run OMNI_DIFF4_GOLDENS, print PASS/XFAIL/XPASS/FAIL per backend
-///   backend-diff <file.omni|"src"> [a..] run one program on vm/wasm/x86/stage1, compare byte-for-byte
+///   backend-diff <file.omni|"src"> [a..] run one program on vm/wasm/x86/stage1/m4, compare byte-for-byte
 /// Exit: 0 = suite green / all comparable backends agree; 1 = FAIL/XPASS / divergence; 2 = usage/frontend error.
 pub fn run_omni_backend_diff_cli(argv: &[String]) -> i32 {
     if argv.first().map(|s| s.as_str()) == Some("--suite") {
@@ -23818,6 +23855,7 @@ pub fn run_m2_foundation_selftests() -> Result<usize, String> {
         ("b2_pure_verifier", selftest_b2_pure_verifier_count),
         ("s2_security", selftest_s2_security),
         ("s4_honesty", selftest_s4_honesty),
+        ("s3_perf", selftest_s3_performance),
         ("b4_pure_launcher", selftest_b4_pure_launcher_count),
     ];
     let mut n = run_selftest_tasks_in_lanes(parallel_tasks)?;
@@ -24406,6 +24444,19 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
                 1
             }
         },
+        "s3-perf" => match selftest_s3_performance() {
+            Ok(n) => {
+                println!(
+                    "[S3-PERF PASS] {} checks | hash-pinned native m3.elf/m2.elf/m4.elf default path (0-word/0-byte parity + native latency bounds + 5 frozen hashes)",
+                    n
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("[S3-PERF FAIL] {}", e);
+                1
+            }
+        },
         "p5-sys" => match selftest_p5_2_zero_shim_sys() {
             Ok((n, sz, h, native)) => {
                 println!(
@@ -24521,7 +24572,7 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
         "m3-4backend" => match selftest_m3_15_four_backend_parity() {
             Ok(n) => {
                 println!(
-                    "[M3-4BACKEND PASS] {} programs verified across VM == Wasm-multi == Rust-x86-multi == Pure-Omni-M2-ELF64 (0-byte diff; Stage-1 N/A legacy exemption)",
+                    "[M3-4BACKEND PASS] {} programs verified across 5 backends: VM == Wasm-multi == Rust-x86-multi == Pure-Omni-M2-ELF64 == Pure-Omni-M4-VM (0-byte diff; Stage-1 N/A legacy exemption)",
                     n
                 );
                 0
@@ -24872,7 +24923,7 @@ fn main() {
                 println!("  pure-bootstrap                    Verify Phase D & 18-module core suite FNV-1a64 hashes");
                 println!("  pure-omni-diff                    Run 49 Pure-Omni differential checks");
                 println!("  acceptance-diff                   Run 41 executable acceptance goldens");
-                println!("  backend-diff --suite              Run 4-backend differential suite (vm/wasm/x86/stage1)");
+                println!("  backend-diff --suite              Run 5-backend differential suite (vm/wasm/x86/stage1/m4)");
                 println!("  m2-lint [file.omni]...            Lint registered pure/m2, m3, m4, m5 & isa modules");
                 println!("  m2-elf | m2-compile | m2-multi | m2-multi-pure | m2-wasm-multi | m2-verify | m2-fixed-point [--write-seed]");
                 println!("  m2-frozen | m2-lock | m2-census | m2-labels | m2-decode [file.omni_bc]");
@@ -24922,7 +24973,7 @@ fn main() {
             "harness" | "--harness" => {
                 std::process::exit(run_omni_harness_cli(&cli_args[2..]));
             }
-            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" | "p7-heal" | "p7-adapt" | "p7-learn" | "a1-pure-default" | "a2-pure-include" | "a3-macro-quarantine" | "b2-pure-verifier" | "b4-pure-launcher" | "s2-security" | "s4-honesty" | "api-stage1" | "api-stage2" | "api-stage2-emit" | "api-stage2-5" => {
+            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" | "p7-heal" | "p7-adapt" | "p7-learn" | "a1-pure-default" | "a2-pure-include" | "a3-macro-quarantine" | "b2-pure-verifier" | "b4-pure-launcher" | "s2-security" | "s4-honesty" | "s3-perf" | "api-stage1" | "api-stage2" | "api-stage2-emit" | "api-stage2-5" => {
                 std::process::exit(run_m2_cli(&cli_args[1..]));
             }
             "agent-driver" | "--agent-driver" => {
@@ -25095,13 +25146,14 @@ fn main() {
             }
             "compile" | "compile-surface" if cli_args.len() >= 4 => {
                 let use_rust = cli_args[2..].iter().any(|a| a == "--rust" || a == "--oracle");
+                let use_interp = cli_args[2..].iter().any(|a| a == "--interpreted");
                 let pos: Vec<&str> = cli_args[2..]
                     .iter()
-                    .filter(|a| *a != "--rust" && *a != "--oracle")
+                    .filter(|a| *a != "--rust" && *a != "--oracle" && *a != "--interpreted")
                     .map(|s| s.as_str())
                     .collect();
                 if pos.len() < 2 {
-                    eprintln!("Usage: omni compile [--rust|--oracle] <in.omni> <out.omni_bc>");
+                    eprintln!("Usage: omni compile [--rust|--oracle|--interpreted] <in.omni> <out.omni_bc>");
                     std::process::exit(2);
                 }
                 if use_rust {
@@ -25119,7 +25171,14 @@ fn main() {
                         std::process::exit(1);
                     }
                 };
-                match pure_default_compile_surface_to_u16(&expanded, expanded.contains("#[strict]")) {
+                let compile_res = if use_interp {
+                    with_pure_default_interpreted(|| {
+                        pure_default_compile_surface_to_u16(&expanded, expanded.contains("#[strict]"))
+                    })
+                } else {
+                    pure_default_compile_surface_to_u16(&expanded, expanded.contains("#[strict]"))
+                };
+                match compile_res {
                     Ok(u16_stream) => {
                         if let Err(ve) = pure_default_verify_u16(&u16_stream, true) {
                             eprintln!("[PURE-VERIFY FAIL] {}", ve);
@@ -25161,13 +25220,14 @@ fn main() {
             }
             "compile-elf" if cli_args.len() >= 4 => {
                 let use_rust = cli_args[2..].iter().any(|a| a == "--rust" || a == "--oracle");
+                let use_interp = cli_args[2..].iter().any(|a| a == "--interpreted");
                 let pos: Vec<&str> = cli_args[2..]
                     .iter()
-                    .filter(|a| *a != "--rust" && *a != "--oracle")
+                    .filter(|a| *a != "--rust" && *a != "--oracle" && *a != "--interpreted")
                     .map(|s| s.as_str())
                     .collect();
                 if pos.len() < 2 {
-                    eprintln!("Usage: omni compile-elf [--rust|--oracle] <in.omni|.omni_bc> <out.elf> [a0 a1 a2]");
+                    eprintln!("Usage: omni compile-elf [--rust|--oracle|--interpreted] <in.omni|.omni_bc> <out.elf> [a0 a1 a2]");
                     std::process::exit(2);
                 }
                 let path = pos[0];
@@ -25196,8 +25256,14 @@ fn main() {
                             std::process::exit(1);
                         }
                     };
-                    pure_default_compile_surface_to_u16(&expanded, expanded.contains("#[strict]"))
-                        .expect("Pure-M3 surface compilation failed")
+                    let c_res = if use_interp {
+                        with_pure_default_interpreted(|| {
+                            pure_default_compile_surface_to_u16(&expanded, expanded.contains("#[strict]"))
+                        })
+                    } else {
+                        pure_default_compile_surface_to_u16(&expanded, expanded.contains("#[strict]"))
+                    };
+                    c_res.expect("Pure-M3 surface compilation failed")
                 } else {
                     let raw = fs::read(path).expect("Failed to read .omni_bc");
                     decode_bytes_to_u16_stream(&raw)
@@ -25206,7 +25272,12 @@ fn main() {
                     eprintln!("[PURE-VERIFY FAIL] {}", ve);
                     std::process::exit(1);
                 }
-                match pure_default_compile_u16_to_elf(&u16_stream, a0, a1, a2) {
+                let elf_res = if use_interp {
+                    with_pure_default_interpreted(|| pure_default_compile_u16_to_elf(&u16_stream, a0, a1, a2))
+                } else {
+                    pure_default_compile_u16_to_elf(&u16_stream, a0, a1, a2)
+                };
+                match elf_res {
                     Ok(elf) => {
                         fs::write(out_path, &elf).expect("Failed to write .elf");
                         println!("[PURE-M2 ELF PASS] Wrote {} bytes to '{}' (FNV-1a64=0x{:016X})", elf.len(), out_path, fnv1a_64_hash(&elf));
@@ -25326,13 +25397,14 @@ fn main() {
             }
             "run" | "run-surface" if cli_args.len() >= 3 => {
                 let use_rust = cli_args[2..].iter().any(|a| a == "--rust" || a == "--oracle");
+                let use_interp = cli_args[2..].iter().any(|a| a == "--interpreted");
                 let pos: Vec<&str> = cli_args[2..]
                     .iter()
-                    .filter(|a| *a != "--rust" && *a != "--oracle")
+                    .filter(|a| *a != "--rust" && *a != "--oracle" && *a != "--interpreted")
                     .map(|s| s.as_str())
                     .collect();
                 if pos.is_empty() {
-                    eprintln!("Usage: omni run [--rust|--oracle] <file.omni|file.omni_bc> [args...]");
+                    eprintln!("Usage: omni run [--rust|--oracle|--interpreted] <file.omni|file.omni_bc> [args...]");
                     std::process::exit(2);
                 }
                 let path = pos[0];
@@ -25347,7 +25419,14 @@ fn main() {
                                 std::process::exit(1);
                             }
                         };
-                        match pure_default_compile_surface_to_u16(&expanded, expanded.contains("#[strict]")) {
+                        let c_res = if use_interp {
+                            with_pure_default_interpreted(|| {
+                                pure_default_compile_surface_to_u16(&expanded, expanded.contains("#[strict]"))
+                            })
+                        } else {
+                            pure_default_compile_surface_to_u16(&expanded, expanded.contains("#[strict]"))
+                        };
+                        match c_res {
                             Ok(u) => u,
                             Err(e) => {
                                 eprintln!("[PURE-RUN FAIL] {}", e);
@@ -25365,7 +25444,12 @@ fn main() {
                         eprintln!("[PURE-VERIFY FAIL] {}", ve);
                         std::process::exit(1);
                     }
-                    match pure_default_run_u16(&u16_stream, a0, a1, a2, false) {
+                    let run_res = if use_interp {
+                        with_pure_default_interpreted(|| pure_default_run_u16(&u16_stream, a0, a1, a2, false))
+                    } else {
+                        pure_default_run_u16(&u16_stream, a0, a1, a2, false)
+                    };
+                    match run_res {
                         Ok((ret, _steps)) => {
                             println!("Int({})", ret);
                             return;
