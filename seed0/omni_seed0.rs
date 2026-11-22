@@ -64,7 +64,7 @@ fn main() {
             println!("  verify-seeds              Verify embedded M3/M2/M4 .omni_bc FNV-1a64 pins");
             println!("  emit-seeds <out_dir>      Write embedded M3/M2/M4 seeds to <out_dir>");
             println!("  run-elf <elf> [args...]   Execute native ELF via 3-op OmniThinShim");
-            println!("  line-audit                Report mandatory Stage-0 Rust line count vs 48,590 baseline");
+            println!("  line-audit                Report classified Stage-0 seed Rust line count (236 lines) vs 48,590 baseline");
         }
         "verify-seeds" => match verify_all_seeds() {
             Ok(()) => println!(
@@ -119,7 +119,7 @@ fn main() {
             let shim_lines = include_str!("../p4_shim/mod.rs").lines().count();
             let total = seed0_lines + shim_lines;
             println!(
-                "[SEED0 LINE-AUDIT] mandatory_rust={} lines (seed0/omni_seed0.rs={} + p4_shim/mod.rs={}) vs baseline=48590 lines ({:.2}% reduction)",
+                "[SEED0 LINE-AUDIT] classified_seed_rust={} lines (seed0/omni_seed0.rs={} + p4_shim/mod.rs={}; runtime VM/host in omni_rust_bootstrap.rs + m2_host) vs baseline=48590 lines ({:.2}% classified seed reduction)",
                 total,
                 seed0_lines,
                 shim_lines,

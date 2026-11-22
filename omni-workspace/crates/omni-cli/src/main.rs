@@ -1167,9 +1167,9 @@ fn main() {
                     let raw = fs::read(path).expect("Failed to read .omni_bc");
                     decode_bytes_to_u16_stream(&raw)
                 };
-                let a0 = args.get(4).and_then(|s| s.parse::<i64>().ok()).unwrap_or(45);
-                let a1 = args.get(5).and_then(|s| s.parse::<i64>().ok()).unwrap_or(40);
-                let a2 = args.get(6).and_then(|s| s.parse::<i64>().ok()).unwrap_or(90);
+                let a0 = args.get(4).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                let a1 = args.get(5).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                let a2 = args.get(6).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
                 let elf = compile_pure_u16_to_x86_64_elf_with_args(&u16s, a0, a1, a2)
                     .expect("x86-64 ELF AOT compilation failed");
                 fs::write(&args[3], &elf).expect("Write failed");
@@ -1232,9 +1232,9 @@ fn main() {
                 let parent_dir = std::path::Path::new(&args[2]).parent();
                 let merged = resolve_omni_surface_includes(&raw_src, parent_dir, None)
                     .expect("Failed to resolve .omni surface file");
-                let a0 = args.get(4).and_then(|s| s.parse::<i64>().ok()).unwrap_or(45);
-                let a1 = args.get(5).and_then(|s| s.parse::<i64>().ok()).unwrap_or(40);
-                let a2 = args.get(6).and_then(|s| s.parse::<i64>().ok()).unwrap_or(90);
+                let a0 = args.get(4).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                let a1 = args.get(5).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                let a2 = args.get(6).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
                 let elf = compile_omni_surface_via_stage1_to_elf(&merged, a0, a1, a2)
                     .expect("Stage-1 ELF compilation failed");
                 fs::write(&args[3], &elf).expect("Write failed");

@@ -7124,4 +7124,92 @@ pub fn selftest_s2_security() -> Result<usize, String> {
     Ok(checks)
 }
 
+/// Parses optional `[a0, a1, a2]` arguments for `omni compile-elf <in> <out> [a0 a1 a2]`.
+/// Audit §4.3: defaults to `(0, 0, 0)` when omitted so `compile-elf` matches the B4 gate.
+pub fn parse_compile_elf_args(pos: &[&str]) -> (i64, i64, i64) {
+    let a0 = pos.get(2).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+    let a1 = pos.get(3).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+    let a2 = pos.get(4).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+    (a0, a1, a2)
+}
+
+/// Audit §4 Honesty hard gate (`./omnic s4-honesty`):
+///   1. §4.3: `compile-elf` defaults `[a0, a1, a2]` to `(0, 0, 0)` so `compile-elf pure/m4/m4.omni_bc`
+///      produces the exact same ELF bytes and FNV-1a64 hash as the B4 gate (`0/0/0`).
+///   2. §4.1: `README.md` and `oracle/README.md` distinguish the 236-line classified Stage-0 seed
+///      (`seed0` 134 + `p4_shim` 102) from the live runtime-required Rust lines (`monolith + m2_host + p4_shim`),
+///      and `oracle/README.md` accurately states that `zero_rust_rebuild.sh` invokes `./omni` ("no Rust toolchain on PATH").
+///   3. §4.2: Line counts in `README.md` and `oracle/README.md` match live `wc -l` measurements on disk,
+///      `seed0/omni_seed0.rs` header comments match code constants, and `pure/m5/launcher.omni` is documented
+///      honestly as a 181-byte `.omni_bc` `0x7EE0` header validator / entry stub.
+pub fn selftest_s4_honesty() -> Result<usize, String> {
+    let mut checks = 0usize;
+
+    // 1. §4.3: `parse_compile_elf_args` must default to (0, 0, 0) when [a0 a1 a2] are omitted.
+    let (a0, a1, a2) = parse_compile_elf_args(&["pure/m4/m4.omni_bc", "out.elf"]);
+    if (a0, a1, a2) != (0, 0, 0) {
+        return Err(format!(
+            "S4.3 compile-elf default args must be (0, 0, 0) to match B4 gate, got ({}, {}, {})",
+            a0, a1, a2
+        ));
+    }
+    checks += 1;
+
+    // 2. §4.1 & §4.2: Live `wc -l` measurements vs `README.md` and `oracle/README.md`.
+    let count_lines = |p: &str| -> Result<usize, String> {
+        let b = std::fs::read(p).map_err(|e| format!("S4 read {}: {}", p, e))?;
+        Ok(b.iter().filter(|&&c| c == b'\n').count())
+    };
+    let monolith_lines = count_lines("omni_rust_bootstrap.rs")?;
+    let m2_host_lines = count_lines("m2_host/decode_diff.rs")? + count_lines("m2_host/lint.rs")?;
+    let p4_shim_lines = count_lines("p4_shim/mod.rs")?;
+    let seed0_lines = count_lines("seed0/omni_seed0.rs")?;
+    let dev_host_lines = count_lines("omni_dev_host.rs")?;
+    if seed0_lines + p4_shim_lines != 236 || dev_host_lines != 40 {
+        return Err(format!(
+            "S4.1 seed0 ({}) + p4_shim ({}) != 236 or dev_host ({}) != 40",
+            seed0_lines, p4_shim_lines, dev_host_lines
+        ));
+    }
+    let runtime_rust_lines = monolith_lines + m2_host_lines + p4_shim_lines;
+    let oracle_readme = std::fs::read_to_string("oracle/README.md")
+        .map_err(|e| format!("S4 read oracle/README.md: {}", e))?;
+    let main_readme = std::fs::read_to_string("README.md")
+        .map_err(|e| format!("S4 read README.md: {}", e))?;
+    if oracle_readme.contains("not invoked on default `compile`/`run`/`self-host` or `zero_rust_rebuild.sh`") {
+        return Err(String::from(
+            "S4.1 oracle/README.md still claims oracle is not invoked on zero_rust_rebuild.sh",
+        ));
+    }
+    if !oracle_readme.contains(&runtime_rust_lines.to_string())
+        || !oracle_readme.contains(&monolith_lines.to_string())
+        || !oracle_readme.contains(&m2_host_lines.to_string())
+    {
+        return Err(format!(
+            "S4.2 oracle/README.md line counts drifted from live wc -l (monolith={}, m2_host={}, runtime_rust={})",
+            monolith_lines, m2_host_lines, runtime_rust_lines
+        ));
+    }
+    if !main_readme.contains("validator/entry stub") {
+        return Err(String::from(
+            "S4.2 README.md must qualify M5 181-byte ELF as a .omni_bc header validator/entry stub",
+        ));
+    }
+    checks += 1;
+
+    // 3. §4.2: `seed0/omni_seed0.rs` header comment must match the active SEED_M2 / SEED_M4 pins.
+    let seed0_src = std::fs::read_to_string("seed0/omni_seed0.rs")
+        .map_err(|e| format!("S4 read seed0/omni_seed0.rs: {}", e))?;
+    if !seed0_src.contains("39,049 words, 0xE2A6C5F117FDF5FE")
+        || !seed0_src.contains("27,876 words, 0xF6613357C0B93634")
+    {
+        return Err(String::from(
+            "S4.2 seed0/omni_seed0.rs header comment drifted from SEED_M2/SEED_M4 constants",
+        ));
+    }
+    checks += 1;
+
+    Ok(checks)
+}
+
 
