@@ -16,8 +16,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Install Rust stable toolchain
-        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - name: Install Rust pinned toolchain (1.100.0)
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
+        with:
+          toolchain: "1.100.0"
 
       - name: Run standalone monolith selftest (fixed-point + M2/M3/P4/P5/S1-S6 gates + 5-backend diff + pure-omni-diff + acceptance-diff + harness)
         run: |
@@ -87,8 +89,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Install Rust stable toolchain
-        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - name: Install Rust pinned toolchain (1.100.0)
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
+        with:
+          toolchain: "1.100.0"
 
       - name: Run 256-mutant .omni_bc verifier/VM fuzzer + native m2.elf crash corpus + strict OOB/PT_GNU_STACK gates
         run: |
@@ -96,6 +100,11 @@ jobs:
           ./omni b2-pure-verifier
           ./omni s2-security
           ./omni s5-refreeze
+          set +e
+          ./omni compile-elf /tmp/nonexistent_fuzz_l2.omni /tmp/fuzz_l2.elf
+          rc=$?
+          set -e
+          test "$rc" -eq 1
 
   pure-default-no-rustc:
     name: Zero-Rust Release Gate & Independent Verifier (Seed-Shrink A4/B4/C1/C2)
