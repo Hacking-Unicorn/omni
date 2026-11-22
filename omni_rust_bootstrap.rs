@@ -19447,6 +19447,29 @@ fn compile_wasm_single_func_body(
     }
 
     let num_params = func.params.len();
+    // Audit Round 2 L3: arity-check every instruction before Wasm lowering so crafted streams
+    // (e.g. 1-operand 0x7F17 or 2-operand 0x7F2C TMAJ) return Err(BAD_ARITY) instead of panicking.
+    for ins in &func.instructions {
+        let min_ops = match ins.op_tok {
+            0x7F42 | 0x7F45 => 4,
+            0x7F2C | 0x7F39 => 3,
+            0x7F0E | 0x7F0F | 0x7F10..=0x7F14 | 0x7F17..=0x7F20 | 0x7F22..=0x7F27
+            | 0x7F29..=0x7F2B | 0x7F2D..=0x7F2F | 0x7F31 | 0x7F34 | 0x7F43 | 0x7F44
+            | 0x7F51 | 0x7F6A | 0x7F7F => 2,
+            0x7F01..=0x7F04 | 0x7F06 | 0x7F08 | 0x7F09 | 0x7F15 | 0x7F16 | 0x7F21
+            | 0x7F28 | 0x7F30 | 0x7F35 | 0x7F3F | 0x7F48 | 0x7F4A
+            | 0x7F50 | 0x7F55..=0x7F59 | 0x7F5D | 0x7F63 | 0x7F76 | 0x7F7D | 0x7F7E => 1,
+            _ => 0,
+        };
+        if ins.operands.len() < min_ops {
+            return Err(format!(
+                "error[BAD_ARITY]: Wasm AOT opcode 0x{:04X} requires at least {} operands, got {}",
+                ins.op_tok,
+                min_ops,
+                ins.operands.len()
+            ));
+        }
+    }
     let max_reg_used = func
         .instructions
         .iter()
@@ -25381,19 +25404,45 @@ fn main() {
                 let (a0, a1, a2) = parse_compile_elf_args(&pos);
                 if use_rust {
                     let u16_stream = if path.ends_with(".omni") {
-                        compile_omni_surface_file_to_u16(path).expect("Rust oracle surface compilation failed")
+                        match compile_omni_surface_file_to_u16(path) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                eprintln!("[RUST-ORACLE ELF FAIL] {}", e);
+                                std::process::exit(1);
+                            }
+                        }
                     } else {
-                        let raw = fs::read(path).expect("Failed to read .omni_bc");
+                        let raw = match fs::read(path) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                eprintln!("[RUST-ORACLE ELF FAIL] error[IO_ERROR]: failed to read '{}': {}", path, e);
+                                std::process::exit(1);
+                            }
+                        };
                         decode_bytes_to_u16_stream(&raw)
                     };
-                    let elf = compile_pure_u16_to_x86_64_elf_with_args(&u16_stream, a0, a1, a2)
-                        .expect("Rust oracle x86-64 ELF AOT compilation failed");
-                    fs::write(out_path, &elf).expect("Failed to write .elf");
+                    let elf = match compile_pure_u16_to_x86_64_elf_with_args(&u16_stream, a0, a1, a2) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            eprintln!("[RUST-ORACLE ELF FAIL] {}", e);
+                            std::process::exit(1);
+                        }
+                    };
+                    if let Err(e) = fs::write(out_path, &elf) {
+                        eprintln!("[RUST-ORACLE ELF FAIL] error[IO_ERROR]: failed to write '{}': {}", out_path, e);
+                        std::process::exit(1);
+                    }
                     println!("[RUST-ORACLE ELF PASS] Wrote {} bytes to '{}' (FNV-1a64=0x{:016X})", elf.len(), out_path, fnv1a_64_hash(&elf));
                     return;
                 }
                 let u16_stream = if path.ends_with(".omni") {
-                    let raw_src = fs::read_to_string(path).expect("Failed to read .omni file");
+                    let raw_src = match fs::read_to_string(path) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[PURE-M2 ELF FAIL] error[IO_ERROR]: failed to read '{}': {}", path, e);
+                            std::process::exit(1);
+                        }
+                    };
                     let parent_dir = std::path::Path::new(path).parent();
                     let expanded = match pure_default_expand_includes(&raw_src, parent_dir, None) {
                         Ok(s) => s,
@@ -25409,9 +25458,21 @@ fn main() {
                     } else {
                         pure_default_compile_surface_to_u16(&expanded, expanded.contains("#[strict]"))
                     };
-                    c_res.expect("Pure-M3 surface compilation failed")
+                    match c_res {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[PURE-M2 ELF FAIL] {}", e);
+                            std::process::exit(1);
+                        }
+                    }
                 } else {
-                    let raw = fs::read(path).expect("Failed to read .omni_bc");
+                    let raw = match fs::read(path) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            eprintln!("[PURE-M2 ELF FAIL] error[IO_ERROR]: failed to read '{}': {}", path, e);
+                            std::process::exit(1);
+                        }
+                    };
                     decode_bytes_to_u16_stream(&raw)
                 };
                 if let Err(ve) = pure_default_verify_u16(&u16_stream, true) {

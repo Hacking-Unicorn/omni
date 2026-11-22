@@ -1901,6 +1901,7 @@ pub fn selftest_m3_10_lower_diff() -> Result<usize, String> {
         ("label_goto", "#[strict]\nfn main(x: i64) -> i64 { goto 2; label 1; return 99; label 2; return x + 1; }\n", false),
         ("nested_calls", "#[strict]\nfn add(a: i64, b: i64) -> i64 { return a + b; }\n#[strict]\nfn mul(a: i64, b: i64) -> i64 { return a * b; }\n#[strict]\nfn main(x: i64) -> i64 { return add(x, mul(add(x, 1), 3)); }\n", false),
         ("mem_and_ret_slice", "#[strict]\nfn main(x: i64) -> bytes { let b: bytes = anew(0); b = iset_i64(b, x); b = st_u32(b, 0, x + 1); let v: i64 = ld_u32(b, 0); b = iset_patch_i64(b, 0, v); return ret_slice(b, 0, 8); }\n", false),
+        ("l1_st_u64_lower", "#[strict]\nfn main(x: i64) -> i64 { let b: bytes = anew(0); b = iset_i64(b, 0); b = st_u64(b, 0, x + 7); return ld_u64(b, 0); }\n", true),
         ("if_pos_nested_join", "#[strict]\nfn main(x: i64) -> i64 { let c: trit = x <=> 0; let r: i64 = if_pos c { let d: trit = (x - 5) <=> 0; if_neg d { let a: i64 = x + 10; a } else { x - 10 } } else { let b: i64 = x * 2; b + 1 }; return r; }\n", false),
         ("match_trit_3arm", "#[strict]\nfn main(x: i64) -> i64 { let t: trit = x <=> 0; let r: i64 = match_trit t { neg => { let a: i64 = x - 1; a * 2 }, zero => 0, pos => { x + 1 } }; return r; }\n", false),
         ("str_lit_cstr", "#[strict]\nfn main(x: i64) -> str { let s: str = \"hello_omni\"; return s; }\n", false),
@@ -7115,6 +7116,41 @@ pub fn selftest_s2_security() -> Result<usize, String> {
     }
     checks += 1;
 
+    // 8. Audit Round 2 L3 & L4: Wasm AOT arity check on crafted 1-op 0x7F17 (`idxpanic_5`) and 2-op 0x7F2C (TMAJ)
+    //    must return Err(BAD_ARITY) without panicking, and native m2.elf rejection must not mislabel as OUT_OF_BOUNDS.
+    for &(label, bad_op, ops) in &[
+        ("idxpanic_5_0x7f17", 0x7F17u16, &[0x7EC0u16][..]),
+        ("tmaj_2op_0x7f2c", 0x7F2Cu16, &[0x7EC0u16, 0x7EC0u16][..]),
+    ] {
+        let mut s = vec![
+            0x7EE0,
+            0x7EE3, 0, 1, 0x7EC0, 0x7F81, 0x7FC0, 0x7F81, 0, 2,
+            0x7E00, bad_op, 0x7F81, 0x7FC0,
+        ];
+        s.extend_from_slice(ops);
+        s.extend_from_slice(&[0x7EE4, 0x7F4A, 0x7E00, 0x7EE4, 0x7EEF]);
+        match compile_pure_u16_to_wasm(&s) {
+            Ok(_) => return Err(format!("L3 Wasm AOT accepted under-arity '{}' without BAD_ARITY", label)),
+            Err(msg) => {
+                if !msg.contains("BAD_ARITY") {
+                    return Err(format!("L3 '{}' expected BAD_ARITY, got: {}", label, msg));
+                }
+            }
+        }
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        match pure_default_compile_u16_to_elf(&bad_call_32539, 0, 0, 0) {
+            Ok(_) => return Err(String::from("L4 native m2.elf accepted bad_call_32539")),
+            Err(msg) => {
+                if msg.starts_with(OMNI_OOB_ERROR) {
+                    return Err(format!("L4 native m2.elf rejection mislabeled as OUT_OF_BOUNDS: {}", msg));
+                }
+            }
+        }
+    }
+    checks += 1;
+
     Ok(checks)
 }
 
@@ -7196,7 +7232,8 @@ pub fn selftest_s4_honesty() -> Result<usize, String> {
     // 3. §4.2: `seed0/omni_seed0.rs` header comment must match the active SEED_M2 / SEED_M4 pins.
     let seed0_src = std::fs::read_to_string("seed0/omni_seed0.rs")
         .map_err(|e| format!("S4 read seed0/omni_seed0.rs: {}", e))?;
-    if !seed0_src.contains("40,234 words, 0x653BD567AAF5E0DB")
+    if !seed0_src.contains("59,540 words, 0xC96457590C836700")
+        || !seed0_src.contains("40,234 words, 0x653BD567AAF5E0DB")
         || !seed0_src.contains("27,819 words, 0x99567F6F5D0E8F32")
     {
         return Err(String::from(

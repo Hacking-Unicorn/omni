@@ -399,11 +399,11 @@ fn m3w_emit_call_done(arena: bytes, src: array, nid: i64, treg: i64, arg_base: i
 fn m3w_emit_call_expr(arena: bytes, src: array, nv: i64, nlen: i64, hlow: i64, nargs: i64, treg: i64, arg_base: i64, fl: i64, fc: i64) -> bytes {
     // Classify core intrinsics:
     // 1=anew(1), 2=slen(1), 3=abs(1), 4=min(2), 5=max(2), 6=iget(2), 7=sel_trit(4)
-    // 8=ld_u8/16/32/64(2), 9=st_u16/32(3), 10=iset_i32/i64(2), 11=iset_patch_i64(3), 12=iset(2+)
+    // 8=ld_u8/16/32/64(2), 9=st_u16/32/64(3), 10=iset_i32/i64(2), 11=iset_patch_i64(3), 12=iset(2+)
     let is_ld: i64 = m2u_eq(hlow, 372681827) + m2u_eq(hlow, 1528998138) * 2 + m2u_eq(hlow, 1596454388) * 4 + m2u_eq(hlow, 1530130971) * 8;
     let is_st: i64 = m2u_eq(hlow, 683641129) * 2 + m2u_eq(hlow, 1018847735) * 4;
     let is_is: i64 = m2u_eq(hlow, 56909121) * 4 + m2u_eq(hlow, 2003554210) * 8;
-    let is_ip: i64 = m2u_eq(hlow, 1657868527);
+    let is_ip: i64 = m2u_eq(hlow, 1657868527) + m2u_eq(hlow, 615397820);
     let is_ib: i64 = m2u_eq(hlow, 476966828);
     let icls: i64 = m2u_eq(hlow, 1069549258) * 1 + m2u_eq(hlow, 1991071177) * 2 + m2u_eq(hlow, 709362235) * 3
         + m2u_eq(hlow, 1234126167) * 4 + m2u_eq(hlow, 1470292761) * 5 + m2u_eq(hlow, 444340544) * 6 + m2u_eq(hlow, 153118099) * 7

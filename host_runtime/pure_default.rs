@@ -29,8 +29,8 @@ pub fn pure_default_reject_macros(src: &str) -> Result<(), String> {
 
 pub const NATIVE_M2_ELF_BYTES: usize = 109_076;
 pub const NATIVE_M2_ELF_FNV: u64 = 0xE2BF_E6BF_AD8E_0D3E;
-pub const NATIVE_M3_ELF_BYTES: usize = 165_849;
-pub const NATIVE_M3_ELF_FNV: u64 = 0x2D65_8F17_30E2_D23B;
+pub const NATIVE_M3_ELF_BYTES: usize = 165_900;
+pub const NATIVE_M3_ELF_FNV: u64 = 0x54B2_48B6_9704_ED59;
 pub const NATIVE_M4_ELF_BYTES: usize = 81_763;
 pub const NATIVE_M4_ELF_FNV: u64 = 0xC935_88C4_A4D4_D962;
 
@@ -498,11 +498,15 @@ pub fn pure_default_compile_u16_to_elf(u16_stream: &[u16], a0: i64, a1: i64, a2:
             ],
         )?;
         if !out.status.success() {
-            return Err(format!(
-                "{}: native m2.elf rejected/trapped input (exit {:?})",
-                OMNI_OOB_ERROR,
-                out.status.code()
-            ));
+            let code = out.status.code();
+            let (tag, reason) = match code {
+                Some(1) => ("error[VERIFY_FAILED]", "input stream failed M2 verification or was empty"),
+                Some(100) => ("error[DECODE_ERROR]", "input stream truncated or malformed"),
+                Some(101) => ("error[VERIFY_OR_OOB]", "M2 verifier rejected stream (bad op/arity/call) or bounds trap"),
+                Some(102) => ("error[BUDGET_EXCEEDED]", "M2 arena output capacity exceeded"),
+                _ => ("error[M2_NATIVE_TRAP]", "native m2.elf exited abnormally"),
+            };
+            return Err(format!("{}: native m2.elf rejected input (exit {:?}: {})", tag, code, reason));
         }
         return Ok(out.stdout);
     }
@@ -565,11 +569,14 @@ pub fn pure_default_run_u16(
             ],
         )?;
         if !out.status.success() {
-            return Err(format!(
-                "{}: native m4.elf trapped with exit {:?}",
-                OMNI_OOB_ERROR,
-                out.status.code()
-            ));
+            let code = out.status.code();
+            let (tag, reason) = match code {
+                Some(100) => ("error[DECODE_ERROR]", "input stream truncated or malformed"),
+                Some(101) => (OMNI_OOB_ERROR, "bounds/memory trap"),
+                Some(102) => ("error[BUDGET_EXCEEDED]", "arena capacity exceeded"),
+                _ => ("error[VM_TRAP]", "native m4.elf exited abnormally"),
+            };
+            return Err(format!("{}: native m4.elf trapped (exit {:?}: {})", tag, code, reason));
         }
         return decode_m4_vm_state_64(&out.stdout);
     }
