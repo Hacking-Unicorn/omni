@@ -51,6 +51,7 @@ jobs:
           ./omni p7-canary
           ./omni p7-heal
           ./omni api-stage1
+          ./omni api-stage2
           ./omni backend-diff --suite
           ./omni selftest
           ./omni pure-omni-diff

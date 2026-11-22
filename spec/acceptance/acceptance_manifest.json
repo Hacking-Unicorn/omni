@@ -62,5 +62,14 @@
       {"id": "neg_taint_consensus", "file": "goldens/neg_taint_consensus.omni", "expected_code": "TAINT_ON_CONSENSUS", "expected_num": 1011, "expected_line": 3, "expected_col": 19},
       {"id": "neg_cap_narrow_expand", "file": "goldens/neg_cap_narrow_expand.omni", "expected_code": "CAP_NARROW_EXPAND", "expected_num": 1013, "expected_line": 5, "expected_col": 19}
     ]
+  },
+  "pure_api_stage2_goldens": {
+    "positive": [
+      {"id": "token_inspect_golden", "file": "goldens/token_inspect_golden.omni", "args": ["32480", "32495"], "expected_result": "2"},
+      {"id": "token_specialize_golden", "file": "goldens/token_specialize_golden.omni", "args": ["1"], "expected_result": "0"}
+    ],
+    "negative_pure_verifier": [
+      {"id": "neg_linear_reflect", "file": "goldens/neg_linear_reflect.omni", "expected_code": "LINEAR_REFLECT", "expected_num": 1012, "expected_line": 8, "expected_col": 13}
+    ]
   }
 }

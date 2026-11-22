@@ -1,0 +1,202 @@
+// ==============================================================================
+// OMNI NEW-LEVEL API (STAGE 2, PART 1) — PURE TOKEN REFLECTIVE HOST
+// `pure/api/reflect.omni`
+// ==============================================================================
+//
+// Link order: `pure/m7/judge.omni`, this file.
+// Pure-Omni library calls (zero host I/O, zero recursion, zero IDIV/IMOD,
+// zero PACK5 opcodes -> 100% Pure-Omni M3, M4 VM, and M2-multi ELF64 clean):
+//   - `api_token_inspect(module_bc: bytes) -> i64`             (#[cap(PURE)])
+//   - `api_token_specialize(module_bc: bytes, hint: i64) -> bytes` (#[cap(PURE)])
+//   - `api_token_inspect_trace(trace_ring: bytes) -> i64`      (#[cap(PURE)])
+//   - `api_token_inspect_trace_bucket(trace_ring: bytes, idx: i64) -> i64`
+// ==============================================================================
+
+// Helper: advance past one operand token at word index `pos` inside `bc`.
+// Follows Omni binary ISA widths:
+//   - TOK_IMM_I16 (32485), TOK_SYM_* (32491..32493), TOK_FIELD_KV (32494): 2 words
+//   - TOK_IMM_I32 (32486): 3 words
+//   - TOK_ENG_SPAN (32490): 2 + word_len words
+//   - REG/PAR/LBL/TRIT_*: 1 word
+#[strict]
+fn api_bc_next_op_word(bc: bytes, nwords: i64, pos: i64) -> i64 {
+    let tok: i64 = ld_u16(bc, pos * 2);
+    let is_i16: i64 = sel_trit(tok <=> 32485, 0, 1, 0);
+    let is_i32: i64 = sel_trit(tok <=> 32486, 0, 1, 0);
+    let is_eng: i64 = sel_trit(tok <=> 32490, 0, 1, 0);
+    let ge_sym: i64 = sel_trit(tok <=> 32491, 0, 1, 1);
+    let le_kv: i64 = sel_trit(tok <=> 32494, 1, 1, 0);
+    let is_w2: i64 = is_i16 | (ge_sym * le_kv);
+    let eng_adv: i64 = if_pos is_eng <=> 0 {
+        let wlen: i64 = if_pos (nwords - (pos + 1)) <=> 0 {
+            ld_u16(bc, (pos + 1) * 2)
+        } else {
+            0
+        };
+        2 + wlen
+    } else {
+        1
+    };
+    let adv: i64 = is_i32 * 3 + is_w2 * 2 + (1 - is_i32 - is_w2) * eng_adv;
+    return pos + adv;
+}
+
+// Helper: advance past one complete instruction starting at word index `pos` (ending after INS_END=32484).
+#[strict]
+fn api_bc_skip_ins(bc: bytes, nwords: i64, pos: i64) -> i64 {
+    let first: i64 = ld_u16(bc, pos * 2);
+    let ge_r: i64 = sel_trit(first <=> 32256, 0, 1, 1);
+    let le_r: i64 = sel_trit(first <=> 32447, 1, 1, 0);
+    let is_dest: i64 = ge_r * le_r;
+    let cur: i64 = pos + 1 + is_dest * 3;
+    let go: i64 = sel_trit(cur <=> nwords, 1, 0, 0);
+    while go <=> 0 {
+        let tok: i64 = ld_u16(bc, cur * 2);
+        let at_end: i64 = sel_trit(tok <=> 32484, 0, 1, 0);
+        let nxt: i64 = if_pos at_end <=> 0 {
+            cur + 1
+        } else {
+            api_bc_next_op_word(bc, nwords, cur)
+        };
+        cur = nxt;
+        go = (1 - at_end) * sel_trit(cur <=> nwords, 1, 0, 0);
+    }
+    return cur;
+}
+
+// Helper: advance past `ins_cnt` instructions starting at `ins_start`.
+#[strict]
+fn api_bc_skip_body(bc: bytes, nwords: i64, ins_start: i64, ins_cnt: i64) -> i64 {
+    let cur: i64 = ins_start;
+    let k: i64 = 0;
+    while k < ins_cnt {
+        cur = api_bc_skip_ins(bc, nwords, cur);
+        k = k + 1;
+    }
+    return cur;
+}
+
+// Pure-Omni `token_inspect(module_bc: bytes) -> i64` (#[cap(PURE)]):
+// Validates MOD_BEGIN (0x7EE0=32480) & even byte length, walks all functions,
+// and returns `-1` on invalid/corrupt stream or `(n_fns << 40) | (total_ins << 20) | (n_words & 1048575)`.
+#[strict]
+fn api_token_inspect(module_bc: bytes) -> i64 {
+    let nbytes: i64 = slen(module_bc);
+    let nwords: i64 = nbytes >> 1;
+    let even: i64 = 1 - (nbytes & 1);
+    let has_hdr: i64 = sel_trit(nwords <=> 2, 0, 1, 1);
+    let hdr_ok: i64 = if_pos (even * has_hdr) <=> 0 {
+        sel_trit(ld_u16(module_bc, 0) <=> 32480, 0, 1, 0)
+    } else {
+        0
+    };
+    let pos: i64 = 1;
+    let n_fns: i64 = 0;
+    let total_ins: i64 = 0;
+    let go: i64 = hdr_ok * sel_trit(pos <=> nwords, 1, 0, 0);
+    while go <=> 0 {
+        let tag: i64 = ld_u16(module_bc, pos * 2);
+        let is_end: i64 = sel_trit(tag <=> 32495, 0, 1, 0);
+        let is_fn: i64 = sel_trit(tag <=> 32483, 0, 1, 0);
+        let is_sch: i64 = sel_trit(tag <=> 32481, 0, 1, 0);
+        let is_ex: i64 = sel_trit(tag <=> 32482, 0, 1, 0);
+        let nxt: i64 = if_pos is_fn <=> 0 {
+            let pcnt: i64 = ld_u16(module_bc, (pos + 2) * 2);
+            let icnt_pos: i64 = pos + 3 + pcnt * 3 + 2;
+            let icnt: i64 = ld_u16(module_bc, icnt_pos * 2);
+            n_fns = n_fns + 1;
+            total_ins = total_ins + icnt;
+            api_bc_skip_body(module_bc, nwords, icnt_pos + 1, icnt)
+        } else {
+            let fcnt: i64 = if_pos is_sch <=> 0 { ld_u16(module_bc, (pos + 2) * 2) } else { 0 };
+            is_sch * (pos + 3 + fcnt * 2) + is_ex * (pos + 5) + (1 - is_sch - is_ex) * nwords
+        };
+        pos = nxt;
+        go = (1 - is_end) * (is_fn + is_sch + is_ex) * sel_trit(pos <=> nwords, 1, 0, 0);
+    }
+    let packed: i64 = (n_fns << 40) | ((total_ins & 1048575) << 20) | (nwords & 1048575);
+    let res: i64 = if_pos hdr_ok <=> 0 { packed } else { -1 };
+    return res;
+}
+
+// Pure-Omni `token_specialize(module_bc: bytes, hint: i64) -> bytes` (#[cap(PURE)]):
+//   hint == 1: strips standalone NOP instructions (`[0x7F00, 0x7EE4]`) inside function
+//              bodies and decrements each function's `ins_cnt` header word in-place.
+//   otherwise: exact canonical clone of `module_bc`.
+#[strict]
+fn api_token_specialize(module_bc: bytes, hint: i64) -> bytes {
+    let nwords: i64 = slen(module_bc) >> 1;
+    let do_nop: i64 = sel_trit(hint <=> 1, 0, 1, 0);
+    let out: bytes = anew(0);
+    let pos: i64 = 0;
+    let cur_icnt_out_byte: i64 = -1;
+    let cur_icnt_val: i64 = 0;
+    let in_body: i64 = 0;
+    let rem_ins: i64 = 0;
+    while pos < nwords {
+        let tok: i64 = ld_u16(module_bc, pos * 2);
+        let is_nop_seq: i64 = do_nop * in_body * sel_trit(tok <=> 32512, 0, 1, 0)
+            * sel_trit((pos + 1) <=> nwords, 1, 0, 0);
+        let skip_nop: i64 = if_pos is_nop_seq <=> 0 {
+            sel_trit(ld_u16(module_bc, (pos + 1) * 2) <=> 32484, 0, 1, 0)
+        } else {
+            0
+        };
+        let out_n: bytes = if_pos skip_nop <=> 0 {
+            cur_icnt_val = cur_icnt_val - 1;
+            rem_ins = rem_ins - 1;
+            in_body = sel_trit(rem_ins <=> 0, 0, 0, 1);
+            pos = pos + 2;
+            st_u16(out, cur_icnt_out_byte, cur_icnt_val & 65535)
+        } else {
+            let is_fn_hdr: i64 = (1 - in_body) * sel_trit(tok <=> 32483, 0, 1, 0);
+            let out2: bytes = if_pos is_fn_hdr <=> 0 {
+                let pcnt: i64 = ld_u16(module_bc, (pos + 2) * 2);
+                let hdr_len: i64 = 3 + pcnt * 3 + 3;
+                let icnt: i64 = ld_u16(module_bc, (pos + hdr_len - 1) * 2);
+                let w: bytes = out;
+                let h: i64 = 0;
+                while h < hdr_len {
+                    let hw: i64 = ld_u16(module_bc, (pos + h) * 2);
+                    w = iset(w, hw & 255);
+                    w = iset(w, (hw >> 8) & 255);
+                    h = h + 1;
+                }
+                cur_icnt_out_byte = slen(w) - 2;
+                cur_icnt_val = icnt;
+                rem_ins = icnt;
+                in_body = sel_trit(icnt <=> 0, 0, 0, 1);
+                pos = pos + hdr_len;
+                w
+            } else {
+                let w1: bytes = iset(out, tok & 255);
+                let w: bytes = iset(w1, (tok >> 8) & 255);
+                let at_end: i64 = in_body * sel_trit(tok <=> 32484, 0, 1, 0);
+                rem_ins = rem_ins - at_end;
+                in_body = in_body * sel_trit(rem_ins <=> 0, 0, 0, 1);
+                pos = pos + 1;
+                w
+            };
+            out2
+        };
+        out = out_n;
+    }
+    return out;
+}
+
+// Pure-Omni `token_inspect_trace(trace_ring: bytes) -> i64` (#[cap(PURE)]):
+// Reuses `pure/m7/judge.omni::p7_trace_histogram` without duplicating its logic.
+// Returns packed 4-class histogram: `(call_ret << 48) | (ctrl << 32) | (mem << 16) | alu`.
+#[strict]
+fn api_token_inspect_trace(trace_ring: bytes) -> i64 {
+    return p7_trace_histogram(trace_ring);
+}
+
+// Extract one 16-bit bucket from the packed 4-class trace histogram:
+//   idx 0 = alu, 1 = mem, 2 = ctrl, 3 = call_ret.
+#[strict]
+fn api_token_inspect_trace_bucket(trace_ring: bytes, idx: i64) -> i64 {
+    let packed: i64 = p7_trace_histogram(trace_ring);
+    let sh: i64 = (idx & 3) * 16;
+    return (packed >> sh) & 65535;
+}

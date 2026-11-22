@@ -1,0 +1,27 @@
+// Phase 7 / New-Level API Stage 2 (Part 1) harness for `pure/api/reflect.omni`.
+// Exposes entry points for M3/M2/M4 differential testing (main <= 4 params).
+
+#[strict]
+fn api_reflect_inspect_entry(module_bc: bytes) -> i64 {
+    return api_token_inspect(module_bc);
+}
+
+#[strict]
+fn api_reflect_specialize_entry(module_bc: bytes, hint: i64) -> bytes {
+    return api_token_specialize(module_bc, hint);
+}
+
+#[strict]
+fn api_reflect_trace_entry(trace_ring: bytes) -> i64 {
+    return api_token_inspect_trace(trace_ring);
+}
+
+#[strict]
+fn api_reflect_trace_bucket_entry(trace_ring: bytes, idx: i64) -> i64 {
+    return api_token_inspect_trace_bucket(trace_ring, idx);
+}
+
+#[strict]
+fn main(a: i64, b: i64, c: i64, d: i64) -> i64 {
+    return (a + b + c + d) & 65535;
+}
