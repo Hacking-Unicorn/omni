@@ -1,0 +1,198 @@
+// ==============================================================================
+// OMNI SEED-SHRINK (PHASE A2) — PURE-OMNI INCLUDE DIRECTIVE SCANNER & STRIPPER
+// `pure/m3/include.omni`
+// ==============================================================================
+//
+// Pure-Omni iterative preprocessor implementing M3 decision O-5 semantics:
+//   - Scans top-level `include "..."` / `include"..."` / `mod "..."` lines
+//     (ignoring leading spaces/tabs and `//` comments) and records
+//     `(path_off, path_len, line, col)` in a binary table.
+//   - Strips top-level `include ` / `include"` / `mod ` lines from source bytes.
+//   - Deterministic 31-bit path hashing + iterative active-stack cycle check
+//     (`CIRCULAR_INCLUDE`).
+// Zero recursion, zero IDIV/IMOD, zero PACK5, single ANEW site, m2-lint clean.
+// ==============================================================================
+
+// Single ANEW site for module (satisfies M2_LINT:ANEW_COUNT <= 1).
+#[strict]
+fn m3i_new_buf() -> bytes {
+    return anew(0);
+}
+
+// Helper: check if byte is ASCII space (32) or tab (9).
+#[strict]
+fn m3i_is_ws(b: i64) -> i64 {
+    return sel_trit(b <=> 32, 0, 1, 0) | sel_trit(b <=> 9, 0, 1, 0);
+}
+
+// Helper: branchless clamp `idx` into `[0 .. max_i]` (0 labels).
+#[strict]
+fn m3i_clamp(idx: i64, max_i: i64) -> i64 {
+    let c0: i64 = sel_trit(idx <=> 0, 0, idx, idx);
+    return sel_trit(c0 <=> max_i, c0, max_i, max_i);
+}
+
+// Helper: check if 8-byte window (b0..b7) is "include " or "include\"".
+#[strict]
+fn m3i_match_inc8(b0: i64, b1: i64, b2: i64, b3: i64, b4: i64, b5: i64, b6: i64, b7: i64) -> i64 {
+    let m0: i64 = sel_trit(b0 <=> 105, 0, 1, 0)
+        * sel_trit(b1 <=> 110, 0, 1, 0)
+        * sel_trit(b2 <=> 99, 0, 1, 0)
+        * sel_trit(b3 <=> 108, 0, 1, 0);
+    let m1: i64 = sel_trit(b4 <=> 117, 0, 1, 0)
+        * sel_trit(b5 <=> 100, 0, 1, 0)
+        * sel_trit(b6 <=> 101, 0, 1, 0);
+    let sep: i64 = sel_trit(b7 <=> 32, 0, 1, 0) | sel_trit(b7 <=> 34, 0, 1, 0);
+    return m0 * m1 * sep;
+}
+
+// Helper: check if 4-byte window (b0..b3) is "mod " or "mod\"".
+#[strict]
+fn m3i_match_mod4(b0: i64, b1: i64, b2: i64, b3: i64) -> i64 {
+    let m0: i64 = sel_trit(b0 <=> 109, 0, 1, 0)
+        * sel_trit(b1 <=> 111, 0, 1, 0)
+        * sel_trit(b2 <=> 100, 0, 1, 0);
+    let sep: i64 = sel_trit(b3 <=> 32, 0, 1, 0) | sel_trit(b3 <=> 34, 0, 1, 0);
+    return m0 * sep;
+}
+
+// Scan `src` for all top-level `include "..."` / `mod "..."` directives.
+// Returns a binary table: `[count:u32, (path_off:u32, path_len:u32, line:u32, col:u32)...]`.
+#[strict]
+fn m3i_scan_includes(src: bytes) -> bytes {
+    let n: i64 = slen(src);
+    let max_i: i64 = n - 1;
+    let out: bytes = m3i_new_buf();
+    out = iset_i32(out, 0);
+    let cnt: i64 = 0;
+    let pos: i64 = 0;
+    let line: i64 = 1;
+    while pos < n {
+        let p: i64 = pos;
+        let tpos: i64 = -1;
+        let q1: i64 = -1;
+        let q2: i64 = -1;
+        let go: i64 = sel_trit(p <=> n, 1, 0, 0);
+        while go <=> 0 {
+            let b: i64 = ld_u8(src, p);
+            let is_nl: i64 = sel_trit(b <=> 10, 0, 1, 0);
+            let need_t: i64 = (1 - is_nl) * sel_trit(tpos <=> 0, 1, 0, 0) * (1 - m3i_is_ws(b));
+            tpos = need_t * p + (1 - need_t) * tpos;
+            let is_q: i64 = (1 - is_nl) * sel_trit(b <=> 34, 0, 1, 0);
+            let set_q1: i64 = is_q * sel_trit(q1 <=> 0, 1, 0, 0);
+            let set_q2: i64 = is_q * (1 - set_q1) * sel_trit(q2 <=> 0, 1, 0, 0);
+            q1 = set_q1 * p + (1 - set_q1) * q1;
+            q2 = set_q2 * p + (1 - set_q2) * q2;
+            p = p + (1 - is_nl);
+            go = (1 - is_nl) * sel_trit(p <=> n, 1, 0, 0);
+        }
+        let eol: i64 = p;
+        let has_t: i64 = sel_trit(tpos <=> 0, 0, 1, 1);
+        let fits8: i64 = has_t * sel_trit((tpos + 8) <=> eol, 1, 1, 0);
+        let fits4: i64 = has_t * sel_trit((tpos + 4) <=> eol, 1, 1, 0);
+        let b0: i64 = ld_u8(src, m3i_clamp(tpos, max_i));
+        let b1: i64 = ld_u8(src, m3i_clamp(tpos + 1, max_i));
+        let b2: i64 = ld_u8(src, m3i_clamp(tpos + 2, max_i));
+        let b3: i64 = ld_u8(src, m3i_clamp(tpos + 3, max_i));
+        let b4: i64 = ld_u8(src, m3i_clamp(tpos + 4, max_i));
+        let b5: i64 = ld_u8(src, m3i_clamp(tpos + 5, max_i));
+        let b6: i64 = ld_u8(src, m3i_clamp(tpos + 6, max_i));
+        let b7: i64 = ld_u8(src, m3i_clamp(tpos + 7, max_i));
+        let is_inc: i64 = fits8 * m3i_match_inc8(b0, b1, b2, b3, b4, b5, b6, b7);
+        let is_mod: i64 = fits4 * m3i_match_mod4(b0, b1, b2, b3);
+        let valid: i64 = (is_inc | is_mod) * sel_trit(q1 <=> 0, 0, 1, 1) * sel_trit(q2 <=> q1, 0, 0, 1);
+        let out_n: bytes = if_pos valid <=> 0 {
+            let poff: i64 = q1 + 1;
+            let plen: i64 = q2 - poff;
+            let col: i64 = (tpos - pos) + 1;
+            let w1: bytes = iset_i32(out, poff);
+            let w2: bytes = iset_i32(w1, plen);
+            let w3: bytes = iset_i32(w2, line);
+            cnt = cnt + 1;
+            iset_i32(w3, col)
+        } else {
+            out
+        };
+        out = out_n;
+        let has_nl: i64 = sel_trit(eol <=> n, 1, 0, 0);
+        pos = eol + has_nl;
+        line = line + 1;
+    }
+    return st_u32(out, 0, cnt);
+}
+
+// Strip all top-level `include ` / `include"` / `mod ` lines from `src`, matching
+// `resolve_omni_surface_includes` line-for-line (normalizing trailing CR before LF).
+#[strict]
+fn m3i_strip_include_lines(src: bytes) -> bytes {
+    let n: i64 = slen(src);
+    let max_i: i64 = n - 1;
+    let out: bytes = m3i_new_buf();
+    let pos: i64 = 0;
+    while pos < n {
+        let p: i64 = pos;
+        let tpos: i64 = -1;
+        let go: i64 = sel_trit(p <=> n, 1, 0, 0);
+        while go <=> 0 {
+            let b: i64 = ld_u8(src, p);
+            let is_nl: i64 = sel_trit(b <=> 10, 0, 1, 0);
+            let need_t: i64 = (1 - is_nl) * sel_trit(tpos <=> 0, 1, 0, 0) * (1 - m3i_is_ws(b));
+            tpos = need_t * p + (1 - need_t) * tpos;
+            p = p + (1 - is_nl);
+            go = (1 - is_nl) * sel_trit(p <=> n, 1, 0, 0);
+        }
+        let eol: i64 = p;
+        let has_t: i64 = sel_trit(tpos <=> 0, 0, 1, 1);
+        let fits8: i64 = has_t * sel_trit((tpos + 8) <=> eol, 1, 1, 0);
+        let fits4: i64 = has_t * sel_trit((tpos + 4) <=> eol, 1, 1, 0);
+        let b0: i64 = ld_u8(src, m3i_clamp(tpos, max_i));
+        let b1: i64 = ld_u8(src, m3i_clamp(tpos + 1, max_i));
+        let b2: i64 = ld_u8(src, m3i_clamp(tpos + 2, max_i));
+        let b3: i64 = ld_u8(src, m3i_clamp(tpos + 3, max_i));
+        let b4: i64 = ld_u8(src, m3i_clamp(tpos + 4, max_i));
+        let b5: i64 = ld_u8(src, m3i_clamp(tpos + 5, max_i));
+        let b6: i64 = ld_u8(src, m3i_clamp(tpos + 6, max_i));
+        let b7: i64 = ld_u8(src, m3i_clamp(tpos + 7, max_i));
+        let is_inc: i64 = fits8 * m3i_match_inc8(b0, b1, b2, b3, b4, b5, b6, b7);
+        let is_mod: i64 = fits4 * m3i_match_mod4(b0, b1, b2, b3);
+        let keep: i64 = 1 - (is_inc | is_mod);
+        let has_cr: i64 = sel_trit(eol <=> pos, 0, 0, 1)
+            * sel_trit(ld_u8(src, m3i_clamp(eol - 1, max_i)) <=> 13, 0, 1, 0);
+        let copy_end: i64 = keep * (eol - has_cr) + (1 - keep) * pos;
+        let c: i64 = pos;
+        while c < copy_end {
+            out = iset(out, ld_u8(src, c));
+            c = c + 1;
+        }
+        out = if_pos keep <=> 0 { iset(out, 10) } else { out };
+        let has_nl: i64 = sel_trit(eol <=> n, 1, 0, 0);
+        pos = eol + has_nl;
+    }
+    return out;
+}
+
+// Deterministic 31-bit FNV-1a hash of path slice `src[off .. off + len)`.
+#[strict]
+fn m3i_hash_path(src: bytes, off: i64, len: i64) -> i64 {
+    let h: i64 = 1073741827;
+    let i: i64 = 0;
+    while i < len {
+        let b: i64 = ld_u8(src, off + i);
+        h = ((h ^ b) * 16777619) & 2147483647;
+        i = i + 1;
+    }
+    return h;
+}
+
+// Iterative active-stack cycle check: returns 1 if `cand_hash` appears in `stack_hashes[0..depth)` (u32 LE), else 0.
+#[strict]
+fn m3i_check_cycle(stack_hashes: bytes, depth: i64, cand_hash: i64) -> i64 {
+    let found: i64 = 0;
+    let i: i64 = 0;
+    while i < depth {
+        let cur: i64 = ld_u32(stack_hashes, i * 4);
+        found = found | sel_trit(cur <=> cand_hash, 0, 1, 0);
+        i = i + 1;
+    }
+    return found;
+}

@@ -45,6 +45,8 @@ jobs:
           ./omni p4-wasm
           ./omni compile-surface --rust spec/acceptance/goldens/seed6_clamp.omni /tmp/seed6_clamp.omni_bc
           ./omni p4-exec /tmp/seed6_clamp.omni_bc 150 10 90 --trace
+          ./omni compile spec/acceptance/goldens/judge_better_golden.omni /tmp/judge_better.omni_bc
+          ./omni p4-exec /tmp/judge_better.omni_bc 100 80 5 --trace
           ./omni p5-sys
           ./omni p5-selfhost
           ./omni p7-measure
@@ -53,6 +55,7 @@ jobs:
           ./omni p7-adapt
           ./omni p7-learn
           ./omni a1-pure-default
+          ./omni a2-pure-include
           ./omni api-stage1
           ./omni api-stage2
           ./omni api-stage2-emit

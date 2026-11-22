@@ -102,6 +102,12 @@ pub const P7_LEARN_OMNI_SRC: &str = concat!(
     include_str!("../spec/m7/learn_harness.omni"),
 );
 
+pub const M3_INCLUDE_OMNI_SRC: &str = concat!(
+    include_str!("../pure/m3/include.omni"),
+    "\n",
+    include_str!("../spec/m3/include_harness.omni"),
+);
+
 pub const API_STAGE1_OMNI_SRC: &str = concat!(
     include_str!("../pure/m7/judge.omni"),
     "\n",
@@ -6066,5 +6072,237 @@ pub fn selftest_a1_pure_default() -> Result<usize, String> {
     checks += 1;
 
     Ok(checks)
+}
+
+/// Seed-Shrink Phase A2 (O-5): Pure-Omni include expander driven by `pure/m3/include.omni`.
+/// Zero Rust lexer/parser calls (`tokenize_omni_surface` / `SurfaceParser` never invoked);
+/// uses Pure-Omni `m3i_scan_includes`, `m3i_strip_include_lines`, `m3i_hash_path`, and `m3i_check_cycle`.
+pub fn pure_default_expand_includes(
+    src: &str,
+    base_dir: Option<&std::path::Path>,
+    vfs: Option<&std::collections::BTreeMap<String, String>>,
+) -> Result<String, String> {
+    if !src.contains("include") && !src.contains("mod ") && !src.contains("mod\"") {
+        return Ok(String::from(src));
+    }
+    let inc_u16 = pure_default_compile_surface_to_u16(M3_INCLUDE_OMNI_SRC, true)?;
+    let inc_mod = decode_omni_token_stream(&inc_u16)?;
+    let n_fns = inc_mod.functions.len();
+    // Order at end of spec/m3/include_harness.omni:
+    //   m3i_scan_entry (-5), m3i_strip_entry (-4), m3i_hash_entry (-3), m3i_cycle_entry (-2), main (-1)
+    let fn_scan = inc_mod.functions[n_fns - 5].fn_idx;
+    let fn_strip = inc_mod.functions[n_fns - 4].fn_idx;
+    let fn_hash = inc_mod.functions[n_fns - 3].fn_idx;
+    let fn_cycle = inc_mod.functions[n_fns - 2].fn_idx;
+    let mut vm = OmniBinaryVm::with_budgets(500_000_000, 64 * 1024 * 1024);
+
+    fn expand_rec(
+        vm: &mut OmniBinaryVm,
+        inc_mod: &BinModule,
+        fn_scan: u16,
+        fn_strip: u16,
+        fn_hash: u16,
+        fn_cycle: u16,
+        cur_src: &str,
+        cur_dir: Option<&std::path::Path>,
+        vfs: Option<&std::collections::BTreeMap<String, String>>,
+        stack_hashes: &mut Vec<u8>,
+    ) -> Result<String, String> {
+        let src_bytes = cur_src.as_bytes().to_vec();
+        let tbl = match vm.execute_function(inc_mod, fn_scan, vec![OmniValue::Bytes(src_bytes.clone())])? {
+            OmniValue::Bytes(b) => b,
+            other => return Err(format!("A2 m3i_scan_includes returned {:?}", other)),
+        };
+        if tbl.len() < 4 {
+            return Ok(String::from(cur_src));
+        }
+        let cnt = u32::from_le_bytes(tbl[0..4].try_into().unwrap()) as usize;
+        if cnt == 0 {
+            return Ok(String::from(cur_src));
+        }
+        let mut combined = String::new();
+        for i in 0..cnt {
+            let off = 4 + i * 16;
+            let poff = u32::from_le_bytes(tbl[off..off + 4].try_into().unwrap()) as usize;
+            let plen = u32::from_le_bytes(tbl[off + 4..off + 8].try_into().unwrap()) as usize;
+            let line = u32::from_le_bytes(tbl[off + 8..off + 12].try_into().unwrap());
+            let col = u32::from_le_bytes(tbl[off + 12..off + 16].try_into().unwrap());
+            let inc_path = std::str::from_utf8(&src_bytes[poff..poff + plen])
+                .map_err(|_| format!("error[SYNTAX_ERROR] line {}, col {}: Invalid UTF-8 in include path", line, col))?
+                .to_string();
+            let phash = match vm.execute_function(
+                inc_mod,
+                fn_hash,
+                vec![
+                    OmniValue::Bytes(src_bytes.clone()),
+                    OmniValue::Int(poff as i64),
+                    OmniValue::Int(plen as i64),
+                ],
+            )? {
+                OmniValue::Int(v) => v,
+                other => return Err(format!("A2 m3i_hash_path returned {:?}", other)),
+            };
+            let depth = (stack_hashes.len() / 4) as i64;
+            let is_cyc = match vm.execute_function(
+                inc_mod,
+                fn_cycle,
+                vec![
+                    OmniValue::Bytes(stack_hashes.clone()),
+                    OmniValue::Int(depth),
+                    OmniValue::Int(phash),
+                ],
+            )? {
+                OmniValue::Int(v) => v,
+                other => return Err(format!("A2 m3i_check_cycle returned {:?}", other)),
+            };
+            if is_cyc != 0 {
+                return Err(format!(
+                    "error[CIRCULAR_INCLUDE] line {}, col {}: Circular include detected for '{}'",
+                    line, col, inc_path
+                ));
+            }
+            let inc_content = if let Some(s) = vfs.and_then(|m| m.get(&inc_path)) {
+                s.clone()
+            } else if let Some(std_src) = lookup_omni_stdlib_module(&inc_path) {
+                String::from(std_src)
+            } else if let Some(dir) = cur_dir {
+                let full_p = dir.join(&inc_path);
+                std::fs::read_to_string(&full_p).map_err(|e| {
+                    format!(
+                        "error[SYNTAX_ERROR] line {}, col {}: Failed to read included file '{}': {}",
+                        line, col, full_p.display(), e
+                    )
+                })?
+            } else {
+                std::fs::read_to_string(&inc_path).map_err(|e| {
+                    format!(
+                        "error[SYNTAX_ERROR] line {}, col {}: Failed to read included file '{}': {}",
+                        line, col, inc_path, e
+                    )
+                })?
+            };
+            stack_hashes.extend_from_slice(&(phash as u32).to_le_bytes());
+            let expanded = expand_rec(
+                vm, inc_mod, fn_scan, fn_strip, fn_hash, fn_cycle,
+                &inc_content, cur_dir, vfs, stack_hashes,
+            )?;
+            let new_len = stack_hashes.len().saturating_sub(4);
+            stack_hashes.truncate(new_len);
+            combined.push_str(&expanded);
+            combined.push('\n');
+        }
+        let body_bytes = match vm.execute_function(inc_mod, fn_strip, vec![OmniValue::Bytes(src_bytes)])? {
+            OmniValue::Bytes(b) => b,
+            other => return Err(format!("A2 m3i_strip_include_lines returned {:?}", other)),
+        };
+        let body_str = String::from_utf8(body_bytes)
+            .map_err(|e| format!("A2 stripped body UTF-8 error: {}", e))?;
+        combined.push_str(&body_str);
+        Ok(combined)
+    }
+
+    let mut stack_hashes: Vec<u8> = Vec::new();
+    expand_rec(
+        &mut vm, &inc_mod, fn_scan, fn_strip, fn_hash, fn_cycle,
+        src, base_dir, vfs, &mut stack_hashes,
+    )
+}
+
+/// Seed-Shrink Phase A2 hard gate (`./omnic a2-pure-include`):
+///   1. Pure-Omni M3 (0-word diff) + Pure-Omni M2 (0-byte diff) on `pure/m3/include.omni`.
+///   2. Multi-file stdlib include (`std/math.omni`) expands with 0-byte diff vs Rust oracle,
+///      compiles via Pure-M3 (0-word diff), lowers via Pure-M2 (0-byte diff), runs on Pure-M4 VM.
+///   3. Nested multi-file VFS include (`a.omni` -> `b.omni` -> `c.omni`) matches Rust oracle & runs on M4 VM.
+///   4. Circular include (`a.omni` -> `b.omni` -> `a.omni`) rejected with `error[CIRCULAR_INCLUDE]` + 1-based `(line, col)`.
+///   5. All 5 frozen FNV-1a64 hashes intact.
+pub fn selftest_a2_pure_include() -> Result<(usize, usize, usize), String> {
+    let mut checks = 0usize;
+
+    // 1. Compile pure/m3/include.omni + spec/m3/include_harness.omni via Pure-M3 (0-word diff) + Pure-M2 (0-byte diff).
+    let inc_u16 = pure_default_compile_surface_to_u16(M3_INCLUDE_OMNI_SRC, true)?;
+    let inc_rust_u16 = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(M3_INCLUDE_OMNI_SRC))?;
+    if inc_u16 != inc_rust_u16 {
+        return Err(format!(
+            "A2 Pure-M3 0-word diff failed on pure/m3/include.omni: pure={}w vs rust={}w",
+            inc_u16.len(),
+            inc_rust_u16.len()
+        ));
+    }
+    let inc_elf_pure = pure_default_compile_u16_to_elf(&inc_u16, 1, 2, 3)?;
+    let inc_elf_rust = compile_pure_u16_to_x86_64_elf_multi(&inc_u16, 1, 2, 3)?;
+    if inc_elf_pure != inc_elf_rust {
+        return Err(format!(
+            "A2 Pure-M2 0-byte diff failed on pure/m3/include.omni: pure={}B vs rust={}B",
+            inc_elf_pure.len(),
+            inc_elf_rust.len()
+        ));
+    }
+    checks += 1;
+
+    // 2. Multi-file stdlib include (`std/trit.omni`) expands identically to Rust oracle, compiles & runs.
+    let std_prog = "include \"std/trit.omni\";\n#[strict]\nfn main(x: i64) -> i64 {\n    return std_trit_mux(x <=> 50, -10, 0, 90);\n}\n";
+    let exp_pure = pure_default_expand_includes(std_prog, None, None)?;
+    let exp_rust = resolve_omni_surface_includes(std_prog, None, None)?;
+    if exp_pure != exp_rust {
+        return Err(format!(
+            "A2 stdlib include expansion mismatch vs Rust oracle (pure={} B vs rust={} B)",
+            exp_pure.len(),
+            exp_rust.len()
+        ));
+    }
+    let std_u16 = pure_default_compile_surface_to_u16(&exp_pure, true)?;
+    let std_u16_r = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(&exp_rust))?;
+    if std_u16 != std_u16_r {
+        return Err(String::from("A2 stdlib include Pure-M3 vs Rust word diff"));
+    }
+    let (std_ret, _) = pure_default_run_u16(&std_u16, 150, 0, 0, false)?;
+    if std_ret != 90 {
+        return Err(format!("A2 stdlib include M4 VM ret={} want 90", std_ret));
+    }
+    checks += 1;
+
+    // 3. Nested VFS include (`a.omni` -> `b.omni` -> `c.omni`) matches Rust oracle & executes on Pure-M4 VM.
+    let mut vfs: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    vfs.insert(
+        String::from("c.omni"),
+        String::from("#[strict]\nfn helper_c(x: i64) -> i64 { return x * 3; }\n"),
+    );
+    vfs.insert(
+        String::from("b.omni"),
+        String::from("include \"c.omni\";\n#[strict]\nfn helper_b(x: i64) -> i64 { return helper_c(x) + 7; }\n"),
+    );
+    let root_a = "include \"b.omni\";\n#[strict]\nfn main(x: i64) -> i64 { return helper_b(x); }\n";
+    let vfs_pure = pure_default_expand_includes(root_a, None, Some(&vfs))?;
+    let vfs_rust = resolve_omni_surface_includes(root_a, None, Some(&vfs))?;
+    if vfs_pure != vfs_rust {
+        return Err(String::from("A2 nested VFS include expansion mismatch vs Rust oracle"));
+    }
+    let vfs_u16 = pure_default_compile_surface_to_u16(&vfs_pure, true)?;
+    let (vfs_ret, _) = pure_default_run_u16(&vfs_u16, 10, 0, 0, false)?;
+    if vfs_ret != 37 {
+        return Err(format!("A2 nested VFS include M4 VM ret={} want 37", vfs_ret));
+    }
+    checks += 1;
+
+    // 4. Circular include (`cyc_a.omni` -> `cyc_b.omni` -> `cyc_a.omni`) rejected with `error[CIRCULAR_INCLUDE]`.
+    let mut cyc_vfs: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    cyc_vfs.insert(String::from("cyc_a.omni"), String::from("include \"cyc_b.omni\";\nfn fa() -> i64 { return 1; }\n"));
+    cyc_vfs.insert(String::from("cyc_b.omni"), String::from("include \"cyc_a.omni\";\nfn fb() -> i64 { return 2; }\n"));
+    let cyc_root = "include \"cyc_a.omni\";\nfn main() -> i64 { return 0; }\n";
+    match pure_default_expand_includes(cyc_root, None, Some(&cyc_vfs)) {
+        Ok(_) => return Err(String::from("A2 circular include must be rejected with CIRCULAR_INCLUDE")),
+        Err(msg) => {
+            if !msg.starts_with("error[CIRCULAR_INCLUDE]") || !msg.contains("line 1, col 1") {
+                return Err(format!("A2 circular include error mismatch: {}", msg));
+            }
+        }
+    }
+    checks += 1;
+
+    // 5. All 5 frozen FNV-1a64 hashes intact.
+    selftest_m2_frozen_hashes()?;
+    checks += 1;
+
+    Ok((checks, inc_u16.len(), inc_elf_pure.len()))
 }
 

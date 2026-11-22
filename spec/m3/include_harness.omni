@@ -1,0 +1,27 @@
+// Seed-Shrink Phase A2 harness for `pure/m3/include.omni`.
+// Exposes entry points for M3/M2/M4 differential testing (main <= 4 params).
+
+#[strict]
+fn m3i_scan_entry(src: bytes) -> bytes {
+    return m3i_scan_includes(src);
+}
+
+#[strict]
+fn m3i_strip_entry(src: bytes) -> bytes {
+    return m3i_strip_include_lines(src);
+}
+
+#[strict]
+fn m3i_hash_entry(src: bytes, off: i64, len: i64) -> i64 {
+    return m3i_hash_path(src, off, len);
+}
+
+#[strict]
+fn m3i_cycle_entry(stack_hashes: bytes, depth: i64, cand_hash: i64) -> i64 {
+    return m3i_check_cycle(stack_hashes, depth, cand_hash);
+}
+
+#[strict]
+fn main(a: i64, b: i64, c: i64, d: i64) -> i64 {
+    return (a + b + c + d) & 65535;
+}
