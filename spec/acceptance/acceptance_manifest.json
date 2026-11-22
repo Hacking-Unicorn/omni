@@ -71,5 +71,10 @@
     "negative_pure_verifier": [
       {"id": "neg_linear_reflect", "file": "goldens/neg_linear_reflect.omni", "expected_code": "LINEAR_REFLECT", "expected_num": 1012, "expected_line": 8, "expected_col": 13}
     ]
+  },
+  "pure_api_stage2_emit_goldens": {
+    "positive": [
+      {"id": "token_emit_golden", "file": "goldens/token_emit_golden.omni", "args": ["42"], "expected_result": "13"}
+    ]
   }
 }

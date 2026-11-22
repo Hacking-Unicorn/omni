@@ -1,0 +1,31 @@
+// Stage 2 (Part 2) positive golden: synthesizes a minimal 13-word `.omni_bc` module
+// returning `x` (`MOD_BEGIN`, `FN_BEGIN`, `RET IMM_I32(x)`, `MOD_END`), validates
+// header/trailer, and returns its word length (`13`) or `-1` on error.
+#[strict]
+fn push_u16(b: bytes, w: i64) -> bytes {
+    let b1: bytes = iset(b, w & 255);
+    return iset(b1, (w >> 8) & 255);
+}
+
+#[strict]
+fn main(x: i64) -> i64 {
+    let w: bytes = anew(0);
+    w = push_u16(w, 32480);           // TOK_MOD_BEGIN
+    w = push_u16(w, 32483);           // TOK_FN_DEF
+    w = push_u16(w, 0);               // fn_idx
+    w = push_u16(w, 0);               // param_cnt
+    w = push_u16(w, 32641);           // TY_I64
+    w = push_u16(w, 0);               // CAP_ID_PURE
+    w = push_u16(w, 1);               // ins_cnt
+    w = push_u16(w, 32586);           // OP_RET
+    w = push_u16(w, 32486);           // TOK_IMM_I32
+    w = push_u16(w, (x >> 16) & 65535);
+    w = push_u16(w, x & 65535);
+    w = push_u16(w, 32484);           // TOK_INS_END
+    w = push_u16(w, 32495);           // TOK_MOD_END
+    let nwords: i64 = slen(w) >> 1;
+    let ok: i64 = sel_trit(ld_u16(w, 0) <=> 32480, 0, 1, 0)
+        * sel_trit(ld_u16(w, (nwords - 1) * 2) <=> 32495, 0, 1, 0);
+    let res: i64 = if_pos ok <=> 0 { nwords } else { -1 };
+    return res;
+}

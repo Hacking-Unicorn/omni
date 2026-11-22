@@ -1,0 +1,206 @@
+// ==============================================================================
+// OMNI NEW-LEVEL API (STAGE 2, PART 2) — PURE TOKEN EMITTER HOST
+// `pure/api/emit.omni`
+// ==============================================================================
+//
+// Link order: `pure/m2/util.omni`, `pure/isa/table.omni`, `pure/m2/decode.omni`,
+//             `pure/m2/labels.omni`, `pure/m2/arena.omni`, `pure/m2/elf.omni`,
+//             `pure/m2/emit_x86.omni`, `pure/m2/emit_multi.omni`, this file.
+//
+// Pure-Omni library calls (zero host I/O, zero recursion, zero IDIV/IMOD,
+// zero PACK5 opcodes -> 100% Pure-Omni M3, M4 VM, and M2-multi ELF64 clean):
+//   - `api_token_emit_const(ret_val: i64) -> bytes`                 (#[cap(PURE)])
+//   - `api_token_emit(module_bc: bytes) -> bytes`                   (#[cap(PURE)])
+//   - `api_token_emit_elf(module_u16: array, a0, a1, a2) -> bytes`  (#[cap(PURE)])
+// ==============================================================================
+
+// Single ANEW site for the module (satisfies M2_LINT:ANEW_COUNT <= 1).
+#[strict]
+fn api_emit_new_buf() -> bytes {
+    return anew(0);
+}
+
+// Helper: append one 16-bit LE token word via 2-op `iset` (M4 VM & Rust VM clean).
+#[strict]
+fn api_emit_push_u16(buf: bytes, w: i64) -> bytes {
+    let b1: bytes = iset(buf, w & 255);
+    return iset(b1, (w >> 8) & 255);
+}
+
+// Helper: advance past one operand token in a byte-packed `.omni_bc` stream.
+#[strict]
+fn api_emit_next_op(bc: bytes, nwords: i64, pos: i64) -> i64 {
+    let tok: i64 = ld_u16(bc, pos * 2);
+    let is_i16: i64 = sel_trit(tok <=> 32485, 0, 1, 0);
+    let is_i32: i64 = sel_trit(tok <=> 32486, 0, 1, 0);
+    let is_eng: i64 = sel_trit(tok <=> 32490, 0, 1, 0);
+    let ge_sym: i64 = sel_trit(tok <=> 32491, 0, 1, 1);
+    let le_kv: i64 = sel_trit(tok <=> 32494, 1, 1, 0);
+    let is_w2: i64 = is_i16 | (ge_sym * le_kv);
+    let eng_adv: i64 = if_pos is_eng <=> 0 {
+        let wlen: i64 = if_pos (nwords - (pos + 1)) <=> 0 {
+            ld_u16(bc, (pos + 1) * 2)
+        } else {
+            0
+        };
+        2 + wlen
+    } else {
+        1
+    };
+    let adv: i64 = is_i32 * 3 + is_w2 * 2 + (1 - is_i32 - is_w2) * eng_adv;
+    return pos + adv;
+}
+
+// Helper: advance past one instruction (ending after TOK_INS_END=32484).
+#[strict]
+fn api_emit_skip_ins(bc: bytes, nwords: i64, pos: i64) -> i64 {
+    let first: i64 = ld_u16(bc, pos * 2);
+    let ge_r: i64 = sel_trit(first <=> 32256, 0, 1, 1);
+    let le_r: i64 = sel_trit(first <=> 32447, 1, 1, 0);
+    let is_dest: i64 = ge_r * le_r;
+    let cur: i64 = pos + 1 + is_dest * 3;
+    let go: i64 = sel_trit(cur <=> nwords, 1, 0, 0);
+    while go <=> 0 {
+        let tok: i64 = ld_u16(bc, cur * 2);
+        let at_end: i64 = sel_trit(tok <=> 32484, 0, 1, 0);
+        let nxt: i64 = if_pos at_end <=> 0 {
+            cur + 1
+        } else {
+            api_emit_next_op(bc, nwords, cur)
+        };
+        cur = nxt;
+        go = (1 - at_end) * sel_trit(cur <=> nwords, 1, 0, 0);
+    }
+    return cur;
+}
+
+// Helper: safely skip one FN_DEF starting at `pos`; returns `nwords` on truncation.
+#[strict]
+fn api_emit_skip_fn(bc: bytes, nwords: i64, pos: i64) -> i64 {
+    let have_p: i64 = sel_trit((pos + 2) <=> nwords, 1, 0, 0);
+    let res: i64 = if_pos have_p <=> 0 {
+        let pcnt: i64 = ld_u16(bc, (pos + 2) * 2);
+        let icnt_pos: i64 = pos + 3 + pcnt * 3 + 2;
+        let have_i: i64 = sel_trit(icnt_pos <=> nwords, 1, 0, 0);
+        if_pos have_i <=> 0 {
+            let icnt: i64 = ld_u16(bc, icnt_pos * 2);
+            let c: i64 = icnt_pos + 1;
+            let k: i64 = 0;
+            while k < icnt {
+                c = if_pos (nwords - c) <=> 0 { api_emit_skip_ins(bc, nwords, c) } else { nwords };
+                k = k + 1;
+            }
+            c
+        } else {
+            nwords
+        }
+    } else {
+        nwords
+    };
+    return res;
+}
+
+// Helper: validate a byte-packed `.omni_bc` module and return word count incl. MOD_END, or 0 on error.
+#[strict]
+fn api_emit_valid_words(bc: bytes) -> i64 {
+    let nbytes: i64 = slen(bc);
+    let nwords: i64 = nbytes >> 1;
+    let even: i64 = 1 - (nbytes & 1);
+    let has_hdr: i64 = sel_trit(nwords <=> 2, 0, 1, 1);
+    let hdr_ok: i64 = if_pos (even * has_hdr) <=> 0 {
+        sel_trit(ld_u16(bc, 0) <=> 32480, 0, 1, 0)
+    } else {
+        0
+    };
+    let pos: i64 = 1;
+    let found_end: i64 = 0;
+    let go: i64 = hdr_ok * sel_trit(pos <=> nwords, 1, 0, 0);
+    while go <=> 0 {
+        let tag: i64 = ld_u16(bc, pos * 2);
+        let is_end: i64 = sel_trit(tag <=> 32495, 0, 1, 0);
+        let is_fn: i64 = sel_trit(tag <=> 32483, 0, 1, 0);
+        let is_sch: i64 = sel_trit(tag <=> 32481, 0, 1, 0);
+        let is_ex: i64 = sel_trit(tag <=> 32482, 0, 1, 0);
+        found_end = found_end | is_end;
+        let nxt: i64 = if_pos is_fn <=> 0 {
+            api_emit_skip_fn(bc, nwords, pos)
+        } else {
+            let have_f: i64 = is_sch * sel_trit((pos + 2) <=> nwords, 1, 0, 0);
+            let fcnt: i64 = if_pos have_f <=> 0 { ld_u16(bc, (pos + 2) * 2) } else { 0 };
+            is_end * (pos + 1) + have_f * (pos + 3 + fcnt * 2) + is_ex * (pos + 5)
+                + (1 - is_end - have_f - is_ex) * nwords
+        };
+        pos = nxt;
+        go = (1 - is_end) * (is_fn + is_sch + is_ex) * sel_trit(pos <=> nwords, 1, 0, 0);
+    }
+    return found_end * pos;
+}
+
+// Pure-Omni token-stream synthesizer (`#[cap(PURE)]`):
+// Emits a complete, valid 13-word `.omni_bc` module (`fn main() -> i64 { return ret_val; }`).
+#[strict]
+fn api_token_emit_const(ret_val: i64) -> bytes {
+    let w: bytes = api_emit_new_buf();
+    w = api_emit_push_u16(w, 32480);                  // TOK_MOD_BEGIN (0x7EE0)
+    w = api_emit_push_u16(w, 32483);                  // TOK_FN_DEF    (0x7EE3)
+    w = api_emit_push_u16(w, 0);                      // fn_idx = 0
+    w = api_emit_push_u16(w, 0);                      // param_cnt = 0
+    w = api_emit_push_u16(w, 32641);                  // TY_I64        (0x7F81)
+    w = api_emit_push_u16(w, 0);                      // CAP_ID_PURE   (0)
+    w = api_emit_push_u16(w, 1);                      // ins_cnt = 1
+    w = api_emit_push_u16(w, 32586);                  // OP_RET        (0x7F4A)
+    w = api_emit_push_u16(w, 32486);                  // TOK_IMM_I32   (0x7EE6)
+    w = api_emit_push_u16(w, (ret_val >> 16) & 65535);// hi16
+    w = api_emit_push_u16(w, ret_val & 65535);        // lo16
+    w = api_emit_push_u16(w, 32484);                  // TOK_INS_END   (0x7EE4)
+    w = api_emit_push_u16(w, 32495);                  // TOK_MOD_END   (0x7EEF)
+    return w;
+}
+
+// Pure-Omni `token_emit(module_bc: bytes) -> bytes` (`#[cap(PURE)]`):
+// Validates the `.omni_bc` stream structure through MOD_END and emits its canonical bytes.
+// Fails closed with empty `bytes` on any corrupt, truncated, or non-terminated stream.
+#[strict]
+fn api_token_emit(module_bc: bytes) -> bytes {
+    let valid_w: i64 = api_emit_valid_words(module_bc);
+    let out: bytes = api_emit_new_buf();
+    let i: i64 = 0;
+    while i < valid_w {
+        out = api_emit_push_u16(out, ld_u16(module_bc, i * 2));
+        i = i + 1;
+    }
+    return out;
+}
+
+// Pure-Omni re-hosted M2 ELF64 emitter (`#[cap(PURE)]`):
+// Validates `MOD_BEGIN` (0x7EE0), allocates a 512 KiB M2 workspace, and delegates to
+// Pure-Omni `m2_compile_multi_x86_into`, returning the exact x86-64 ELF64 binary slice.
+// Fails closed with empty `bytes` when the stream header is invalid.
+#[strict]
+fn api_token_emit_elf(module_u16: array, arg0: i64, arg1: i64, arg2: i64) -> bytes {
+    let n: i64 = slen(module_u16);
+    let hdr_ok: i64 = if_pos (n - 1) <=> 0 {
+        m2u_eq(m2u_tok(module_u16, n, 0), 32480)
+    } else {
+        0
+    };
+    let w: bytes = api_emit_new_buf();
+    let i: i64 = 0;
+    let cap: i64 = hdr_ok * 65536;
+    while cap - i <=> 0 {
+        w = iset_i64(w, 0);
+        i = i + 1;
+    }
+    let w2: bytes = if_pos hdr_ok <=> 0 {
+        m2_compile_multi_x86_into(w, module_u16, arg0, arg1, arg2)
+    } else {
+        w
+    };
+    let out_n: i64 = if_pos hdr_ok <=> 0 {
+        ld_u64(w2, m2l_regs())
+    } else {
+        0
+    };
+    let out_off: i64 = hdr_ok * m2l_out();
+    return ret_slice(w2, out_off, out_n);
+}
