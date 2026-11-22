@@ -19731,20 +19731,16 @@ fn compile_wasm_single_func_body(
                     _ => 0,
                 };
                 if patch_width > 0 {
-                    // Patch in place, length unchanged. -9 (8 bytes): silent no-op unless
-                    // 0 <= off && off + 8 <= len. ISA-B -4/-2 (4/2 bytes): out of bounds traps.
+                    // Patch in place, length unchanged. ISA-B strict bounds: -9/-4/-2 all
+                    // trap (OUT_OF_BOUNDS) unless 0 <= off && off + width <= len.
                     emit_src(b);
                     wasm_buf_split(b, &bl);
                     emit_wasm_op(b, &ops[2]);
                     wasm_lset(b, scratch0);
                     emit_wasm_op(b, &ops[3]);
                     wasm_lset(b, scratch1);
-                    if patch_width == 8 {
-                        wasm_buf_in_bounds(b, &bl, scratch0, patch_width);
-                    } else {
-                        wasm_trap_unless_in_bounds(b, &bl, scratch0, patch_width);
-                        wasm_buf_in_bounds(b, &bl, scratch0, patch_width); // now always true
-                    }
+                    wasm_trap_unless_in_bounds(b, &bl, scratch0, patch_width);
+                    wasm_buf_in_bounds(b, &bl, scratch0, patch_width); // now always true
                     b.extend_from_slice(&[0x04, 0x40]);
                     wasm_lget(b, bl.bbase);
                     wasm_lget(b, scratch0);
