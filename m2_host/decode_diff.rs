@@ -60,6 +60,24 @@ pub const M4_VM_OMNI_SRC: &str = concat!(
     include_str!("../spec/m4/vm_harness.omni")
 );
 
+pub const M4_STANDALONE_OMNI_SRC: &str = concat!(
+    include_str!("../pure/m2/util.omni"),
+    "\n",
+    include_str!("../pure/isa/table.omni"),
+    "\n",
+    include_str!("../pure/m2/decode.omni"),
+    "\n",
+    include_str!("../pure/m2/labels.omni"),
+    "\n",
+    include_str!("../pure/m4/arena.omni"),
+    "\n",
+    include_str!("../pure/m4/ops_core.omni"),
+    "\n",
+    include_str!("../pure/m4/vm.omni"),
+    "\n",
+    include_str!("../pure/m4/m4_standalone.omni")
+);
+
 pub const M4_VM_WASM_HARNESS_SRC: &str = concat!(
     include_str!("../pure/m2/util.omni"),
     "\n",
@@ -709,6 +727,9 @@ pub const M3_LOWER_OMNI_SRC: &str = concat!(
     "\n",
     include_str!("../spec/m3/lower_harness.omni")
 );
+
+pub const M3_STANDALONE_OMNI_SRC: &str =
+    include_str!("../pure/m3/m3_standalone.omni");
 
 /// M3-04 selftest: `pure/isa/encode.omni` re-encodes every positive acceptance golden,
 /// `pure/verifier_engine.omni` (11,893 words), and `build_step7_stage1_compiler_stream`
@@ -5954,11 +5975,291 @@ pub fn pure_default_reject_macros(src: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Seed-Shrink Phase A1/A3: Compile `.omni` surface source using ONLY the committed Pure-Omni M3 seed
-/// (`pure/m3/m3.omni_bc`) — zero Rust frontend calls, and hard-rejects Rust-only `macro` directives
-/// with `error[ORACLE_ONLY_MACRO]` (Seed-Shrink A3 quarantine).
+// ==============================================================================
+// Audit §3.1: Hash-pinned native ELF toolchain (`m2.elf`, `m3.elf`, `m4.elf`)
+// + Audit §3.3: Per-process decoded seed module caches (`OnceLock`).
+// ==============================================================================
+
+pub const NATIVE_M2_ELF_BYTES: usize = 105_722;
+pub const NATIVE_M2_ELF_FNV: u64 = 0x7C76_51D8_126F_C127;
+pub const NATIVE_M3_ELF_BYTES: usize = 159_913;
+pub const NATIVE_M3_ELF_FNV: u64 = 0x347D_EAE5_0D5F_109F;
+pub const NATIVE_M4_ELF_BYTES: usize = 81_599;
+pub const NATIVE_M4_ELF_FNV: u64 = 0x0C1B_F0B3_526B_EBDC;
+
+fn cached_m2_seed_module() -> Result<&'static BinModule, String> {
+    static M2_MOD: std::sync::OnceLock<Result<BinModule, String>> = std::sync::OnceLock::new();
+    M2_MOD
+        .get_or_init(|| {
+            let m2_raw = std::fs::read("pure/m2/m2.omni_bc")
+                .map_err(|e| format!("Pure-M2 seed read failed (pure/m2/m2.omni_bc): {}", e))?;
+            let m2_u16 = decode_bytes_to_u16_stream(&m2_raw);
+            decode_omni_token_stream(&m2_u16)
+        })
+        .as_ref()
+        .map_err(|e| e.clone())
+}
+
+fn cached_m4_seed_module() -> Result<&'static BinModule, String> {
+    static M4_MOD: std::sync::OnceLock<Result<BinModule, String>> = std::sync::OnceLock::new();
+    M4_MOD
+        .get_or_init(|| {
+            let m4_raw = std::fs::read("pure/m4/m4.omni_bc")
+                .map_err(|e| format!("Pure-M4 seed read failed (pure/m4/m4.omni_bc): {}", e))?;
+            let m4_u16 = decode_bytes_to_u16_stream(&m4_raw);
+            decode_omni_token_stream(&m4_u16)
+        })
+        .as_ref()
+        .map_err(|e| e.clone())
+}
+
+fn cached_verifier_engine_module() -> Result<&'static BinModule, String> {
+    static VE_MOD: std::sync::OnceLock<Result<BinModule, String>> = std::sync::OnceLock::new();
+    VE_MOD
+        .get_or_init(|| {
+            let ve_u16 = with_lockstep_suspended(|| {
+                compile_omni_surface_strict_to_u16(OMNI_VERIFIER_ENGINE_SURFACE)
+            })?;
+            decode_omni_token_stream(&ve_u16)
+        })
+        .as_ref()
+        .map_err(|e| e.clone())
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn native_toolchain_cache_dir() -> Result<std::path::PathBuf, String> {
+    use std::os::unix::fs::DirBuilderExt;
+    let base = if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
+        if !xdg.is_empty() {
+            std::path::PathBuf::from(xdg).join("omni").join("native-v1")
+        } else {
+            std::env::temp_dir().join(format!("omni-native-cache-{}", std::process::id()))
+        }
+    } else if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            std::path::PathBuf::from(home).join(".cache").join("omni").join("native-v1")
+        } else {
+            std::env::temp_dir().join(format!("omni-native-cache-{}", std::process::id()))
+        }
+    } else {
+        std::env::temp_dir().join(format!("omni-native-cache-{}", std::process::id()))
+    };
+    if !base.exists() {
+        let mut b = std::fs::DirBuilder::new();
+        b.recursive(true).mode(0o700);
+        b.create(&base)
+            .map_err(|e| format!("create native cache dir {}: {}", base.display(), e))?;
+    }
+    Ok(base)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+struct PrivateTempDataFile {
+    path: std::path::PathBuf,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl PrivateTempDataFile {
+    fn create(prefix: &str, bytes: &[u8]) -> Result<Self, String> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = native_toolchain_cache_dir()?;
+        let pid = std::process::id();
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = dir.join(format!("{}_{}_{}_{}.tmp", prefix, pid, seq, nanos));
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| format!("create temp input {}: {}", path.display(), e))?;
+        f.write_all(bytes)
+            .map_err(|e| format!("write temp input {}: {}", path.display(), e))?;
+        Ok(Self { path })
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl Drop for PrivateTempDataFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn ensure_cached_native_elf<F: FnOnce() -> Result<Vec<u8>, String>>(
+    name: &str,
+    expected_len: usize,
+    expected_fnv: u64,
+    build_fn: F,
+) -> Result<std::path::PathBuf, String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = native_toolchain_cache_dir()?;
+    let final_path = dir.join(format!("{}_{:016x}.elf", name, expected_fnv));
+    if let Ok(existing) = std::fs::read(&final_path) {
+        if existing.len() == expected_len && fnv1a_64_hash(&existing) == expected_fnv {
+            return Ok(final_path);
+        }
+        let _ = std::fs::remove_file(&final_path);
+    }
+    let elf = build_fn()?;
+    let got_fnv = fnv1a_64_hash(&elf);
+    if elf.len() != expected_len || got_fnv != expected_fnv {
+        return Err(format!(
+            "native {}.elf pin mismatch: got {} B (0x{:016X}), expected {} B (0x{:016X})",
+            name,
+            elf.len(),
+            got_fnv,
+            expected_len,
+            expected_fnv
+        ));
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_path = dir.join(format!(".{}_{}_{}.tmp", name, std::process::id(), nanos));
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&tmp_path)
+            .map_err(|e| format!("create native elf tmp {}: {}", tmp_path.display(), e))?;
+        f.write_all(&elf)
+            .map_err(|e| format!("write native elf tmp {}: {}", tmp_path.display(), e))?;
+    }
+    std::fs::rename(&tmp_path, &final_path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        format!("rename native elf {}: {}", final_path.display(), e)
+    })?;
+    Ok(final_path)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn ensure_native_m2_elf() -> Result<&'static std::path::PathBuf, String> {
+    static M2_ELF: std::sync::OnceLock<Result<std::path::PathBuf, String>> = std::sync::OnceLock::new();
+    M2_ELF
+        .get_or_init(|| {
+            ensure_cached_native_elf("m2", NATIVE_M2_ELF_BYTES, NATIVE_M2_ELF_FNV, || {
+                let m2_raw = std::fs::read("pure/m2/m2.omni_bc")
+                    .map_err(|e| format!("read pure/m2/m2.omni_bc: {}", e))?;
+                let m2_u16 = decode_bytes_to_u16_stream(&m2_raw);
+                pure_default_compile_u16_to_elf_interpreted(&m2_u16, 0, 0, 0)
+            })
+        })
+        .as_ref()
+        .map_err(|e| e.clone())
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn ensure_native_m3_elf() -> Result<&'static std::path::PathBuf, String> {
+    static M3_ELF: std::sync::OnceLock<Result<std::path::PathBuf, String>> = std::sync::OnceLock::new();
+    M3_ELF
+        .get_or_init(|| {
+            ensure_cached_native_elf("m3", NATIVE_M3_ELF_BYTES, NATIVE_M3_ELF_FNV, || {
+                let m2_elf = ensure_native_m2_elf()?;
+                let out = std::process::Command::new(m2_elf)
+                    .arg("pure/m3/m3_standalone.omni_bc")
+                    .arg("0")
+                    .arg("0")
+                    .arg("0")
+                    .output()
+                    .map_err(|e| format!("spawn m2.elf for m3.elf: {}", e))?;
+                if !out.status.success() {
+                    return Err(format!(
+                        "m2.elf failed building m3.elf with status {:?}",
+                        out.status.code()
+                    ));
+                }
+                Ok(out.stdout)
+            })
+        })
+        .as_ref()
+        .map_err(|e| e.clone())
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn ensure_native_m4_elf() -> Result<&'static std::path::PathBuf, String> {
+    static M4_ELF: std::sync::OnceLock<Result<std::path::PathBuf, String>> = std::sync::OnceLock::new();
+    M4_ELF
+        .get_or_init(|| {
+            ensure_cached_native_elf("m4", NATIVE_M4_ELF_BYTES, NATIVE_M4_ELF_FNV, || {
+                let m2_elf = ensure_native_m2_elf()?;
+                let out = std::process::Command::new(m2_elf)
+                    .arg("pure/m4/m4_standalone.omni_bc")
+                    .arg("0")
+                    .arg("0")
+                    .arg("0")
+                    .output()
+                    .map_err(|e| format!("spawn m2.elf for m4.elf: {}", e))?;
+                if !out.status.success() {
+                    return Err(format!(
+                        "m2.elf failed building m4.elf with status {:?}",
+                        out.status.code()
+                    ));
+                }
+                Ok(out.stdout)
+            })
+        })
+        .as_ref()
+        .map_err(|e| e.clone())
+}
+
+/// Seed-Shrink Phase A1/A3 + Audit §3.1: Compile `.omni` surface source using ONLY the committed
+/// Pure-Omni M3 seed (hash-pinned native `m3.elf` on Linux x86-64 when `src.len() <= 65_536` and
+/// not forced interpreted; otherwise interpreted `pure/m3/m3.omni_bc`) — zero Rust frontend calls,
+/// and hard-rejects Rust-only `macro` directives with `error[ORACLE_ONLY_MACRO]`.
 pub fn pure_default_compile_surface_to_u16(src: &str, strict: bool) -> Result<Vec<u16>, String> {
     pure_default_reject_macros(src)?;
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if !pure_default_force_interpreted()
+        && src.len() <= 65_536
+        && std::path::Path::new("pure/m3/m3_standalone.omni_bc").exists()
+    {
+        if let Ok(m3_elf) = ensure_native_m3_elf() {
+            let mut u16_bytes = Vec::with_capacity(src.len() * 2);
+            for &b in src.as_bytes() {
+                u16_bytes.extend_from_slice(&(b as u16).to_le_bytes());
+            }
+            let tmp = PrivateTempDataFile::create("m3_in", &u16_bytes)?;
+            let out = std::process::Command::new(m3_elf)
+                .arg(&tmp.path)
+                .arg(if strict { "1" } else { "0" })
+                .output()
+                .map_err(|e| format!("spawn native m3.elf: {}", e))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "error[M3_NATIVE_TRAP]: native m3.elf exited with {:?}",
+                    out.status.code()
+                ));
+            }
+            let out_bytes = out.stdout;
+            if out_bytes.len() == 16 && u16::from_le_bytes([out_bytes[0], out_bytes[1]]) == 0xFFFF {
+                let code = u16::from_le_bytes([out_bytes[2], out_bytes[3]]);
+                let line = u16::from_le_bytes([out_bytes[4], out_bytes[5]]);
+                let col = u16::from_le_bytes([out_bytes[6], out_bytes[7]]);
+                return Err(format!(
+                    "error[M3_CODE_{}] line {}, col {}: Pure-Omni M3 frontend rejected input",
+                    code, line, col
+                ));
+            }
+            if out_bytes.len() % 2 != 0 {
+                return Err(format!("native m3.elf returned odd byte length {}", out_bytes.len()));
+            }
+            let words: Vec<u16> = out_bytes
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            return Ok(words);
+        }
+    }
     match m3_lockstep_compile_via_omni(src, strict)? {
         Ok(u16_stream) => Ok(u16_stream),
         Err((code, line, col)) => Err(format!(
@@ -5968,17 +6269,19 @@ pub fn pure_default_compile_surface_to_u16(src: &str, strict: bool) -> Result<Ve
     }
 }
 
-/// Seed-Shrink Phase A1: Lower a `.omni_bc` u16 stream to native Linux x86-64 ELF64 using ONLY
-/// the committed Pure-Omni M2 seed (`pure/m2/m2.omni_bc`) â€” zero Rust emitter calls.
-pub fn pure_default_compile_u16_to_elf(u16_stream: &[u16], a0: i64, a1: i64, a2: i64) -> Result<Vec<u8>, String> {
-    let m2_raw = std::fs::read("pure/m2/m2.omni_bc")
-        .map_err(|e| format!("Pure-M2 seed read failed (pure/m2/m2.omni_bc): {}", e))?;
-    let m2_u16 = decode_bytes_to_u16_stream(&m2_raw);
-    let m2_mod = decode_omni_token_stream(&m2_u16)?;
-    let m2_entry = m2_entry_of(&m2_mod);
+/// Interpreted Pure-M2 path (`pure/m2/m2.omni_bc` on `OmniBinaryVm`), used on non-Linux hosts,
+/// for `--interpreted` / `OMNI_FORCE_INTERPRETED=1` differential tests, and to bootstrap `m2.elf` once.
+pub fn pure_default_compile_u16_to_elf_interpreted(
+    u16_stream: &[u16],
+    a0: i64,
+    a1: i64,
+    a2: i64,
+) -> Result<Vec<u8>, String> {
+    let m2_mod = cached_m2_seed_module()?;
+    let m2_entry = m2_entry_of(m2_mod);
     let mut vm_m2 = OmniBinaryVm::with_budgets(500_000_000, 128 * 1024 * 1024);
     match vm_m2.execute_function(
-        &m2_mod,
+        m2_mod,
         m2_entry,
         vec![
             OmniValue::U16Array(u16_stream.to_vec()),
@@ -5992,8 +6295,63 @@ pub fn pure_default_compile_u16_to_elf(u16_stream: &[u16], a0: i64, a1: i64, a2:
     }
 }
 
-/// Seed-Shrink Phase A1: Execute a `.omni_bc` u16 stream using ONLY the committed Pure-Omni M4 VM
-/// seed (`pure/m4/m4.omni_bc`), returning `(ret_i64, vm_steps)`.
+/// Seed-Shrink Phase A1 + Audit §3.1: Lower a `.omni_bc` u16 stream to native Linux x86-64 ELF64
+/// using ONLY the committed Pure-Omni M2 seed (hash-pinned native `m2.elf` on Linux x86-64 when
+/// not forced interpreted; otherwise interpreted `pure/m2/m2.omni_bc`) — zero Rust emitter calls.
+pub fn pure_default_compile_u16_to_elf(u16_stream: &[u16], a0: i64, a1: i64, a2: i64) -> Result<Vec<u8>, String> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if !pure_default_force_interpreted()
+        && u16_stream.len() <= 65_536
+        && std::path::Path::new("pure/m2/m2.omni_bc").exists()
+    {
+        if let Ok(m2_elf) = ensure_native_m2_elf() {
+            let bc_bytes = encode_u16_stream_to_bytes(u16_stream);
+            let tmp = PrivateTempDataFile::create("m2_in", &bc_bytes)?;
+            let out = std::process::Command::new(m2_elf)
+                .arg(&tmp.path)
+                .arg(a0.to_string())
+                .arg(a1.to_string())
+                .arg(a2.to_string())
+                .output()
+                .map_err(|e| format!("spawn native m2.elf: {}", e))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "{}: native m2.elf rejected/trapped input (exit {:?})",
+                    OMNI_OOB_ERROR,
+                    out.status.code()
+                ));
+            }
+            return Ok(out.stdout);
+        }
+    }
+    pure_default_compile_u16_to_elf_interpreted(u16_stream, a0, a1, a2)
+}
+
+fn decode_m4_vm_state_64(st_bytes: &[u8]) -> Result<(i64, i64), String> {
+    if st_bytes.len() < 64 {
+        return Err(format!(
+            "error[VM_TRAP]: Pure-M4 VM state truncated ({} B < 64 B)",
+            st_bytes.len()
+        ));
+    }
+    let status = u32::from_le_bytes(st_bytes[28..32].try_into().unwrap()) as i64;
+    let ret = i64::from_le_bytes(st_bytes[32..40].try_into().unwrap());
+    let steps = u32::from_le_bytes(st_bytes[44..48].try_into().unwrap()) as i64;
+    if status != 0 {
+        let prefix = match status {
+            2 => OMNI_OOB_ERROR,
+            3 | 4 => "error[BUDGET_EXCEEDED]",
+            1 => "error[DECODE_ERROR]",
+            _ => "error[VM_TRAP]",
+        };
+        return Err(format!("{}: Pure-M4 VM trapped with status={} after {} steps", prefix, status, steps));
+    }
+    Ok((ret, steps))
+}
+
+/// Seed-Shrink Phase A1 + Audit §3.1: Execute a `.omni_bc` u16 stream using ONLY the committed
+/// Pure-Omni M4 VM seed (hash-pinned native `m4.elf` on Linux x86-64 when `!trace` and not forced
+/// interpreted; otherwise interpreted `pure/m4/m4.omni_bc`), returning `(ret_i64, vm_steps)`.
 pub fn pure_default_run_u16(
     u16_stream: &[u16],
     a0: i64,
@@ -6001,14 +6359,37 @@ pub fn pure_default_run_u16(
     a2: i64,
     trace: bool,
 ) -> Result<(i64, i64), String> {
-    let m4_raw = std::fs::read("pure/m4/m4.omni_bc")
-        .map_err(|e| format!("Pure-M4 seed read failed (pure/m4/m4.omni_bc): {}", e))?;
-    let m4_u16 = decode_bytes_to_u16_stream(&m4_raw);
-    let m4_mod = decode_omni_token_stream(&m4_u16)?;
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if !pure_default_force_interpreted()
+        && !trace
+        && u16_stream.len() <= 65_536
+        && std::path::Path::new("pure/m4/m4_standalone.omni_bc").exists()
+    {
+        if let Ok(m4_elf) = ensure_native_m4_elf() {
+            let bc_bytes = encode_u16_stream_to_bytes(u16_stream);
+            let tmp = PrivateTempDataFile::create("m4_in", &bc_bytes)?;
+            let out = std::process::Command::new(m4_elf)
+                .arg(&tmp.path)
+                .arg(a0.to_string())
+                .arg(a1.to_string())
+                .arg(a2.to_string())
+                .output()
+                .map_err(|e| format!("spawn native m4.elf: {}", e))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "{}: native m4.elf trapped with exit {:?}",
+                    OMNI_OOB_ERROR,
+                    out.status.code()
+                ));
+            }
+            return decode_m4_vm_state_64(&out.stdout);
+        }
+    }
+    let m4_mod = cached_m4_seed_module()?;
     let m4_run_fn = m4_mod.functions[m4_mod.functions.len() - 2].fn_idx;
     let mut vm = OmniBinaryVm::with_budgets(500_000_000, 128 * 1024 * 1024);
     let arena = match vm.execute_function(
-        &m4_mod,
+        m4_mod,
         m4_run_fn,
         vec![
             OmniValue::Bytes(vec![0u8; 524_288]),
@@ -6024,19 +6405,7 @@ pub fn pure_default_run_u16(
         other => return Err(format!("Pure-M4 VM seed returned unexpected value: {:?}", other)),
     };
     let st = 167_936usize;
-    let status = u32::from_le_bytes(arena[st + 28..st + 32].try_into().unwrap()) as i64;
-    let ret = i64::from_le_bytes(arena[st + 32..st + 40].try_into().unwrap());
-    let steps = u32::from_le_bytes(arena[st + 44..st + 48].try_into().unwrap()) as i64;
-    if status != 0 {
-        let prefix = match status {
-            2 => OMNI_OOB_ERROR,
-            3 | 4 => "error[BUDGET_EXCEEDED]",
-            1 => "error[DECODE_ERROR]",
-            _ => "error[VM_TRAP]",
-        };
-        return Err(format!("{}: Pure-M4 VM trapped with status={} after {} steps", prefix, status, steps));
-    }
-    Ok((ret, steps))
+    decode_m4_vm_state_64(&arena[st..st + 64])
 }
 
 /// Seed-Shrink Phase A1 hard gate (`./omnic a1-pure-default`):
@@ -6429,8 +6798,7 @@ pub fn selftest_a3_macro_quarantine() -> Result<usize, String> {
 /// (`pure/verifier_engine.omni`: `omni_verify_module_api` when `api_mode=true`, `omni_verify_module`
 /// otherwise) â€” ZERO calls to the frozen Rust verifier on the default hot path.
 pub fn pure_default_verify_u16(u16_stream: &[u16], api_mode: bool) -> Result<(), String> {
-    let ve_u16 = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(OMNI_VERIFIER_ENGINE_SURFACE))?;
-    let ve_mod = decode_omni_token_stream(&ve_u16)?;
+    let ve_mod = cached_verifier_engine_module()?;
     let fn_verify = if api_mode {
         ve_mod.functions[ve_mod.functions.len() - 2].fn_idx
     } else {
@@ -6438,7 +6806,7 @@ pub fn pure_default_verify_u16(u16_stream: &[u16], api_mode: bool) -> Result<(),
     };
     let mut vm = OmniBinaryVm::with_budgets(500_000_000, 64 * 1024 * 1024);
     let rep = match vm.execute_function(
-        &ve_mod,
+        ve_mod,
         fn_verify,
         vec![OmniValue::Bytes(encode_u16_stream_to_bytes(u16_stream))],
     )? {
@@ -7207,6 +7575,198 @@ pub fn selftest_s4_honesty() -> Result<usize, String> {
             "S4.2 seed0/omni_seed0.rs header comment drifted from SEED_M2/SEED_M4 constants",
         ));
     }
+    checks += 1;
+
+    Ok(checks)
+}
+
+thread_local! {
+    static PURE_DEFAULT_FORCE_INTERPRETED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Returns true when the caller explicitly requested the interpreted Pure-Omni VM path
+/// via `--interpreted` or `OMNI_FORCE_INTERPRETED=1` (for differential testing).
+pub fn pure_default_force_interpreted() -> bool {
+    if PURE_DEFAULT_FORCE_INTERPRETED.with(|c| c.get()) {
+        return true;
+    }
+    matches!(
+        std::env::var("OMNI_FORCE_INTERPRETED").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes")
+    )
+}
+
+/// Runs `f` with the interpreted Pure-Omni VM path forced on the current thread.
+pub fn with_pure_default_interpreted<T, F: FnOnce() -> T>(f: F) -> T {
+    let prev = PURE_DEFAULT_FORCE_INTERPRETED.with(|c| {
+        let p = c.get();
+        c.set(true);
+        p
+    });
+    let out = f();
+    PURE_DEFAULT_FORCE_INTERPRETED.with(|c| c.set(prev));
+    out
+}
+
+/// Audit §3 Performance gate (`./omni s3-perf`):
+///   1. Committed standalone seeds `pure/m3/m3_standalone.omni_bc` and `pure/m4/m4_standalone.omni_bc`
+///      exist and match `M3_STANDALONE_OMNI_SRC` / `M4_STANDALONE_OMNI_SRC` with 0-word diff.
+///   2. On Linux x86-64, the default `pure_default_compile_surface_to_u16`, `pure_default_compile_u16_to_elf`,
+///      and `pure_default_run_u16` paths execute hash-pinned native ELFs (`m3.elf`, `m2.elf`, `m4.elf`) with:
+///        - 0-word diff vs interpreted on `pure/verifier_engine.omni` & `pure/m3/include.omni` (< 1,000 ms)
+///        - exact negative error span parity (`error[M3_CODE_...]`, line 3)
+///        - 0-byte diff vs interpreted on `pure/m4/m4.omni_bc` -> `81,663 B` (`0x05304F996E83AD5B`, < 500 ms)
+///        - exact `(ret, steps)` parity on `loop n=20000` -> `(200010000, 180010)` (< 1,000 ms) and
+///          `error[OUT_OF_BOUNDS]` trap parity on OOB input.
+///   3. All 5 frozen FNV-1a64 hashes remain intact.
+pub fn selftest_s3_performance() -> Result<usize, String> {
+    let mut checks = 0usize;
+
+    // 1. Standalone seeds exist and match source (0-word diff).
+    let m3_sa_raw = std::fs::read("pure/m3/m3_standalone.omni_bc")
+        .map_err(|e| format!("S3.1 missing pure/m3/m3_standalone.omni_bc: {}", e))?;
+    let m4_sa_raw = std::fs::read("pure/m4/m4_standalone.omni_bc")
+        .map_err(|e| format!("S3.1 missing pure/m4/m4_standalone.omni_bc: {}", e))?;
+    if m3_sa_raw.len() % 2 != 0 || m4_sa_raw.len() % 2 != 0 {
+        return Err(String::from("S3.1 standalone .omni_bc seed has odd byte length"));
+    }
+    let m3_sa_exp = resolve_omni_surface_includes(M3_STANDALONE_OMNI_SRC, None, None)?;
+    let m3_sa_ref = encode_u16_stream_to_bytes(&with_lockstep_suspended(|| {
+        compile_omni_surface_strict_to_u16(&m3_sa_exp)
+    })?);
+    if m3_sa_raw != m3_sa_ref {
+        return Err(format!(
+            "S3.1 pure/m3/m3_standalone.omni_bc drift ({} B, 0x{:016X} != {} B, 0x{:016X})",
+            m3_sa_raw.len(),
+            fnv1a_64_hash(&m3_sa_raw),
+            m3_sa_ref.len(),
+            fnv1a_64_hash(&m3_sa_ref)
+        ));
+    }
+    let m4_sa_ref = encode_u16_stream_to_bytes(&with_lockstep_suspended(|| {
+        compile_omni_surface_strict_to_u16(M4_STANDALONE_OMNI_SRC)
+    })?);
+    if m4_sa_raw != m4_sa_ref {
+        return Err(format!(
+            "S3.1 pure/m4/m4_standalone.omni_bc drift ({} B, 0x{:016X} != {} B, 0x{:016X})",
+            m4_sa_raw.len(),
+            fnv1a_64_hash(&m4_sa_raw),
+            m4_sa_ref.len(),
+            fnv1a_64_hash(&m4_sa_ref)
+        ));
+    }
+    checks += 1;
+
+    // 2. Native-ELF default path parity & latency bounds (on Linux x86-64).
+    let ve_src = std::fs::read_to_string("pure/verifier_engine.omni")
+        .map_err(|e| format!("S3 read verifier_engine.omni: {}", e))?;
+    let inc_src = std::fs::read_to_string("pure/m3/include.omni")
+        .map_err(|e| format!("S3 read include.omni: {}", e))?;
+
+    // Warm once so cold-cache first-time m2.elf bootstrap isn't counted against steady-state latency.
+    let _warm_inc = pure_default_compile_surface_to_u16(&inc_src, true)?;
+
+    let t0 = std::time::Instant::now();
+    let ve_default = pure_default_compile_surface_to_u16(&ve_src, true)?;
+    let dt_ve_ms = t0.elapsed().as_millis();
+    let ve_rust = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(&ve_src))?;
+    if ve_default != ve_rust {
+        return Err(format!(
+            "S3.2 native-default M3 word diff on pure/verifier_engine.omni ({}w vs {}w)",
+            ve_default.len(),
+            ve_rust.len()
+        ));
+    }
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) && dt_ve_ms > 1000 {
+        return Err(format!(
+            "S3.2 compile pure/verifier_engine.omni took {} ms (> 1000 ms native bound — still interpreted?)",
+            dt_ve_ms
+        ));
+    }
+
+    // Negative surface error span parity between default and interpreted.
+    let bad_src = "#[strict]\nfn main(x: i64) -> i64 {\n    return unknown_ident_xyz;\n}\n";
+    let err_def = pure_default_compile_surface_to_u16(bad_src, true).err().unwrap_or_default();
+    let err_int = with_pure_default_interpreted(|| pure_default_compile_surface_to_u16(bad_src, true))
+        .err()
+        .unwrap_or_default();
+    if err_def != err_int || !err_def.contains("line 3,") {
+        return Err(format!(
+            "S3.2 negative surface error mismatch: default='{}' vs interpreted='{}'",
+            err_def, err_int
+        ));
+    }
+    checks += 1;
+
+    // 3. Default compile-elf on pure/m4/m4.omni_bc -> exact 81,663 B (0x05304F996E83AD5B) in < 500 ms.
+    let m4_raw = std::fs::read("pure/m4/m4.omni_bc")
+        .map_err(|e| format!("S3 read m4.omni_bc: {}", e))?;
+    let m4_u16 = decode_bytes_to_u16_stream(&m4_raw);
+    let t1 = std::time::Instant::now();
+    let m4_elf = pure_default_compile_u16_to_elf(&m4_u16, 0, 0, 0)?;
+    let dt_m2_ms = t1.elapsed().as_millis();
+    let h_m4_elf = fnv1a_64_hash(&m4_elf);
+    if m4_elf.len() != 81_663 || h_m4_elf != 0x0530_4F99_6E83_AD5B {
+        return Err(format!(
+            "S3.3 default compile-elf m4.omni_bc mismatch: {} B (0x{:016X}) != 81663 B (0x05304F996E83AD5B)",
+            m4_elf.len(),
+            h_m4_elf
+        ));
+    }
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) && dt_m2_ms > 500 {
+        return Err(format!(
+            "S3.3 compile-elf pure/m4/m4.omni_bc took {} ms (> 500 ms native bound — still interpreted?)",
+            dt_m2_ms
+        ));
+    }
+    checks += 1;
+
+    // 4. Default run on loop n=20000 -> (200010000, 180010) in < 1000 ms + OOB trap parity.
+    let loop_src = "#[strict]\nfn main(n: i64) -> i64 {\n    let s: i64 = 0;\n    let i: i64 = 1;\n    while n - i + 1 <=> 0 {\n        s = s + i;\n        i = i + 1;\n    }\n    return s;\n}\n";
+    let loop_u16 = pure_default_compile_surface_to_u16(loop_src, true)?;
+    let (ret_100_def, steps_100_def) = pure_default_run_u16(&loop_u16, 100, 0, 0, false)?;
+    let (ret_100_int, steps_100_int) =
+        with_pure_default_interpreted(|| pure_default_run_u16(&loop_u16, 100, 0, 0, false))?;
+    if (ret_100_def, steps_100_def) != (5050, steps_100_int) || ret_100_int != 5050 {
+        return Err(format!(
+            "S3.4 loop n=100 parity mismatch: default=({}, {}) vs interpreted=({}, {})",
+            ret_100_def, steps_100_def, ret_100_int, steps_100_int
+        ));
+    }
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        let t2 = std::time::Instant::now();
+        let (ret_20k, steps_20k) = pure_default_run_u16(&loop_u16, 20_000, 0, 0, false)?;
+        let dt_m4_ms = t2.elapsed().as_millis();
+        if ret_20k != 200_010_000 || steps_20k != 180_010 {
+            return Err(format!(
+                "S3.4 loop n=20000 result mismatch: got ({}, {}) want (200010000, 180010)",
+                ret_20k, steps_20k
+            ));
+        }
+        if dt_m4_ms > 1000 {
+            return Err(format!(
+                "S3.4 run loop n=20000 took {} ms (> 1000 ms native bound — still interpreted?)",
+                dt_m4_ms
+            ));
+        }
+    }
+    // OOB trap parity: negative index on `ld_u64` must trap with `error[OUT_OF_BOUNDS]`.
+    let oob_src = "#[strict]\nfn main(x: i64) -> i64 {\n    let b: bytes = anew(0);\n    return ld_u64(b, 0 - 8);\n}\n";
+    let oob_u16 = pure_default_compile_surface_to_u16(oob_src, true)?;
+    let oob_def = pure_default_run_u16(&oob_u16, 0, 0, 0, false).err().unwrap_or_default();
+    let oob_int = with_pure_default_interpreted(|| pure_default_run_u16(&oob_u16, 0, 0, 0, false))
+        .err()
+        .unwrap_or_default();
+    if !oob_def.starts_with(OMNI_OOB_ERROR) || oob_def != oob_int {
+        return Err(format!(
+            "S3.4 OOB trap parity mismatch: default='{}' vs interpreted='{}'",
+            oob_def, oob_int
+        ));
+    }
+    checks += 1;
+
+    // 5. All 5 frozen FNV-1a64 hashes intact.
+    selftest_m2_frozen_hashes()?;
     checks += 1;
 
     Ok(checks)

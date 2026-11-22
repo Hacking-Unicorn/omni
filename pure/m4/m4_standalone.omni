@@ -1,0 +1,20 @@
+// ==============================================================================
+// pure/m4/m4_standalone.omni  (Audit §3.1) — Standalone native M4 VM entry
+// ==============================================================================
+// 4-parameter standalone entry point for compiling `pure/m4/*` into a native
+// Linux x86-64 ELF64 binary (`m4.elf <prog.omni_bc> [a0] [a1] [a2]`).
+// Allocates the 512 KiB M4 arena in M2's 1 MiB rbx arena, executes `arr` with
+// fuel=500,000, and returns the 64-byte VM_STATE slice via ret_slice.
+// ==============================================================================
+
+#[strict]
+fn m4_standalone_entry(arr: array, a0: i64, a1: i64, a2: i64) -> bytes {
+    let w: bytes = anew(0);
+    let i: i64 = 0;
+    while 65536 - i <=> 0 {
+        w = iset_i64(w, 0);
+        i = i + 1;
+    }
+    let out: bytes = m4_vm_run_i64(w, arr, a0, a1, a2, 500000, 0);
+    return ret_slice(out, m4a_state(), 64);
+}

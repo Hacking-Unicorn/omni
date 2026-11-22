@@ -1150,9 +1150,10 @@ fn m3w_compile_one_fn(arena: bytes, src: array, ntok: i64, fi: i64) -> bytes {
     return r;
 }
 
-// Top-level Pure-Omni `.omni` -> `.omni_bc` u16 stream compiler (Pass L + Pass S + Pass P + Pass B).
+// Top-level Pure-Omni `.omni` -> `.omni_bc` u16 stream compiler (in-place into `arena`).
+// Leaves `sbase` at arena+232, `err` at arena+40, and word count at arena+240.
 #[strict]
-fn m3_compile_all(arena: bytes, src: array, strict_arg: i64) -> bytes {
+fn m3_compile_all_into(arena: bytes, src: array, strict_arg: i64) -> bytes {
     let w: bytes = m3_lex_into(arena, src, strict_arg);
     let ntok: i64 = ld_u64(w, 64);
     let going: i64 = m2u_eq(ld_u64(w, 40), 0) * m2u_lt(0, ntok);
@@ -1187,6 +1188,15 @@ fn m3_compile_all(arena: bytes, src: array, strict_arg: i64) -> bytes {
         let u: bytes = iset_patch_i64(w1, sbase, hdr);
         iset_patch_i64(u, sbase + 8, 0)
     } else { w1 };
+    return w2;
+}
+
+// Top-level Pure-Omni `.omni` -> `.omni_bc` u16 stream compiler (Pass L + Pass S + Pass P + Pass B).
+#[strict]
+fn m3_compile_all(arena: bytes, src: array, strict_arg: i64) -> bytes {
+    let w2: bytes = m3_compile_all_into(arena, src, strict_arg);
+    let sbase: i64 = ld_u64(w2, 232);
+    let err: i64 = ld_u64(w2, 40);
     let nbytes: i64 = m2u_sel(m2u_lt(0, err), 16, ld_u64(w2, 240) << 1);
     return ret_slice(w2, sbase, nbytes);
 }
