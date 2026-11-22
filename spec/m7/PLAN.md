@@ -152,6 +152,18 @@ Pure-Omni workload-driven self-adaptive policy, hysteresis, and ledger engine (`
 
 ---
 
+## P7-3 — Self-Learning (`pure/m7/learn.omni`, `omnic p7-learn`)
+
+Pure-Omni persistent, deterministic, balanced-ternary experience table & policy-ranking engine (`pure/m7/learn.omni`, registered in `m2-lint` 23/23 with 0 findings):
+
+1. **Tamper-Checked Binary Experience Table (`p7_learn_init`, `p7_learn_stamp_checksum`, `p7_learn_verify`):** 512 B buffer (`magic="OML7"`, `version=1`, `total_updates`, 32-bit FNV-1a rolling checksum over header + 20 cells of `[wins, losses, neutral, score]` for 5 workload profiles × 4 candidate policies). Any bit-flip fails closed (`verify == -1`, `rank_best == 0`).
+2. **Asymmetric Ternary Reinforcement (`p7_learn_update`):** `+1t` → `wins += 1, score += 2`; `0t` → `neutral += 1`; `-1t` → `losses += 1, score -= 3` (clamped `[0, 65535]`, bias `32768`) — safety bias ensures a single regression outweighs a single win.
+3. **Safety-Floored, Capability-Bounded Policy Ranker (`p7_learn_rank_best`):** Ranks the 4 candidate policy slots (`bits 1/2/4/8`) intersected with `cap_mask` and strictly rejects any slot below the neutral safety floor (`32768`), failing closed to `0` (`POLICY_HOLD`).
+4. **`@PACK5` Experience Summary Export (`p7_learn_export_pack5`):** Packs the learned ternary preference (`+1t`/`0t`/`-1t`) across all 5 workload profiles for a policy slot into 1 single `@PACK5` radix-3 byte (`0..=242`) via `pure/m7/judge.omni::p7_pack5_byte`.
+5. **Hard Gate (`omnic p7-learn`, 6 checks):** M3/M2 0-diff on `pure/m7/learn.omni`, init + checksum + tamper fail-closed, asymmetric reinforcement + safety floor + `cap_mask` gating, `@PACK5=52` summary export, closed-loop `p7-learn → Stage 2.5 adaptive_step → M2 ELF64 → M4 VM (ret=90) + native Linux exec`, and all 5 frozen FNV-1a64 hashes intact.
+
+---
+
 ## Hard Rules (All of Phase 7)
 
 - The verifier, determinism, and capability model are never self-modified.

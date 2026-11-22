@@ -51,6 +51,7 @@ jobs:
           ./omni p7-canary
           ./omni p7-heal
           ./omni p7-adapt
+          ./omni p7-learn
           ./omni api-stage1
           ./omni api-stage2
           ./omni api-stage2-emit
