@@ -1,0 +1,59 @@
+// ==============================================================================
+// OMNI SEED-SHRINK (PHASE B4) — PURE-OMNI M5 ZERO-SHIM LAUNCHER EMITTER
+// `pure/m5/launcher.omni`
+// ==============================================================================
+// Link order: `pure/m2/util.omni`, `pure/isa/table.omni`, `pure/m2/decode.omni`,
+//             `pure/m2/labels.omni`, `pure/m2/arena.omni`, `pure/m2/elf.omni`,
+//             `pure/m5/elf_sys.omni`, this file.
+//
+// Emits a standalone 181-byte Linux x86-64 ELF64 zero-shim launcher binary
+// (raw Linux `0F 05` syscalls only — zero Rust, zero C, zero libc):
+//   _start:
+//     sub rsp, 4096; mov rbx, rsp
+//     sys_read(0, rbx, 4096)        ; read .omni_bc seed stream from stdin
+//     cmp rax, 2; jl fail (+16)     ; require >= 2 bytes
+//     cmp word [rbx], 0x7EE0        ; validate TOK_MOD_BEGIN (0x7EE0)
+//     jne fail (+9)
+//     xor edi, edi; mov eax, 60; syscall   ; exit(0) on valid .omni_bc seed
+//   fail:
+//     mov edi, 1; mov eax, 60; syscall     ; exit(1) fail-closed on corrupt input
+//
+// Zero recursion, zero ANEW, zero IDIV/IMOD, zero PACK5, m2-lint clean.
+// ==============================================================================
+
+// Emit the 34-byte MOD_BEGIN (0x7EE0) validator + ok(exit 0) / fail(exit 1) stubs.
+#[strict]
+fn m5l_emit_mod_begin_gate(w: bytes) -> bytes {
+    // cmp rax, 2 (48 83 F8 02)
+    let w1: bytes = m2a_emit_u32(w, 49840968);       // 0x02F88348 LE
+    // jl +16 (7C 10)
+    let w2: bytes = m2a_emit_u16(w1, 4220);          // 0x107C LE
+    // cmp word ptr [rbx], 0x7EE0 (66 81 3B E0 7E)
+    let w3: bytes = m2a_emit_u32(w2, 0 - 532971162); // 0xE03B8166 LE (signed i32)
+    let w4: bytes = m2a_emit_u8(w3, 126);            // 0x7E
+    // jne +9 (75 09)
+    let w5: bytes = m2a_emit_u16(w4, 2421);          // 0x0975 LE
+    // ok: xor edi, edi (31 FF); mov eax, 60 (B8 3C 00 00 00); syscall (0F 05)
+    let w6: bytes = m2a_emit_u16(w5, 65329);         // 0xFF31 LE
+    let w7: bytes = m2a_emit_u8(w6, 184);            // 0xB8
+    let w8: bytes = m2a_emit_u32(w7, 60);            // 60 (sys_exit)
+    let w9: bytes = m2a_emit_u16(w8, 1295);          // 0x050F LE (syscall)
+    // fail: mov edi, 1 (BF 01 00 00 00); mov eax, 60 (B8 3C 00 00 00); syscall (0F 05)
+    let w10: bytes = m2a_emit_u8(w9, 191);           // 0xBF
+    let w11: bytes = m2a_emit_u32(w10, 1);           // exit code 1
+    let w12: bytes = m2a_emit_u8(w11, 184);          // 0xB8
+    let w13: bytes = m2a_emit_u32(w12, 60);          // 60 (sys_exit)
+    return m2a_emit_u16(w13, 1295);                  // 0x050F LE (syscall)
+}
+
+// Emits the complete standalone 181-byte Pure-Omni M5 zero-shim launcher ELF64.
+#[strict]
+fn m5l_emit_launcher_elf(w_in: bytes) -> bytes {
+    let w0: bytes = m2a_init(w_in, 0, 0, 0);
+    let w1: bytes = m2e_emit_elf64_hdr(w0, 0);
+    let w2: bytes = m5s_emit_arena_entry(w1, 4096);
+    let w3: bytes = m5s_emit_sys_read(w2, 0, 4096);
+    let w4: bytes = m5l_emit_mod_begin_gate(w3);
+    let total: i64 = ld_u64(w4, m2l_regs());
+    return m2e_patch_elf64_size(w4, total);
+}
