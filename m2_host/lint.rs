@@ -520,6 +520,9 @@ pub fn m2_lint_cli(paths: &[String]) -> i32 {
             items.push((String::from(name), String::from(src)));
         }
     }
+    // Audit §6.3: deduplicate repeated foreign-module notes (e.g. fn#53 LINEAR_BYTES across linked modules).
+    let mut seen_foreign_notes: std::collections::BTreeSet<(String, u16, usize, String)> =
+        std::collections::BTreeSet::new();
     for (path, src) in &items {
         let asm = path.ends_with(".omni_asm");
         let (cap, producer) = if asm { (M2_LABEL_CAP_ASM, "asm") } else { (M2_LABEL_CAP_FRONTEND, "frontend") };
@@ -527,7 +530,10 @@ pub fn m2_lint_cli(paths: &[String]) -> i32 {
         match res {
             Ok((findings, notes, budget)) => {
                 for f in &notes {
-                    println!("{}	note[M2_LINT_FOREIGN:{}] fn#{} @{}: {} (foreign module, not gated)", path, f.rule, f.fn_idx, f.offset, f.msg);
+                    let key = (f.rule.to_string(), f.fn_idx, f.offset, f.msg.clone());
+                    if seen_foreign_notes.insert(key) {
+                        println!("{}	note[M2_LINT_FOREIGN:{}] fn#{} @{}: {} (foreign module, not gated; deduplicated)", path, f.rule, f.fn_idx, f.offset, f.msg);
+                    }
                 }
                 for r in &budget {
                     println!("{}", m2_render_budget_row(path, r, cap, producer));

@@ -23959,6 +23959,7 @@ pub fn run_m2_foundation_selftests() -> Result<usize, String> {
         ("s4_honesty", selftest_s4_honesty),
         ("s3_perf", selftest_s3_performance),
         ("s5_refreeze", selftest_s5_refreeze),
+        ("s6_cleanup", selftest_s6_cleanup),
         ("b4_pure_launcher", selftest_b4_pure_launcher_count),
     ];
     let mut n = run_selftest_tasks_in_lanes(parallel_tasks)?;
@@ -24573,6 +24574,19 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
                 1
             }
         },
+        "s6-cleanup" => match selftest_s6_cleanup() {
+            Ok(n) => {
+                println!(
+                    "[S6-CLEANUP PASS] {} checks | host_runtime/pure_default.rs extracted + duplicate workspace archived + CI fuzz-smoke job + m2-lint foreign note deduplicated + 5 re-frozen hashes",
+                    n
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("[S6-CLEANUP FAIL] {}", e);
+                1
+            }
+        },
         "p5-sys" => match selftest_p5_2_zero_shim_sys() {
             Ok((n, sz, h, native)) => {
                 println!(
@@ -25015,6 +25029,7 @@ pub fn selftest_m2_label_reference() -> Result<usize, String> {
 // M2-03+: host-side M2 tooling lives in m2_host/ (kept out of the monolith to avoid main-line collisions).
 include!("m2_host/lint.rs");
 include!("m2_host/decode_diff.rs");
+include!("host_runtime/pure_default.rs");
 include!("p4_shim/mod.rs");
 
 // ==== END M2 FOUNDATION ====
@@ -25088,7 +25103,7 @@ fn main() {
             "harness" | "--harness" => {
                 std::process::exit(run_omni_harness_cli(&cli_args[2..]));
             }
-            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" | "p7-heal" | "p7-adapt" | "p7-learn" | "a1-pure-default" | "a2-pure-include" | "a3-macro-quarantine" | "b2-pure-verifier" | "b4-pure-launcher" | "s2-security" | "s4-honesty" | "s3-perf" | "s5-refreeze" | "api-stage1" | "api-stage2" | "api-stage2-emit" | "api-stage2-5" => {
+            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" | "p7-heal" | "p7-adapt" | "p7-learn" | "a1-pure-default" | "a2-pure-include" | "a3-macro-quarantine" | "b2-pure-verifier" | "b4-pure-launcher" | "s2-security" | "s4-honesty" | "s3-perf" | "s5-refreeze" | "s6-cleanup" | "api-stage1" | "api-stage2" | "api-stage2-emit" | "api-stage2-5" => {
                 std::process::exit(run_m2_cli(&cli_args[1..]));
             }
             "agent-driver" | "--agent-driver" => {
