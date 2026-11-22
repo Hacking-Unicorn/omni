@@ -7061,6 +7061,60 @@ pub fn selftest_s2_security() -> Result<usize, String> {
     }
     checks += 1;
 
+    // 7. Audit Round 2 N4: Native cache hardening (reject pre-created loose dir, mkdtemp unset-HOME fallback).
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let prev_xdg = std::env::var_os("XDG_CACHE_HOME");
+        let prev_home = std::env::var_os("HOME");
+        let loose_root = std::env::temp_dir().join(format!("omni_n4_loose_{}", std::process::id()));
+        let loose_cache = loose_root.join("omni").join("native-v1");
+        let _ = std::fs::remove_dir_all(&loose_root);
+        std::fs::create_dir_all(&loose_cache).map_err(|e| format!("N4 mkdir loose: {}", e))?;
+        std::fs::set_permissions(&loose_cache, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("N4 chmod loose: {}", e))?;
+        std::env::set_var("XDG_CACHE_HOME", &loose_root);
+        let loose_res = native_toolchain_cache_dir();
+        let _ = std::fs::remove_dir_all(&loose_root);
+
+        std::env::remove_var("XDG_CACHE_HOME");
+        std::env::remove_var("HOME");
+        let fallback_res = native_toolchain_cache_dir();
+
+        match prev_xdg {
+            Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+
+        if loose_res.is_ok() {
+            return Err(String::from("N4 native_toolchain_cache_dir accepted pre-created 0755 loose dir"));
+        }
+        let fb_dir = fallback_res.map_err(|e| format!("N4 unset-HOME fallback failed: {}", e))?;
+        let predictable = std::env::temp_dir().join(format!("omni-native-cache-{}", std::process::id()));
+        if fb_dir == predictable {
+            return Err(format!("N4 unset-HOME fallback used predictable PID path: {}", fb_dir.display()));
+        }
+        let fb_meta = std::fs::symlink_metadata(&fb_dir).map_err(|e| format!("N4 lstat fallback: {}", e))?;
+        if (fb_meta.mode() & 0o077) != 0 {
+            return Err(format!("N4 unset-HOME fallback dir has loose mode {:o}", fb_meta.mode()));
+        }
+        // Re-verify before spawn: wrong FNV pin must fail closed before exec.
+        let fake_elf = PrivateTempElf::new(&[0x7F, b'E', b'L', b'F'], "n4_tamper")?;
+        match spawn_verified_native_elf(&fake_elf.path, 4, 0xDEAD_BEEF_CAFE_BABE, &[]) {
+            Ok(_) => return Err(String::from("N4 spawn_verified_native_elf spawned ELF with mismatched pin")),
+            Err(msg) => {
+                if !msg.contains("NATIVE_ELF_PIN_MISMATCH") {
+                    return Err(format!("N4 expected NATIVE_ELF_PIN_MISMATCH, got: {}", msg));
+                }
+            }
+        }
+    }
+    checks += 1;
+
     Ok(checks)
 }
 

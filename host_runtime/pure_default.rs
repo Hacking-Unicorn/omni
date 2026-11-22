@@ -74,22 +74,88 @@ fn cached_verifier_engine_module() -> Result<&'static BinModule, String> {
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn current_euid() -> u32 {
+    extern "C" {
+        fn geteuid() -> u32;
+    }
+    unsafe { geteuid() }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn fallback_mkdtemp_cache_dir() -> Result<std::path::PathBuf, String> {
+    static FALLBACK_DIR: std::sync::OnceLock<Result<std::path::PathBuf, String>> =
+        std::sync::OnceLock::new();
+    FALLBACK_DIR
+        .get_or_init(|| {
+            extern "C" {
+                fn mkdtemp(template: *mut std::os::raw::c_char) -> *mut std::os::raw::c_char;
+            }
+            use std::os::unix::ffi::OsStrExt;
+            let tpl_path = std::env::temp_dir().join("omni-native-cache-XXXXXX");
+            let mut buf: Vec<u8> = tpl_path.as_os_str().as_bytes().to_vec();
+            buf.push(0);
+            let res = unsafe { mkdtemp(buf.as_mut_ptr() as *mut std::os::raw::c_char) };
+            if res.is_null() {
+                return Err(format!(
+                    "mkdtemp failed for {}: {}",
+                    tpl_path.display(),
+                    std::io::Error::last_os_error()
+                ));
+            }
+            buf.pop(); // strip NUL
+            Ok(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&buf)))
+        })
+        .clone()
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn verify_private_cache_dir(dir: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(dir).map_err(|e| {
+        format!("error[CACHE_UNSAFE_DIR]: lstat {}: {}", dir.display(), e)
+    })?;
+    if !meta.file_type().is_dir() {
+        return Err(format!(
+            "error[CACHE_UNSAFE_DIR]: {} is not a real directory (symlink/non-dir rejected)",
+            dir.display()
+        ));
+    }
+    let euid = current_euid();
+    if meta.uid() != euid {
+        return Err(format!(
+            "error[CACHE_UNSAFE_DIR]: {} owned by uid {} != euid {}",
+            dir.display(),
+            meta.uid(),
+            euid
+        ));
+    }
+    if (meta.mode() & 0o077) != 0 {
+        return Err(format!(
+            "error[CACHE_UNSAFE_DIR]: {} has loose permissions {:o} (require 0700 / mode & 077 == 0)",
+            dir.display(),
+            meta.mode() & 0o777
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn native_toolchain_cache_dir() -> Result<std::path::PathBuf, String> {
     use std::os::unix::fs::DirBuilderExt;
     let base = if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
         if !xdg.is_empty() {
             std::path::PathBuf::from(xdg).join("omni").join("native-v1")
         } else {
-            std::env::temp_dir().join(format!("omni-native-cache-{}", std::process::id()))
+            fallback_mkdtemp_cache_dir()?
         }
     } else if let Ok(home) = std::env::var("HOME") {
         if !home.is_empty() {
             std::path::PathBuf::from(home).join(".cache").join("omni").join("native-v1")
         } else {
-            std::env::temp_dir().join(format!("omni-native-cache-{}", std::process::id()))
+            fallback_mkdtemp_cache_dir()?
         }
     } else {
-        std::env::temp_dir().join(format!("omni-native-cache-{}", std::process::id()))
+        fallback_mkdtemp_cache_dir()?
     };
     if !base.exists() {
         let mut b = std::fs::DirBuilder::new();
@@ -97,7 +163,59 @@ fn native_toolchain_cache_dir() -> Result<std::path::PathBuf, String> {
         b.create(&base)
             .map_err(|e| format!("create native cache dir {}: {}", base.display(), e))?;
     }
+    verify_private_cache_dir(&base)?;
     Ok(base)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn spawn_verified_native_elf(
+    path: &std::path::Path,
+    expected_len: usize,
+    expected_fnv: u64,
+    args: &[&std::ffi::OsStr],
+) -> Result<std::process::Output, String> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::unix::io::AsRawFd;
+    const O_NOFOLLOW: i32 = 0x20000;
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| format!("open verified native elf {}: {}", path.display(), e))?;
+    let meta = f
+        .metadata()
+        .map_err(|e| format!("fstat native elf {}: {}", path.display(), e))?;
+    let euid = current_euid();
+    if !meta.is_file() || meta.uid() != euid || (meta.mode() & 0o022) != 0 {
+        return Err(format!(
+            "error[CACHE_UNSAFE_ELF]: {} failed fstat check (uid={}, mode={:o})",
+            path.display(),
+            meta.uid(),
+            meta.mode() & 0o777
+        ));
+    }
+    let mut bytes = Vec::with_capacity(expected_len);
+    f.read_to_end(&mut bytes)
+        .map_err(|e| format!("read verified native elf {}: {}", path.display(), e))?;
+    let got_fnv = fnv1a_64_hash(&bytes);
+    if bytes.len() != expected_len || got_fnv != expected_fnv {
+        return Err(format!(
+            "error[NATIVE_ELF_PIN_MISMATCH]: {} pin mismatch before spawn: got {} B (0x{:016X}), expected {} B (0x{:016X})",
+            path.display(),
+            bytes.len(),
+            got_fnv,
+            expected_len,
+            expected_fnv
+        ));
+    }
+    let fd_path = format!("/proc/self/fd/{}", f.as_raw_fd());
+    let out = std::process::Command::new(&fd_path)
+        .args(args)
+        .output()
+        .map_err(|e| format!("spawn verified native elf {} ({}): {}", path.display(), fd_path, e))?;
+    drop(f);
+    Ok(out)
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -212,13 +330,17 @@ fn ensure_native_m3_elf() -> Result<&'static std::path::PathBuf, String> {
         .get_or_init(|| {
             ensure_cached_native_elf("m3", NATIVE_M3_ELF_BYTES, NATIVE_M3_ELF_FNV, || {
                 let m2_elf = ensure_native_m2_elf()?;
-                let out = std::process::Command::new(m2_elf)
-                    .arg("pure/m3/m3_standalone.omni_bc")
-                    .arg("0")
-                    .arg("0")
-                    .arg("0")
-                    .output()
-                    .map_err(|e| format!("spawn m2.elf for m3.elf: {}", e))?;
+                let out = spawn_verified_native_elf(
+                    m2_elf,
+                    NATIVE_M2_ELF_BYTES,
+                    NATIVE_M2_ELF_FNV,
+                    &[
+                        std::ffi::OsStr::new("pure/m3/m3_standalone.omni_bc"),
+                        std::ffi::OsStr::new("0"),
+                        std::ffi::OsStr::new("0"),
+                        std::ffi::OsStr::new("0"),
+                    ],
+                )?;
                 if !out.status.success() {
                     return Err(format!(
                         "m2.elf failed building m3.elf with status {:?}",
@@ -239,13 +361,17 @@ fn ensure_native_m4_elf() -> Result<&'static std::path::PathBuf, String> {
         .get_or_init(|| {
             ensure_cached_native_elf("m4", NATIVE_M4_ELF_BYTES, NATIVE_M4_ELF_FNV, || {
                 let m2_elf = ensure_native_m2_elf()?;
-                let out = std::process::Command::new(m2_elf)
-                    .arg("pure/m4/m4_standalone.omni_bc")
-                    .arg("0")
-                    .arg("0")
-                    .arg("0")
-                    .output()
-                    .map_err(|e| format!("spawn m2.elf for m4.elf: {}", e))?;
+                let out = spawn_verified_native_elf(
+                    m2_elf,
+                    NATIVE_M2_ELF_BYTES,
+                    NATIVE_M2_ELF_FNV,
+                    &[
+                        std::ffi::OsStr::new("pure/m4/m4_standalone.omni_bc"),
+                        std::ffi::OsStr::new("0"),
+                        std::ffi::OsStr::new("0"),
+                        std::ffi::OsStr::new("0"),
+                    ],
+                )?;
                 if !out.status.success() {
                     return Err(format!(
                         "m2.elf failed building m4.elf with status {:?}",
@@ -276,11 +402,15 @@ pub fn pure_default_compile_surface_to_u16(src: &str, strict: bool) -> Result<Ve
             u16_bytes.extend_from_slice(&(b as u16).to_le_bytes());
         }
         let tmp = PrivateTempDataFile::create("m3_in", &u16_bytes)?;
-        let out = std::process::Command::new(m3_elf)
-            .arg(&tmp.path)
-            .arg(if strict { "1" } else { "0" })
-            .output()
-            .map_err(|e| format!("spawn native m3.elf: {}", e))?;
+        let out = spawn_verified_native_elf(
+            m3_elf,
+            NATIVE_M3_ELF_BYTES,
+            NATIVE_M3_ELF_FNV,
+            &[
+                tmp.path.as_os_str(),
+                std::ffi::OsStr::new(if strict { "1" } else { "0" }),
+            ],
+        )?;
         if !out.status.success() {
             return Err(format!(
                 "error[M3_NATIVE_TRAP]: native m3.elf exited with {:?}",
@@ -353,13 +483,20 @@ pub fn pure_default_compile_u16_to_elf(u16_stream: &[u16], a0: i64, a1: i64, a2:
         let m2_elf = ensure_native_m2_elf()?;
         let bc_bytes = encode_u16_stream_to_bytes(u16_stream);
         let tmp = PrivateTempDataFile::create("m2_in", &bc_bytes)?;
-        let out = std::process::Command::new(m2_elf)
-            .arg(&tmp.path)
-            .arg(a0.to_string())
-            .arg(a1.to_string())
-            .arg(a2.to_string())
-            .output()
-            .map_err(|e| format!("spawn native m2.elf: {}", e))?;
+        let s0 = a0.to_string();
+        let s1 = a1.to_string();
+        let s2 = a2.to_string();
+        let out = spawn_verified_native_elf(
+            m2_elf,
+            NATIVE_M2_ELF_BYTES,
+            NATIVE_M2_ELF_FNV,
+            &[
+                tmp.path.as_os_str(),
+                std::ffi::OsStr::new(&s0),
+                std::ffi::OsStr::new(&s1),
+                std::ffi::OsStr::new(&s2),
+            ],
+        )?;
         if !out.status.success() {
             return Err(format!(
                 "{}: native m2.elf rejected/trapped input (exit {:?})",
@@ -413,13 +550,20 @@ pub fn pure_default_run_u16(
         let m4_elf = ensure_native_m4_elf()?;
         let bc_bytes = encode_u16_stream_to_bytes(u16_stream);
         let tmp = PrivateTempDataFile::create("m4_in", &bc_bytes)?;
-        let out = std::process::Command::new(m4_elf)
-            .arg(&tmp.path)
-            .arg(a0.to_string())
-            .arg(a1.to_string())
-            .arg(a2.to_string())
-            .output()
-            .map_err(|e| format!("spawn native m4.elf: {}", e))?;
+        let s0 = a0.to_string();
+        let s1 = a1.to_string();
+        let s2 = a2.to_string();
+        let out = spawn_verified_native_elf(
+            m4_elf,
+            NATIVE_M4_ELF_BYTES,
+            NATIVE_M4_ELF_FNV,
+            &[
+                tmp.path.as_os_str(),
+                std::ffi::OsStr::new(&s0),
+                std::ffi::OsStr::new(&s1),
+                std::ffi::OsStr::new(&s2),
+            ],
+        )?;
         if !out.status.success() {
             return Err(format!(
                 "{}: native m4.elf trapped with exit {:?}",
