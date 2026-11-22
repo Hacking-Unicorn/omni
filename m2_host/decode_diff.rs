@@ -6641,7 +6641,7 @@ pub fn selftest_b4_pure_launcher() -> Result<(usize, usize, u64, bool), String> 
         }
 
         // 4. Pure native M2 compiler ELF (emitted by Pure M2 itself, zero Rust binary) compiles
-        //    pure/m4/m4.omni_bc -> exact 78,020-B ELF64 (0xF66A7081E2B43319).
+        //    pure/m4/m4.omni_bc -> exact 76,782-B ELF64 (0x82F217F319C2BDF5).
         let m2_raw = std::fs::read("pure/m2/m2.omni_bc").map_err(|e| format!("B4 read m2 seed: {}", e))?;
         let m2_u16 = decode_bytes_to_u16_stream(&m2_raw);
         let m2_elf = pure_default_compile_u16_to_elf(&m2_u16, 0, 0, 0)?;
@@ -6654,7 +6654,7 @@ pub fn selftest_b4_pure_launcher() -> Result<(usize, usize, u64, bool), String> 
             .output()
             .map_err(|e| format!("B4 exec m2_native: {}", e))?;
         let _ = std::fs::remove_file(&m2path);
-        if !out_m4.status.success() || out_m4.stdout.len() != 78_020 || fnv1a_64_hash(&out_m4.stdout) != 0xF66A7081E2B43319 {
+        if !out_m4.status.success() || out_m4.stdout.len() != 76_782 || fnv1a_64_hash(&out_m4.stdout) != 0x82F217F319C2BDF5 {
             return Err(format!(
                 "B4 pure native m2.elf -> m4.elf mismatch: status={:?} len={} hash=0x{:016X}",
                 out_m4.status,

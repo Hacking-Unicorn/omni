@@ -1153,14 +1153,30 @@ pub fn compile_pure_u16_to_x86_64_elf_multi(
                 }
                 0x7F10 | 0x7F11 | 0x7F12 | 0x7F1E | 0x7F1F | 0x7F20 => {
                     emit_load_op(&mut code, &ins.operands[0], false);
-                    emit_load_op(&mut code, &ins.operands[1], true);
-                    match ins.op_tok {
-                        0x7F10 => code.extend_from_slice(&[0x48, 0x01, 0xC8]),
-                        0x7F11 => code.extend_from_slice(&[0x48, 0x29, 0xC8]),
-                        0x7F12 => code.extend_from_slice(&[0x48, 0x0F, 0xAF, 0xC1]),
-                        0x7F1E => code.extend_from_slice(&[0x48, 0x21, 0xC8]),
-                        0x7F1F => code.extend_from_slice(&[0x48, 0x09, 0xC8]),
-                        _      => code.extend_from_slice(&[0x48, 0x31, 0xC8]),
+                    let imm1 = match ins.operands[1] {
+                        BinOperand::ImmInt(v) => Some(v),
+                        BinOperand::ImmTrit(t) => Some(t as i64),
+                        _ => None,
+                    };
+                    if let Some(v) = imm1.filter(|&v| (-128..=127).contains(&v)) {
+                        match ins.op_tok {
+                            0x7F10 => code.extend_from_slice(&[0x48, 0x83, 0xC0, v as u8]),
+                            0x7F11 => code.extend_from_slice(&[0x48, 0x83, 0xE8, v as u8]),
+                            0x7F12 => code.extend_from_slice(&[0x48, 0x6B, 0xC0, v as u8]),
+                            0x7F1E => code.extend_from_slice(&[0x48, 0x83, 0xE0, v as u8]),
+                            0x7F1F => code.extend_from_slice(&[0x48, 0x83, 0xC8, v as u8]),
+                            _      => code.extend_from_slice(&[0x48, 0x83, 0xF0, v as u8]),
+                        }
+                    } else {
+                        emit_load_op(&mut code, &ins.operands[1], true);
+                        match ins.op_tok {
+                            0x7F10 => code.extend_from_slice(&[0x48, 0x01, 0xC8]),
+                            0x7F11 => code.extend_from_slice(&[0x48, 0x29, 0xC8]),
+                            0x7F12 => code.extend_from_slice(&[0x48, 0x0F, 0xAF, 0xC1]),
+                            0x7F1E => code.extend_from_slice(&[0x48, 0x21, 0xC8]),
+                            0x7F1F => code.extend_from_slice(&[0x48, 0x09, 0xC8]),
+                            _      => code.extend_from_slice(&[0x48, 0x31, 0xC8]),
+                        }
                     }
                     if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
                 }
@@ -1195,13 +1211,37 @@ pub fn compile_pure_u16_to_x86_64_elf_multi(
                 }
                 0x7F22 | 0x7F23 => {
                     emit_load_op(&mut code, &ins.operands[0], false);
-                    emit_load_op(&mut code, &ins.operands[1], true);
-                    code.extend_from_slice(&[0x48, 0xD3, if ins.op_tok == 0x7F22 { 0xE0 } else { 0xF8 }]);
+                    let modrm = if ins.op_tok == 0x7F22 { 0xE0 } else { 0xF8 };
+                    let imm1 = match ins.operands[1] {
+                        BinOperand::ImmInt(v) => Some(v),
+                        BinOperand::ImmTrit(t) => Some(t as i64),
+                        _ => None,
+                    };
+                    if imm1 == Some(1) {
+                        code.extend_from_slice(&[0x48, 0xD1, modrm]);
+                    } else if let Some(v) = imm1.filter(|&v| (0..=63).contains(&v)) {
+                        code.extend_from_slice(&[0x48, 0xC1, modrm, (v & 63) as u8]);
+                    } else {
+                        emit_load_op(&mut code, &ins.operands[1], true);
+                        code.extend_from_slice(&[0x48, 0xD3, modrm]);
+                    }
                     if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
                 }
                 0x7F24 | 0x7F25 | 0x7F26 | 0x7F27 => {
                     emit_load_op(&mut code, &ins.operands[0], false);
-                    emit_load_op(&mut code, &ins.operands[1], true);
+                    let imm1 = match ins.operands[1] {
+                        BinOperand::ImmInt(v) => Some(v),
+                        BinOperand::ImmTrit(t) => Some(t as i64),
+                        _ => None,
+                    };
+                    if imm1 == Some(0) {
+                        code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+                    } else if let Some(v) = imm1.filter(|&v| (-128..=127).contains(&v)) {
+                        code.extend_from_slice(&[0x48, 0x83, 0xF8, v as u8]);
+                    } else {
+                        emit_load_op(&mut code, &ins.operands[1], true);
+                        code.extend_from_slice(&[0x48, 0x39, 0xC8]);
+                    }
                     let setcc: u8 = match ins.op_tok {
                         0x7F24 => 0x94,
                         0x7F25 => 0x95,
@@ -1209,7 +1249,7 @@ pub fn compile_pure_u16_to_x86_64_elf_multi(
                         _      => 0x9F,
                     };
                     code.extend_from_slice(&[
-                        0x48, 0x39, 0xC8, 0x0F, setcc, 0xC0, 0x0F, 0xB6, 0xC0, 0x48, 0x8D, 0x44, 0x00, 0xFF,
+                        0x0F, setcc, 0xC0, 0x0F, 0xB6, 0xC0, 0x48, 0x8D, 0x44, 0x00, 0xFF,
                     ]);
                     if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
                 }
@@ -1244,9 +1284,21 @@ pub fn compile_pure_u16_to_x86_64_elf_multi(
                 }
                 0x7F2D => {
                     emit_load_op(&mut code, &ins.operands[0], false);
-                    emit_load_op(&mut code, &ins.operands[1], true);
+                    let imm1 = match ins.operands[1] {
+                        BinOperand::ImmInt(v) => Some(v),
+                        BinOperand::ImmTrit(t) => Some(t as i64),
+                        _ => None,
+                    };
+                    if imm1 == Some(0) {
+                        code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+                    } else if let Some(v) = imm1.filter(|&v| (-128..=127).contains(&v)) {
+                        code.extend_from_slice(&[0x48, 0x83, 0xF8, v as u8]);
+                    } else {
+                        emit_load_op(&mut code, &ins.operands[1], true);
+                        code.extend_from_slice(&[0x48, 0x39, 0xC8]);
+                    }
                     code.extend_from_slice(&[
-                        0x48, 0x39, 0xC8, 0x0F, 0x9F, 0xC2, 0x0F, 0x9C, 0xC1,
+                        0x0F, 0x9F, 0xC2, 0x0F, 0x9C, 0xC1,
                         0x0F, 0xB6, 0xD2, 0x0F, 0xB6, 0xC9, 0x29, 0xCA, 0x48, 0x63, 0xC2,
                     ]);
                     if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
