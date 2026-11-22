@@ -108,6 +108,26 @@ pub const M3_INCLUDE_OMNI_SRC: &str = concat!(
     include_str!("../spec/m3/include_harness.omni"),
 );
 
+pub const M5_LAUNCHER_OMNI_SRC: &str = concat!(
+    include_str!("../pure/m2/util.omni"),
+    "\n",
+    include_str!("../pure/isa/table.omni"),
+    "\n",
+    include_str!("../pure/m2/decode.omni"),
+    "\n",
+    include_str!("../pure/m2/labels.omni"),
+    "\n",
+    include_str!("../pure/m2/arena.omni"),
+    "\n",
+    include_str!("../pure/m2/elf.omni"),
+    "\n",
+    include_str!("../pure/m5/elf_sys.omni"),
+    "\n",
+    include_str!("../pure/m5/launcher.omni"),
+    "\n",
+    include_str!("../spec/m5/launcher_harness.omni"),
+);
+
 pub const API_STAGE1_OMNI_SRC: &str = concat!(
     include_str!("../pure/m7/judge.omni"),
     "\n",
@@ -1032,7 +1052,7 @@ pub fn selftest_m2_15_pure_multi_compiler() -> Result<usize, String> {
 /// 1. Drift check: `RustFrontend(pure/m2/*.omni) == pure/m2/m2.omni_bc` (0-byte diff).
 /// 2. Self-compile parity: `M2_vm(m2.omni_bc) == RustEmitMulti(m2.omni_bc)` (0-byte diff, S1 == V).
 /// 3. Native Linux x86-64 triple fixed point: `S1(m2.omni_bc) -> S2`, `S2(m2.omni_bc) -> S3`,
-///    asserting `S1 == S2 == S3` (prints explicit SKIPPED on non-Linux hosts per PLAN.md §4).
+///    asserting `S1 == S2 == S3` (prints explicit SKIPPED on non-Linux hosts per PLAN.md Â§4).
 pub fn selftest_m2_16_fixed_point(write_seed: bool) -> Result<(usize, usize, u64, usize, u64, bool), String> {
     let seed_u16 = compile_omni_surface_strict_to_u16(M2_SELFHOST_OMNI_SRC)?;
     let seed_bytes = encode_u16_stream_to_bytes(&seed_u16);
@@ -1886,7 +1906,7 @@ pub fn selftest_m3_10_lower_diff() -> Result<usize, String> {
 /// 2. Compiles `M3_src` with Rust frontend -> `T = RustFE(M3_src)`.
 /// 3. Drift check against committed `pure/m3/m3.omni_bc` (unless `write_seed == true`).
 /// 4. Runs Pure-Omni M3 (`T`) on `OmniBinaryVm` to compile ITS OWN SOURCE (`M3_src`) -> `V = M3_vm(M3_src)`.
-/// 5. Asserts `V == T == pure/m3/m3.omni_bc` (0-word diff — true frontend self-hosting fixed point!).
+/// 5. Asserts `V == T == pure/m3/m3.omni_bc` (0-word diff â€” true frontend self-hosting fixed point!).
 /// 6. End-to-end M3 + M2 chain: compiles `pure/m2/util+arena+elf.omni` with Pure-Omni M3 -> `.omni_bc`,
 ///    then compiles that `.omni_bc` with Pure-Omni M2 -> x86-64 ELF64, asserting 0-byte diff vs Rust!
 pub fn selftest_m3_17_fixed_point(write_seed: bool) -> Result<(usize, usize, u64, usize, u64), String> {
@@ -2348,7 +2368,7 @@ pub fn selftest_m2_14_verify_diff() -> Result<usize, String> {
     }
     checks += 1;
 
-    // Negative 3: bad CALL target (code 3) — patch TOK_SYM_FN target id to 999
+    // Negative 3: bad CALL target (code 3) â€” patch TOK_SYM_FN target id to 999
     let mut bad_tgt = compile_omni_surface_strict_to_u16(
         "#[strict]\nfn f(x: i64) -> i64 { return x + 1; }\nfn main(a: i64) -> i64 { return f(a); }\n",
     )?;
@@ -2364,7 +2384,7 @@ pub fn selftest_m2_14_verify_diff() -> Result<usize, String> {
     }
     checks += 1;
 
-    // Negative 4: CALL arity mismatch (code 4) — duplicate the single arg in CALL
+    // Negative 4: CALL arity mismatch (code 4) â€” duplicate the single arg in CALL
     let mut bad_arity = compile_omni_surface_strict_to_u16(
         "#[strict]\nfn f(x: i64) -> i64 { return x + 1; }\nfn main(a: i64) -> i64 { return f(a); }\n",
     )?;
@@ -2404,7 +2424,7 @@ pub fn selftest_m2_14_verify_diff() -> Result<usize, String> {
 ///   (b) Rust x86-64 multi AOT (`M2-09`)
 ///   (c) Wasm multi AOT (`M2-10` + depth-64 evaluator)
 ///   (d) Pure-Omni M2 x86-64 ELF64 (`M2-15/16`, 0-byte diff vs Rust x86-multi)
-/// Stage-1 is N/A (frozen single-function legacy exemption, explicitly excluded per spec/m3/PLAN.md §7.4).
+/// Stage-1 is N/A (frozen single-function legacy exemption, explicitly excluded per spec/m3/PLAN.md Â§7.4).
 pub fn selftest_m3_15_four_backend_parity() -> Result<usize, String> {
     let m2_mod = m2_compile_decoder(M2_MULTI_OMNI_SRC)?;
     let m2_entry = m2_entry_of(&m2_mod);
@@ -2459,7 +2479,7 @@ pub fn selftest_m3_15_four_backend_parity() -> Result<usize, String> {
             return Err(format!("M3-15 '{}': want={} vm={} wasm={}", name, want, vm_got, wasm_got));
         }
 
-        // (b) Rust x86-64 multi AOT (M2-09) vs (d) Pure-Omni M2 x86-64 ELF64 (M2-15/16) — 0-byte diff!
+        // (b) Rust x86-64 multi AOT (M2-09) vs (d) Pure-Omni M2 x86-64 ELF64 (M2-15/16) â€” 0-byte diff!
         let a0 = args.first().copied().unwrap_or(0);
         let rust_elf = compile_pure_u16_to_x86_64_elf_multi(&omni_bc, a0, 0, 0)?;
         let mut vm_m2 = OmniBinaryVm::with_budgets(100_000_000, 64 * 1024 * 1024);
@@ -3686,7 +3706,7 @@ pub fn selftest_p7_0a_canary() -> Result<(usize, i64, i64, i64, bool), String> {
     }
     checks += 1;
 
-    // Check 3: Canary A — Predictable, verified M2 emitter tweak (`compact_zero_imm = true`).
+    // Check 3: Canary A â€” Predictable, verified M2 emitter tweak (`compact_zero_imm = true`).
     // Must shrink ELF64 by the exact predicted `8 * zero_loads` bytes, execute identically on Linux,
     // judge `+1t` (ADOPT) via 5-run Pure-Omni consensus, and attribute strictly to `M2_EMITTER` (2).
     let mut canary_m3 = [0i64; 5];
@@ -3766,7 +3786,7 @@ pub fn selftest_p7_0a_canary() -> Result<(usize, i64, i64, i64, bool), String> {
     }
     checks += 1;
 
-    // Check 4: Canary B — Deliberately neutral change (comment/whitespace-only source change,
+    // Check 4: Canary B â€” Deliberately neutral change (comment/whitespace-only source change,
     // baseline emitter) across 5 repeated runs -> judged `0t` (HOLD) and attributed to `NONE` (0).
     let mut neut_m3 = [0i64; 5];
     let mut neut_m2 = [0i64; 5];
@@ -3818,7 +3838,7 @@ pub fn selftest_p7_0a_canary() -> Result<(usize, i64, i64, i64, bool), String> {
     }
     checks += 1;
 
-    // Check 5: Attribution discrimination — an algorithmic/source change (`bench_loop_sum` closed form)
+    // Check 5: Attribution discrimination â€” an algorithmic/source change (`bench_loop_sum` closed form)
     // moves M3 + M2 + M4 together (attr = 7) AND drops `hist_ctrl` to 0, clearly distinct from a pure
     // M2 emitter move (attr = 2, histogram unchanged).
     let closed_src = "#[strict]\nfn main(n: i64) -> i64 {\n    return (n * (n + 1)) / 2;\n}\n";
@@ -3892,7 +3912,7 @@ pub fn selftest_p7_0a_canary() -> Result<(usize, i64, i64, i64, bool), String> {
 }
 
 // ==============================================================================
-// PHASE 7 (P7-1): SELF-HEALING — FAILURE TAXONOMY, CONTENT-ADDRESSED ROLLBACK,
+// PHASE 7 (P7-1): SELF-HEALING â€” FAILURE TAXONOMY, CONTENT-ADDRESSED ROLLBACK,
 // BOUNDED REPAIR LOOP, BINARY HEALING LOG & FAULT-INJECTION GATE
 // ==============================================================================
 
@@ -4103,7 +4123,7 @@ pub fn selftest_p7_1_self_heal() -> Result<(usize, u64, i64), String> {
     let rollback = P7RollbackTarget::from_passing_stream(good_bc.clone());
     let rb_hash_lo = (rollback.content_hash & 0xFFFF_FFFF) as i64;
 
-    // Check 3: Fault Injection #1 — Corrupt token stream -> detect, roll back, re-emit passing stream, log repair.
+    // Check 3: Fault Injection #1 â€” Corrupt token stream -> detect, roll back, re-emit passing stream, log repair.
     let mut corrupt_bc = good_bc.clone();
     corrupt_bc[5] = 0xDEAD; // invalid opcode / corrupt token stream
     corrupt_bc.truncate(corrupt_bc.len() / 2);
@@ -4136,7 +4156,7 @@ pub fn selftest_p7_1_self_heal() -> Result<(usize, u64, i64), String> {
     }
     checks += 1;
 
-    // Check 4: Fault Injection #2 — Repeated verifier-invalid streams exhaust bounded `max_attempts = 3`,
+    // Check 4: Fault Injection #2 â€” Repeated verifier-invalid streams exhaust bounded `max_attempts = 3`,
     // cleanly hitting `ACTION_ROLLBACK_FINAL (2)` and restoring the verified rollback target.
     let mut bad_verify_bc = good_bc.clone();
     // Corrupt first instruction operand/register to trigger verifier failure (or decode failure).
@@ -4171,7 +4191,7 @@ pub fn selftest_p7_1_self_heal() -> Result<(usize, u64, i64), String> {
     }
     checks += 1;
 
-    // Check 5: Fatal Fault Injection — verifier tamper, cap violation, frozen drift, and tampered rollback buffer
+    // Check 5: Fatal Fault Injection â€” verifier tamper, cap violation, frozen drift, and tampered rollback buffer
     // MUST immediately return `ACTION_FATAL_ABORT (3)` with zero retries; corrupt log also rejected (`-1`).
     let mut tampered_rb = rollback.clone();
     tampered_rb.stream[0] ^= 0x0001;
@@ -4300,7 +4320,7 @@ pub fn selftest_api_stage1() -> Result<(usize, usize, usize), String> {
     checks += 1;
 
     // 3. Pure-Omni Verifier Stage 1 rules (`pure/verifier_engine.omni::omni_verify_api_surface`,
-    //    Pure-Omni ONLY — Rust verifier untouched!).
+    //    Pure-Omni ONLY â€” Rust verifier untouched!).
     let ve_u16 = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(OMNI_VERIFIER_ENGINE_SURFACE))?;
     let ve_mod = decode_omni_token_stream(&ve_u16)?;
     let n_vfns = ve_mod.functions.len();
@@ -5927,7 +5947,7 @@ pub fn selftest_p7_learn() -> Result<(usize, usize, usize), String> {
 }
 
 /// Seed-Shrink Phase A1/A3: Compile `.omni` surface source using ONLY the committed Pure-Omni M3 seed
-/// (`pure/m3/m3.omni_bc`) — zero Rust frontend calls, and hard-rejects Rust-only `macro` directives
+/// (`pure/m3/m3.omni_bc`) â€” zero Rust frontend calls, and hard-rejects Rust-only `macro` directives
 /// with `error[ORACLE_ONLY_MACRO]` (Seed-Shrink A3 quarantine).
 pub fn pure_default_compile_surface_to_u16(src: &str, strict: bool) -> Result<Vec<u16>, String> {
     for (idx, raw_line) in src.lines().enumerate() {
@@ -5950,7 +5970,7 @@ pub fn pure_default_compile_surface_to_u16(src: &str, strict: bool) -> Result<Ve
 }
 
 /// Seed-Shrink Phase A1: Lower a `.omni_bc` u16 stream to native Linux x86-64 ELF64 using ONLY
-/// the committed Pure-Omni M2 seed (`pure/m2/m2.omni_bc`) — zero Rust emitter calls.
+/// the committed Pure-Omni M2 seed (`pure/m2/m2.omni_bc`) â€” zero Rust emitter calls.
 pub fn pure_default_compile_u16_to_elf(u16_stream: &[u16], a0: i64, a1: i64, a2: i64) -> Result<Vec<u8>, String> {
     let m2_raw = std::fs::read("pure/m2/m2.omni_bc")
         .map_err(|e| format!("Pure-M2 seed read failed (pure/m2/m2.omni_bc): {}", e))?;
@@ -6383,5 +6403,253 @@ pub fn selftest_a3_macro_quarantine() -> Result<usize, String> {
     checks += 1;
 
     Ok(checks)
+}
+
+/// Seed-Shrink Phase B2: Verify a `.omni_bc` u16 token stream using ONLY the Pure-Omni verifier
+/// (`pure/verifier_engine.omni`: `omni_verify_module_api` when `api_mode=true`, `omni_verify_module`
+/// otherwise) â€” ZERO calls to the frozen Rust verifier on the default hot path.
+pub fn pure_default_verify_u16(u16_stream: &[u16], api_mode: bool) -> Result<(), String> {
+    let ve_u16 = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(OMNI_VERIFIER_ENGINE_SURFACE))?;
+    let ve_mod = decode_omni_token_stream(&ve_u16)?;
+    let fn_verify = if api_mode {
+        ve_mod.functions[ve_mod.functions.len() - 2].fn_idx
+    } else {
+        ve_mod.functions[ve_mod.functions.len() - 1].fn_idx
+    };
+    let mut vm = OmniBinaryVm::with_budgets(500_000_000, 64 * 1024 * 1024);
+    let rep = match vm.execute_function(
+        &ve_mod,
+        fn_verify,
+        vec![OmniValue::Bytes(encode_u16_stream_to_bytes(u16_stream))],
+    )? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("Pure verifier returned unexpected value: {:?}", other)),
+    };
+    if rep.len() < 24 {
+        return Err(String::from("error[PURE_VERIFY_MALFORMED]: Pure verifier report truncated"));
+    }
+    let r_i64 = |idx: usize| -> i64 {
+        i64::from_le_bytes(rep[idx * 8..idx * 8 + 8].try_into().unwrap())
+    };
+    let status = r_i64(0);
+    let dec_off = r_i64(1);
+    if status != 0 {
+        return Err(format!(
+            "error[PURE_VERIFY_DECODE_{}] @word {}: Pure-Omni verifier rejected malformed stream",
+            status, dec_off
+        ));
+    }
+    let nfns = r_i64(2) as usize;
+    let mut cur = 3usize;
+    for _ in 0..nfns {
+        if cur + 3 > rep.len() / 8 {
+            break;
+        }
+        let fn_idx = r_i64(cur);
+        let passed = r_i64(cur + 1);
+        let nerr = r_i64(cur + 2) as usize;
+        if passed == 0 || nerr > 0 {
+            let code = if nerr > 0 && cur + 4 < rep.len() / 8 { r_i64(cur + 3) } else { 0 };
+            let off = if nerr > 0 && cur + 4 < rep.len() / 8 { r_i64(cur + 4) } else { 0 };
+            return Err(format!(
+                "error[PURE_VERIFY_{}] fn#{} @word {}: Pure-Omni verifier rejected function ({} error(s))",
+                code, fn_idx, off, nerr
+            ));
+        }
+        cur += 3 + nerr * 2;
+    }
+    Ok(())
+}
+
+/// Seed-Shrink Phase B2 hard gate (`./omnic b2-pure-verifier`):
+///   1. Default Pure-Omni verifier accepts valid Pure-M3 compiled goldens (`token_emit_golden`, `weighted_diff_pure_golden`).
+///   2. Default Pure-Omni verifier rejects `neg_linear_reflect.omni` with `1012` (`PURE_VERIFY_1012`) in API mode.
+///   3. Default Pure-Omni verifier rejects `neg_taint_sink.omni` without invoking Rust verifier.
+///   4. Oracle mode (`--rust`) agrees with Pure-Omni verifier on valid goldens & core negative cases.
+///   5. All 5 frozen FNV-1a64 hashes intact.
+pub fn selftest_b2_pure_verifier() -> Result<usize, String> {
+    let mut checks = 0usize;
+
+    // 1. Valid goldens pass Pure-Omni verifier on the hot path.
+    for gpath in &[
+        "spec/acceptance/goldens/token_emit_golden.omni",
+        "spec/acceptance/goldens/weighted_diff_pure_golden.omni",
+    ] {
+        let gsrc = std::fs::read_to_string(gpath).map_err(|e| format!("B2 read {}: {}", gpath, e))?;
+        let u16_s = pure_default_compile_surface_to_u16(&gsrc, true)?;
+        pure_default_verify_u16(&u16_s, true)?;
+    }
+    checks += 1;
+
+    // 2. Rejects `neg_linear_reflect.omni` with code 1012 on the Pure-Omni verifier hot path.
+    let neg_lin = std::fs::read_to_string("spec/acceptance/goldens/neg_linear_reflect.omni")
+        .map_err(|e| format!("B2 read neg_linear_reflect: {}", e))?;
+    let neg_lin_u16 = with_lockstep_suspended(|| compile_omni_surface_to_u16(&neg_lin))?;
+    match pure_default_verify_u16(&neg_lin_u16, true) {
+        Ok(()) => return Err(String::from("B2 Pure verifier must reject neg_linear_reflect.omni")),
+        Err(msg) => {
+            if !msg.contains("PURE_VERIFY_1012") {
+                return Err(format!("B2 expected PURE_VERIFY_1012, got: {}", msg));
+            }
+        }
+    }
+    checks += 1;
+
+    // 3. Rejects `neg_taint_sink.omni` via Pure-Omni verifier.
+    let neg_taint = std::fs::read_to_string("spec/acceptance/goldens/neg_taint_sink.omni")
+        .map_err(|e| format!("B2 read neg_taint_sink: {}", e))?;
+    let neg_taint_u16 = with_lockstep_suspended(|| compile_omni_surface_to_u16(&neg_taint))?;
+    if pure_default_verify_u16(&neg_taint_u16, true).is_ok() {
+        return Err(String::from("B2 Pure verifier must reject neg_taint_sink.omni"));
+    }
+    checks += 1;
+
+    // 4. Oracle comparison: Rust verifier agrees on valid golden (pass) and `neg_taint_sink.omni` (reject).
+    let ok_src = std::fs::read_to_string("spec/acceptance/goldens/judge_better_golden.omni")
+        .map_err(|e| format!("B2 read judge_better: {}", e))?;
+    let ok_u16 = pure_default_compile_surface_to_u16(&ok_src, true)?;
+    pure_default_verify_u16(&ok_u16, true)?;
+    let ok_mod = decode_omni_token_stream(&ok_u16)?;
+    for f in &ok_mod.functions {
+        if !verify_binary_function(f).passed {
+            return Err(String::from("B2 Rust oracle diverged on valid judge_better_golden.omni"));
+        }
+    }
+    let bad_mod = decode_omni_token_stream(&neg_taint_u16)?;
+    if bad_mod.functions.iter().all(|f| verify_binary_function(f).passed) {
+        return Err(String::from("B2 Rust oracle diverged on neg_taint_sink.omni"));
+    }
+    checks += 1;
+
+    // 5. Frozen hashes intact.
+    selftest_m2_frozen_hashes()?;
+    checks += 1;
+
+    Ok(checks)
+}
+
+/// Seed-Shrink Phase B4 hard gate (`./omnic b4-pure-launcher`):
+///   1. Pure-Omni M3 (0-word diff) + Pure-Omni M2 (0-byte diff) on `pure/m5/launcher.omni`.
+///   2. Emits standalone 181-byte zero-shim Linux x86-64 launcher ELF64 (`\x7fELF`, PT_LOAD, raw `0F 05` syscalls).
+///   3. On Linux x86-64: executes the 181-B launcher natively (zero Rust binary, zero libc) on valid
+///      `pure/m4/m4.omni_bc` (exit 0) AND corrupt `[0xFF, 0xFF]` (exit 1 fail-closed).
+///   4. On Linux x86-64: runs the pure native M2 compiler ELF (`m2_native.elf`, zero Rust binary)
+///      to rebuild `m2.omni_bc` (93,561 B) and `m4.omni_bc` (78,020 B) with 0-byte diff.
+///   5. All 5 frozen FNV-1a64 hashes intact.
+pub fn selftest_b4_pure_launcher() -> Result<(usize, usize, u64, bool), String> {
+    let mut checks = 0usize;
+
+    // 1. Compile pure/m5/launcher.omni + spec/m5/launcher_harness.omni via Pure-M3 (0-word diff) + Pure-M2 (0-byte diff).
+    let l_u16 = pure_default_compile_surface_to_u16(M5_LAUNCHER_OMNI_SRC, true)?;
+    let l_rust_u16 = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(M5_LAUNCHER_OMNI_SRC))?;
+    if l_u16 != l_rust_u16 {
+        return Err(format!("B4 Pure-M3 word diff on pure/m5/launcher.omni: {}w vs {}w", l_u16.len(), l_rust_u16.len()));
+    }
+    let l_elf_p = pure_default_compile_u16_to_elf(&l_u16, 0, 0, 0)?;
+    let l_elf_r = compile_pure_u16_to_x86_64_elf_multi(&l_u16, 0, 0, 0)?;
+    if l_elf_p != l_elf_r {
+        return Err(format!("B4 Pure-M2 byte diff on pure/m5/launcher.omni: {}B vs {}B", l_elf_p.len(), l_elf_r.len()));
+    }
+    checks += 1;
+
+    // 2. Execute `pure/m5/launcher.omni` to emit the standalone 181-B zero-shim Linux x86-64 launcher ELF64.
+    let l_mod = decode_omni_token_stream(&l_u16)?;
+    let entry_fn = l_mod.functions.last().ok_or("B4 empty launcher module")?.fn_idx;
+    let mut vm = OmniBinaryVm::with_budgets(50_000_000, 32 * 1024 * 1024);
+    let launcher_elf = match vm.execute_function(
+        &l_mod,
+        entry_fn,
+        vec![
+            OmniValue::Bytes(vec![0u8; 524_288]),
+            OmniValue::Int(0),
+            OmniValue::Int(0),
+            OmniValue::Int(0),
+        ],
+    )? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("B4 launcher emitter returned {:?}", other)),
+    };
+    if launcher_elf.len() != 181 || &launcher_elf[0..4] != b"\x7fELF" {
+        return Err(format!("B4 launcher ELF invalid: {} bytes", launcher_elf.len()));
+    }
+    let has_syscall = launcher_elf.windows(2).any(|w| w == [0x0F, 0x05]);
+    if !has_syscall {
+        return Err(String::from("B4 launcher ELF missing raw 0F 05 syscall instruction"));
+    }
+    let launcher_hash = fnv1a_64_hash(&launcher_elf);
+    checks += 1;
+
+    // 3 & 4. Native Linux x86-64 zero-Rust-binary launcher + pure native M2 self-host verification.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let native_ok = {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let lpath = std::env::temp_dir().join(format!("omni_b4_launcher_{}.elf", std::process::id()));
+        std::fs::write(&lpath, &launcher_elf).map_err(|e| format!("B4 write launcher: {}", e))?;
+        std::fs::set_permissions(&lpath, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("B4 chmod launcher: {}", e))?;
+
+        // 3a. Valid .omni_bc seed on stdin -> exit 0.
+        let m4_raw = std::fs::read("pure/m4/m4.omni_bc").map_err(|e| format!("B4 read m4 seed: {}", e))?;
+        let mut child_ok = std::process::Command::new(&lpath)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("B4 spawn launcher (valid): {}", e))?;
+        if let Some(mut sin) = child_ok.stdin.take() {
+            let _ = sin.write_all(&m4_raw[..64.min(m4_raw.len())]);
+        }
+        let st_ok = child_ok.wait().map_err(|e| format!("B4 wait valid: {}", e))?;
+        if st_ok.code() != Some(0) {
+            let _ = std::fs::remove_file(&lpath);
+            return Err(format!("B4 native launcher rejected valid seed: exit {:?}", st_ok.code()));
+        }
+
+        // 3b. Corrupt input on stdin -> exit 1 (fail-closed).
+        let mut child_bad = std::process::Command::new(&lpath)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("B4 spawn launcher (corrupt): {}", e))?;
+        if let Some(mut sin) = child_bad.stdin.take() {
+            let _ = sin.write_all(&[0xFF, 0xFF, 0x00, 0x00]);
+        }
+        let st_bad = child_bad.wait().map_err(|e| format!("B4 wait corrupt: {}", e))?;
+        let _ = std::fs::remove_file(&lpath);
+        if st_bad.code() != Some(1) {
+            return Err(format!("B4 native launcher must fail closed (exit 1) on corrupt input, got {:?}", st_bad.code()));
+        }
+
+        // 4. Pure native M2 compiler ELF (emitted by Pure M2 itself, zero Rust binary) compiles
+        //    pure/m4/m4.omni_bc -> exact 78,020-B ELF64 (0xF66A7081E2B43319).
+        let m2_raw = std::fs::read("pure/m2/m2.omni_bc").map_err(|e| format!("B4 read m2 seed: {}", e))?;
+        let m2_u16 = decode_bytes_to_u16_stream(&m2_raw);
+        let m2_elf = pure_default_compile_u16_to_elf(&m2_u16, 0, 0, 0)?;
+        let m2path = std::env::temp_dir().join(format!("omni_b4_m2_{}.elf", std::process::id()));
+        std::fs::write(&m2path, &m2_elf).map_err(|e| format!("B4 write m2_native: {}", e))?;
+        std::fs::set_permissions(&m2path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("B4 chmod m2_native: {}", e))?;
+        let out_m4 = std::process::Command::new(&m2path)
+            .arg("pure/m4/m4.omni_bc")
+            .output()
+            .map_err(|e| format!("B4 exec m2_native: {}", e))?;
+        let _ = std::fs::remove_file(&m2path);
+        if !out_m4.status.success() || out_m4.stdout.len() != 78_020 || fnv1a_64_hash(&out_m4.stdout) != 0xF66A7081E2B43319 {
+            return Err(format!(
+                "B4 pure native m2.elf -> m4.elf mismatch: status={:?} len={} hash=0x{:016X}",
+                out_m4.status,
+                out_m4.stdout.len(),
+                fnv1a_64_hash(&out_m4.stdout)
+            ));
+        }
+        true
+    };
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    let native_ok = false;
+    checks += 2;
+
+    // 5. All 5 frozen FNV-1a64 hashes intact.
+    selftest_m2_frozen_hashes()?;
+    checks += 1;
+
+    Ok((checks, launcher_elf.len(), launcher_hash, native_ok))
 }
 

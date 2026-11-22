@@ -57,6 +57,8 @@ jobs:
           ./omni a1-pure-default
           ./omni a2-pure-include
           ./omni a3-macro-quarantine
+          ./omni b2-pure-verifier
+          ./omni b4-pure-launcher
           ./omni api-stage1
           ./omni api-stage2
           ./omni api-stage2-emit
@@ -96,6 +98,8 @@ jobs:
       - name: Build Stage-0 runner once (before stripping rustc/cargo from PATH)
         run: |
           rustc -O --edition 2021 omni_rust_bootstrap.rs -o ./omni
+          rustc -O --edition 2021 seed0/omni_seed0.rs -o ./omni-seed0
+          rustc -O --edition 2021 omni_dev_host.rs -o ./omni-dev-host
 
       - name: Run full pure-default compile/run/self-host/fixed-point suite with rustc & cargo absent from PATH
         run: |
@@ -104,9 +108,14 @@ jobs:
             echo "ERROR: rustc or cargo still reachable on PATH"
             exit 1
           fi
+          ./omni-seed0 verify-seeds
+          ./omni-seed0 line-audit
+          ./omni-dev-host --version
           ./omni a1-pure-default
           ./omni a2-pure-include
           ./omni a3-macro-quarantine
+          ./omni b2-pure-verifier
+          ./omni b4-pure-launcher
           ./omni self-host
           ./omni p5-sys
           ./omni m2-fixed-point

@@ -1051,6 +1051,8 @@ fn main() {
                 println!("  a1-pure-default                   Seed-Shrink A1: Pure-Omni M3->M2/M4 default CLI path vs --rust oracle gate");
                 println!("  a2-pure-include                   Seed-Shrink A2: Pure-Omni O-5 include expander (pure/m3/include.omni) & cycle gate");
                 println!("  a3-macro-quarantine               Seed-Shrink A3: quarantine macros behind --rust oracle & verify pure replacement golden");
+                println!("  b2-pure-verifier                  Seed-Shrink B2: Pure-Omni verifier_engine.omni on default hot path gate");
+                println!("  b4-pure-launcher                  Seed-Shrink B4: Pure-Omni M5 181-B zero-shim launcher ELF64 & native chain gate");
                 println!();
                 println!("Compilation, Execution & Tooling:");
                 println!("  run <file.omni|file.omni_bc> [args...]   Compile/verify and execute on VM");
@@ -1117,7 +1119,7 @@ fn main() {
                     }
                 }
             }
-            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" | "p7-heal" | "p7-adapt" | "p7-learn" | "a1-pure-default" | "a2-pure-include" | "a3-macro-quarantine" | "api-stage1" | "api-stage2" | "api-stage2-emit" | "api-stage2-5" => {
+            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" | "p7-heal" | "p7-adapt" | "p7-learn" | "a1-pure-default" | "a2-pure-include" | "a3-macro-quarantine" | "b2-pure-verifier" | "b4-pure-launcher" | "api-stage1" | "api-stage2" | "api-stage2-emit" | "api-stage2-5" => {
                 std::process::exit(monolith::run_m2_cli(&args[1..]));
             }
             "selftest" => {
