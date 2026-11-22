@@ -2118,12 +2118,8 @@ fn compile_wasm_single_func_body(
                     wasm_lset(b, scratch0);
                     emit_wasm_op(b, &ops[3]);
                     wasm_lset(b, scratch1);
-                    if patch_width == 8 {
-                        wasm_buf_in_bounds(b, &bl, scratch0, patch_width);
-                    } else {
-                        wasm_trap_unless_in_bounds(b, &bl, scratch0, patch_width);
-                        wasm_buf_in_bounds(b, &bl, scratch0, patch_width); // now always true
-                    }
+                    wasm_trap_unless_in_bounds(b, &bl, scratch0, patch_width);
+                    wasm_buf_in_bounds(b, &bl, scratch0, patch_width); // now always true
                     b.extend_from_slice(&[0x04, 0x40]);
                     wasm_lget(b, bl.bbase);
                     wasm_lget(b, scratch0);
