@@ -23899,13 +23899,13 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
             Ok((n, metrics, packed_better)) => {
                 for m in &metrics {
                     println!(
-                        "  [P7-BENCH] {:<18} ret={:<5} bc={}w elf={}B steps={} trace={} arena={}B hist(alu/mem/ctrl/cr)={}/{}/{}/{} fe={}us emit={}us vm={}us",
+                        "  [P7-BENCH] {:<22} ret={:<5} bc={}w elf={}B steps={} trace={} arena={}B hist(alu/mem/ctrl/cr)={}/{}/{}/{} fe={}us emit={}us vm={}us",
                         m.name, m.ret_val, m.bc_words, m.elf_bytes, m.vm_steps, m.trace_ops, m.arena_bytes,
                         m.hist_alu, m.hist_mem, m.hist_ctrl, m.hist_call_ret, m.compile_us, m.emit_us, m.vm_us
                     );
                 }
                 println!(
-                    "[P7-MEASURE PASS] {} checks (5 fixed benchmarks + P4-5 trace ring + pure/m7/judge.omni ternary +1t/0t/-1t + @PACK5 byte={} + frozen hashes intact)",
+                    "[P7-MEASURE PASS] {} checks (6 fixed benchmarks + P4-5 trace ring + pure/m7/judge.omni ternary +1t/0t/-1t + @PACK5 byte={} + frozen hashes intact)",
                     n, packed_better
                 );
                 0

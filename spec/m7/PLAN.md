@@ -164,6 +164,28 @@ Pure-Omni persistent, deterministic, balanced-ternary experience table & policy-
 
 ---
 
+## Post-Round-2 Baselines (`main@19a448d`) & 6th Benchmark (`bench_verifier_engine`)
+
+After Flywheel Round 2 (PR #16, `main@19a448d`), full re-measurement (`p7-measure`, `p7-canary`, `selftest` 1,474 checks on Windows) and expansion of the benchmark corpus from 5 micro-benchmarks to **6 benchmarks** (adding `bench_verifier_engine`, which compiles `pure/verifier_engine.omni` + a minimal 1-function harness through the **default Pure-Omni M3 frontend** `pure/m3/m3.omni_bc`, lowers via M2-multi, and executes `omni_verify_module` on the Pure-Omni M4 VM with P4-5 trace ring active):
+
+| ID | Benchmark | Compiler Path | `ret` | `bc_words` | `elf_bytes` (Compact) | `vm_steps` / `trace_ops` | `arena_bytes` | `hist (alu/mem/ctrl/cr)` | `fe_us` | `emit_us` | `vm_us` |
+|---:|---|---|---:|---:|---:|---:|---:|---|---:|---:|---:|
+| 0 | `bench_clamp` | Rust strict | `90` | `34` | `591 B` | `3` | `0 B` | `2/0/0/1` | `25` | `3` | `4,460` |
+| 1 | `bench_loop_sum` | Rust strict | `5050` | `75` | `656 B` | `809` | `0 B` | `404/0/404/1` | `34` | `6` | `304,097` |
+| 2 | `bench_branch_tree` | Rust strict | `70` | `69` | `650 B` | `6` | `0 B` | `2/0/3/1` | `80` | `11` | `10,760` |
+| 3 | `bench_multi_call` | Rust strict | `1209` | `73` | `665 B` | `10` | `0 B` | `5/0/0/5` | `80` | `11` | `10,271` |
+| 4 | `bench_arena_buf` | Rust strict | `120` | `143` | `810 B` | `271` | `128 B` | `101/33/136/1` | `194` | `13` | `119,826` |
+| 5 | **`bench_verifier_engine`** | **Pure-Omni M3** | **`11`** | **`13,426`** | **`32,672 B`** | **`25,692`** | **`3,682 B`** | **`2377/430/254/1035`** | **`12,350,860`** | **`386`** | **`13,097,108`** |
+
+- **Target confirmed by measurements:** On `bench_verifier_engine`, M2 emission is `0.39 ms`, while the **Pure-Omni M3 frontend** takes **`12.35 s`** (`12,350,860 us`) and **M4 VM** execution takes **`13.10 s`** (`13,097,108 us`). Pure-default CLI `omnic compile pure/verifier_engine.omni` takes `12,952 ms` vs `655 ms` on `--rust` (~20× slower). M3 frontend (interpreted on the VM) is confirmed as the next optimization target.
+- **Canary proof (`omnic p7-canary`, 6 benchmarks × 5 runs):** `PASS` (7 checks) — Canary A = `+1t (ADOPT, attr=2 [M2_EMITTER])` with exact `1,032 B` (`8 * 129`) reduction on `bench_verifier_engine` and `11,637 B` total production M2 savings (`44,021 B → 32,672 B` on `bench_verifier_engine`); Canary B = `0t (HOLD, attr=0 [NONE])`; 0 histogram drift; all 5 frozen FNV-1a64 hashes intact.
+- **Measurement-engine bugs caught by `bench_verifier_engine`:**
+  1. `pure/m7/judge.omni::p7_verify_trace_ring` now handles circular P4-5 ring wraparound (`trace_cnt > 4096`) via `start = sel_trit((trace_cnt - 4096) <=> 0, 0, 0, trace_cnt & 4095)` and `slot = (start + i) & 4095`.
+  2. `p7_count_m2_zero_imm_loads` updated to exclude `operands[1] == 0` on opcodes lowered via Round 2's `imm8` ALU / `test rax, rax` fast paths (`168 → 129`, exact `1,032 B` match).
+- **Closed-Loop Proposer Design:** See `spec/m7/PROPOSER_LOOP_DESIGN.md` (design only — awaiting agreement before implementation).
+
+---
+
 ## Hard Rules (All of Phase 7)
 
 - The verifier, determinism, and capability model are never self-modified.
