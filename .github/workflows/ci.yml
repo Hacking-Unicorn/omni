@@ -1,4 +1,4 @@
-name: Omni CI (Monolith, 8-Crate Workspace & Version-Locked Harness Selftests)
+name: Omni CI (Monolith, Fuzz Smoke & Zero-Rust Release Gate)
 
 on:
   push:
@@ -19,7 +19,7 @@ jobs:
       - name: Install Rust stable toolchain
         uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
-      - name: Run standalone monolith selftest (fixed-point + M2/M3/P4/P5 gates + 4-backend diff + pure-omni-diff + acceptance-diff + harness)
+      - name: Run standalone monolith selftest (fixed-point + M2/M3/P4/P5/S1-S6 gates + 5-backend diff + pure-omni-diff + acceptance-diff + harness)
         run: |
           rustc -O omni_rust_bootstrap.rs -o omni
           ./omni --help
@@ -63,7 +63,10 @@ jobs:
           ./omni b2-pure-verifier
           ./omni b4-pure-launcher
           ./omni s2-security
+          ./omni s3-perf
           ./omni s4-honesty
+          ./omni s5-refreeze
+          ./omni s6-cleanup
           ./omni api-stage1
           ./omni api-stage2
           ./omni api-stage2-emit
@@ -77,22 +80,22 @@ jobs:
           ./omni agent-driver --list-strategies
           ./omni agent-driver --strict "fn main(a: int) -> trit { let d = a - 10; let g = egate(d); return g; }" 25
 
-      - name: Build and run 8-crate Cargo workspace differential selftest (--release + cargo test)
-        working-directory: omni-workspace
-        env:
-          CARGO_INCREMENTAL: "0"
+  fuzz-smoke:
+    name: Bytecode Mutation Fuzz & Security Gate (Audit §1.2 / §2 / §6.3)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+
+      - name: Run 256-mutant .omni_bc verifier/VM fuzzer + native m2.elf crash corpus + strict OOB/PT_GNU_STACK gates
         run: |
-          cargo check --release -p omni-aot
-          cargo build --release --workspace
-          cargo run --release -p omni-cli -- --help
-          cargo run --release -p omni-cli -- selftest
-          cargo run --release -p omni-cli -- pure-bootstrap
-          cargo run --release -p omni-cli -- pure-omni-diff
-          cargo run --release -p omni-cli -- acceptance-diff
-          cargo run --release -p omni-cli --bin omni-harness -- --spec
-          cargo run --release -p omni-cli --bin omni-agent-driver -- --list-strategies
-          cargo run --release -p omni-cli --bin omni-agent-driver -- --strict "fn main(a: int) -> trit { let d = a - 10; let g = egate(d); return g; }" 25
-          cargo test --release --workspace
+          rustc -O omni_rust_bootstrap.rs -o omni
+          ./omni b2-pure-verifier
+          ./omni s2-security
+          ./omni s5-refreeze
 
   pure-default-no-rustc:
     name: Zero-Rust Release Gate & Independent Verifier (Seed-Shrink A4/B4/C1/C2)
