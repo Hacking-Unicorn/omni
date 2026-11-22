@@ -43,7 +43,7 @@ jobs:
           ./omni p4-vm
           ./omni p4-shim
           ./omni p4-wasm
-          ./omni compile-surface spec/acceptance/goldens/seed6_clamp.omni /tmp/seed6_clamp.omni_bc
+          ./omni compile-surface --rust spec/acceptance/goldens/seed6_clamp.omni /tmp/seed6_clamp.omni_bc
           ./omni p4-exec /tmp/seed6_clamp.omni_bc 150 10 90 --trace
           ./omni p5-sys
           ./omni p5-selfhost
