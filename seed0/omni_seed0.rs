@@ -20,11 +20,11 @@ const SEED_M2_BYTES: &[u8] = include_bytes!("../pure/m2/m2.omni_bc");
 const SEED_M4_BYTES: &[u8] = include_bytes!("../pure/m4/m4.omni_bc");
 
 const SEED_M3_FNV: u64 = 0x0668919FB4378D88;
-const SEED_M2_FNV: u64 = 0xC30924711C8C95E9;
+const SEED_M2_FNV: u64 = 0x04A83A6E91820FB2;
 const SEED_M4_FNV: u64 = 0x00299F8C0BB3F88A;
 
 const SEED_M3_WORDS: usize = 59_474;
-const SEED_M2_WORDS: usize = 33_551;
+const SEED_M2_WORDS: usize = 34_168;
 const SEED_M4_WORDS: usize = 26_076;
 
 fn fnv1a_64(bytes: &[u8]) -> u64 {
