@@ -1,0 +1,130 @@
+// ==============================================================================
+// OMNI PHASE 7 (P7-2) — PURE-OMNI SELF-ADAPTIVE POLICY & HYSTERESIS ENGINE
+// `pure/m7/adapt.omni`
+// ==============================================================================
+//
+// Link order: `pure/m7/judge.omni`, this file.
+// Pure-Omni iterative workload classifier, capability-bounded policy selector,
+// hysteresis anti-thrashing state machine, and binary adaptation ledger.
+// Zero host I/O, zero recursion, zero IDIV/IMOD, zero PACK5, m2-lint clean.
+// ==============================================================================
+
+// Workload profile IDs:
+//   0 = WORKLOAD_IDLE  (0 traced ops)
+//   1 = WORKLOAD_ALU   (ALU-dominant)
+//   2 = WORKLOAD_MEM   (arena/memory-active)
+//   3 = WORKLOAD_CTRL  (branch/loop-heavy)
+//   4 = WORKLOAD_CALL  (call-DAG-heavy)
+//
+// Policy bitmask:
+//   0 = POLICY_HOLD
+//   1 = POLICY_STRIP_NOP
+//   2 = POLICY_PREFETCH_LBL
+//   4 = POLICY_ARENA_FAST
+//   8 = POLICY_CALL_DAG
+//
+// Adaptation actions:
+//   0 = ADAPT_HOLD
+//   1 = ADAPT_COMMIT
+//   2 = ADAPT_REVERT
+
+// Classify a live P4-5 binary trace ring (`0x70000..0x7FFFF`) into a workload profile (0..4).
+// Reuses `pure/m7/judge.omni::p7_trace_histogram` without duplicating trace parsing.
+#[strict]
+fn p7_classify_workload(trace_ring: bytes) -> i64 {
+    let packed: i64 = p7_trace_histogram(trace_ring);
+    let alu: i64 = packed & 65535;
+    let mem: i64 = (packed >> 16) & 65535;
+    let ctrl: i64 = (packed >> 32) & 65535;
+    let cr: i64 = (packed >> 48) & 65535;
+    let total: i64 = alu + mem + ctrl + cr;
+    let is_idle: i64 = sel_trit(total <=> 0, 1, 1, 0);
+    let is_mem: i64 = (1 - is_idle) * sel_trit(mem <=> 0, 0, 0, 1);
+    let is_call: i64 = (1 - is_idle) * (1 - is_mem) * sel_trit((cr * 2) <=> total, 0, 1, 1);
+    let is_ctrl: i64 = (1 - is_idle) * (1 - is_mem) * (1 - is_call)
+        * sel_trit(ctrl <=> 0, 0, 0, 1)
+        * sel_trit(ctrl <=> alu, 0, 1, 1);
+    let is_alu: i64 = (1 - is_idle) * (1 - is_mem) * (1 - is_call) * (1 - is_ctrl);
+    return is_alu * 1 + is_mem * 2 + is_ctrl * 3 + is_call * 4;
+}
+
+// Capability-bounded policy selector: maps workload profile (0..4) into a strategy mask,
+// then strictly intersects with `cap_mask` (so `cap_mask == 0` always fails closed to 0).
+#[strict]
+fn p7_select_policy(profile: i64, cap_mask: i64) -> i64 {
+    let p1: i64 = sel_trit(profile <=> 1, 0, 1, 0);
+    let p2: i64 = sel_trit(profile <=> 2, 0, 1, 0);
+    let p3: i64 = sel_trit(profile <=> 3, 0, 1, 0);
+    let p4: i64 = sel_trit(profile <=> 4, 0, 1, 0);
+    // ALU -> STRIP_NOP (1), MEM -> STRIP_NOP|ARENA_FAST (5),
+    // CTRL -> STRIP_NOP|PREFETCH_LBL (3), CALL -> STRIP_NOP|CALL_DAG (9)
+    let raw: i64 = p1 * 1 + p2 * 5 + p3 * 3 + p4 * 9;
+    return raw & cap_mask;
+}
+
+// Hysteresis anti-thrashing decision state machine.
+// Returns `(new_streak << 8) | action`, where action is:
+//   0 = ADAPT_HOLD, 1 = ADAPT_COMMIT, 2 = ADAPT_REVERT.
+// Rules:
+//   - Any regression (`verdict == -1t`) -> immediate ADAPT_REVERT (2), streak reset to 0.
+//   - Same profile as previous -> streak = streak + 1; changed profile -> streak = 1.
+//   - Commit (`1`) ONLY when `verdict == +1t` AND `new_streak >= min_streak`.
+//   - Otherwise HOLD (`0`).
+#[strict]
+fn p7_adapt_decide(prev_profile: i64, cur_profile: i64, streak: i64, min_streak: i64, verdict: trit) -> i64 {
+    let is_reg: i64 = sel_trit(verdict, 1, 0, 0);
+    let is_imp: i64 = sel_trit(verdict, 0, 0, 1);
+    let same: i64 = sel_trit(prev_profile <=> cur_profile, 0, 1, 0);
+    let cand_streak: i64 = same * (streak + 1) + (1 - same) * 1;
+    let new_streak: i64 = (1 - is_reg) * cand_streak;
+    let stable: i64 = sel_trit(new_streak <=> min_streak, 0, 1, 1);
+    let do_commit: i64 = (1 - is_reg) * is_imp * stable;
+    let action: i64 = is_reg * 2 + do_commit * 1;
+    return (new_streak << 8) | action;
+}
+
+// Binary adaptation ledger: 4 KiB buffer (`log_buf`), header `[count:u32 at 0]`,
+// followed by 16-byte records at `16 + idx * 16`:
+//   [epoch:u32, profile:u32, policy:u32, verdict_action:u32].
+#[strict]
+fn p7_adapt_log_push(log_buf: bytes, epoch: i64, profile: i64, policy: i64, verdict_action: i64) -> bytes {
+    let cnt: i64 = ld_u32(log_buf, 0);
+    let can_fit: i64 = sel_trit(cnt <=> 250, 1, 0, 0);
+    let out: bytes = if_pos can_fit <=> 0 {
+        let off: i64 = 16 + cnt * 16;
+        let w1: bytes = st_u32(log_buf, off, epoch & 65535);
+        let w2: bytes = st_u32(w1, off + 4, profile & 65535);
+        let w3: bytes = st_u32(w2, off + 8, policy & 65535);
+        let w4: bytes = st_u32(w3, off + 12, verdict_action & 65535);
+        st_u32(w4, 0, cnt + 1)
+    } else {
+        log_buf
+    };
+    return out;
+}
+
+// Verify adaptation ledger integrity: returns record count (>= 0) if all records have
+// strictly monotonic epochs, valid profiles (0..4), and valid actions (0..2), else -1.
+#[strict]
+fn p7_adapt_log_verify(log_buf: bytes) -> i64 {
+    let cnt: i64 = ld_u32(log_buf, 0);
+    let cnt_ok: i64 = sel_trit(cnt <=> 0, 0, 1, 1) * sel_trit(cnt <=> 250, 1, 1, 0);
+    let ok: i64 = cnt_ok;
+    let prev_ep: i64 = -1;
+    let i: i64 = 0;
+    while i < cnt {
+        let off: i64 = 16 + i * 16;
+        let ep: i64 = ld_u32(log_buf, off);
+        let prof: i64 = ld_u32(log_buf, off + 4);
+        let va: i64 = ld_u32(log_buf, off + 12);
+        let act: i64 = va & 255;
+        let ep_ok: i64 = sel_trit(ep <=> prev_ep, 0, 0, 1);
+        let prof_ok: i64 = sel_trit(prof <=> 0, 0, 1, 1) * sel_trit(prof <=> 4, 1, 1, 0);
+        let act_ok: i64 = sel_trit(act <=> 0, 0, 1, 1) * sel_trit(act <=> 2, 1, 1, 0);
+        ok = ok * ep_ok * prof_ok * act_ok;
+        prev_ep = ep;
+        i = i + 1;
+    }
+    let res: i64 = if_pos ok <=> 0 { cnt } else { -1 };
+    return res;
+}

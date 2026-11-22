@@ -86,6 +86,14 @@ pub const P7_HEAL_OMNI_SRC: &str = concat!(
     include_str!("../spec/m7/heal_harness.omni"),
 );
 
+pub const P7_ADAPT_OMNI_SRC: &str = concat!(
+    include_str!("../pure/m7/judge.omni"),
+    "\n",
+    include_str!("../pure/m7/adapt.omni"),
+    "\n",
+    include_str!("../spec/m7/adapt_harness.omni"),
+);
+
 pub const API_STAGE1_OMNI_SRC: &str = concat!(
     include_str!("../pure/m7/judge.omni"),
     "\n",
@@ -5373,5 +5381,283 @@ pub fn selftest_api_stage2_5() -> Result<(usize, usize, usize), String> {
     checks += 1;
 
     Ok((checks, adp_u16.len(), adp_elf_rust.len()))
+}
+
+/// Phase 7 (P7-2) Self-Adaptive hard gate (`./omnic p7-adapt`):
+///   1. Pure-Omni M3 (0-word diff) + Pure-Omni M2 (0-byte diff) on `pure/m7/adapt.omni`.
+///   2. Live P4-5 trace-ring workload classification across all 5 P7 benchmarks:
+///      bench_clamp=ALU(1), bench_loop_sum=CTRL(3), bench_branch_tree=CTRL(3),
+///      bench_multi_call=CALL(4), bench_arena_buf=MEM(2).
+///   3. Capability-bounded policy selection (`p7_select_policy`): full cap mask vs `cap_mask=0` fail-closed.
+///   4. Hysteresis anti-thrashing state machine (`p7_adapt_decide`): noisy flip holds, sustained streak+`+1t` commits,
+///      any `-1t` immediately reverts & resets streak to 0.
+///   5. Closed-loop Self-Adaptive run (`pure/m7/adapt.omni` + `pure/api/adaptive.omni` + `pure/api/emit.omni`):
+///      bloated bench_clamp -> M4 trace -> classify -> policy -> adaptive_step -> M2 ELF64 (0-byte diff) ->
+///      M4 VM (`ret=90`) + Linux native exec -> binary ledger push & verify (2 entries).
+///   6. All 5 frozen FNV-1a64 hashes intact.
+pub fn selftest_p7_adapt() -> Result<(usize, usize, usize), String> {
+    let mut checks = 0usize;
+
+    // 1. Compile pure/m7/adapt.omni + spec/m7/adapt_harness.omni via Rust M3, Pure-Omni M3 (0-word diff),
+    //    Rust M2-multi ELF64, and Pure-Omni M2 (0-byte diff).
+    let ad_u16 = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(P7_ADAPT_OMNI_SRC))?;
+    let ad_m3_u16 = match m3_lockstep_compile_via_omni(P7_ADAPT_OMNI_SRC, true)? {
+        Ok(v) => v,
+        Err((c, l, col)) => return Err(format!("P7-2 M3 compile failed ({}, {}:{})", c, l, col)),
+    };
+    if ad_m3_u16 != ad_u16 {
+        return Err(format!(
+            "P7-2 M3 0-word diff failed on pure/m7/adapt.omni: pure={}w vs rust={}w",
+            ad_m3_u16.len(),
+            ad_u16.len()
+        ));
+    }
+    let ad_elf_rust = compile_pure_u16_to_x86_64_elf_multi(&ad_u16, 1, 15, 2)?;
+    let m2_u16 = decode_bytes_to_u16_stream(
+        &std::fs::read("pure/m2/m2.omni_bc").map_err(|e| format!("P7-2 read m2 seed: {}", e))?,
+    );
+    let m2_mod = decode_omni_token_stream(&m2_u16)?;
+    let m2_entry = m2_entry_of(&m2_mod);
+    let mut vm_m2 = OmniBinaryVm::with_budgets(500_000_000, 128 * 1024 * 1024);
+    let ad_elf_pure = match vm_m2.execute_function(
+        &m2_mod,
+        m2_entry,
+        vec![
+            OmniValue::U16Array(ad_u16.clone()),
+            OmniValue::Int(1),
+            OmniValue::Int(15),
+            OmniValue::Int(2),
+        ],
+    ).map_err(|e| format!("P7-2 step1 M2: {}", e))? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("P7-2 Pure-Omni M2 returned {:?}", other)),
+    };
+    if ad_elf_pure != ad_elf_rust {
+        return Err(format!(
+            "P7-2 Pure-Omni M2 diff on pure/m7/adapt.omni: pure={}B vs rust={}B",
+            ad_elf_pure.len(),
+            ad_elf_rust.len()
+        ));
+    }
+    checks += 1;
+
+    let ad_mod = decode_omni_token_stream(&ad_u16)?;
+    let n_fns = ad_mod.functions.len();
+    // Order at end of spec/m7/adapt_harness.omni:
+    //   p7_adapt_classify_entry (-6), p7_adapt_policy_entry (-5),
+    //   p7_adapt_decide_entry (-4), p7_adapt_log_push_entry (-3),
+    //   p7_adapt_log_verify_entry (-2), main (-1)
+    let fn_classify = ad_mod.functions[n_fns - 6].fn_idx;
+    let fn_policy = ad_mod.functions[n_fns - 5].fn_idx;
+    let fn_decide = ad_mod.functions[n_fns - 4].fn_idx;
+    let fn_log_push = ad_mod.functions[n_fns - 3].fn_idx;
+    let fn_log_verify = ad_mod.functions[n_fns - 2].fn_idx;
+
+    let m4_u16 = decode_bytes_to_u16_stream(
+        &std::fs::read("pure/m4/m4.omni_bc").map_err(|e| format!("P7-2 read m4 seed: {}", e))?,
+    );
+    let m4_mod = decode_omni_token_stream(&m4_u16)?;
+    let m4_run_fn = m4_mod.functions[m4_mod.functions.len() - 2].fn_idx;
+    let mut vm = OmniBinaryVm::with_budgets(500_000_000, 128 * 1024 * 1024);
+
+    // 2. Live P4-5 trace-ring workload classification across all 5 P7 benchmarks.
+    let expected_profiles: [i64; 5] = [1, 3, 3, 4, 2]; // ALU, CTRL, CTRL, CALL, MEM
+    for (bi, &(bname, bsrc, bargs, _bwant)) in P7_BENCHMARK_CORPUS.iter().enumerate() {
+        let bbc = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(bsrc))?;
+        let t_arena = match vm.execute_function(
+            &m4_mod,
+            m4_run_fn,
+            vec![
+                OmniValue::Bytes(vec![0u8; 524_288]),
+                OmniValue::U16Array(bbc),
+                OmniValue::Int(bargs[0]),
+                OmniValue::Int(bargs[1]),
+                OmniValue::Int(bargs[2]),
+                OmniValue::Int(200_000),
+                OmniValue::Int(1),
+            ],
+        ).map_err(|e| format!("P7-2 step2 M4({}): {}", bname, e))? {
+            OmniValue::Bytes(b) => b,
+            other => return Err(format!("P7-2 M4({}) returned {:?}", bname, other)),
+        };
+        let prof = match vm.execute_function(&ad_mod, fn_classify, vec![OmniValue::Bytes(t_arena)])
+            .map_err(|e| format!("P7-2 step2 classify({}): {}", bname, e))?
+        {
+            OmniValue::Int(v) => v,
+            other => return Err(format!("P7-2 classify({}) returned {:?}", bname, other)),
+        };
+        if prof != expected_profiles[bi] {
+            return Err(format!(
+                "P7-2 workload classify({}) got {} want {}",
+                bname, prof, expected_profiles[bi]
+            ));
+        }
+    }
+    checks += 1;
+
+    // 3. Capability-bounded policy selection (`p7_select_policy`).
+    for &(prof, cap_mask, want_pol) in &[
+        (0i64, 15i64, 0i64),
+        (1, 15, 1),
+        (2, 15, 5),
+        (3, 15, 3),
+        (4, 15, 9),
+        (2, 1, 1),  // narrowed cap_mask drops ARENA_FAST
+        (4, 0, 0),  // zero cap_mask fails closed to POLICY_HOLD
+    ] {
+        let got = match vm.execute_function(
+            &ad_mod,
+            fn_policy,
+            vec![OmniValue::Int(prof), OmniValue::Int(cap_mask)],
+        ).map_err(|e| format!("P7-2 step3 policy({},{}): {}", prof, cap_mask, e))? {
+            OmniValue::Int(v) => v,
+            other => return Err(format!("P7-2 policy returned {:?}", other)),
+        };
+        if got != want_pol {
+            return Err(format!("P7-2 policy({}, {}) got {} want {}", prof, cap_mask, got, want_pol));
+        }
+    }
+    checks += 1;
+
+    // 4. Hysteresis anti-thrashing state machine (`p7_adapt_decide`).
+    //    (prev, cur, streak, min_streak, verdict) -> (new_streak << 8) | action
+    for &(prev_p, cur_p, st_in, min_st, v_i64, want_st, want_act) in &[
+        (1i64, 3i64, 5i64, 2i64, 1i64, 1i64, 0i64),  // noisy flip -> streak=1 < 2 -> HOLD
+        (3, 3, 1, 2, 1, 2, 1),                       // sustained streak=2 + +1t -> COMMIT
+        (3, 3, 2, 2, 0, 3, 0),                       // neutral 0t -> HOLD (streak=3)
+        (3, 3, 3, 2, -1, 0, 2),                      // regression -1t -> immediate REVERT, streak=0
+    ] {
+        let packed = match vm.execute_function(
+            &ad_mod,
+            fn_decide,
+            vec![
+                OmniValue::Int(prev_p),
+                OmniValue::Int(cur_p),
+                OmniValue::Int(st_in),
+                OmniValue::Int(min_st),
+                OmniValue::Int(v_i64),
+            ],
+        ).map_err(|e| format!("P7-2 step4 decide: {}", e))? {
+            OmniValue::Int(v) => v,
+            other => return Err(format!("P7-2 decide returned {:?}", other)),
+        };
+        let got_st = packed >> 8;
+        let got_act = packed & 255;
+        if got_st != want_st || got_act != want_act {
+            return Err(format!(
+                "P7-2 decide({},{},{},{},{}) got (streak={},act={}) want ({},{})",
+                prev_p, cur_p, st_in, min_st, v_i64, got_st, got_act, want_st, want_act
+            ));
+        }
+    }
+    checks += 1;
+
+    // 5. Closed-loop Self-Adaptive run: bloated bench_clamp -> trace -> classify -> policy ->
+    //    Stage 2.5 `api_adaptive_step` -> M2 ELF64 (0-byte diff) -> M4 VM (ret=90) + Linux native ->
+    //    binary ledger push & verify (2 entries: epoch 1 HOLD, epoch 2 COMMIT).
+    let (_bname0, bsrc0, bargs0, bwant0) = P7_BENCHMARK_CORPUS[0];
+    let clean_bc = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(bsrc0))?;
+    let mut bloated_bc = clean_bc.clone();
+    let pcnt0 = bloated_bc[3] as usize;
+    let icnt_idx = 4 + pcnt0 * 3 + 2;
+    bloated_bc[icnt_idx] += 2;
+    bloated_bc.splice(icnt_idx + 1..icnt_idx + 1, [0x7F00u16, 0x7EE4, 0x7F00, 0x7EE4]);
+
+    let s25_u16 = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(API_STAGE2_5_OMNI_SRC))?;
+    let s25_mod = decode_omni_token_stream(&s25_u16)?;
+    let fn_s25_step = s25_mod.functions[s25_mod.functions.len() - 2].fn_idx;
+
+    let pol = match vm.execute_function(&ad_mod, fn_policy, vec![OmniValue::Int(1), OmniValue::Int(15)])? {
+        OmniValue::Int(v) => v,
+        other => return Err(format!("P7-2 step5 policy returned {:?}", other)),
+    };
+    let adapted_bytes = match vm.execute_function(
+        &s25_mod,
+        fn_s25_step,
+        vec![
+            OmniValue::Bytes(encode_u16_stream_to_bytes(&bloated_bc)),
+            OmniValue::Int(pol),
+            OmniValue::Int(0),
+        ],
+    ).map_err(|e| format!("P7-2 step5 adaptive_step: {}", e))? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("P7-2 step5 adaptive_step returned {:?}", other)),
+    };
+    let adapted_u16 = decode_bytes_to_u16_stream(&adapted_bytes);
+    if adapted_u16 != clean_bc {
+        return Err(String::from("P7-2 closed-loop adaptive_step did not converge to clean bench_clamp"));
+    }
+    let elf_r = compile_pure_u16_to_x86_64_elf_multi(&adapted_u16, bargs0[0], bargs0[1], bargs0[2])?;
+    let elf_p = match vm_m2.execute_function(
+        &m2_mod,
+        m2_entry,
+        vec![
+            OmniValue::U16Array(adapted_u16.clone()),
+            OmniValue::Int(bargs0[0]),
+            OmniValue::Int(bargs0[1]),
+            OmniValue::Int(bargs0[2]),
+        ],
+    )? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("P7-2 step5 M2 returned {:?}", other)),
+    };
+    if elf_p != elf_r {
+        return Err(String::from("P7-2 step5 M2 0-byte diff failed on adapted stream"));
+    }
+    let st = 167_936usize;
+    let out_arena = match vm.execute_function(
+        &m4_mod,
+        m4_run_fn,
+        vec![
+            OmniValue::Bytes(vec![0u8; 524_288]),
+            OmniValue::U16Array(adapted_u16),
+            OmniValue::Int(bargs0[0]),
+            OmniValue::Int(bargs0[1]),
+            OmniValue::Int(bargs0[2]),
+            OmniValue::Int(50_000),
+            OmniValue::Int(0),
+        ],
+    )? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("P7-2 step5 M4 returned {:?}", other)),
+    };
+    let got_ret = i64::from_le_bytes(out_arena[st + 32..st + 40].try_into().unwrap());
+    if got_ret != bwant0 {
+        return Err(format!("P7-2 step5 M4 ret={} want {}", got_ret, bwant0));
+    }
+    let _ = p7_verify_native_elf_i64("p7_2_adapted", &elf_p, bwant0)?;
+
+    // Log 2 epochs into binary adaptation ledger & verify integrity.
+    let mut log_buf = vec![0u8; 4096];
+    log_buf = match vm.execute_function(
+        &ad_mod,
+        fn_log_push,
+        vec![OmniValue::Bytes(log_buf), OmniValue::Int(1), OmniValue::Int(1), OmniValue::Int(pol), OmniValue::Int(0)],
+    )? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("P7-2 log_push#1 returned {:?}", other)),
+    };
+    log_buf = match vm.execute_function(
+        &ad_mod,
+        fn_log_push,
+        vec![OmniValue::Bytes(log_buf), OmniValue::Int(2), OmniValue::Int(1), OmniValue::Int(pol), OmniValue::Int(1)],
+    )? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("P7-2 log_push#2 returned {:?}", other)),
+    };
+    let v_cnt = match vm.execute_function(&ad_mod, fn_log_verify, vec![OmniValue::Bytes(log_buf)])? {
+        OmniValue::Int(v) => v,
+        other => return Err(format!("P7-2 log_verify returned {:?}", other)),
+    };
+    if v_cnt != 2 {
+        return Err(format!("P7-2 adaptation ledger verify got {} want 2", v_cnt));
+    }
+    checks += 1;
+
+    // 6. All 5 frozen FNV-1a64 hashes intact.
+    selftest_m2_frozen_hashes()?;
+    checks += 1;
+
+    Ok((checks, ad_u16.len(), ad_elf_rust.len()))
 }
 
