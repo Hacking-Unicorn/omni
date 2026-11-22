@@ -6274,8 +6274,154 @@ pub fn selftest_b2_pure_verifier() -> Result<usize, String> {
     // 5. Audit §1.2: CALL-target and arity validation in Pure verifier + M2 trap stub + fuzz corpus.
     checks += selftest_s1_2_call_target_arity_and_fuzz()?;
 
-    // 6. Frozen hashes intact.
+    // 6. Audit Round 2 N1: per-opcode minimum operand arity + EMPTY_MODULE + reconciled 0x7F42 (BR_TRIT min=4).
+    checks += selftest_n1_op_arity_and_empty_module()?;
+
+    // 7. Frozen hashes intact.
     selftest_m2_frozen_hashes()?;
+    checks += 1;
+
+    Ok(checks)
+}
+
+/// Audit Round 2 N1 gate:
+///   1. Rejects TMAJ (0x7F2C) with 2 operands (`PURE_VERIFY_2012`).
+///   2. Rejects 0x7F17 with 1 operand (`PURE_VERIFY_2012`).
+///   3. Rejects header-only zero-function module `[0x7EE0, 0x7EEF]` (`PURE_VERIFY_EMPTY_MODULE`),
+///      while keeping 0-word `[]` rejected as `PURE_VERIFY_DECODE_3006`.
+///   4. Rejects `vok_crash_128` (`0x7F42` BR_TRIT with 1 operand — reconciled min=4) in BOTH
+///      `pure_default_verify_u16` (`PURE_VERIFY_2012`) and Rust `OmniBinaryVm` (`BAD_ARITY`).
+pub fn selftest_n1_op_arity_and_empty_module() -> Result<usize, String> {
+    let mut checks = 0usize;
+
+    let build_dest_op_stream = |op: u16, ops: &[u16]| -> Vec<u16> {
+        let mut s = vec![
+            0x7EE0, // TOK_MOD_BEGIN
+            0x7EE3, 0, 1, 0x7EC0, 0x7F81, 0x7FC0, 0x7F81, 0, 2, // fn#0(p0: i64) -> i64, 2 ins
+            0x7E00, op, 0x7F81, 0x7FC0, // r0: i64 = op ...
+        ];
+        s.extend_from_slice(ops);
+        s.extend_from_slice(&[
+            0x7EE4, // INS_END
+            0x7F4A, 0x7E00, 0x7EE4, // RET r0
+            0x7EEF, // TOK_MOD_END
+        ]);
+        s
+    };
+
+    // 1. TMAJ (0x7F2C) with 2 operands (requires 3).
+    let tmaj_2op = build_dest_op_stream(0x7F2C, &[0x7EC0, 0x7EC0]);
+    match pure_default_verify_u16(&tmaj_2op, false) {
+        Ok(()) => return Err(String::from("N1 Pure verifier accepted TMAJ (0x7F2C) with 2 operands")),
+        Err(msg) => {
+            if !msg.contains("PURE_VERIFY_2012") {
+                return Err(format!("N1 tmaj_2op expected PURE_VERIFY_2012, got: {}", msg));
+            }
+        }
+    }
+    checks += 1;
+
+    // 2. 0x7F17 with 1 operand (requires 2).
+    let op_7f17_1op = build_dest_op_stream(0x7F17, &[0x7EC0]);
+    match pure_default_verify_u16(&op_7f17_1op, false) {
+        Ok(()) => return Err(String::from("N1 Pure verifier accepted 0x7F17 with 1 operand")),
+        Err(msg) => {
+            if !msg.contains("PURE_VERIFY_2012") {
+                return Err(format!("N1 op_7f17_1op expected PURE_VERIFY_2012, got: {}", msg));
+            }
+        }
+    }
+    checks += 1;
+
+    // 3. Header-only zero-function module `[0x7EE0, 0x7EEF]` (EMPTY_MODULE) + 0-word `[]` (DECODE_3006).
+    let empty_hdr_only: Vec<u16> = vec![0x7EE0, 0x7EEF];
+    match pure_default_verify_u16(&empty_hdr_only, false) {
+        Ok(()) => return Err(String::from("N1 Pure verifier accepted header-only zero-function module")),
+        Err(msg) => {
+            if !msg.contains("PURE_VERIFY_EMPTY_MODULE") && !msg.contains("3007") {
+                return Err(format!("N1 empty_module expected PURE_VERIFY_EMPTY_MODULE, got: {}", msg));
+            }
+        }
+    }
+    match pure_default_verify_u16(&[], false) {
+        Ok(()) => return Err(String::from("N1 Pure verifier accepted 0-word empty stream")),
+        Err(msg) => {
+            if !msg.contains("PURE_VERIFY_DECODE_3006") {
+                return Err(format!("N1 0-word stream expected PURE_VERIFY_DECODE_3006, got: {}", msg));
+            }
+        }
+    }
+    checks += 1;
+
+    // 4. `vok_crash_128`: BR_TRIT (0x7F42) with 1 operand (reconciled min=4 across Pure verifier, mod_check, and Rust VM).
+    let br_trit_1op: Vec<u16> = vec![
+        0x7EE0,
+        0x7EE3, 0, 1, 0x7EC0, 0x7F81, 0x7FC0, 0x7F81, 0, 2,
+        0x7F42, 0x7EC0, 0x7EE4, // BR_TRIT with only 1 operand (missing l_neg, l_zero, l_pos)
+        0x7F4A, 0x7EC0, 0x7EE4, // RET p0
+        0x7EEF,
+    ];
+    match pure_default_verify_u16(&br_trit_1op, false) {
+        Ok(()) => return Err(String::from("N1 Pure verifier accepted BR_TRIT (0x7F42) with 1 operand")),
+        Err(msg) => {
+            if !msg.contains("PURE_VERIFY_2012") {
+                return Err(format!("N1 vok_crash_128 expected PURE_VERIFY_2012, got: {}", msg));
+            }
+        }
+    }
+    let decoded_br = decode_omni_token_stream(&br_trit_1op)?;
+    let mut rust_vm = OmniBinaryVm::new();
+    match rust_vm.execute_function(&decoded_br, 0, vec![OmniValue::Int(1)]) {
+        Ok(v) => return Err(format!("N1 Rust VM accepted BR_TRIT (0x7F42) with 1 operand (returned {:?})", v)),
+        Err(msg) => {
+            if !msg.contains("BAD_ARITY") && !msg.contains("Missing branch target label") {
+                return Err(format!("N1 Rust VM expected BAD_ARITY/UNRESOLVED_LABEL on 0x7F42 1-op, got: {}", msg));
+            }
+        }
+    }
+    checks += 1;
+
+    // 5. Drift-lock: `pure/verifier_engine.omni::op_min_ops` agrees with `pure/m2/verify/mod_check.omni::m2v_ins_min_ops`
+    //    for every opcode known to `mod_check.omni` across 0x7F00..=0x7F7F.
+    let ve_mod = cached_verifier_engine_module()?;
+    let m2_mod = cached_m2_seed_module()?;
+    let find_fn_idx = |src: &str, name: &str| -> Result<u16, String> {
+        let needle = format!("fn {}(", name);
+        let mut idx: u16 = 0;
+        for line in src.lines() {
+            let t = line.trim_start();
+            if t.starts_with("fn ") {
+                if t.starts_with(&needle) {
+                    return Ok(idx);
+                }
+                idx += 1;
+            }
+        }
+        Err(format!("N1 could not locate '{}' in source", name))
+    };
+    let ve_min_pos = find_fn_idx(OMNI_VERIFIER_ENGINE_SURFACE, "op_min_ops")? as usize;
+    let m2_min_pos = find_fn_idx(M2_SELFHOST_OMNI_SRC, "m2v_ins_min_ops")? as usize;
+    let ve_min_fn = ve_mod.functions.get(ve_min_pos).ok_or("N1 ve_min_pos OOB")?.fn_idx;
+    let m2_min_fn = m2_mod.functions.get(m2_min_pos).ok_or("N1 m2_min_pos OOB")?.fn_idx;
+    let mut parity_vm = OmniBinaryVm::with_budgets(50_000_000, 16 * 1024 * 1024);
+    for op in 0x7F00i64..=0x7F7Fi64 {
+        let m2_v = match parity_vm.execute_function(m2_mod, m2_min_fn, vec![OmniValue::Int(op)])? {
+            OmniValue::Int(v) => v,
+            other => return Err(format!("N1 m2v_ins_min_ops(0x{:04X}) returned {:?}", op, other)),
+        };
+        if m2_v >= 0 {
+            let ve_v = match parity_vm.execute_function(ve_mod, ve_min_fn, vec![OmniValue::Int(op)])? {
+                OmniValue::Int(v) => v,
+                other => return Err(format!("N1 op_min_ops(0x{:04X}) returned {:?}", op, other)),
+            };
+            if ve_v != m2_v {
+                return Err(format!(
+                    "N1 opcode arity drift at 0x{:04X}: verifier_engine={} != mod_check={}",
+                    op, ve_v, m2_v
+                ));
+            }
+        }
+    }
     checks += 1;
 
     Ok(checks)

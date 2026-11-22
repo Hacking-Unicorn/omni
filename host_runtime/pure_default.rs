@@ -616,6 +616,11 @@ pub fn pure_default_verify_u16(u16_stream: &[u16], api_mode: bool) -> Result<(),
     };
     let status = r_i64(0);
     let dec_off = r_i64(1);
+    if status == 3007 {
+        return Err(String::from(
+            "error[PURE_VERIFY_EMPTY_MODULE] @word 0: Pure-Omni verifier rejected zero-function module",
+        ));
+    }
     if status != 0 {
         return Err(format!(
             "error[PURE_VERIFY_DECODE_{}] @word {}: Pure-Omni verifier rejected malformed stream",
