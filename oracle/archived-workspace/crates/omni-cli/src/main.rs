@@ -1052,7 +1052,7 @@ fn main() {
                 println!("  a2-pure-include                   Seed-Shrink A2: Pure-Omni O-5 include expander (pure/m3/include.omni) & cycle gate");
                 println!("  a3-macro-quarantine               Seed-Shrink A3: quarantine macros behind --rust oracle & verify pure replacement golden");
                 println!("  b2-pure-verifier                  Seed-Shrink B2: Pure-Omni verifier_engine.omni on default hot path gate");
-                println!("  b4-pure-launcher                  Seed-Shrink B4: Pure-Omni M5 181-B zero-shim launcher ELF64 & native chain gate");
+                println!("  b4-pure-launcher                  Seed-Shrink B4: Pure-Omni M5 237-B zero-shim launcher ELF64 & native chain gate");
                 println!();
                 println!("Compilation, Execution & Tooling:");
                 println!("  run <file.omni|file.omni_bc> [args...]   Compile/verify and execute on VM");

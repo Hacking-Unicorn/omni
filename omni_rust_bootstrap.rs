@@ -1386,17 +1386,15 @@ impl OmniBinaryVm {
                     }
                 }
                 0x7F42 => {
-                    let mut all_ok = true;
                     for op in c.operands.get(1..4).into_iter().flatten() {
                         if let Some(tp) = extract_label_id(op).and_then(&find_lbl) {
                             push_target(tp, &mut work, &mut work_len, &mut work_heap);
-                        } else {
-                            all_ok = false;
                         }
                     }
-                    if !all_ok || c.operands.len() < 4 {
-                        push_target(cur + 1, &mut work, &mut work_len, &mut work_heap);
-                    }
+                    // Audit Round-3 R3-3: BR_TRIT falls through (`pc += 1`) whenever its
+                    // condition is not an int/trit (`eval_as_trit` -> None), so the
+                    // fall-through is always a successor, even when all three labels resolve.
+                    push_target(cur + 1, &mut work, &mut work_len, &mut work_heap);
                 }
                 0x7F43 | 0x7F44 => {
                     if let Some(tp) = c.operands.get(1).and_then(extract_label_id).and_then(&find_lbl) {
@@ -22657,6 +22655,44 @@ RET %4
     }
     checks_passed += 1;
 
+    // 5b. Audit Round-3 R3-3: the zero-copy liveness walk (`tok_dead_after`) must explore the
+    //     BR_TRIT fall-through even when all three labels resolve (a non-trit condition falls
+    //     through at runtime), so a buffer read only on the fall-through path stays live.
+    {
+        let mk = |op_tok: u16, dest_reg: Option<u16>, operands: Vec<BinOperand>| BinInstruction {
+            offset: 0,
+            dest_reg,
+            op_tok,
+            ty_tok: 0,
+            tc_tok: 0,
+            operands,
+        };
+        let buf_tok: u16 = REG_BASE + 1;
+        let insns = vec![
+            mk(0x7F0D, Some(buf_tok), vec![]),
+            mk(0x7F42, None, vec![BinOperand::Reg(REG_BASE), BinOperand::Label(1), BinOperand::Label(2), BinOperand::Label(3)]),
+            mk(0x7F4A, None, vec![BinOperand::Reg(buf_tok)]),
+            mk(0x7F40, None, vec![BinOperand::Label(1)]),
+            mk(0x7F4A, None, vec![BinOperand::ImmInt(0)]),
+            mk(0x7F40, None, vec![BinOperand::Label(2)]),
+            mk(0x7F4A, None, vec![BinOperand::ImmInt(0)]),
+            mk(0x7F40, None, vec![BinOperand::Label(3)]),
+            mk(0x7F4A, None, vec![BinOperand::ImmInt(0)]),
+        ];
+        if OmniBinaryVm::tok_dead_after(&insns, 0, buf_tok) {
+            return Err(String::from(
+                "R3-3 tok_dead_after treated a buffer read on the BR_TRIT fall-through path as dead",
+            ));
+        }
+        // Control: with no fall-through read the buffer is still dead (precision kept elsewhere).
+        let mut insns_dead = insns.clone();
+        insns_dead[2] = mk(0x7F4A, None, vec![BinOperand::ImmInt(0)]);
+        if !OmniBinaryVm::tok_dead_after(&insns_dead, 0, buf_tok) {
+            return Err(String::from("R3-3 tok_dead_after control: unread buffer must be dead"));
+        }
+    }
+    checks_passed += 1;
+
     // 6. Verifier / AOT Consistency Test: All 8 seed kinds verified against both AOT backends
     for &num_seed in &[0usize, 4, 6] {
         let (_, num_u16, _, _) = build_transpiled_seed_stream(num_seed);
@@ -24705,7 +24741,7 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
             match selftest_s4_honesty() {
                 Ok(n) => {
                     println!(
-                        "[S4-HONESTY PASS] {} checks | compile-elf 0/0/0 default args + live wc -l doc drift lock + honest 236-line classified seed vs runtime Rust + M5 181-B validator/entry stub",
+                        "[S4-HONESTY PASS] {} checks | compile-elf 0/0/0 default args + live wc -l doc drift lock + honest 236-line classified seed vs runtime Rust + M5 237-B validator/entry stub",
                         n
                     );
                     0
@@ -25228,6 +25264,17 @@ include!("p4_shim/mod.rs");
 
 // ==== END M2 FOUNDATION ====
 
+/// Audit Round-3 L-D: native-toolchain cache errors (every one carries a `CACHE_` marker from
+/// `host_runtime/pure_default.rs`) print as `[NATIVE-CACHE FAIL] <err>`; all other errors keep
+/// their verifier/compiler label, so a cache problem is never reported as a verifier failure.
+fn cli_fail_label(label: &str, err: &str) -> String {
+    if err.contains("CACHE_") {
+        format!("[NATIVE-CACHE FAIL] {}", err)
+    } else {
+        format!("[{}] {}", label, err)
+    }
+}
+
 fn main() {
     let cli_args: Vec<String> = env::args().collect();
     if cli_args.first().map(|a| a.contains("omni-harness")).unwrap_or(false)
@@ -25267,7 +25314,7 @@ fn main() {
                 println!("  a2-pure-include                   Seed-Shrink A2: Pure-Omni O-5 include expander (pure/m3/include.omni) & cycle gate");
                 println!("  a3-macro-quarantine               Seed-Shrink A3: quarantine macros behind --rust oracle & verify pure replacement golden");
                 println!("  b2-pure-verifier                  Seed-Shrink B2: Pure-Omni verifier_engine.omni on default hot path gate");
-                println!("  b4-pure-launcher                  Seed-Shrink B4: Pure-Omni M5 181-B zero-shim launcher ELF64 & native chain gate");
+                println!("  b4-pure-launcher                  Seed-Shrink B4: Pure-Omni M5 237-B zero-shim launcher ELF64 & native chain gate");
                 println!("  compile [--rust|--oracle] <in> <out>     Compile .omni to .omni_bc via Pure M3 by default");
                 println!("  self-host [--rust|--oracle]              Run Pure M3->M4->M2 self-host chain by default");
                 println!();
@@ -25481,17 +25528,32 @@ fn main() {
                     std::process::exit(2);
                 }
                 if use_rust {
-                    let u16_stream = compile_omni_surface_file_to_u16(pos[0]).expect("Rust oracle surface compilation failed");
-                    fs::write(pos[1], encode_u16_stream_to_bytes(&u16_stream)).expect("Failed to write .omni_bc");
+                    let u16_stream = match compile_omni_surface_file_to_u16(pos[0]) {
+                        Ok(u) => u,
+                        Err(e) => {
+                            eprintln!("[RUST-ORACLE COMPILE FAIL] {}", e);
+                            std::process::exit(1);
+                        }
+                    };
+                    if let Err(e) = fs::write(pos[1], encode_u16_stream_to_bytes(&u16_stream)) {
+                        eprintln!("[RUST-ORACLE COMPILE FAIL] error[IO_ERROR]: failed to write '{}': {}", pos[1], e);
+                        std::process::exit(1);
+                    }
                     println!("[RUST-ORACLE COMPILE PASS] Wrote {} u16 tokens to '{}'", u16_stream.len(), pos[1]);
                     return;
                 }
-                let raw_src = fs::read_to_string(pos[0]).expect("Failed to read .omni file");
+                let raw_src = match fs::read_to_string(pos[0]) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[PURE-M3 COMPILE FAIL] error[IO_ERROR]: failed to read '{}': {}", pos[0], e);
+                        std::process::exit(1);
+                    }
+                };
                 let parent_dir = std::path::Path::new(pos[0]).parent();
                 let expanded = match pure_default_expand_includes(&raw_src, parent_dir, None) {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("[PURE-M3 COMPILE FAIL] {}", e);
+                        eprintln!("{}", cli_fail_label("PURE-M3 COMPILE FAIL", &e));
                         std::process::exit(1);
                     }
                 };
@@ -25505,15 +25567,18 @@ fn main() {
                 match compile_res {
                     Ok(u16_stream) => {
                         if let Err(ve) = pure_default_verify_u16(&u16_stream, true) {
-                            eprintln!("[PURE-VERIFY FAIL] {}", ve);
+                            eprintln!("{}", cli_fail_label("PURE-VERIFY FAIL", &ve));
                             std::process::exit(1);
                         }
-                        fs::write(pos[1], encode_u16_stream_to_bytes(&u16_stream)).expect("Failed to write .omni_bc");
+                        if let Err(e) = fs::write(pos[1], encode_u16_stream_to_bytes(&u16_stream)) {
+                            eprintln!("[PURE-M3 COMPILE FAIL] error[IO_ERROR]: failed to write '{}': {}", pos[1], e);
+                            std::process::exit(1);
+                        }
                         println!("[PURE-M3 COMPILE PASS] Wrote {} u16 tokens to '{}' (Pure-Omni verified)", u16_stream.len(), pos[1]);
                         return;
                     }
                     Err(e) => {
-                        eprintln!("[PURE-M3 COMPILE FAIL] {}", e);
+                        eprintln!("{}", cli_fail_label("PURE-M3 COMPILE FAIL", &e));
                         std::process::exit(1);
                     }
                 }
@@ -25602,7 +25667,7 @@ fn main() {
                     let expanded = match pure_default_expand_includes(&raw_src, parent_dir, None) {
                         Ok(s) => s,
                         Err(e) => {
-                            eprintln!("[PURE-M2 ELF FAIL] {}", e);
+                            eprintln!("{}", cli_fail_label("PURE-M2 ELF FAIL", &e));
                             std::process::exit(1);
                         }
                     };
@@ -25616,7 +25681,7 @@ fn main() {
                     match c_res {
                         Ok(s) => s,
                         Err(e) => {
-                            eprintln!("[PURE-M2 ELF FAIL] {}", e);
+                            eprintln!("{}", cli_fail_label("PURE-M2 ELF FAIL", &e));
                             std::process::exit(1);
                         }
                     }
@@ -25631,7 +25696,7 @@ fn main() {
                     decode_bytes_to_u16_stream(&raw)
                 };
                 if let Err(ve) = pure_default_verify_u16(&u16_stream, true) {
-                    eprintln!("[PURE-VERIFY FAIL] {}", ve);
+                    eprintln!("{}", cli_fail_label("PURE-VERIFY FAIL", &ve));
                     std::process::exit(1);
                 }
                 let elf_res = if use_interp {
@@ -25646,7 +25711,7 @@ fn main() {
                         return;
                     }
                     Err(e) => {
-                        eprintln!("[PURE-M2 ELF FAIL] {}", e);
+                        eprintln!("{}", cli_fail_label("PURE-M2 ELF FAIL", &e));
                         std::process::exit(1);
                     }
                 }
@@ -25654,13 +25719,33 @@ fn main() {
             "compile-wasm" if cli_args.len() >= 4 => {
                 let path = &cli_args[2];
                 let u16_stream = if path.ends_with(".omni") {
-                    compile_omni_surface_file_to_u16(path).expect("Surface compilation failed")
+                    match compile_omni_surface_file_to_u16(path) {
+                        Ok(u) => u,
+                        Err(e) => {
+                            eprintln!("[WASM AOT FAIL] {}", e);
+                            std::process::exit(1);
+                        }
+                    }
                 } else {
-                    let raw = fs::read(path).expect("Failed to read .omni_bc");
-                    decode_bytes_to_u16_stream(&raw)
+                    match fs::read(path) {
+                        Ok(raw) => decode_bytes_to_u16_stream(&raw),
+                        Err(e) => {
+                            eprintln!("[WASM AOT FAIL] error[IO_ERROR]: failed to read '{}': {}", path, e);
+                            std::process::exit(1);
+                        }
+                    }
                 };
-                let wasm = compile_pure_u16_to_wasm(&u16_stream).expect("WebAssembly AOT compilation failed");
-                fs::write(&cli_args[3], &wasm).expect("Failed to write .wasm");
+                let wasm = match compile_pure_u16_to_wasm(&u16_stream) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        eprintln!("[WASM AOT FAIL] {}", e);
+                        std::process::exit(1);
+                    }
+                };
+                if let Err(e) = fs::write(&cli_args[3], &wasm) {
+                    eprintln!("[WASM AOT FAIL] error[IO_ERROR]: failed to write '{}': {}", cli_args[3], e);
+                    std::process::exit(1);
+                }
                 println!("[WASM AOT PASS] Wrote {} bytes to '{}' (FNV-1a64=0x{:016X})", wasm.len(), cli_args[3], fnv1a_64_hash(&wasm));
                 return;
             }
@@ -25702,7 +25787,7 @@ fn main() {
                     };
                     let u16_stream = decode_bytes_to_u16_stream(&raw);
                     if let Err(ve) = pure_default_verify_u16(&u16_stream, true) {
-                        eprintln!("[PURE-VERIFY FAIL] {}", ve);
+                        eprintln!("{}", cli_fail_label("PURE-VERIFY FAIL", &ve));
                         std::process::exit(1);
                     }
                     match compile_pure_u16_to_wasm(&u16_stream) {
@@ -25717,10 +25802,28 @@ fn main() {
                 return;
             }
             "surface-to-asm" if cli_args.len() >= 3 => {
-                let raw_src = fs::read_to_string(&cli_args[2]).expect("Failed to read .omni surface file");
+                let raw_src = match fs::read_to_string(&cli_args[2]) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[SURFACE-TO-ASM FAIL] error[IO_ERROR]: failed to read '{}': {}", cli_args[2], e);
+                        std::process::exit(1);
+                    }
+                };
                 let parent_dir = std::path::Path::new(&cli_args[2]).parent();
-                let expanded = resolve_omni_surface_includes(&raw_src, parent_dir, None).expect("Include resolution failed");
-                let asm = compile_omni_surface_to_asm(&expanded).expect("Surface-to-asm lowering failed");
+                let expanded = match resolve_omni_surface_includes(&raw_src, parent_dir, None) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[SURFACE-TO-ASM FAIL] {}", e);
+                        std::process::exit(1);
+                    }
+                };
+                let asm = match compile_omni_surface_to_asm(&expanded) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        eprintln!("[SURFACE-TO-ASM FAIL] {}", e);
+                        std::process::exit(1);
+                    }
+                };
                 print!("{}", asm);
                 return;
             }
@@ -25820,7 +25923,7 @@ fn main() {
                         let expanded = match pure_default_expand_includes(&raw_src, parent_dir, None) {
                             Ok(s) => s,
                             Err(e) => {
-                                eprintln!("[PURE-RUN FAIL] {}", e);
+                                eprintln!("{}", cli_fail_label("PURE-RUN FAIL", &e));
                                 std::process::exit(1);
                             }
                         };
@@ -25834,7 +25937,7 @@ fn main() {
                         match c_res {
                             Ok(u) => u,
                             Err(e) => {
-                                eprintln!("[PURE-RUN FAIL] {}", e);
+                                eprintln!("{}", cli_fail_label("PURE-RUN FAIL", &e));
                                 std::process::exit(1);
                             }
                         }
@@ -25852,7 +25955,7 @@ fn main() {
                     let a1 = pos.get(2).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
                     let a2 = pos.get(3).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
                     if let Err(ve) = pure_default_verify_u16(&u16_stream, true) {
-                        eprintln!("[PURE-VERIFY FAIL] {}", ve);
+                        eprintln!("{}", cli_fail_label("PURE-VERIFY FAIL", &ve));
                         std::process::exit(1);
                     }
                     let run_res = if use_interp {
@@ -25866,14 +25969,20 @@ fn main() {
                             return;
                         }
                         Err(e) => {
-                            eprintln!("[PURE-RUN FAIL] {}", e);
+                            eprintln!("{}", cli_fail_label("PURE-RUN FAIL", &e));
                             std::process::exit(1);
                         }
                     }
                 }
                 let vm_args: Vec<OmniValue> = pos[1..].iter().map(|s| parse_cli_omni_value(s)).collect();
                 if path.ends_with(".omni") {
-                    let raw_src = fs::read_to_string(path).expect("Failed to read .omni file");
+                    let raw_src = match fs::read_to_string(path) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[RUN FAIL] error[IO_ERROR]: failed to read '{}': {}", path, e);
+                            std::process::exit(1);
+                        }
+                    };
                     let parent_dir = std::path::Path::new(path).parent();
                     let expanded = match resolve_omni_surface_includes(&raw_src, parent_dir, None) {
                         Ok(s) => s,
@@ -25894,12 +26003,30 @@ fn main() {
                     }
                 }
                 let u16_stream = {
-                    let raw = fs::read(path).expect("Failed to read input file");
+                    let raw = match fs::read(path) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            eprintln!("[RUN FAIL] error[IO_ERROR]: failed to read '{}': {}", path, e);
+                            std::process::exit(1);
+                        }
+                    };
                     if let Ok(txt) = std::str::from_utf8(&raw) {
                         if txt.contains("fn ") {
                             let parent_dir = std::path::Path::new(path).parent();
-                            let expanded = resolve_omni_surface_includes(txt, parent_dir, None).expect("Include resolution failed");
-                            compile_omni_surface_to_u16(&expanded).expect("Surface compilation failed")
+                            let expanded = match resolve_omni_surface_includes(txt, parent_dir, None) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    eprintln!("[RUN FAIL] {}", e);
+                                    std::process::exit(1);
+                                }
+                            };
+                            match compile_omni_surface_to_u16(&expanded) {
+                                Ok(u) => u,
+                                Err(e) => {
+                                    eprintln!("[RUN FAIL] {}", e);
+                                    std::process::exit(1);
+                                }
+                            }
                         } else {
                             decode_bytes_to_u16_stream(&raw)
                         }

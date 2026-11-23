@@ -1,12 +1,12 @@
 // ==============================================================================
-// OMNI SEED-SHRINK (PHASE B4) — PURE-OMNI M5 181-B .omni_bc VALIDATOR / ENTRY STUB
+// OMNI SEED-SHRINK (PHASE B4) — PURE-OMNI M5 237-B .omni_bc VALIDATOR / ENTRY STUB
 // `pure/m5/launcher.omni`
 // ==============================================================================
 // Link order: `pure/m2/util.omni`, `pure/isa/table.omni`, `pure/m2/decode.omni`,
 //             `pure/m2/labels.omni`, `pure/m2/arena.omni`, `pure/m2/elf.omni`,
 //             `pure/m5/elf_sys.omni`, this file.
 //
-// Emits a standalone 181-byte Linux x86-64 ELF64 zero-shim `.omni_bc` header
+// Emits a standalone 237-byte Linux x86-64 ELF64 zero-shim `.omni_bc` header
 // validator / entry stub (raw Linux `0F 05` syscalls only — chaining is done by B4):
 //   _start:
 //     sub rsp, 4096; mov rbx, rsp
@@ -46,7 +46,7 @@ fn m5l_emit_mod_begin_gate(w: bytes) -> bytes {
     return m2a_emit_u16(w13, 1295);                  // 0x050F LE (syscall)
 }
 
-// Emits the complete standalone 181-byte Pure-Omni M5 zero-shim launcher ELF64.
+// Emits the complete standalone 237-byte Pure-Omni M5 zero-shim launcher ELF64.
 #[strict]
 fn m5l_emit_launcher_elf(w_in: bytes) -> bytes {
     let w0: bytes = m2a_init(w_in, 0, 0, 0);

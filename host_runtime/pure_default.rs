@@ -33,8 +33,8 @@ pub const NATIVE_M3_ELF_BYTES: usize = 182_435;
 pub const NATIVE_M3_ELF_FNV: u64 = 0x414F_C127_C2BB_3376;
 pub const NATIVE_M4_ELF_BYTES: usize = 89_705;
 pub const NATIVE_M4_ELF_FNV: u64 = 0xAE3F_3DF0_69BE_D8B7;
-pub const NATIVE_VERIFIER_ELF_BYTES: usize = 37_970;
-pub const NATIVE_VERIFIER_ELF_FNV: u64 = 0x173F_4080_7112_E2CE;
+pub const NATIVE_VERIFIER_ELF_BYTES: usize = 37_992;
+pub const NATIVE_VERIFIER_ELF_FNV: u64 = 0x00BD_060A_772E_6762;
 
 /// Audit Round 2 L5: Default & maximum fuel for `omni run --fuel N`, plus documented
 /// 65,536-word (128 KiB) native M2/M3/M4/verifier input-window threshold (larger inputs
@@ -116,31 +116,15 @@ fn current_euid() -> u32 {
     unsafe { geteuid() }
 }
 
+/// Audit Round-3 L-C: one stable per-user fallback cache directory
+/// (`$TMPDIR/omni-native-cache-<euid>`, default `/tmp`) when `XDG_CACHE_HOME`/`HOME` are
+/// unset or empty, so consecutive runs reuse the cached native ELFs instead of leaking a fresh
+/// `mkdtemp` directory per process. The caller creates it 0700 and runs it through
+/// `verify_private_cache_dir` (real dir, owned by euid, mode & 077 == 0), so a directory
+/// pre-created by another user is rejected (`CACHE_UNSAFE_DIR`), never used.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn fallback_mkdtemp_cache_dir() -> Result<std::path::PathBuf, String> {
-    static FALLBACK_DIR: std::sync::OnceLock<Result<std::path::PathBuf, String>> =
-        std::sync::OnceLock::new();
-    FALLBACK_DIR
-        .get_or_init(|| {
-            extern "C" {
-                fn mkdtemp(template: *mut std::os::raw::c_char) -> *mut std::os::raw::c_char;
-            }
-            use std::os::unix::ffi::OsStrExt;
-            let tpl_path = std::env::temp_dir().join("omni-native-cache-XXXXXX");
-            let mut buf: Vec<u8> = tpl_path.as_os_str().as_bytes().to_vec();
-            buf.push(0);
-            let res = unsafe { mkdtemp(buf.as_mut_ptr() as *mut std::os::raw::c_char) };
-            if res.is_null() {
-                return Err(format!(
-                    "mkdtemp failed for {}: {}",
-                    tpl_path.display(),
-                    std::io::Error::last_os_error()
-                ));
-            }
-            buf.pop(); // strip NUL
-            Ok(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&buf)))
-        })
-        .clone()
+fn fallback_user_cache_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("omni-native-cache-{}", current_euid()))
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -181,22 +165,30 @@ fn native_toolchain_cache_dir() -> Result<std::path::PathBuf, String> {
         if !xdg.is_empty() {
             std::path::PathBuf::from(xdg).join("omni").join("native-v1")
         } else {
-            fallback_mkdtemp_cache_dir()?
+            fallback_user_cache_dir()
         }
     } else if let Ok(home) = std::env::var("HOME") {
         if !home.is_empty() {
             std::path::PathBuf::from(home).join(".cache").join("omni").join("native-v1")
         } else {
-            fallback_mkdtemp_cache_dir()?
+            fallback_user_cache_dir()
         }
     } else {
-        fallback_mkdtemp_cache_dir()?
+        fallback_user_cache_dir()
     };
     if !base.exists() {
         let mut b = std::fs::DirBuilder::new();
         b.recursive(true).mode(0o700);
-        b.create(&base)
-            .map_err(|e| format!("create native cache dir {}: {}", base.display(), e))?;
+        if let Err(e) = b.create(&base) {
+            // A concurrent process may have created it first; verify_private_cache_dir decides.
+            if e.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(format!(
+                    "error[CACHE_CREATE_DIR]: create native cache dir {}: {}",
+                    base.display(),
+                    e
+                ));
+            }
+        }
     }
     verify_private_cache_dir(&base)?;
     Ok(base)
@@ -217,10 +209,10 @@ fn spawn_verified_native_elf(
         .read(true)
         .custom_flags(O_NOFOLLOW)
         .open(path)
-        .map_err(|e| format!("open verified native elf {}: {}", path.display(), e))?;
+        .map_err(|e| format!("error[CACHE_IO]: open verified native elf {}: {}", path.display(), e))?;
     let meta = f
         .metadata()
-        .map_err(|e| format!("fstat native elf {}: {}", path.display(), e))?;
+        .map_err(|e| format!("error[CACHE_IO]: fstat native elf {}: {}", path.display(), e))?;
     let euid = current_euid();
     if !meta.is_file() || meta.uid() != euid || (meta.mode() & 0o022) != 0 {
         return Err(format!(
@@ -232,7 +224,7 @@ fn spawn_verified_native_elf(
     }
     let mut bytes = Vec::with_capacity(expected_len);
     f.read_to_end(&mut bytes)
-        .map_err(|e| format!("read verified native elf {}: {}", path.display(), e))?;
+        .map_err(|e| format!("error[CACHE_IO]: read verified native elf {}: {}", path.display(), e))?;
     let got_fnv = fnv1a_64_hash(&bytes);
     if bytes.len() != expected_len || got_fnv != expected_fnv {
         return Err(format!(
@@ -277,9 +269,9 @@ impl PrivateTempDataFile {
             .create_new(true)
             .mode(0o600)
             .open(&path)
-            .map_err(|e| format!("create temp input {}: {}", path.display(), e))?;
+            .map_err(|e| format!("error[CACHE_IO]: create temp input {}: {}", path.display(), e))?;
         f.write_all(bytes)
-            .map_err(|e| format!("write temp input {}: {}", path.display(), e))?;
+            .map_err(|e| format!("error[CACHE_IO]: write temp input {}: {}", path.display(), e))?;
         Ok(Self { path })
     }
 }
@@ -331,13 +323,13 @@ fn ensure_cached_native_elf<F: FnOnce() -> Result<Vec<u8>, String>>(
             .create_new(true)
             .mode(0o700)
             .open(&tmp_path)
-            .map_err(|e| format!("create native elf tmp {}: {}", tmp_path.display(), e))?;
+            .map_err(|e| format!("error[CACHE_IO]: create native elf tmp {}: {}", tmp_path.display(), e))?;
         f.write_all(&elf)
-            .map_err(|e| format!("write native elf tmp {}: {}", tmp_path.display(), e))?;
+            .map_err(|e| format!("error[CACHE_IO]: write native elf tmp {}: {}", tmp_path.display(), e))?;
     }
     std::fs::rename(&tmp_path, &final_path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp_path);
-        format!("rename native elf {}: {}", final_path.display(), e)
+        format!("error[CACHE_IO]: rename native elf {}: {}", final_path.display(), e)
     })?;
     Ok(final_path)
 }
