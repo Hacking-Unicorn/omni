@@ -7464,7 +7464,7 @@ pub fn selftest_s4_honesty() -> Result<usize, String> {
     );
     if strict_readme {
         for &(label, needle) in &[
-            ("M3 seed hash", "0xC96457590C836700"),
+            ("M3 seed hash", "0x6209BB280E70BD5F"),
             ("M2 seed hash", "0x1DE7EDF361BB3626"),
             ("M4 seed hash", "0x99567F6F5D0E8F32"),
             ("M4 ELF size", "89,789"),
@@ -7486,7 +7486,7 @@ pub fn selftest_s4_honesty() -> Result<usize, String> {
     // 3. §4.2: `seed0/omni_seed0.rs` header comment must match the active SEED_M2 / SEED_M4 pins.
     let seed0_src = std::fs::read_to_string("seed0/omni_seed0.rs")
         .map_err(|e| format!("S4 read seed0/omni_seed0.rs: {}", e))?;
-    if !seed0_src.contains("59,540 words, 0xC96457590C836700")
+    if !seed0_src.contains("59,685 words, 0x6209BB280E70BD5F")
         || !seed0_src.contains("41,289 words, 0x1DE7EDF361BB3626")
         || !seed0_src.contains("27,819 words, 0x99567F6F5D0E8F32")
     {

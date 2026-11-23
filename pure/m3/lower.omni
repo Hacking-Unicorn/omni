@@ -270,7 +270,18 @@ fn m3w_ensure_join_slot(arena: bytes, start_w: i64, dst_tok: i64) -> bytes {
         i = i + 1;
         g = m2u_lt(i, sw) * m2u_eq(first_dst, 0);
     }
-    let need: trit = (1 - m2u_eq(first_dst, dst_tok)) <=> 0;
+    // A join dest bound to a named variable in `m3l_vtab()` (`w = if_pos ..` assigning an existing
+    // variable) is live: never clobber it with `CINT 0`. Only a fresh `let r = if_pos ..` dest gets
+    // the contiguity init (Rust `ensure_contiguous_join_slot`, `var_map` check).
+    let vcnt: i64 = ld_u64(arena, 272);
+    let j: i64 = 0;
+    let bound: i64 = 0;
+    while vcnt - j <=> 0 {
+        let vw0: i64 = ld_u64(arena, m3l_vtab() + (j << 4));
+        bound = bound | m2u_eq((vw0 >> 48) & 65535, dst_tok);
+        j = j + 1;
+    }
+    let need: trit = (1 - m2u_eq(first_dst, dst_tok)) * (1 - bound) <=> 0;
     let r: bytes = if_pos need {
         let w: bytes = arena;
         let k: i64 = sw - 1;

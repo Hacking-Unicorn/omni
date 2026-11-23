@@ -2078,6 +2078,14 @@ impl SurfaceLowerCtx {
         if self.first_dest_name_in_range(region_start, end).as_deref() == Some(dst) {
             return Ok(());
         }
+        // A join dest bound to a named variable (`w = if_pos c {..} else {..}` assigning an existing
+        // variable, possibly through nested if tails) is live: the arm may read it, so it must never be
+        // clobbered with `CINT 0`. Only a fresh `let r = if_pos ..` join dest (not yet bound) gets the
+        // contiguity init, exactly as before. A write of a fresh dest in a sibling/nested branch does
+        // not dominate this arm, so it is deliberately not consulted here.
+        if self.var_map.values().any(|r| r == dst) {
+            return Ok(());
+        }
         let asm = format!("{} = CINT 0", dst);
         if self.emit_asm {
             self.lines.insert(region_start, asm);
