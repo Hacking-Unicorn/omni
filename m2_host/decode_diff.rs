@@ -6883,7 +6883,7 @@ pub fn selftest_b4_pure_launcher() -> Result<(usize, usize, u64, bool), String> 
         }
 
         // 4. Pure native M2 compiler ELF (emitted by Pure M2 itself, zero Rust binary) compiles
-        //    pure/m4/m4.omni_bc -> exact 81,663-B ELF64 (0x05304F996E83AD5B).
+        //    pure/m4/m4.omni_bc -> exact 89,772-B ELF64 (0xD4B4CE81CFFF4636).
         let m2_raw = std::fs::read("pure/m2/m2.omni_bc").map_err(|e| format!("B4 read m2 seed: {}", e))?;
         let m2_u16 = decode_bytes_to_u16_stream(&m2_raw);
         let m2_elf = pure_default_compile_u16_to_elf(&m2_u16, 0, 0, 0)?;
@@ -6893,7 +6893,7 @@ pub fn selftest_b4_pure_launcher() -> Result<(usize, usize, u64, bool), String> 
             .output()
             .map_err(|e| format!("B4 exec m2_native: {}", e))?;
         drop(tmp_m2);
-        if !out_m4.status.success() || out_m4.stdout.len() != 81_827 || fnv1a_64_hash(&out_m4.stdout) != 0x1EA1507B0BBFDBAD {
+        if !out_m4.status.success() || out_m4.stdout.len() != 89_772 || fnv1a_64_hash(&out_m4.stdout) != 0xD4B4CE81CFFF4636 {
             return Err(format!(
                 "B4 pure native m2.elf -> m4.elf mismatch: status={:?} len={} hash=0x{:016X}",
                 out_m4.status,
@@ -7300,9 +7300,9 @@ pub fn selftest_s4_honesty() -> Result<usize, String> {
     if strict_readme {
         for &(label, needle) in &[
             ("M3 seed hash", "0xC96457590C836700"),
-            ("M2 seed hash", "0x653BD567AAF5E0DB"),
+            ("M2 seed hash", "0xB3CA3BEB90A1C98E"),
             ("M4 seed hash", "0x99567F6F5D0E8F32"),
-            ("M4 ELF size", "81,827"),
+            ("M4 ELF size", "89,772"),
             ("archived workspace", "oracle/archived-workspace/Cargo.toml"),
         ] {
             if !main_readme.contains(needle) {
@@ -7322,7 +7322,7 @@ pub fn selftest_s4_honesty() -> Result<usize, String> {
     let seed0_src = std::fs::read_to_string("seed0/omni_seed0.rs")
         .map_err(|e| format!("S4 read seed0/omni_seed0.rs: {}", e))?;
     if !seed0_src.contains("59,540 words, 0xC96457590C836700")
-        || !seed0_src.contains("40,234 words, 0x653BD567AAF5E0DB")
+        || !seed0_src.contains("41,220 words, 0xB3CA3BEB90A1C98E")
         || !seed0_src.contains("27,819 words, 0x99567F6F5D0E8F32")
     {
         return Err(String::from(
@@ -7342,7 +7342,7 @@ pub fn selftest_s4_honesty() -> Result<usize, String> {
 ///      and `pure_default_run_u16` paths execute hash-pinned native ELFs (`m3.elf`, `m2.elf`, `m4.elf`) with:
 ///        - 0-word diff vs interpreted on `pure/verifier_engine.omni` & `pure/m3/include.omni` (< 1,000 ms)
 ///        - exact negative error span parity (`error[M3_CODE_...]`, line 3)
-///        - 0-byte diff vs interpreted on `pure/m4/m4.omni_bc` -> `81,663 B` (`0x05304F996E83AD5B`, < 500 ms)
+///        - 0-byte diff vs interpreted on `pure/m4/m4.omni_bc` -> `89,772 B` (`0xD4B4CE81CFFF4636`, < 500 ms)
 ///        - exact `(ret, steps)` parity on `loop n=20000` -> `(200010000, 180010)` (< 1,000 ms) and
 ///          `error[OUT_OF_BOUNDS]` trap parity on OOB input.
 ///   3. All 5 frozen FNV-1a64 hashes remain intact.
@@ -7441,7 +7441,7 @@ pub fn selftest_s3_performance() -> Result<usize, String> {
     }
     checks += 1;
 
-    // 3. Default compile-elf on pure/m4/m4.omni_bc -> exact 81,663 B (0x05304F996E83AD5B) in < 500 ms.
+    // 3. Default compile-elf on pure/m4/m4.omni_bc -> exact 89,772 B (0xD4B4CE81CFFF4636) in < 500 ms.
     let m4_raw = std::fs::read("pure/m4/m4.omni_bc")
         .map_err(|e| format!("S3 read m4.omni_bc: {}", e))?;
     let m4_u16 = decode_bytes_to_u16_stream(&m4_raw);
@@ -7449,9 +7449,9 @@ pub fn selftest_s3_performance() -> Result<usize, String> {
     let m4_elf = pure_default_compile_u16_to_elf(&m4_u16, 0, 0, 0)?;
     let dt_m2_ms = t1.elapsed().as_millis();
     let h_m4_elf = fnv1a_64_hash(&m4_elf);
-    if m4_elf.len() != 81_827 || h_m4_elf != 0x1EA1_507B_0BBF_DBAD {
+    if m4_elf.len() != 89_772 || h_m4_elf != 0xD4B4_CE81_CFFF_4636 {
         return Err(format!(
-            "S3.3 default compile-elf m4.omni_bc mismatch: {} B (0x{:016X}) != 81827 B (0x1EA1507B0BBFDBAD)",
+            "S3.3 default compile-elf m4.omni_bc mismatch: {} B (0x{:016X}) != 89772 B (0xD4B4CE81CFFF4636)",
             m4_elf.len(),
             h_m4_elf
         ));

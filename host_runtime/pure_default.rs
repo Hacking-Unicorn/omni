@@ -27,14 +27,14 @@ pub fn pure_default_reject_macros(src: &str) -> Result<(), String> {
 // + Audit §3.3: Per-process decoded seed module caches (`OnceLock`).
 // ==============================================================================
 
-pub const NATIVE_M2_ELF_BYTES: usize = 109_076;
-pub const NATIVE_M2_ELF_FNV: u64 = 0xE2BF_E6BF_AD8E_0D3E;
-pub const NATIVE_M3_ELF_BYTES: usize = 165_900;
-pub const NATIVE_M3_ELF_FNV: u64 = 0x54B2_48B6_9704_ED59;
-pub const NATIVE_M4_ELF_BYTES: usize = 81_763;
-pub const NATIVE_M4_ELF_FNV: u64 = 0xC935_88C4_A4D4_D962;
-pub const NATIVE_VERIFIER_ELF_BYTES: usize = 37_938;
-pub const NATIVE_VERIFIER_ELF_FNV: u64 = 0x5EFE_59B8_6269_7CDA;
+pub const NATIVE_M2_ELF_BYTES: usize = 119_371;
+pub const NATIVE_M2_ELF_FNV: u64 = 0xDC26_DF4A_5601_DF5C;
+pub const NATIVE_M3_ELF_BYTES: usize = 182_330;
+pub const NATIVE_M3_ELF_FNV: u64 = 0x5C0D_9004_9D86_B3A4;
+pub const NATIVE_M4_ELF_BYTES: usize = 89_688;
+pub const NATIVE_M4_ELF_FNV: u64 = 0x6567_6439_7E92_6D3D;
+pub const NATIVE_VERIFIER_ELF_BYTES: usize = 38_080;
+pub const NATIVE_VERIFIER_ELF_FNV: u64 = 0xE928_B971_9DDB_F1B6;
 
 /// Audit Round 2 L5: Default & maximum fuel for `omni run --fuel N`, plus documented
 /// 65,536-word (128 KiB) native M2/M3/M4/verifier input-window threshold (larger inputs
