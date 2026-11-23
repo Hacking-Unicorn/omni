@@ -79,7 +79,7 @@ pub const CAP_ID_SYS: u16    = 10;
 
 #[inline(always)]
 pub const fn cap_bit(cap_id: u16) -> CapMask {
-    if cap_id == 0 { 0 } else { 1u16 << (cap_id - 1) }
+    if cap_id == 0 { 0 } else if cap_id > 16 { 1u16 << 15 } else { 1u16 << (cap_id - 1) }
 }
 
 #[inline(always)]
@@ -455,3 +455,61 @@ pub fn pack5_gate_direct(packed: &[u8], n_trits: usize) -> Result<i8, &'static s
 }
 
 // ==============================================================================
+
+
+#[cfg(test)]
+mod cap_bit_tests {
+    use super::*;
+
+    /// Defined caps occupy bits 0..=9. PURE (id 0) has no bit.
+    const DEFINED_CAP_BITS: [(u16, CapMask); 11] = [
+        (CAP_ID_PURE, 0x0000),
+        (CAP_ID_DB_R, 0x0001),
+        (CAP_ID_DB_W, 0x0002),
+        (CAP_ID_NET, 0x0004),
+        (CAP_ID_DOM, 0x0008),
+        (CAP_ID_AI, 0x0010),
+        (CAP_ID_VISION, 0x0020),
+        (CAP_ID_AUDIO, 0x0040),
+        (CAP_ID_AUTH, 0x0080),
+        (CAP_ID_FS, 0x0100),
+        (CAP_ID_SYS, 0x0200),
+    ];
+    const DEFINED_MASK: CapMask = 0x03FF;
+
+    #[test]
+    fn cap_bit_defined_ids_keep_stable_bits() {
+        for &(id, bit) in &DEFINED_CAP_BITS {
+            assert_eq!(cap_bit(id), bit, "defined cap_id {id} bit changed");
+        }
+        let mut acc: CapMask = 0;
+        for &(id, _) in &DEFINED_CAP_BITS {
+            acc |= cap_bit(id);
+        }
+        assert_eq!(acc, DEFINED_MASK);
+    }
+
+    #[test]
+    fn cap_bit_undefined_ids_fail_closed_no_alias() {
+        // Ids 11..=16 take unused bits 10..=15. Ids 17..=31 (and above) clamp to bit 15.
+        // Before: debug panics on id >= 17 (`1u16 << 16+`); release wraps so
+        // cap_bit(17) == 0x0001 (aliases DB_R) and cap_bit(18) == 0x0002 (aliases DB_W).
+        for id in 11u16..=16 {
+            let bit = cap_bit(id);
+            assert_eq!(bit, 1u16 << (id - 1), "cap_id {id} should use unused bit {}", id - 1);
+            assert_eq!(bit & DEFINED_MASK, 0, "cap_id {id} aliased a defined cap: 0x{bit:04X}");
+        }
+        for id in [17u16, 18, 19, 31, 32, 255, u16::MAX] {
+            let bit = cap_bit(id);
+            assert_eq!(bit, 1u16 << 15, "cap_id {id} should clamp to bit 15, got 0x{bit:04X}");
+            assert_eq!(bit & DEFINED_MASK, 0, "cap_id {id} aliased a defined cap: 0x{bit:04X}");
+        }
+        // unpack_tc masks the packed id to 0x1F, so a token can only carry 0..=31.
+        for id in 11u16..=31 {
+            let (_untrusted, got_id, mask) = unpack_tc(pack_tc(false, id));
+            assert_eq!(got_id, id);
+            assert_eq!(mask, cap_bit(id));
+            assert_eq!(mask & DEFINED_MASK, 0, "packed cap_id {id} aliased a defined cap");
+        }
+    }
+}
