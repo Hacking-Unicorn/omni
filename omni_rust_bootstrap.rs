@@ -128,7 +128,7 @@ pub const CAP_ID_SYS: u16    = 10;
 
 #[inline(always)]
 pub const fn cap_bit(cap_id: u16) -> CapMask {
-    if cap_id == 0 { 0 } else { 1u16 << (cap_id - 1) }
+    if cap_id == 0 { 0 } else if cap_id > 16 { 1u16 << 15 } else { 1u16 << (cap_id - 1) }
 }
 
 #[inline(always)]

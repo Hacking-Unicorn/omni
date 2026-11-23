@@ -1419,4 +1419,52 @@ mod tests {
             assert!(n >= 40, "expected at least 40 verifier-diff cases, got {n}");
         });
     }
+
+    /// A token packed with an undefined cap id (11..=31, including the former
+    /// overflow ids 17 and 31) must yield structured MISSING_CAP from the
+    /// path-included monolith verifier, even if the function holds every defined
+    /// cap. Before this fix, debug `cargo test` panicked in `cap_bit` and
+    /// release aliased cap 17 to DB_R.
+    #[test]
+    fn monolith_undefined_cap_token_reports_missing_cap() {
+        const ALL_DEFINED_CAPS: monolith::CapMask = 0x03FF;
+        let make = |cap_id: u16, fn_cap_mask: monolith::CapMask| monolith::BinFunction {
+            fn_idx: 0,
+            params: vec![],
+            ret_ty_tok: monolith::TY_I64,
+            cap_mask: fn_cap_mask,
+            instructions: vec![monolith::BinInstruction {
+                offset: 0,
+                dest_reg: Some(monolith::REG_BASE),
+                op_tok: 0x7F06, // CINT
+                ty_tok: monolith::TY_I64,
+                tc_tok: monolith::pack_tc(false, cap_id),
+                operands: vec![monolith::BinOperand::ImmInt(0)],
+            }],
+        };
+        // Defined-cap controls: PURE is accepted; DB_R is accepted only when granted.
+        let ok = monolith::verify_binary_function(&make(monolith::CAP_ID_PURE, 0));
+        assert!(ok.passed, "PURE CINT should pass: {:?}", ok.errors);
+        let granted = monolith::verify_binary_function(&make(
+            monolith::CAP_ID_DB_R,
+            monolith::cap_bit(monolith::CAP_ID_DB_R),
+        ));
+        assert!(granted.passed, "DB_R CINT on a DB_R fn should pass: {:?}", granted.errors);
+        let denied = monolith::verify_binary_function(&make(monolith::CAP_ID_DB_R, 0));
+        assert!(
+            !denied.passed && denied.errors.iter().any(|e| e.contains("MISSING_CAP")),
+            "DB_R CINT on a PURE fn should be MISSING_CAP: {:?}",
+            denied.errors
+        );
+        for cap_id in 11u16..=31 {
+            for fn_mask in [0, ALL_DEFINED_CAPS] {
+                let rep = monolith::verify_binary_function(&make(cap_id, fn_mask));
+                assert!(
+                    !rep.passed && rep.errors.iter().any(|e| e.contains("MISSING_CAP")),
+                    "cap_id {cap_id} on fn mask 0x{fn_mask:04X} should be MISSING_CAP, not a panic or alias; errors={:?}",
+                    rep.errors
+                );
+            }
+        }
+    }
 }
