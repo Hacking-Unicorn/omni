@@ -33,8 +33,8 @@ pub const NATIVE_M3_ELF_BYTES: usize = 182_330;
 pub const NATIVE_M3_ELF_FNV: u64 = 0x5C0D_9004_9D86_B3A4;
 pub const NATIVE_M4_ELF_BYTES: usize = 89_688;
 pub const NATIVE_M4_ELF_FNV: u64 = 0x6567_6439_7E92_6D3D;
-pub const NATIVE_VERIFIER_ELF_BYTES: usize = 38_080;
-pub const NATIVE_VERIFIER_ELF_FNV: u64 = 0xE928_B971_9DDB_F1B6;
+pub const NATIVE_VERIFIER_ELF_BYTES: usize = 37_953;
+pub const NATIVE_VERIFIER_ELF_FNV: u64 = 0x9C69_BF73_64DB_B04E;
 
 /// Audit Round 2 L5: Default & maximum fuel for `omni run --fuel N`, plus documented
 /// 65,536-word (128 KiB) native M2/M3/M4/verifier input-window threshold (larger inputs
@@ -64,7 +64,7 @@ pub fn verifier_standalone_source() -> String {
         "    let nwords: i64 = slen(stream);",
     );
     s.push_str(
-        "\n#[strict]\nfn verifier_standalone_entry(stream: array, api_mode: i64, _a1: i64, _a2: i64) -> bytes {\n    let rep: bytes = omni_verify_module_with_mode(stream, api_mode);\n    let n: i64 = ld_u64(rep, 168) * 8;\n    return ret_slice(rep, 8192, n);\n}\n",
+        "\n#[strict]\nfn verifier_standalone_entry(stream: array, api_mode: i64, _a1: i64, _a2: i64) -> bytes {\n    let rep: bytes = omni_verify_module_with_mode(stream, api_mode);\n    return rep;\n}\n",
     );
     s
 }
