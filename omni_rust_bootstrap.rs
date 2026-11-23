@@ -1318,44 +1318,98 @@ impl OmniBinaryVm {
 
     #[inline]
     /// Sound last-use check for zero-copy Bytes moves (zero semantic change):
-    /// `tok` is dead after `pc` iff it is never read after `pc`, AND either no branch after `pc`
-    /// jumps back to a label at `<= pc`, OR `tok` is a local register written after the last label
-    /// at `<= pc` and never read before `pc`.
+    /// `tok` is dead after `pc` iff no reachable execution path from `pc + 1` reads `tok`
+    /// before overwriting `tok` (`dest_reg == Some(tok)`) or returning (`0x7F4A`).
+    /// Walking the CFG avoids false-live scans past unconditional `JMP`s into mutually
+    /// exclusive `else` branches (Audit Round-3 L-F).
     fn tok_dead_after(insns: &[BinInstruction], pc: usize, tok: u16) -> bool {
-        let read_after = insns[pc + 1..].iter().any(|later| {
-            later.operands.iter().any(|op| matches!(op, BinOperand::Reg(ot) | BinOperand::Param(ot) if *ot == tok))
-        });
-        if read_after {
-            return false;
+        let n = insns.len();
+        if pc + 1 >= n {
+            return true;
         }
-        let mut prior_lbl_mask: u16 = 0;
-        let mut last_lbl_pc: usize = 0;
-        for (i, c) in insns[..=pc].iter().enumerate() {
-            if c.op_tok == 0x7F40 {
-                last_lbl_pc = i + 1;
-                if let Some(lid) = c.operands.first().and_then(extract_label_id) {
-                    prior_lbl_mask |= 1u16 << (lid & 0xF);
+        let mut visited_stack = [0u64; 16]; // covers up to 1024 instructions without heap alloc
+        let mut visited_heap: Vec<u64> = if n > 1024 { vec![0u64; (n + 63) / 64] } else { Vec::new() };
+        let mut work = [0usize; 64];
+        let mut work_len = 1usize;
+        work[0] = pc + 1;
+        let mut work_heap: Vec<usize> = Vec::new();
+        let find_lbl = |lbl: u16| -> Option<usize> {
+            insns
+                .iter()
+                .position(|c| c.op_tok == 0x7F40 && c.operands.first().and_then(extract_label_id) == Some(lbl))
+                .map(|p| p + 1)
+        };
+        let push_target = |t: usize, work: &mut [usize; 64], work_len: &mut usize, work_heap: &mut Vec<usize>| {
+            if t < n {
+                if *work_len < 64 {
+                    work[*work_len] = t;
+                    *work_len += 1;
                 } else {
-                    prior_lbl_mask = 0xFFFF;
+                    work_heap.push(t);
+                }
+            }
+        };
+        while work_len > 0 || !work_heap.is_empty() {
+            let cur = if let Some(v) = work_heap.pop() {
+                v
+            } else {
+                work_len -= 1;
+                work[work_len]
+            };
+            let w = cur >> 6;
+            let bit = 1u64 << (cur & 63);
+            if n <= 1024 {
+                if (visited_stack[w] & bit) != 0 {
+                    continue;
+                }
+                visited_stack[w] |= bit;
+            } else {
+                if (visited_heap[w] & bit) != 0 {
+                    continue;
+                }
+                visited_heap[w] |= bit;
+            }
+            let c = &insns[cur];
+            if c.operands.iter().any(|op| matches!(op, BinOperand::Reg(ot) | BinOperand::Param(ot) if *ot == tok)) {
+                return false;
+            }
+            if c.dest_reg == Some(tok) {
+                continue;
+            }
+            match c.op_tok {
+                0x7F4A => {} // RET terminates path
+                0x7F41 => {
+                    if let Some(tp) = c.operands.first().and_then(extract_label_id).and_then(&find_lbl) {
+                        push_target(tp, &mut work, &mut work_len, &mut work_heap);
+                    } else {
+                        push_target(cur + 1, &mut work, &mut work_len, &mut work_heap);
+                    }
+                }
+                0x7F42 => {
+                    let mut all_ok = true;
+                    for op in c.operands.get(1..4).into_iter().flatten() {
+                        if let Some(tp) = extract_label_id(op).and_then(&find_lbl) {
+                            push_target(tp, &mut work, &mut work_len, &mut work_heap);
+                        } else {
+                            all_ok = false;
+                        }
+                    }
+                    if !all_ok || c.operands.len() < 4 {
+                        push_target(cur + 1, &mut work, &mut work_len, &mut work_heap);
+                    }
+                }
+                0x7F43 | 0x7F44 => {
+                    if let Some(tp) = c.operands.get(1).and_then(extract_label_id).and_then(&find_lbl) {
+                        push_target(tp, &mut work, &mut work_len, &mut work_heap);
+                    }
+                    push_target(cur + 1, &mut work, &mut work_len, &mut work_heap);
+                }
+                _ => {
+                    push_target(cur + 1, &mut work, &mut work_len, &mut work_heap);
                 }
             }
         }
-        if prior_lbl_mask == 0 {
-            return true;
-        }
-        let has_back_branch = insns[pc + 1..].iter().any(|later| {
-            matches!(later.op_tok, 0x7F41..=0x7F44) && later.operands.iter().any(|op| {
-                extract_label_id(op).map_or(false, |lid| (prior_lbl_mask & (1u16 << (lid & 0xF))) != 0)
-            })
-        });
-        if !has_back_branch {
-            return true;
-        }
-        (REG_BASE..=REG_MAX).contains(&tok)
-            && insns[last_lbl_pc..pc].iter().any(|c| c.dest_reg == Some(tok))
-            && !insns[..pc].iter().any(|c| {
-                c.operands.iter().any(|op| matches!(op, BinOperand::Reg(ot) if *ot == tok))
-            })
+        true
     }
 
     fn eval_op_ref<'a>(op: &BinOperand, regs: &'a [OmniValue; 224]) -> Option<&'a OmniValue> {
@@ -1400,7 +1454,9 @@ impl OmniBinaryVm {
         args: Vec<OmniValue>,
     ) -> Result<OmniValue, String> {
         let mut no_restore: [(usize, OmniValue); 0] = [];
-        self.execute_function_inner(module, fn_idx, args, 0, &mut no_restore)
+        // Top-level `args` are owned by value and `no_restore` is empty, so all entry parameters
+        // are owned (Audit Round-3 L-F: avoids cloning top-level `Bytes` arenas on `ISET`/`CALL`).
+        self.execute_function_inner(module, fn_idx, args, u32::MAX, &mut no_restore)
     }
 
     fn execute_function_inner(
