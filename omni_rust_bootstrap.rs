@@ -4676,6 +4676,25 @@ impl SurfaceLowerCtx {
         }
     }
 
+    /// True if any instruction in `start..end` writes `dst` as its destination register.
+    fn dest_defined_in_range(&self, start: usize, end: usize, dst: &str) -> bool {
+        if self.emit_asm {
+            self.lines[start..end].iter().any(|line| {
+                let mut it = line.split_whitespace();
+                it.next() == Some(dst) && it.next() == Some("=")
+            })
+        } else {
+            let want: Option<u16> = dst
+                .strip_prefix('%')
+                .and_then(|n| n.parse::<u16>().ok())
+                .map(|n| REG_BASE + n);
+            match want {
+                Some(tok) => self.packets[start..end].iter().any(|pkt| pkt.first() == Some(&tok)),
+                None => false,
+            }
+        }
+    }
+
     /// If a value-returning branch would emit temps before writing the join dest,
     /// define that dest first so SSA numbering stays a single contiguous join slot.
     /// Programs whose first branch already writes the dest (existing goldens) are unchanged.
@@ -4692,6 +4711,12 @@ impl SurfaceLowerCtx {
             self.packets.len()
         };
         if self.first_dest_name_in_range(region_start, end).as_deref() == Some(dst) {
+            return Ok(());
+        }
+        // A join dest that is already defined earlier in this function (e.g. `w = if_pos c {..} else {..}`
+        // assigning an existing variable) is live: the arm may read it, so it must not be clobbered with
+        // `CINT 0`. Only a fresh join dest (from `let r = if_pos ..`) gets the contiguity init.
+        if self.dest_defined_in_range(0, region_start, dst) {
             return Ok(());
         }
         let asm = format!("{} = CINT 0", dst);
@@ -14647,6 +14672,124 @@ pub fn run_if_pos_join_slot_stage1_selftests() -> Result<usize, String> {
     Ok(checks)
 }
 
+/// Regression (lowerer live-dest clobber): `w = if_pos c { .. } else { .. }` / `w = match_trit ..`
+/// assigning an EXISTING variable must not get the fresh-join `w = CINT 0` init. Before the fix,
+/// `ensure_contiguous_join_slot` inserted it at the start of the first stream-order arm (the
+/// `else` / `neg` arm) whenever that arm emitted a temp before writing `w`, so the arm then read
+/// `w == 0` (e.g. `else { add2(w, 1024 + cur) }`). Fresh `let r = if_pos ..` joins keep the init.
+pub const JOIN_LIVE_DEST_CASES: &[(&str, &str, &[(i64, i64)])] = &[
+    (
+        "repro_9024_golden",
+        include_str!("spec/m3/join_live_dest_golden.omni"),
+        &[(0, 9024), (5, 8001), (-3, 9021)],
+    ),
+    (
+        "else_arm_binexpr_arg",
+        "fn add2(a: i64, b: i64) -> i64 { return a + b; }\nfn main(x: i64) -> i64 { let w: i64 = 7; let cur: i64 = x * 3; let c: trit = x <=> 0; w = if_pos c { add2(w, 1) } else { add2(w, 1024 + cur) }; return w; }",
+        &[(5, 8), (0, 1031), (-2, 1025)],
+    ),
+    (
+        "then_arm_binexpr_arg",
+        "fn add2(a: i64, b: i64) -> i64 { return a + b; }\nfn main(x: i64) -> i64 { let w: i64 = 7; let cur: i64 = x * 3; let c: trit = x <=> 0; w = if_pos c { let t: i64 = add2(w, 1024 + cur); t } else { add2(w, cur - 1) }; return w; }",
+        &[(5, 1046), (0, 6), (-2, 0)],
+    ),
+    (
+        "nested_if_else",
+        "fn add2(a: i64, b: i64) -> i64 { return a + b; }\nfn main(x: i64) -> i64 { let w: i64 = 7; let cur: i64 = x * 3; let c: trit = x <=> 0; w = if_pos c { add2(w, 1) } else { let d: trit = x <=> -3; if_pos d { add2(w, 1024 + cur) } else { add2(1024 + cur, w) * 2 } }; return w; }",
+        &[(5, 8), (0, 1031), (-2, 1025), (-3, 2044), (-4, 2038)],
+    ),
+    (
+        "result_used_after_if",
+        "fn main(x: i64) -> i64 { let w: i64 = 7; let cur: i64 = x * 3; let c: trit = x <=> 0; w = if_pos c { w * 2 } else { w + (cur - 1) }; let z: i64 = w * 10 + x; return z; }",
+        &[(5, 145), (0, 60), (-2, -2)],
+    ),
+    (
+        "match_trit_neg_arm",
+        "fn add2(a: i64, b: i64) -> i64 { return a + b; }\nfn main(x: i64) -> i64 { let w: i64 = 7; let cur: i64 = x * 3; let c: trit = x <=> 0; w = match_trit c { neg => add2(w, 1024 + cur), zero => w + 100, pos => add2(1024 + cur, w) }; return w; }",
+        &[(-2, 1025), (0, 107), (5, 1046)],
+    ),
+    (
+        // Fresh `let` join whose first stream-order write is nested in an inner if: every path
+        // still writes `r`, and the fresh-dest contiguity init behaviour is unchanged.
+        "fresh_nested_first_write",
+        "fn main(x: i64) -> i64 { let d: trit = x <=> -5; let c: trit = x <=> 0; let r: i64 = if_pos c { x * 2 } else { if_pos d { x + 30 } else { (x - 1) * 3 } }; return r * 10 + 1; }",
+        &[(5, 101), (0, 301), (-5, -179), (-6, -209)],
+    ),
+    (
+        "loop_carried_else",
+        "fn add2(a: i64, b: i64) -> i64 { return a + b; }\nfn main(x: i64) -> i64 { let acc: i64 = 1; let i: i64 = 0; while i < x { let c: trit = i <=> 1; acc = if_pos c { acc + 1 } else { add2(acc, 1000 + i) }; i = i + 1; } return acc; }",
+        &[(0, 1), (1, 1001), (3, 2003)],
+    ),
+];
+
+pub fn run_join_live_dest_selftests() -> Result<usize, String> {
+    let mut checks = 0usize;
+    for &(name, src, ios) in JOIN_LIVE_DEST_CASES {
+        let stream = compile_omni_surface_to_u16(src)
+            .map_err(|e| format!("join live-dest '{name}' failed to compile: {e}"))?;
+        for rep in verify_u16_stream(&stream)? {
+            if !rep.passed {
+                return Err(format!("join live-dest '{name}' failed binary verify (fn #{}): {:?}", rep.fn_idx, rep.errors));
+            }
+        }
+        let asm = compile_omni_surface_to_asm(src)
+            .map_err(|e| format!("join live-dest '{name}' asm lower failed: {e}"))?;
+        if assemble_omni_text_to_u16(&asm)? != stream {
+            return Err(format!("join live-dest '{name}': direct u16 != assembled asm"));
+        }
+        // Pure-Omni M3 must lower the same words as the Rust lowerer.
+        let pure_u16 = pure_default_compile_surface_to_u16(src, false)
+            .map_err(|e| format!("join live-dest '{name}' Pure-M3 compile failed: {e}"))?;
+        if pure_u16 != stream {
+            return Err(format!("join live-dest '{name}': Pure-M3 words != Rust lowerer words"));
+        }
+        checks += 1;
+        for &(inp, want) in ios {
+            let module = decode_omni_token_stream(&stream)?;
+            let mut vm = OmniBinaryVm::new();
+            let got = vm.execute_function(&module, 0, vec![OmniValue::Int(inp)])?;
+            if got != OmniValue::Int(want) {
+                return Err(format!("join live-dest '{name}' VM x={inp} got {got:?} want {want}"));
+            }
+            // Multi-function Wasm AOT (M2-10) on the same lowered stream.
+            let wasm = execute_wasm_module_i64(&compile_pure_u16_to_wasm_multi(&stream)?, &[inp])?;
+            if wasm != want {
+                return Err(format!("join live-dest '{name}' Wasm x={inp} got {wasm} want {want}"));
+            }
+            let (m4, _) = pure_default_run_u16(&stream, inp, 0, 0, false)?;
+            if m4 != want {
+                return Err(format!("join live-dest '{name}' Pure-M4 x={inp} got {m4} want {want}"));
+            }
+            checks += 1;
+            #[cfg(all(unix, target_arch = "x86_64"))]
+            {
+                let elf = compile_pure_u16_to_x86_64_elf_multi(&stream, inp, 0, 0)?;
+                let native = execute_native_elf_i64(&elf, &[inp])?;
+                if native != want {
+                    return Err(format!("join live-dest '{name}' Rust x86-64 x={inp} got {native} want {want}"));
+                }
+                let pure_elf = pure_default_compile_u16_to_elf(&stream, inp, 0, 0)?;
+                if pure_elf != elf {
+                    return Err(format!("join live-dest '{name}' x={inp}: Pure-M2 ELF != Rust multi x86-64 ELF"));
+                }
+                let pure_native = execute_native_elf_i64(&pure_elf, &[inp])?;
+                if pure_native != want {
+                    return Err(format!("join live-dest '{name}' Pure-M2 ELF x={inp} got {pure_native} want {want}"));
+                }
+                checks += 1;
+            }
+        }
+    }
+    // A fresh `let r = if_pos ..` join keeps its contiguity init (`%k = CINT 0`) unchanged.
+    let fresh = "fn main(x: i64) -> i64 { let c = x <=> 0; let r = if_pos c { 200 } else { (x + 1) * 2 }; return r; }";
+    let fresh_asm = compile_omni_surface_to_asm(fresh)?;
+    if !fresh_asm.lines().any(|l| l.trim() == "%1 = CINT 0") {
+        return Err(String::from("join live-dest: fresh let-join lost its `%1 = CINT 0` contiguity init"));
+    }
+    checks += 1;
+    Ok(checks)
+}
+
 pub fn run_if_pos_join_slot_selftests() -> Result<usize, String> {
     let mut checks = 0usize;
     let cases = IF_POS_JOIN_SLOT_CASES;
@@ -23540,6 +23683,7 @@ fn main(a: i64) -> i64 {
         // count check (omni-cli main.rs:870-873) still compares like with like.
         checks_passed += run_cross_backend_effect_golden_selftests()?;
         checks_passed += run_if_pos_join_slot_stage1_selftests()?;
+        checks_passed += run_join_live_dest_selftests()?;
 
         // 13AZ. Port-plan step 9 KV slice: `pure/host_kv.omni` vs Rust VM KV lockstep (VM-only)
         checks_passed += run_host_kv_lockstep_selftests()?;

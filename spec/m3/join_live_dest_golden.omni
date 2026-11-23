@@ -1,0 +1,16 @@
+// Regression golden (lowerer live-dest join clobber). `w` is an existing variable assigned from a
+// value `if_pos`; the fall-through `else` arm computes `1024 + cur` into a temp before writing `w`.
+// Before the fix the lowerer inserted `w = CINT 0` at the top of that arm, so x = 0 returned 1024.
+// Expected: main(0) = 9024 on `run --rust` and on the Pure default `run` / `run-surface` drivers.
+fn add2(a: i64, b: i64) -> i64 { return a + b; }
+fn main(x: i64) -> i64 {
+    let w: i64 = 8000;
+    let cur: i64 = x;
+    let ch: trit = x <=> 0;
+    w = if_pos ch {
+        add2(w, 1)
+    } else {
+        add2(w, 1024 + cur)
+    };
+    return w;
+}

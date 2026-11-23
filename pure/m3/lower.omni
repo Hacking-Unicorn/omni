@@ -270,7 +270,18 @@ fn m3w_ensure_join_slot(arena: bytes, start_w: i64, dst_tok: i64) -> bytes {
         i = i + 1;
         g = m2u_lt(i, sw) * m2u_eq(first_dst, 0);
     }
-    let need: trit = (1 - m2u_eq(first_dst, dst_tok)) <=> 0;
+    // A join dest already written earlier in this function (scan `fn_start..start_w`, fn_start at
+    // arena+328) is a live variable (`w = if_pos ..` assignment): never clobber it with `CINT 0`.
+    let j: i64 = ld_u64(arena, 328);
+    let at_ins: i64 = 1;
+    let def_before: i64 = 0;
+    while start_w - j <=> 0 {
+        let tj: i64 = ld_u16(arena, sbase + (j << 1));
+        def_before = def_before | (at_ins * m2u_eq(tj, dst_tok));
+        at_ins = m2u_eq(tj, 32484); // TOK_INS_END
+        j = j + 1;
+    }
+    let need: trit = (1 - m2u_eq(first_dst, dst_tok)) * (1 - def_before) <=> 0;
     let r: bytes = if_pos need {
         let w: bytes = arena;
         let k: i64 = sw - 1;
@@ -1139,6 +1150,7 @@ fn m3w_compile_one_fn(arena: bytes, src: array, ntok: i64, fi: i64) -> bytes {
         u = m3w_emit_u16(u, cap_mask);
         let ic_word_off: i64 = ld_u64(u, 232) + (ld_u64(u, 240) << 1);
         u = m3w_emit_u16(u, 0);                     // placeholder ins_cnt
+        u = iset_patch_i64(u, 328, ld_u64(u, 240)); // fn_start: first instruction word of this fn
         u = m3w_run_lower(u, src, root);
         let ok2: trit = m2u_eq(ld_u64(u, 40), 0) <=> 0;
         if_pos ok2 {
