@@ -128,7 +128,7 @@ pub const CAP_ID_SYS: u16    = 10;
 
 #[inline(always)]
 pub const fn cap_bit(cap_id: u16) -> CapMask {
-    if cap_id == 0 { 0 } else { 1u16 << (cap_id - 1) }
+    if cap_id == 0 { 0 } else if cap_id > 16 { 1u16 << 15 } else { 1u16 << (cap_id - 1) }
 }
 
 #[inline(always)]
@@ -18620,15 +18620,19 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x20]); // add rsp, 32
 
     if entry_is_bytes {
-        // Bytes return ABI: rax = off, rdx = len -> write(1, rbx + rax, rdx); exit(0)
+        // Bytes return ABI: rax = descriptor (base << 32) | len.
+        // Extract base (rcx) and len (rdx); write(1, rbx+base, len); exit(0).
         code.extend_from_slice(&[
-            0x48, 0x8D, 0x34, 0x03,             // lea rsi, [rbx+rax]
-            0xBF, 0x01, 0x00, 0x00, 0x00,       // mov edi, 1
-            0xB8, 0x01, 0x00, 0x00, 0x00,       // mov eax, 1 (sys_write)
-            0x0F, 0x05,                         // syscall
-            0x31, 0xFF,                         // xor edi, edi
-            0xB8, 0x3C, 0x00, 0x00, 0x00,       // mov eax, 60 (sys_exit)
-            0x0F, 0x05,                         // syscall
+            0x48, 0x89, 0xC1,             // mov rcx, rax
+            0x48, 0xC1, 0xE9, 0x20,       // shr rcx, 32 (base)
+            0x89, 0xC2,                   // mov edx, eax (len)
+            0x48, 0x8D, 0x34, 0x0B,       // lea rsi, [rbx+rcx]
+            0xBF, 0x01, 0x00, 0x00, 0x00, // mov edi, 1
+            0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1 (sys_write)
+            0x0F, 0x05,                   // syscall
+            0x31, 0xFF,                   // xor edi, edi
+            0xB8, 0x3C, 0x00, 0x00, 0x00, // mov eax, 60 (sys_exit)
+            0x0F, 0x05,                   // syscall
         ]);
     } else {
         code.extend_from_slice(&[
@@ -18725,12 +18729,6 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
 
         let mut label_offsets: Vec<(u16, usize)> = Vec::new();
         let mut relocs: Vec<RelocPatch> = Vec::new();
-        let multi_buffer_regs: std::collections::BTreeSet<u16> = func
-            .instructions
-            .iter()
-            .filter(|i| matches!(i.op_tok, 0x7F0D | 0x7F0F))
-            .filter_map(|i| i.dest_reg)
-            .collect();
 
         for ins in &func.instructions {
             match ins.op_tok {
@@ -18740,7 +18738,9 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
                     if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
                 }
                 0x7F0D => {
-                    code.extend_from_slice(&[0x45, 0x31, 0xDB]); // xor r11d, r11d
+                    // Descriptor model (VM parity): ANEW allocates at the top,
+                    // dest = (r11 << 32) | 0, r11 unchanged.
+                    code.extend_from_slice(&[0x4C, 0x89, 0xD8, 0x48, 0xC1, 0xE0, 0x20]); // mov rax, r11; shl rax, 32
                     if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
                 }
                 0x7F50 => {
@@ -18755,7 +18755,9 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
                     if is_arr_param {
                         code.extend_from_slice(&[0x48, 0x8B, 0x83, 0x00, 0x00, 0x12, 0x00]); // mov rax, [rbx+0x120000]
                     } else {
-                        code.extend_from_slice(&[0x4C, 0x89, 0xD8]); // mov rax, r11
+                        // Descriptor model: len = desc & 0xFFFFFFFF.
+                        emit_load_op(&mut code, &ins.operands[0], false); // rax = descriptor
+                        code.extend_from_slice(&[0x89, 0xC0]); // mov eax, eax (len)
                     }
                     if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
                 }
@@ -18768,8 +18770,13 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
                             BinOperand::ImmInt(-8) => 8,
                             _ => return Err(String::from("error[BAD_TYPE]: 3-op IGET mode must be -1, -2, -4, or -8")),
                         };
+                        // Descriptor model: load at [rbx + base + off], bounds-checked
+                        // against len (trap T_OOB). base = desc >> 32 (rsi), len = desc (rdx).
+                        emit_load_op(&mut code, &ins.operands[0], false); // rax = descriptor
+                        code.extend_from_slice(&[0x48, 0x89, 0xC6, 0x48, 0xC1, 0xEE, 0x20]); // mov rsi, rax; shr rsi, 32 (base)
+                        code.extend_from_slice(&[0x89, 0xC2]); // mov edx, eax (len)
                         emit_load_op(&mut code, &ins.operands[2], true); // rcx = off
-                        // Bounds check: off >= 0 && off + width <= r11 (no wrap)
+                        // Bounds check: off >= 0 && off + width <= len (no wrap)
                         code.extend_from_slice(&[0x48, 0x85, 0xC9, 0x0F, 0x88]); // test rcx,rcx; js T_OOB
                         trap_relocs.push((code.len(), 1));
                         code.extend_from_slice(&[0, 0, 0, 0]);
@@ -18777,40 +18784,56 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
                         code.extend_from_slice(&[0x48, 0x39, 0xC8, 0x0F, 0x82]); // cmp rax, rcx; jb T_OOB
                         trap_relocs.push((code.len(), 1));
                         code.extend_from_slice(&[0, 0, 0, 0]);
-                        code.extend_from_slice(&[0x4C, 0x39, 0xD8, 0x0F, 0x87]); // cmp rax, r11; ja T_OOB
+                        code.extend_from_slice(&[0x48, 0x39, 0xD0, 0x0F, 0x87]); // cmp rax, rdx; ja T_OOB
                         trap_relocs.push((code.len(), 1));
                         code.extend_from_slice(&[0, 0, 0, 0]);
+                        code.extend_from_slice(&[0x48, 0x01, 0xCE]); // add rsi, rcx (base+off)
                         match width {
-                            1 => code.extend_from_slice(&[0x0F, 0xB6, 0x04, 0x0B]),
-                            2 => code.extend_from_slice(&[0x0F, 0xB7, 0x04, 0x0B]),
-                            4 => code.extend_from_slice(&[0x8B, 0x04, 0x0B]),
-                            _ => code.extend_from_slice(&[0x48, 0x8B, 0x04, 0x0B]),
+                            1 => code.extend_from_slice(&[0x0F, 0xB6, 0x04, 0x1E]),
+                            2 => code.extend_from_slice(&[0x0F, 0xB7, 0x04, 0x1E]),
+                            4 => code.extend_from_slice(&[0x8B, 0x04, 0x1E]),
+                            _ => code.extend_from_slice(&[0x48, 0x8B, 0x04, 0x1E]),
                         }
                         if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
-                    } else if let Some(BinOperand::Reg(r_arr)) = ins.operands.first().filter(|o| {
-                        matches!(o, BinOperand::Reg(r) if multi_buffer_regs.contains(r))
-                    }) {
-                        let _ = r_arr;
-                        // Guarded arena-heap byte readback for provable ANEW/ISET buffer registers.
-                        emit_load_op(&mut code, &ins.operands[0], false); // rax = len
-                        emit_load_op(&mut code, &ins.operands[1], true);  // rcx = idx
-                        code.extend_from_slice(&[
-                            0x48, 0x39, 0xC1, 0x73, 0x0B, // cmp rcx, rax; jae +11
-                            0x4C, 0x39, 0xD9, 0x73, 0x06, // cmp rcx, r11; jae +6
-                            0x0F, 0xB6, 0x04, 0x0B,       // movzx eax, byte [rbx+rcx]
-                            0xEB, 0x02, 0x31, 0xC0,       // jmp +2; xor eax, eax
-                        ]);
-                        if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
                     } else {
-                        // Bounded 2-op input-window u16 read: idx >= nwords (unsigned) -> 0
-                        emit_load_op(&mut code, &ins.operands[1], false);
-                        code.extend_from_slice(&[
-                            0x48, 0x3B, 0x83, 0x00, 0x00, 0x12, 0x00, // cmp rax, [rbx+0x120000]
-                            0x73, 0x0A,                               // jae +10
-                            0x0F, 0xB7, 0x84, 0x43, 0x00, 0x00, 0x10, 0x00, // movzx eax, word [rbx+rax*2+0x100000]
-                            0xEB, 0x02,                               // jmp +2
-                            0x31, 0xC0,                               // xor eax, eax
-                        ]);
+                        // 2-op IGET: (buf, idx) -> byte, lenient (0 on OOB). Descriptor
+                        // model: read [rbx + base + idx] (0 if idx >= len). A TY_ARRAY
+                        // param reads the stdin window (token input) as before.
+                        let is_arr_param = match ins.operands.first() {
+                            Some(BinOperand::Param(p_tok)) => func
+                                .params
+                                .get((*p_tok - PAR_BASE) as usize)
+                                .map(|&(_, ty, _)| ty == TY_ARRAY)
+                                .unwrap_or(false),
+                            _ => false,
+                        };
+                        if is_arr_param {
+                            // Bounded 2-op input-window u16 read: idx >= nwords (unsigned) -> 0
+                            emit_load_op(&mut code, &ins.operands[1], false);
+                            code.extend_from_slice(&[
+                                0x48, 0x3B, 0x83, 0x00, 0x00, 0x12, 0x00, // cmp rax, [rbx+0x120000]
+                                0x73, 0x0A,                               // jae +10
+                                0x0F, 0xB7, 0x84, 0x43, 0x00, 0x00, 0x10, 0x00, // movzx eax, word [rbx+rax*2+0x100000]
+                                0xEB, 0x02,                               // jmp +2
+                                0x31, 0xC0,                               // xor eax, eax
+                            ]);
+                        } else {
+                            emit_load_op(&mut code, &ins.operands[0], false); // rax = descriptor
+                            code.extend_from_slice(&[
+                                0x48, 0x89, 0xC1, // mov rcx, rax
+                                0x48, 0xC1, 0xE9, 0x20, // shr rcx, 32 (base)
+                                0x89, 0xC2, // mov edx, eax (len)
+                            ]);
+                            emit_load_op(&mut code, &ins.operands[1], false); // rax = idx
+                            code.extend_from_slice(&[
+                                0x48, 0x39, 0xD0, // cmp rax, rdx
+                                0x73, 0x09, // jae +9
+                                0x48, 0x01, 0xC8, // add rax, rcx (base+idx)
+                                0x0F, 0xB6, 0x04, 0x03, // movzx eax, byte [rbx+rax]
+                                0xEB, 0x02, // jmp +2
+                                0x31, 0xC0, // xor eax, eax
+                            ]);
+                        }
                         if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
                     }
                 }
@@ -18822,14 +18845,32 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
                         tr.push((c.len(), 2));
                         c.extend_from_slice(&[0, 0, 0, 0]);
                     };
+                    // Descriptor model: appends write at [rbx+r11] (at-top) and bump r11
+                    // as before, but the dest is the new descriptor (base<<32)|(len+k).
+                    // rsi holds the base across an append; the desc is rebuilt from it.
+                    let emit_save_base_rsi = |c: &mut Vec<u8>| {
+                        c.extend_from_slice(&[0x48, 0x89, 0xC6, 0x48, 0xC1, 0xEE, 0x20]); // mov rsi, rax; shr rsi, 32 (base)
+                    };
+                    let emit_desc_after_append = |c: &mut Vec<u8>| {
+                        c.extend_from_slice(&[0x48, 0x89, 0xF0, 0x48, 0xC1, 0xE0, 0x20]); // mov rax, rsi; shl rax, 32
+                        c.extend_from_slice(&[0x4C, 0x89, 0xDA, 0x48, 0x29, 0xF2, 0x48, 0x09, 0xD0]); // mov rdx, r11; sub rdx, rsi; or rax, rdx
+                    };
                     if ins.operands.len() == 3 && ins.operands[1] == BinOperand::ImmInt(-4) {
+                        emit_load_op(&mut code, &ins.operands[0], false); // rax = descriptor
+                        emit_save_base_rsi(&mut code);
                         emit_cap_guard(&mut code, &mut trap_relocs, 4);
                         emit_load_op(&mut code, &ins.operands[2], false);
                         code.extend_from_slice(&[0x42, 0x89, 0x04, 0x1B, 0x49, 0x83, 0xC3, 0x04]);
+                        emit_desc_after_append(&mut code);
+                        if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
                     } else if ins.operands.len() == 3 && ins.operands[1] == BinOperand::ImmInt(-8) {
+                        emit_load_op(&mut code, &ins.operands[0], false); // rax = descriptor
+                        emit_save_base_rsi(&mut code);
                         emit_cap_guard(&mut code, &mut trap_relocs, 8);
                         emit_load_op(&mut code, &ins.operands[2], false);
                         code.extend_from_slice(&[0x4A, 0x89, 0x04, 0x1B, 0x49, 0x83, 0xC3, 0x08]);
+                        emit_desc_after_append(&mut code);
+                        if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
                     } else if ins.operands.len() == 4
                         && (ins.operands[1] == BinOperand::ImmInt(-2)
                             || ins.operands[1] == BinOperand::ImmInt(-4)
@@ -18842,37 +18883,44 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
                         } else {
                             8
                         };
-                        emit_load_op(&mut code, &ins.operands[3], false);
-                        code.extend_from_slice(&[0x48, 0x89, 0xC2]); // mov rdx, rax
+                        emit_load_op(&mut code, &ins.operands[0], false); // rax = descriptor
+                        code.extend_from_slice(&[0x48, 0x89, 0xC7, 0x48, 0xC1, 0xEF, 0x20]); // mov rdi, rax; shr rdi, 32 (base)
+                        code.extend_from_slice(&[0x89, 0xC2]); // mov edx, eax (len)
+                        emit_load_op(&mut code, &ins.operands[3], false); // rax = val
+                        code.extend_from_slice(&[0x48, 0x89, 0xC6]); // mov rsi, rax (save val)
                         emit_load_op(&mut code, &ins.operands[2], true); // rcx = off
-                        code.extend_from_slice(&[0x48, 0x85, 0xC9, 0x0F, 0x88]); // js T_OOB
+                        code.extend_from_slice(&[0x48, 0x85, 0xC9, 0x0F, 0x88]); // test rcx, rcx; js T_OOB
                         trap_relocs.push((code.len(), 1));
                         code.extend_from_slice(&[0, 0, 0, 0]);
                         code.extend_from_slice(&[0x48, 0x8D, 0x41, width]); // lea rax, [rcx+width]
-                        code.extend_from_slice(&[0x48, 0x39, 0xC8, 0x0F, 0x82]); // jb T_OOB
+                        code.extend_from_slice(&[0x48, 0x39, 0xC8, 0x0F, 0x82]); // cmp rax, rcx; jb T_OOB
                         trap_relocs.push((code.len(), 1));
                         code.extend_from_slice(&[0, 0, 0, 0]);
-                        code.extend_from_slice(&[0x4C, 0x39, 0xD8, 0x0F, 0x87]); // ja T_OOB
+                        code.extend_from_slice(&[0x48, 0x39, 0xD0, 0x0F, 0x87]); // cmp rax, rdx; ja T_OOB
                         trap_relocs.push((code.len(), 1));
                         code.extend_from_slice(&[0, 0, 0, 0]);
+                        code.extend_from_slice(&[0x48, 0x01, 0xCF]); // add rdi, rcx (base+off)
+                        code.extend_from_slice(&[0x48, 0x89, 0xF0]); // mov rax, rsi (restore val)
                         if width == 2 {
-                            code.extend_from_slice(&[0x66, 0x89, 0x14, 0x0B]); // mov [rbx+rcx], dx
+                            code.extend_from_slice(&[0x66, 0x89, 0x04, 0x1F]); // mov [rbx+rdi], ax
                         } else if width == 4 {
-                            code.extend_from_slice(&[0x89, 0x14, 0x0B]);       // mov [rbx+rcx], edx
+                            code.extend_from_slice(&[0x89, 0x04, 0x1F]);       // mov [rbx+rdi], eax
                         } else {
-                            code.extend_from_slice(&[0x48, 0x89, 0x14, 0x0B]); // mov [rbx+rcx], rdx
+                            code.extend_from_slice(&[0x48, 0x89, 0x04, 0x1F]); // mov [rbx+rdi], rax
                         }
+                        emit_load_op(&mut code, &ins.operands[0], false); // rax = descriptor (unchanged)
+                        if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
                     } else {
                         let k = ins.operands.len().saturating_sub(1) as u32;
+                        emit_load_op(&mut code, &ins.operands[0], false); // rax = descriptor
+                        emit_save_base_rsi(&mut code);
                         emit_cap_guard(&mut code, &mut trap_relocs, k);
                         for op_b in &ins.operands[1..] {
                             emit_load_op(&mut code, op_b, false);
                             code.extend_from_slice(&[0x42, 0x88, 0x04, 0x1B, 0x49, 0xFF, 0xC3]);
                         }
-                    }
-                    if let Some(d) = ins.dest_reg {
-                        code.extend_from_slice(&[0x4C, 0x89, 0xD8]);
-                        emit_store_rax(&mut code, d);
+                        emit_desc_after_append(&mut code);
+                        if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
                     }
                 }
                 0x7F10 | 0x7F11 | 0x7F12 | 0x7F1E | 0x7F1F | 0x7F20 => {
@@ -19109,6 +19157,9 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
                 0x7F4A => {
                     if func.ret_ty_tok == TY_BYTES {
                         if ins.operands.len() == 3 {
+                            // 3-op bytes RET `RET buf, off, len`: slice of op0's buffer.
+                            emit_load_op(&mut code, &ins.operands[0], false); // rax = buf descriptor
+                            code.extend_from_slice(&[0x49, 0x89, 0xC0]); // mov r8, rax
                             emit_load_op(&mut code, &ins.operands[1], false); // rax = off
                             emit_load_op(&mut code, &ins.operands[2], true);  // rcx = len
                             code.extend_from_slice(&[0x48, 0x85, 0xC0, 0x0F, 0x88]); // js T_OOB
@@ -19121,12 +19172,21 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
                             code.extend_from_slice(&[0x48, 0x39, 0xC6, 0x0F, 0x82]); // cmp rsi, rax; jb T_OOB
                             trap_relocs.push((code.len(), 1));
                             code.extend_from_slice(&[0, 0, 0, 0]);
-                            code.extend_from_slice(&[0x4C, 0x39, 0xDE, 0x0F, 0x87]); // cmp rsi, r11; ja T_OOB
+                            code.extend_from_slice(&[0x44, 0x89, 0xC2]); // mov edx, r8d (buf_len)
+                            code.extend_from_slice(&[0x48, 0x39, 0xD6, 0x0F, 0x87]); // cmp rsi, rdx; ja T_OOB
                             trap_relocs.push((code.len(), 1));
                             code.extend_from_slice(&[0, 0, 0, 0]);
+                            code.extend_from_slice(&[0x49, 0xC1, 0xE8, 0x20]); // shr r8, 32 (buf_base)
+                            code.extend_from_slice(&[0x4C, 0x01, 0xC0]); // add rax, r8
+                            // Return the slice as a descriptor in rax: ((base + off) << 32) | len.
+                            code.extend_from_slice(&[0x48, 0xC1, 0xE0, 0x20]); // shl rax, 32
+                            code.extend_from_slice(&[0x48, 0x09, 0xC8]); // or rax, rcx
                             code.extend_from_slice(&[0x48, 0x89, 0xCA, 0xC9, 0xC3]); // mov rdx, rcx; leave; ret
                         } else {
-                            code.extend_from_slice(&[0x31, 0xC0, 0x4C, 0x89, 0xDA, 0xC9, 0xC3]); // xor eax,eax; mov rdx,r11; leave; ret
+                            // 1-op bytes RET: return the descriptor itself in rax
+                            // (rax = (base << 32) | len).
+                            emit_load_op(&mut code, &ins.operands[0], false); // rax = descriptor
+                            code.extend_from_slice(&[0xC9, 0xC3]); // leave; ret
                         }
                     } else if ins.operands.len() == 3 {
                         return Err(String::from("error[BAD_TYPE]: 3-op RET requires Bytes return type"));

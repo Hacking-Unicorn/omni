@@ -1,5 +1,5 @@
 // Seed-Shrink Phase B4 harness for `pure/m5/launcher.omni`.
-// Exposes 4-param `main` returning the 181-byte standalone Linux x86-64 launcher ELF64.
+// Exposes 4-param `main` returning the 237-byte standalone Linux x86-64 launcher ELF64.
 
 #[strict]
 fn main(arena: bytes, a: i64, b: i64, c: i64) -> bytes {

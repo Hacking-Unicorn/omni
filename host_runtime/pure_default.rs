@@ -27,14 +27,14 @@ pub fn pure_default_reject_macros(src: &str) -> Result<(), String> {
 // + Audit §3.3: Per-process decoded seed module caches (`OnceLock`).
 // ==============================================================================
 
-pub const NATIVE_M2_ELF_BYTES: usize = 109_076;
-pub const NATIVE_M2_ELF_FNV: u64 = 0xE2BF_E6BF_AD8E_0D3E;
-pub const NATIVE_M3_ELF_BYTES: usize = 165_900;
-pub const NATIVE_M3_ELF_FNV: u64 = 0x54B2_48B6_9704_ED59;
-pub const NATIVE_M4_ELF_BYTES: usize = 81_763;
-pub const NATIVE_M4_ELF_FNV: u64 = 0xC935_88C4_A4D4_D962;
-pub const NATIVE_VERIFIER_ELF_BYTES: usize = 37_960;
-pub const NATIVE_VERIFIER_ELF_FNV: u64 = 0x0191_7D97_B6D3_5247;
+pub const NATIVE_M2_ELF_BYTES: usize = 119_581;
+pub const NATIVE_M2_ELF_FNV: u64 = 0x92F8_5264_4E07_8AA6;
+pub const NATIVE_M3_ELF_BYTES: usize = 182_435;
+pub const NATIVE_M3_ELF_FNV: u64 = 0x414F_C127_C2BB_3376;
+pub const NATIVE_M4_ELF_BYTES: usize = 89_705;
+pub const NATIVE_M4_ELF_FNV: u64 = 0xAE3F_3DF0_69BE_D8B7;
+pub const NATIVE_VERIFIER_ELF_BYTES: usize = 37_992;
+pub const NATIVE_VERIFIER_ELF_FNV: u64 = 0x00BD_060A_772E_6762;
 
 /// Audit Round 2 L5: Default & maximum fuel for `omni run --fuel N`, plus documented
 /// 65,536-word (128 KiB) native M2/M3/M4/verifier input-window threshold (larger inputs
@@ -64,7 +64,7 @@ pub fn verifier_standalone_source() -> String {
         "    let nwords: i64 = slen(stream);",
     );
     s.push_str(
-        "\n#[strict]\nfn verifier_standalone_entry(stream: array, api_mode: i64, _a1: i64, _a2: i64) -> bytes {\n    let rep: bytes = omni_verify_module_with_mode(stream, api_mode);\n    let n: i64 = ld_u64(rep, 168) * 8;\n    return ret_slice(rep, 8192, n);\n}\n",
+        "\n#[strict]\nfn verifier_standalone_entry(stream: array, api_mode: i64, _a1: i64, _a2: i64) -> bytes {\n    let rep: bytes = omni_verify_module_with_mode(stream, api_mode);\n    return rep;\n}\n",
     );
     s
 }
