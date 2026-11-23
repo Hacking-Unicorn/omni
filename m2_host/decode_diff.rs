@@ -1111,7 +1111,10 @@ pub fn selftest_m2_15_pure_multi_compiler() -> Result<usize, String> {
             if !out.status.success() || out.stdout.len() != 8 {
                 return Err(format!("N2 {} exited {:?} stdout={}B", tag, out.status, out.stdout.len()));
             }
-            let got = i64::from_le_bytes(out.stdout[..8].try_into().unwrap());
+            let got_arr: [u8; 8] = out.stdout[..8]
+                .try_into()
+                .map_err(|_| format!("N2 {} stdout slice length != 8", tag))?;
+            let got = i64::from_le_bytes(got_arr);
             if got != 44 {
                 return Err(format!("N2 {} 2-op IGET buffer repro returned {}, want 44", tag, got));
             }
@@ -1125,7 +1128,10 @@ pub fn selftest_m2_15_pure_multi_compiler() -> Result<usize, String> {
         if !out_oob.status.success() || out_oob.stdout.len() != 8 {
             return Err(format!("N2 oob exited {:?} stdout={}B", out_oob.status, out_oob.stdout.len()));
         }
-        let got_oob = i64::from_le_bytes(out_oob.stdout[..8].try_into().unwrap());
+        let oob_arr: [u8; 8] = out_oob.stdout[..8]
+            .try_into()
+            .map_err(|_| String::from("N2 oob stdout slice length != 8"))?;
+        let got_oob = i64::from_le_bytes(oob_arr);
         if got_oob != 0 {
             return Err(format!("N2 multi-mode 2-op IGET OOB returned {}, want 0", got_oob));
         }
@@ -6342,7 +6348,48 @@ pub fn selftest_b2_pure_verifier() -> Result<usize, String> {
     // 6. Audit Round 2 N1: per-opcode minimum operand arity + EMPTY_MODULE + reconciled 0x7F42 (BR_TRIT min=4).
     checks += selftest_n1_op_arity_and_empty_module()?;
 
-    // 7. Frozen hashes intact.
+    // 7. Audit Round 3 M1: pure verifier must fail closed (REPORT_OVERFLOW 3008) on >2,387 functions,
+    //    never silently dropping trailing functions or returning Ok(()) on truncated reports.
+    let build_n_good_then_bad = |n_good: usize| -> Vec<u16> {
+        let mut s = Vec::with_capacity(2 + (n_good + 1) * 14);
+        s.push(0x7EE0); // TOK_MOD_BEGIN
+        for fid in 0..n_good {
+            // fn#fid() -> i64, cap=0, 1 ins: RET imm16(0)
+            s.extend_from_slice(&[
+                0x7EE3, fid as u16, 0, 0x7F81, 0, 1,
+                0x7F4A, 0x7EE5, 0, 0x7EE4,
+            ]);
+        }
+        // Trailing bad fn: r0: i64 [cap=1] = CINT 0 (missing cap 1003), RET r0
+        s.extend_from_slice(&[
+            0x7EE3, n_good as u16, 0, 0x7F81, 0, 2,
+            0x7E00, 0x7F06, 0x7F81, 0x7FC1, 0x7EE5, 0, 0x7EE4,
+            0x7F4A, 0x7E00, 0x7EE4,
+            0x7EEF, // TOK_MOD_END
+        ]);
+        s
+    };
+    let s_2388 = build_n_good_then_bad(2388);
+    match pure_default_verify_u16(&s_2388, false) {
+        Ok(()) => return Err(String::from("M1 pure verifier failed open (returned Ok) on 2,388 good + 1 bad fn")),
+        Err(msg) => {
+            if !msg.contains("PURE_VERIFY_REPORT_OVERFLOW") && !msg.contains("3008") {
+                return Err(format!("M1 2,388-fn stream expected PURE_VERIFY_REPORT_OVERFLOW, got: {}", msg));
+            }
+        }
+    }
+    let s_2387 = build_n_good_then_bad(2387);
+    match pure_default_verify_u16(&s_2387, false) {
+        Ok(()) => return Err(String::from("M1 pure verifier failed open on 2,387 good + 1 bad fn")),
+        Err(msg) => {
+            if msg.contains("PURE_VERIFY_0 ") {
+                return Err(format!("M1 2,387-fn stream reported bogus code 0 instead of overflow/1003: {}", msg));
+            }
+        }
+    }
+    checks += 1;
+
+    // 8. Frozen hashes intact.
     selftest_m2_frozen_hashes()?;
     checks += 1;
 
@@ -6470,21 +6517,26 @@ pub fn selftest_n1_op_arity_and_empty_module() -> Result<usize, String> {
     let m2_min_fn = m2_mod.functions.get(m2_min_pos).ok_or("N1 m2_min_pos OOB")?.fn_idx;
     let mut parity_vm = OmniBinaryVm::with_budgets(50_000_000, 16 * 1024 * 1024);
     for op in 0x7F00i64..=0x7F7Fi64 {
+        let ve_v = match parity_vm.execute_function(ve_mod, ve_min_fn, vec![OmniValue::Int(op)])? {
+            OmniValue::Int(v) => v,
+            other => return Err(format!("N1 op_min_ops(0x{:04X}) returned {:?}", op, other)),
+        };
+        let rust_v = vm_op_min_ops(op as u16) as i64;
+        if rust_v > 0 && ve_v != rust_v {
+            return Err(format!(
+                "L-E opcode arity drift at 0x{:04X}: verifier_engine={} != Rust vm_op_min_ops={}",
+                op, ve_v, rust_v
+            ));
+        }
         let m2_v = match parity_vm.execute_function(m2_mod, m2_min_fn, vec![OmniValue::Int(op)])? {
             OmniValue::Int(v) => v,
             other => return Err(format!("N1 m2v_ins_min_ops(0x{:04X}) returned {:?}", op, other)),
         };
-        if m2_v >= 0 {
-            let ve_v = match parity_vm.execute_function(ve_mod, ve_min_fn, vec![OmniValue::Int(op)])? {
-                OmniValue::Int(v) => v,
-                other => return Err(format!("N1 op_min_ops(0x{:04X}) returned {:?}", op, other)),
-            };
-            if ve_v != m2_v {
-                return Err(format!(
-                    "N1 opcode arity drift at 0x{:04X}: verifier_engine={} != mod_check={}",
-                    op, ve_v, m2_v
-                ));
-            }
+        if m2_v >= 0 && ve_v != m2_v {
+            return Err(format!(
+                "N1 opcode arity drift at 0x{:04X}: verifier_engine={} != mod_check={}",
+                op, ve_v, m2_v
+            ));
         }
     }
     checks += 1;

@@ -624,6 +624,23 @@ fn parse_one_operand(stream: &[u16], pos: &mut usize) -> Result<BinOperand, Stri
     }
 }
 
+/// Audit Round 3 L-E: Single authoritative Rust per-opcode minimum operand count table
+/// shared by `OmniBinaryVm` and `compile_pure_u16_to_wasm`, and drift-locked against
+/// `pure/verifier_engine.omni::op_min_ops` and `pure/m2/verify/mod_check.omni::m2v_ins_min_ops`.
+pub const fn vm_op_min_ops(op_tok: u16) -> usize {
+    match op_tok {
+        0x7F42 | 0x7F45 => 4,
+        0x7F2C | 0x7F39 => 3,
+        0x7F0E | 0x7F0F | 0x7F10..=0x7F14 | 0x7F17..=0x7F20 | 0x7F22..=0x7F27
+        | 0x7F29..=0x7F2B | 0x7F2D..=0x7F2F | 0x7F31 | 0x7F34 | 0x7F43 | 0x7F44
+        | 0x7F51 | 0x7F6A | 0x7F7F => 2,
+        0x7F01..=0x7F04 | 0x7F06 | 0x7F08 | 0x7F09 | 0x7F15 | 0x7F16 | 0x7F21
+        | 0x7F28 | 0x7F30 | 0x7F35 | 0x7F3F | 0x7F48 | 0x7F4A
+        | 0x7F50 | 0x7F55..=0x7F59 | 0x7F5D | 0x7F63 | 0x7F76 | 0x7F7D | 0x7F7E => 1,
+        _ => 0,
+    }
+}
+
 pub fn decode_omni_token_stream(stream: &[u16]) -> Result<BinModule, String> {
     if stream.is_empty() || stream[0] != TOK_MOD_BEGIN {
         return Err(String::from("Missing 0x7EE0 (TOK_MOD_BEGIN) header token"));
@@ -1513,17 +1530,7 @@ impl OmniBinaryVm {
                 }
             }
             let ins = &func.instructions[pc];
-            let min_ops = match ins.op_tok {
-                0x7F42 | 0x7F45 => 4,
-                0x7F2C | 0x7F39 => 3,
-                0x7F0E | 0x7F0F | 0x7F10..=0x7F14 | 0x7F17..=0x7F20 | 0x7F22..=0x7F27
-                | 0x7F29..=0x7F2B | 0x7F2D..=0x7F2F | 0x7F31 | 0x7F34 | 0x7F43 | 0x7F44
-                | 0x7F51 | 0x7F6A | 0x7F7F => 2,
-                0x7F01..=0x7F04 | 0x7F06 | 0x7F08 | 0x7F09 | 0x7F15 | 0x7F16 | 0x7F21
-                | 0x7F28 | 0x7F30 | 0x7F35 | 0x7F3F | 0x7F48 | 0x7F4A
-                | 0x7F50 | 0x7F55..=0x7F59 | 0x7F5D | 0x7F63 | 0x7F76 | 0x7F7D | 0x7F7E => 1,
-                _ => 0,
-            };
+            let min_ops = vm_op_min_ops(ins.op_tok);
             if ins.operands.len() < min_ops {
                 for &mut (p_idx, ref mut out_v) in restore_borrowed.iter_mut() {
                     *out_v = std::mem::replace(&mut regs[192 + p_idx], OmniValue::Void);
@@ -19450,17 +19457,7 @@ fn compile_wasm_single_func_body(
     // Audit Round 2 L3: arity-check every instruction before Wasm lowering so crafted streams
     // (e.g. 1-operand 0x7F17 or 2-operand 0x7F2C TMAJ) return Err(BAD_ARITY) instead of panicking.
     for ins in &func.instructions {
-        let min_ops = match ins.op_tok {
-            0x7F42 | 0x7F45 => 4,
-            0x7F2C | 0x7F39 => 3,
-            0x7F0E | 0x7F0F | 0x7F10..=0x7F14 | 0x7F17..=0x7F20 | 0x7F22..=0x7F27
-            | 0x7F29..=0x7F2B | 0x7F2D..=0x7F2F | 0x7F31 | 0x7F34 | 0x7F43 | 0x7F44
-            | 0x7F51 | 0x7F6A | 0x7F7F => 2,
-            0x7F01..=0x7F04 | 0x7F06 | 0x7F08 | 0x7F09 | 0x7F15 | 0x7F16 | 0x7F21
-            | 0x7F28 | 0x7F30 | 0x7F35 | 0x7F3F | 0x7F48 | 0x7F4A
-            | 0x7F50 | 0x7F55..=0x7F59 | 0x7F5D | 0x7F63 | 0x7F76 | 0x7F7D | 0x7F7E => 1,
-            _ => 0,
-        };
+        let min_ops = vm_op_min_ops(ins.op_tok);
         if ins.operands.len() < min_ops {
             return Err(format!(
                 "error[BAD_ARITY]: Wasm AOT opcode 0x{:04X} requires at least {} operands, got {}",
@@ -24606,13 +24603,20 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
         "s3-perf" => {
             if args.get(1).map(|s| s.as_str()) == Some("--write-verifier-seed") {
                 let ve_sa_src = verifier_standalone_source();
-                let ve_sa_u16 = with_lockstep_suspended(|| {
+                let ve_sa_u16 = match with_lockstep_suspended(|| {
                     compile_omni_surface_strict_to_u16(&ve_sa_src)
-                })
-                .expect("compile verifier_standalone_source");
+                }) {
+                    Ok(u) => u,
+                    Err(e) => {
+                        eprintln!("[L6 VERIFIER SEED FAIL] {}", e);
+                        return 1;
+                    }
+                };
                 let ve_sa_bytes = encode_u16_stream_to_bytes(&ve_sa_u16);
-                std::fs::write("pure/verifier_standalone.omni_bc", &ve_sa_bytes)
-                    .expect("write pure/verifier_standalone.omni_bc");
+                if let Err(e) = std::fs::write("pure/verifier_standalone.omni_bc", &ve_sa_bytes) {
+                    eprintln!("[L6 VERIFIER SEED FAIL] error[IO_ERROR]: write pure/verifier_standalone.omni_bc: {}", e);
+                    return 1;
+                }
                 println!(
                     "[L6 VERIFIER SEED] Wrote {} words (FNV-1a64=0x{:016X}) to pure/verifier_standalone.omni_bc",
                     ve_sa_u16.len(),
@@ -25581,6 +25585,10 @@ fn main() {
                         Err(e) => { eprintln!("error[IO_ERROR]: {}: {}", path, e); std::process::exit(1); }
                     };
                     let u16_stream = decode_bytes_to_u16_stream(&raw);
+                    if let Err(ve) = pure_default_verify_u16(&u16_stream, true) {
+                        eprintln!("[PURE-VERIFY FAIL] {}", ve);
+                        std::process::exit(1);
+                    }
                     match compile_pure_u16_to_wasm(&u16_stream) {
                         Ok(w) => w,
                         Err(e) => { eprintln!("[WASM FAIL] {}", e); std::process::exit(1); }
@@ -25685,7 +25693,13 @@ fn main() {
                 let path = pos[0];
                 if !use_rust {
                     let u16_stream = if path.ends_with(".omni") {
-                        let raw_src = fs::read_to_string(path).expect("Failed to read .omni file");
+                        let raw_src = match fs::read_to_string(path) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                eprintln!("[PURE-RUN FAIL] error[IO_ERROR]: failed to read '{}': {}", path, e);
+                                std::process::exit(1);
+                            }
+                        };
                         let parent_dir = std::path::Path::new(path).parent();
                         let expanded = match pure_default_expand_includes(&raw_src, parent_dir, None) {
                             Ok(s) => s,
@@ -25709,7 +25723,13 @@ fn main() {
                             }
                         }
                     } else {
-                        let raw = fs::read(path).expect("Failed to read .omni_bc file");
+                        let raw = match fs::read(path) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                eprintln!("[PURE-RUN FAIL] error[IO_ERROR]: failed to read '{}': {}", path, e);
+                                std::process::exit(1);
+                            }
+                        };
                         decode_bytes_to_u16_stream(&raw)
                     };
                     let a0 = pos.get(1).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);

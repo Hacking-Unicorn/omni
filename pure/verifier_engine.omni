@@ -977,6 +977,15 @@ fn verify_ins_body(stream: bytes, ws: bytes, ins_start: i64, ins_cnt: i64, cap: 
 }
 
 #[strict]
+fn set_overflow_err(ws: bytes, off: i64) -> bytes {
+    let prev: i64 = ws_get(ws, 13);
+    let is_ok: i64 = is_eq(prev, 0);
+    let t: bytes = ws_set(ws, 13, is_ok * 3008 + (1 - is_ok) * prev);
+    let prev_off: i64 = ws_get(t, 11);
+    return ws_set(t, 11, is_ok * off + (1 - is_ok) * prev_off);
+}
+
+#[strict]
 fn emit_fn_result(ws: bytes, fn_idx: i64) -> bytes {
     let w: bytes = ws;
     let nerr: i64 = ws_get(w, 8);
@@ -990,7 +999,7 @@ fn emit_fn_result(ws: bytes, fn_idx: i64) -> bytes {
         t = ws_set(t, 1024 + cur + 2, nerr);
         ws_set(t, 21, cur + 3)
     } else {
-        w
+        set_overflow_err(w, fn_idx)
     };
     let i: i64 = 0;
     while nerr - i <=> 0 {
@@ -1003,7 +1012,7 @@ fn emit_fn_result(ws: bytes, fn_idx: i64) -> bytes {
             t = ws_set(t, 1024 + c2 + 1, off);
             ws_set(t, 21, c2 + 2)
         } else {
-            w
+            set_overflow_err(w, off)
         };
         i = i + 1;
     }
