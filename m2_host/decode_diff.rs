@@ -7304,14 +7304,14 @@ pub fn selftest_s2_security() -> Result<usize, String> {
         std::fs::create_dir_all(&ld_cache).map_err(|e| format!("L-D mkdir: {}", e))?;
         std::fs::set_permissions(&ld_cache, std::fs::Permissions::from_mode(0o755))
             .map_err(|e| format!("L-D chmod: {}", e))?;
-        // Under `cargo test` the current exe is the libtest harness in `target/*/deps/`, which
-        // would treat `run-wasm` as a test filter and exit 0. There, check the same cache-dir
-        // rejection and CLI label mapping in-process instead of spawning.
-        let exe_is_test_harness = exe
-            .parent()
-            .and_then(|p| p.file_name())
-            .map(|n| n == "deps")
-            .unwrap_or(false);
+        // Under `cargo test` the exe is the libtest harness, at `target/*/deps/<name>-<hash>` or (build-dir layout)
+        // `target/*/build/<crate>-<hash>/out/<name>-<hash>`; it would take `run-wasm` as a test filter and exit 0. So any
+        // ancestor named `deps` or `build` selects the in-process check below, which is exactly as strict. A real omnic
+        // (built at the repo root, or installed) does not live under a cargo `deps/`/`build/` dir, so it keeps the spawn
+        // path; if one ever did, it would only lose spawn coverage, never pass a loose cache dir or a bad stream.
+        let exe_is_test_harness = exe.parent().map_or(false, |d| {
+            d.ancestors().filter_map(|a| a.file_name()).any(|n| n == "deps" || n == "build")
+        });
         let ld_check = (|| -> Result<(), String> {
             if exe_is_test_harness {
                 let cache_e = match verify_private_cache_dir(&ld_cache) {
