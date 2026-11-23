@@ -33,8 +33,8 @@ pub const NATIVE_M3_ELF_BYTES: usize = 165_900;
 pub const NATIVE_M3_ELF_FNV: u64 = 0x54B2_48B6_9704_ED59;
 pub const NATIVE_M4_ELF_BYTES: usize = 81_763;
 pub const NATIVE_M4_ELF_FNV: u64 = 0xC935_88C4_A4D4_D962;
-pub const NATIVE_VERIFIER_ELF_BYTES: usize = 37_636;
-pub const NATIVE_VERIFIER_ELF_FNV: u64 = 0xF3F0_CC71_77A2_FA84;
+pub const NATIVE_VERIFIER_ELF_BYTES: usize = 37_938;
+pub const NATIVE_VERIFIER_ELF_FNV: u64 = 0x5EFE_59B8_6269_7CDA;
 
 /// Audit Round 2 L5: Default & maximum fuel for `omni run --fuel N`, plus documented
 /// 65,536-word (128 KiB) native M2/M3/M4/verifier input-window threshold (larger inputs
@@ -903,6 +903,12 @@ pub fn pure_default_verify_u16(u16_stream: &[u16], api_mode: bool) -> Result<(),
             "error[PURE_VERIFY_EMPTY_MODULE] @word 0: Pure-Omni verifier rejected zero-function module",
         ));
     }
+    if status == 3008 {
+        return Err(format!(
+            "error[PURE_VERIFY_REPORT_OVERFLOW] @word {}: Pure-Omni verifier report buffer overflowed",
+            dec_off
+        ));
+    }
     if status != 0 {
         return Err(format!(
             "error[PURE_VERIFY_DECODE_{}] @word {}: Pure-Omni verifier rejected malformed stream",
@@ -910,23 +916,41 @@ pub fn pure_default_verify_u16(u16_stream: &[u16], api_mode: bool) -> Result<(),
         ));
     }
     let nfns = r_i64(2) as usize;
+    let total_words = rep.len() / 8;
     let mut cur = 3usize;
+    let mut read_fns = 0usize;
     for _ in 0..nfns {
-        if cur + 3 > rep.len() / 8 {
-            break;
+        if cur + 3 > total_words {
+            return Err(format!(
+                "error[PURE_VERIFY_TRUNCATED]: Pure-Omni verifier report truncated at fn {}/{} (cur={}, words={})",
+                read_fns, nfns, cur, total_words
+            ));
         }
         let fn_idx = r_i64(cur);
         let passed = r_i64(cur + 1);
         let nerr = r_i64(cur + 2) as usize;
+        if cur + 3 + nerr.saturating_mul(2) > total_words {
+            return Err(format!(
+                "error[PURE_VERIFY_TRUNCATED]: Pure-Omni verifier error list truncated at fn#{} (nerr={}, cur={}, words={})",
+                fn_idx, nerr, cur, total_words
+            ));
+        }
         if passed == 0 || nerr > 0 {
-            let code = if nerr > 0 && cur + 4 < rep.len() / 8 { r_i64(cur + 3) } else { 0 };
-            let off = if nerr > 0 && cur + 4 < rep.len() / 8 { r_i64(cur + 4) } else { 0 };
+            let code = if nerr > 0 { r_i64(cur + 3) } else { 0 };
+            let off = if nerr > 0 { r_i64(cur + 4) } else { 0 };
             return Err(format!(
                 "error[PURE_VERIFY_{}] fn#{} @word {}: Pure-Omni verifier rejected function ({} error(s))",
                 code, fn_idx, off, nerr
             ));
         }
         cur += 3 + nerr * 2;
+        read_fns += 1;
+    }
+    if read_fns != nfns {
+        return Err(format!(
+            "error[PURE_VERIFY_TRUNCATED]: Pure-Omni verifier read {} of {} function entries",
+            read_fns, nfns
+        ));
     }
     Ok(())
 }
