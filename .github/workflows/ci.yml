@@ -1,4 +1,4 @@
-name: Omni CI (Monolith, 8-Crate Workspace & Version-Locked Harness Selftests)
+name: Omni CI (Monolith, Fuzz Smoke & Zero-Rust Release Gate)
 
 on:
   push:
@@ -6,17 +6,22 @@ on:
   pull_request:
     branches: [ main, master ]
 
+permissions:
+  contents: read
+
 jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Install Rust stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust pinned toolchain (1.100.0)
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
+        with:
+          toolchain: "1.100.0"
 
-      - name: Run standalone monolith selftest (fixed-point + M2/M3/P4/P5 gates + 4-backend diff + pure-omni-diff + acceptance-diff + harness)
+      - name: Run standalone monolith selftest (fixed-point + M2/M3/P4/P5/S1-S6 gates + 5-backend diff + pure-omni-diff + acceptance-diff + harness)
         run: |
           rustc -O omni_rust_bootstrap.rs -o omni
           ./omni --help
@@ -59,6 +64,11 @@ jobs:
           ./omni a3-macro-quarantine
           ./omni b2-pure-verifier
           ./omni b4-pure-launcher
+          ./omni s2-security
+          ./omni s3-perf
+          ./omni s4-honesty
+          ./omni s5-refreeze
+          ./omni s6-cleanup
           ./omni api-stage1
           ./omni api-stage2
           ./omni api-stage2-emit
@@ -72,28 +82,52 @@ jobs:
           ./omni agent-driver --list-strategies
           ./omni agent-driver --strict "fn main(a: int) -> trit { let d = a - 10; let g = egate(d); return g; }" 25
 
-      - name: Build and run 8-crate Cargo workspace differential selftest (--release + cargo test)
-        working-directory: omni-workspace
-        env:
-          CARGO_INCREMENTAL: "0"
+  fuzz-smoke:
+    name: Bytecode Mutation Fuzz & Security Gate (Audit §1.2 / §2 / §6.3)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust pinned toolchain (1.100.0)
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
+        with:
+          toolchain: "1.100.0"
+
+      - name: Run 256-mutant .omni_bc verifier/VM fuzzer + native m2.elf crash corpus + strict OOB/PT_GNU_STACK gates
         run: |
-          cargo check --release -p omni-aot
-          cargo build --release --workspace
-          cargo run --release -p omni-cli -- --help
-          cargo run --release -p omni-cli -- selftest
-          cargo run --release -p omni-cli -- pure-bootstrap
-          cargo run --release -p omni-cli -- pure-omni-diff
-          cargo run --release -p omni-cli -- acceptance-diff
-          cargo run --release -p omni-cli --bin omni-harness -- --spec
-          cargo run --release -p omni-cli --bin omni-agent-driver -- --list-strategies
-          cargo run --release -p omni-cli --bin omni-agent-driver -- --strict "fn main(a: int) -> trit { let d = a - 10; let g = egate(d); return g; }" 25
-          cargo test --release --workspace
+          rustc -O omni_rust_bootstrap.rs -o omni
+          ./omni b2-pure-verifier
+          ./omni s2-security
+          ./omni s5-refreeze
+          # Audit L2 + Round-3 L-B: every command exits 1 with a structured error (never a
+          # rc=101 panic) on a missing input file.
+          lb_fail=0
+          while IFS= read -r lb_cmd; do
+            set +e
+            ./omni $lb_cmd >/dev/null 2>/tmp/fuzz_lb.err
+            rc=$?
+            set -e
+            if [ "$rc" -ne 1 ] || ! grep -q 'FAIL\]' /tmp/fuzz_lb.err; then
+              echo "::error::L-B '$lb_cmd' exited rc=$rc (want 1 + structured [... FAIL] error)"; cat /tmp/fuzz_lb.err; lb_fail=1
+            fi
+          done <<'LB_CMDS'
+          compile-elf /tmp/nonexistent_fuzz_l2.omni /tmp/fuzz_l2.elf
+          compile /tmp/nonexistent_fuzz_lb.omni /tmp/fuzz_lb.omni_bc
+          compile --rust /tmp/nonexistent_fuzz_lb.omni /tmp/fuzz_lb.omni_bc
+          compile-wasm /tmp/nonexistent_fuzz_lb.omni /tmp/fuzz_lb.wasm
+          compile-wasm /tmp/nonexistent_fuzz_lb.omni_bc /tmp/fuzz_lb.wasm
+          surface-to-asm /tmp/nonexistent_fuzz_lb.omni
+          run --rust /tmp/nonexistent_fuzz_lb.omni
+          run --rust /tmp/nonexistent_fuzz_lb.omni_bc
+          LB_CMDS
+          test "$lb_fail" -eq 0
 
   pure-default-no-rustc:
     name: Zero-Rust Release Gate & Independent Verifier (Seed-Shrink A4/B4/C1/C2)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Independent External Verifier Trace Check (C2 — Python 3, zero Rust/Omni)
         run: |

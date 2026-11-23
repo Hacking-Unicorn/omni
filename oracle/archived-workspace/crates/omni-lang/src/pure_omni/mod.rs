@@ -1590,7 +1590,7 @@ pub fn run_pure_core_phase4_selfhost_fixed_point_selftests() -> Result<usize, St
     // 3. Verify Phase D ELF64 fixed point and Stage-1 compiler stream remain bit-exact alongside the expanded suite
     let (g1_u16, g2_u16, g1_elf, g2_elf) = run_phase_d_pure_omni_selfhost_bootstrap()?;
     let s1_u16 = build_step7_stage1_compiler_stream();
-    if g1_u16.len() != 159 || g1_u16 != g2_u16 || g1_elf.len() != 824 || g1_elf != g2_elf || s1_u16.len() != 19731 {
+    if g1_u16.len() != FROZEN_PHASE_D_BC_WORDS || g1_u16 != g2_u16 || g1_elf.len() != FROZEN_PHASE_D_ELF_BYTES || g1_elf != g2_elf || s1_u16.len() != FROZEN_STAGE1_BC_WORDS {
         return Err(format!(
             "Phase 4 Stage-1 or Phase-D fixed-point regression detected: g1={}, g2={}, elf={}, s1={}",
             g1_u16.len(),
@@ -2796,14 +2796,15 @@ fn main(x: i64, y: i64) -> i64 {
 
 pub const FROZEN_PHASE_D_BC_WORDS: usize = 159;
 pub const FROZEN_PHASE_D_BC_FNV1A64: u64 = 0x23B8D17257CCA9C4;
-pub const FROZEN_PHASE_D_ELF_BYTES: usize = 824;
-pub const FROZEN_PHASE_D_ELF_FNV1A64: u64 = 0xE221085777B8AC47;
+// Re-frozen in Audit §5 (single deliberate re-freeze: PT_GNU_STACK + strict ISET -9 + IMOD/trit-clamp/BR_POS/BR_NEG).
+pub const FROZEN_PHASE_D_ELF_BYTES: usize = 880;
+pub const FROZEN_PHASE_D_ELF_FNV1A64: u64 = 0x8D5AAAD22399A1EE;
 pub const FROZEN_CORE_SUITE_WORDS: usize = 14_559;
 pub const FROZEN_CORE_SUITE_FNV1A64: u64 = 0x78462AE4C81DF408;
-pub const FROZEN_STAGE1_ELF_BYTES: usize = 106_242;
-pub const FROZEN_STAGE1_ELF_FNV1A64: u64 = 0xEAFC81F46B482FF8;
-pub const FROZEN_STAGE1_BC_WORDS: usize = 19_731;
-pub const FROZEN_STAGE1_BC_FNV1A64: u64 = 0x677F57AE71D28FED;
+pub const FROZEN_STAGE1_ELF_BYTES: usize = 112_180;
+pub const FROZEN_STAGE1_ELF_FNV1A64: u64 = 0x62F14B335B52BECC;
+pub const FROZEN_STAGE1_BC_WORDS: usize = 20_443;
+pub const FROZEN_STAGE1_BC_FNV1A64: u64 = 0xED4C50AA79563EFF;
 
 /// 13BF. C1: Pin the 5 frozen FNV-1a64 hashes and exact sizes (`HANDOFF.md` §3).
 pub fn run_frozen_hash_pin_selftests() -> Result<usize, String> {

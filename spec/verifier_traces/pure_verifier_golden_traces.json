@@ -63,6 +63,34 @@
       ],
       "expected_pass": false,
       "expected_code": "TAINT_SINK"
+    },
+    {
+      "id": "neg_bad_call_target_2010",
+      "description": "CALL to non-existent function fn#32539 -> Pure verifier rule 2010 (BAD_CALL_TARGET)",
+      "u16_words": [
+        32480, 32483, 0, 1,
+        32448, 32641, 32656,
+        32641, 0, 2,
+        32256, 32641, 32656, 32584, 32492, 32539, 32448, 32484,
+        32586, 32256, 32484,
+        32495
+      ],
+      "expected_pass": false,
+      "expected_code": "BAD_CALL_TARGET"
+    },
+    {
+      "id": "neg_call_arity_mismatch_2011",
+      "description": "CALL to fn#0 (1 param) with 2 arguments -> Pure verifier rule 2011 (CALL_ARITY_MISMATCH)",
+      "u16_words": [
+        32480, 32483, 0, 1,
+        32448, 32641, 32656,
+        32641, 0, 2,
+        32256, 32641, 32656, 32584, 32492, 0, 32448, 32448, 32484,
+        32586, 32256, 32484,
+        32495
+      ],
+      "expected_pass": false,
+      "expected_code": "CALL_ARITY_MISMATCH"
     }
   ]
 }

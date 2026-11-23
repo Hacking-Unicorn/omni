@@ -3,19 +3,19 @@
 // ==============================================================================
 // Link order: pure/m2/util.omni, pure/isa/table.omni, pure/m2/decode.omni,
 //             pure/m2/labels.omni, pure/m2/arena.omni, this file.
-// Emits byte-exact ELF64 headers (120 B, base 0x400000, entry 0x400078, PT_LOAD
-// p_flags=5, align 0x1000) and x86-64 frame/trap/multi stubs per spec/m2/PLAN.md §2.
+// Emits byte-exact ELF64 headers (176 B, base 0x400000, entry 0x4000B0, PT_LOAD
+// p_flags=5 align 0x1000 + PT_GNU_STACK p_flags=6 align 0x10) and x86-64 frame/trap/multi stubs.
 // Iterative, zero recursion, zero ANEW, gated by `omni m2-lint` with 0 findings.
 // ==============================================================================
 
-// Emits the 120-byte ELF64 header + 1 PT_LOAD program header into the output band.
+// Emits the 176-byte ELF64 header + PT_LOAD + PT_GNU_STACK (non-exec stack) into the output band.
 // Byte-identical to omni_rust_bootstrap.rs (compile_pure_u16_to_x86_64_elf_with_args).
 #[strict]
 fn m2e_emit_elf64_hdr(arena: bytes, total_size: i64) -> bytes {
     let w: bytes = arena;
-    // Zero 120 bytes (15 x u64) first so every reserved field is 0.
+    // Zero 176 bytes (22 x u64) first so every reserved field is 0.
     let i: i64 = 0;
-    while 15 - i <=> 0 {
+    while 22 - i <=> 0 {
         w = m2a_emit_u64(w, 0);
         i = i + 1;
     }
@@ -27,14 +27,14 @@ fn m2e_emit_elf64_hdr(arena: bytes, total_size: i64) -> bytes {
     w = m2a_patch_u32(w, 16, 4063234);
     // e_version (20..24) = 1
     w = m2a_patch_u32(w, 20, 1);
-    // e_entry (24..32) = 0x400078 (4194424)
-    w = m2a_patch_u64(w, 24, 4194424);
+    // e_entry (24..32) = 0x4000B0 (4194480)
+    w = m2a_patch_u64(w, 24, 4194480);
     // e_phoff (32..40) = 64
     w = m2a_patch_u64(w, 32, 64);
     // e_ehsize (52..54) = 64, e_phentsize (54..56) = 56 -> 0x00380040 (3670080)
     w = m2a_patch_u32(w, 52, 3670080);
-    // e_phnum (56..58) = 1, e_shentsize (58..60) = 0
-    w = m2a_patch_u32(w, 56, 1);
+    // e_phnum (56..58) = 2 (PT_LOAD + PT_GNU_STACK), e_shentsize (58..60) = 0
+    w = m2a_patch_u32(w, 56, 2);
     // PT_LOAD program header at offset 64:
     // p_type (64..68) = 1 (PT_LOAD), p_flags (68..72) = 5 (PF_R | PF_X)
     w = m2a_patch_u32(w, 64, 1);
@@ -47,6 +47,12 @@ fn m2e_emit_elf64_hdr(arena: bytes, total_size: i64) -> bytes {
     w = m2a_patch_u64(w, 104, total_size);
     // p_align (112..120) = 0x1000 (4096)
     w = m2a_patch_u64(w, 112, 4096);
+    // PT_GNU_STACK program header at offset 120 (non-executable stack: PF_R | PF_W):
+    // p_type (120..124) = 0x6474E551 (1685382481), p_flags (124..128) = 6 (PF_R | PF_W)
+    w = m2a_patch_u32(w, 120, 1685382481);
+    w = m2a_patch_u32(w, 124, 6);
+    // p_align (168..176) = 16
+    w = m2a_patch_u64(w, 168, 16);
     return w;
 }
 

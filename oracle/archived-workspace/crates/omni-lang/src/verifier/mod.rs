@@ -269,7 +269,7 @@ pub fn run_phase7_pure_omni_selftests() -> Result<usize, String> {
 
 pub const OMNI_VERIFIER_ENGINE_VERSION: &str = "omni-verifier-engine-v1.0.0";
 pub const OMNI_VERIFIER_ENGINE_SURFACE: &str =
-    include_str!("../../../../../pure/verifier_engine.omni");
+    include_str!("../../../../../../pure/verifier_engine.omni");
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OmniEngineError {
@@ -298,7 +298,13 @@ pub fn verifier_engine_error_name(code: i64) -> &'static str {
         1003 => "MISSING_CAP",
         1004 => "LINEAR_LEAK",
         1005 => "BORROW_CONFLICT",
+        1010 => "MISSING_CAP_TERNARY",
+        1011 => "TAINT_ON_CONSENSUS",
+        1012 => "LINEAR_REFLECT",
+        1013 => "CAP_NARROW_EXPAND",
         2009 => "UNRESOLVED_LABEL",
+        2010 => "BAD_CALL_TARGET",
+        2011 => "CALL_ARITY_MISMATCH",
         3001 => "UNKNOWN_OPCODE",
         3003 => "SSA_NONCANONICAL",
         3004 => "ARENA_OVERWRITE",

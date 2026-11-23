@@ -467,3 +467,73 @@ pub fn format_debug_lens(stream: &[u16]) -> Result<String, String> {
     Ok(out)
 }
 
+
+
+#[cfg(test)]
+mod cap_bit_overflow_tests {
+    use super::*;
+
+    /// All defined caps (ids 1..=10, bits 0..=9). No function holds bit 15.
+    const ALL_DEFINED_CAPS: CapMask = 0x03FF;
+
+    fn cint_with_cap(cap_id: u16, fn_cap_mask: CapMask) -> BinFunction {
+        BinFunction {
+            fn_idx: 0,
+            params: vec![],
+            ret_ty_tok: TY_I64,
+            cap_mask: fn_cap_mask,
+            instructions: vec![BinInstruction {
+                offset: 0,
+                dest_reg: Some(REG_BASE),
+                op_tok: 0x7F06, // CINT: has dest, requires no cap of its own
+                ty_tok: TY_I64,
+                tc_tok: pack_tc(false, cap_id),
+                operands: vec![BinOperand::ImmInt(0)],
+            }],
+        }
+    }
+
+    fn report_for(cap_id: u16, fn_cap_mask: CapMask) -> BinVerificationReport {
+        verify_binary_function(&cint_with_cap(cap_id, fn_cap_mask))
+    }
+
+    fn assert_missing_cap(cap_id: u16, fn_cap_mask: CapMask) {
+        let rep = report_for(cap_id, fn_cap_mask);
+        assert!(
+            !rep.passed,
+            "cap_id {cap_id} on fn mask 0x{fn_cap_mask:04X} should fail, errors={:?}",
+            rep.errors
+        );
+        assert!(
+            rep.errors.iter().any(|e| e.contains("MISSING_CAP")),
+            "cap_id {cap_id} on fn mask 0x{fn_cap_mask:04X} should report MISSING_CAP, errors={:?}",
+            rep.errors
+        );
+    }
+
+    #[test]
+    fn defined_cap_token_accepted_when_function_holds_it() {
+        let rep = report_for(CAP_ID_PURE, 0);
+        assert!(rep.passed, "PURE CINT on a PURE fn should pass: {:?}", rep.errors);
+        let rep = report_for(CAP_ID_DB_R, cap_bit(CAP_ID_DB_R));
+        assert!(rep.passed, "DB_R CINT on a DB_R fn should pass: {:?}", rep.errors);
+        let rep = report_for(CAP_ID_DB_R, 0);
+        assert!(!rep.passed && rep.errors.iter().any(|e| e.contains("MISSING_CAP")));
+    }
+
+    #[test]
+    fn undefined_cap_token_reports_missing_cap() {
+        // Before: unpack_tc -> cap_bit(17) panics in debug; in release cap 17 aliases
+        // DB_R (bit 0) so a function holding 0x03FF would silently pass.
+        // After: ids 11..=31 are fail-closed MISSING_CAP even when the function
+        // holds every defined cap, and the verifier does not panic.
+        for cap_id in 11u16..=31 {
+            assert_missing_cap(cap_id, 0);
+            assert_missing_cap(cap_id, ALL_DEFINED_CAPS);
+        }
+        // Explicit pins from the overflow report.
+        for cap_id in [17u16, 31] {
+            assert_missing_cap(cap_id, ALL_DEFINED_CAPS);
+        }
+    }
+}

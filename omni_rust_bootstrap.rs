@@ -128,7 +128,7 @@ pub const CAP_ID_SYS: u16    = 10;
 
 #[inline(always)]
 pub const fn cap_bit(cap_id: u16) -> CapMask {
-    if cap_id == 0 { 0 } else { 1u16 << (cap_id - 1) }
+    if cap_id == 0 { 0 } else if cap_id > 16 { 1u16 << 15 } else { 1u16 << (cap_id - 1) }
 }
 
 #[inline(always)]
@@ -621,6 +621,23 @@ fn parse_one_operand(stream: &[u16], pos: &mut usize) -> Result<BinOperand, Stri
             Ok(BinOperand::FieldKV(f_idx, Box::new(inner)))
         }
         other => Err(format!("Invalid operand token 0x{:04X} at offset {}", other, *pos - 1)),
+    }
+}
+
+/// Audit Round 3 L-E: Single authoritative Rust per-opcode minimum operand count table
+/// shared by `OmniBinaryVm` and `compile_pure_u16_to_wasm`, and drift-locked against
+/// `pure/verifier_engine.omni::op_min_ops` and `pure/m2/verify/mod_check.omni::m2v_ins_min_ops`.
+pub const fn vm_op_min_ops(op_tok: u16) -> usize {
+    match op_tok {
+        0x7F42 | 0x7F45 => 4,
+        0x7F2C | 0x7F39 => 3,
+        0x7F0E | 0x7F0F | 0x7F10..=0x7F14 | 0x7F17..=0x7F20 | 0x7F22..=0x7F27
+        | 0x7F29..=0x7F2B | 0x7F2D..=0x7F2F | 0x7F31 | 0x7F34 | 0x7F43 | 0x7F44
+        | 0x7F51 | 0x7F6A | 0x7F7F => 2,
+        0x7F01..=0x7F04 | 0x7F06 | 0x7F08 | 0x7F09 | 0x7F15 | 0x7F16 | 0x7F21
+        | 0x7F28 | 0x7F30 | 0x7F35 | 0x7F3F | 0x7F48 | 0x7F4A
+        | 0x7F50 | 0x7F55..=0x7F59 | 0x7F5D | 0x7F63 | 0x7F76 | 0x7F7D | 0x7F7E => 1,
+        _ => 0,
     }
 }
 
@@ -1200,6 +1217,7 @@ pub const OMNI_DB_GET_MISS: i64 = -1;
 /// Fixed KV key cap (Boss Lady 2026-11-14): 8192 distinct keys, the `pure/host_kv.omni` arena size
 /// (0x1B0000..0x1EFFFF at 32 B). The 8193rd new key is `BUDGET_EXCEEDED`; overwrites still succeed.
 pub const OMNI_VM_KV_MAX_KEYS: usize = 8192;
+pub const DEFAULT_VM_WALL_TIMEOUT_MS: u64 = 600_000;
 
 pub struct OmniBinaryVm {
     pub tables: HashMap<u16, Vec<BTreeMap<u16, OmniValue>>>,
@@ -1211,7 +1229,10 @@ pub struct OmniBinaryVm {
     pub memory_budget_bytes: usize,
     pub allocated_bytes: usize,
     pub call_depth: usize,
-    pub verified_fns: u64,
+    pub verified_fns: [u64; 16],
+    pub wall_timeout_ms: u64,
+    pub start_instant: Option<Instant>,
+    frame_pool: Vec<Box<[OmniValue; 224]>>,
 }
 
 impl OmniBinaryVm {
@@ -1226,7 +1247,10 @@ impl OmniBinaryVm {
             memory_budget_bytes: DEFAULT_VM_MEMORY_BUDGET_BYTES,
             allocated_bytes: 0,
             call_depth: 0,
-            verified_fns: 0,
+            verified_fns: [0; 16],
+            wall_timeout_ms: DEFAULT_VM_WALL_TIMEOUT_MS,
+            start_instant: None,
+            frame_pool: Vec::new(),
         }
     }
 
@@ -1241,8 +1265,15 @@ impl OmniBinaryVm {
             memory_budget_bytes,
             allocated_bytes: 0,
             call_depth: 0,
-            verified_fns: 0,
+            verified_fns: [0; 16],
+            wall_timeout_ms: DEFAULT_VM_WALL_TIMEOUT_MS,
+            start_instant: None,
+            frame_pool: Vec::new(),
         }
+    }
+
+    pub fn set_wall_timeout_ms(&mut self, timeout_ms: u64) {
+        self.wall_timeout_ms = timeout_ms;
     }
 
     pub fn clear_tables(&mut self) {
@@ -1253,7 +1284,8 @@ impl OmniBinaryVm {
         self.steps_executed = 0;
         self.allocated_bytes = 0;
         self.call_depth = 0;
-        self.verified_fns = 0;
+        self.verified_fns = [0; 16];
+        self.start_instant = None;
     }
 
     #[inline]
@@ -1286,44 +1318,96 @@ impl OmniBinaryVm {
 
     #[inline]
     /// Sound last-use check for zero-copy Bytes moves (zero semantic change):
-    /// `tok` is dead after `pc` iff it is never read after `pc`, AND either no branch after `pc`
-    /// jumps back to a label at `<= pc`, OR `tok` is a local register written after the last label
-    /// at `<= pc` and never read before `pc`.
+    /// `tok` is dead after `pc` iff no reachable execution path from `pc + 1` reads `tok`
+    /// before overwriting `tok` (`dest_reg == Some(tok)`) or returning (`0x7F4A`).
+    /// Walking the CFG avoids false-live scans past unconditional `JMP`s into mutually
+    /// exclusive `else` branches (Audit Round-3 L-F).
     fn tok_dead_after(insns: &[BinInstruction], pc: usize, tok: u16) -> bool {
-        let read_after = insns[pc + 1..].iter().any(|later| {
-            later.operands.iter().any(|op| matches!(op, BinOperand::Reg(ot) | BinOperand::Param(ot) if *ot == tok))
-        });
-        if read_after {
-            return false;
+        let n = insns.len();
+        if pc + 1 >= n {
+            return true;
         }
-        let mut prior_lbl_mask: u16 = 0;
-        let mut last_lbl_pc: usize = 0;
-        for (i, c) in insns[..=pc].iter().enumerate() {
-            if c.op_tok == 0x7F40 {
-                last_lbl_pc = i + 1;
-                if let Some(lid) = c.operands.first().and_then(extract_label_id) {
-                    prior_lbl_mask |= 1u16 << (lid & 0xF);
+        let mut visited_stack = [0u64; 16]; // covers up to 1024 instructions without heap alloc
+        let mut visited_heap: Vec<u64> = if n > 1024 { vec![0u64; (n + 63) / 64] } else { Vec::new() };
+        let mut work = [0usize; 64];
+        let mut work_len = 1usize;
+        work[0] = pc + 1;
+        let mut work_heap: Vec<usize> = Vec::new();
+        let find_lbl = |lbl: u16| -> Option<usize> {
+            insns
+                .iter()
+                .position(|c| c.op_tok == 0x7F40 && c.operands.first().and_then(extract_label_id) == Some(lbl))
+                .map(|p| p + 1)
+        };
+        let push_target = |t: usize, work: &mut [usize; 64], work_len: &mut usize, work_heap: &mut Vec<usize>| {
+            if t < n {
+                if *work_len < 64 {
+                    work[*work_len] = t;
+                    *work_len += 1;
                 } else {
-                    prior_lbl_mask = 0xFFFF;
+                    work_heap.push(t);
+                }
+            }
+        };
+        while work_len > 0 || !work_heap.is_empty() {
+            let cur = if let Some(v) = work_heap.pop() {
+                v
+            } else {
+                work_len -= 1;
+                work[work_len]
+            };
+            let w = cur >> 6;
+            let bit = 1u64 << (cur & 63);
+            if n <= 1024 {
+                if (visited_stack[w] & bit) != 0 {
+                    continue;
+                }
+                visited_stack[w] |= bit;
+            } else {
+                if (visited_heap[w] & bit) != 0 {
+                    continue;
+                }
+                visited_heap[w] |= bit;
+            }
+            let c = &insns[cur];
+            if c.operands.iter().any(|op| matches!(op, BinOperand::Reg(ot) | BinOperand::Param(ot) if *ot == tok)) {
+                return false;
+            }
+            if c.dest_reg == Some(tok) {
+                continue;
+            }
+            match c.op_tok {
+                0x7F4A => {} // RET terminates path
+                0x7F41 => {
+                    if let Some(tp) = c.operands.first().and_then(extract_label_id).and_then(&find_lbl) {
+                        push_target(tp, &mut work, &mut work_len, &mut work_heap);
+                    } else {
+                        push_target(cur + 1, &mut work, &mut work_len, &mut work_heap);
+                    }
+                }
+                0x7F42 => {
+                    for op in c.operands.get(1..4).into_iter().flatten() {
+                        if let Some(tp) = extract_label_id(op).and_then(&find_lbl) {
+                            push_target(tp, &mut work, &mut work_len, &mut work_heap);
+                        }
+                    }
+                    // Audit Round-3 R3-3: BR_TRIT falls through (`pc += 1`) whenever its
+                    // condition is not an int/trit (`eval_as_trit` -> None), so the
+                    // fall-through is always a successor, even when all three labels resolve.
+                    push_target(cur + 1, &mut work, &mut work_len, &mut work_heap);
+                }
+                0x7F43 | 0x7F44 => {
+                    if let Some(tp) = c.operands.get(1).and_then(extract_label_id).and_then(&find_lbl) {
+                        push_target(tp, &mut work, &mut work_len, &mut work_heap);
+                    }
+                    push_target(cur + 1, &mut work, &mut work_len, &mut work_heap);
+                }
+                _ => {
+                    push_target(cur + 1, &mut work, &mut work_len, &mut work_heap);
                 }
             }
         }
-        if prior_lbl_mask == 0 {
-            return true;
-        }
-        let has_back_branch = insns[pc + 1..].iter().any(|later| {
-            matches!(later.op_tok, 0x7F41..=0x7F44) && later.operands.iter().any(|op| {
-                extract_label_id(op).map_or(false, |lid| (prior_lbl_mask & (1u16 << (lid & 0xF))) != 0)
-            })
-        });
-        if !has_back_branch {
-            return true;
-        }
-        (REG_BASE..=REG_MAX).contains(&tok)
-            && insns[last_lbl_pc..pc].iter().any(|c| c.dest_reg == Some(tok))
-            && !insns[..pc].iter().any(|c| {
-                c.operands.iter().any(|op| matches!(op, BinOperand::Reg(ot) if *ot == tok))
-            })
+        true
     }
 
     fn eval_op_ref<'a>(op: &BinOperand, regs: &'a [OmniValue; 224]) -> Option<&'a OmniValue> {
@@ -1368,7 +1452,9 @@ impl OmniBinaryVm {
         args: Vec<OmniValue>,
     ) -> Result<OmniValue, String> {
         let mut no_restore: [(usize, OmniValue); 0] = [];
-        self.execute_function_inner(module, fn_idx, args, 0, &mut no_restore)
+        // Top-level `args` are owned by value and `no_restore` is empty, so all entry parameters
+        // are owned (Audit Round-3 L-F: avoids cloning top-level `Bytes` arenas on `ISET`/`CALL`).
+        self.execute_function_inner(module, fn_idx, args, u32::MAX, &mut no_restore)
     }
 
     fn execute_function_inner(
@@ -1380,7 +1466,8 @@ impl OmniBinaryVm {
         restore_borrowed: &mut [(usize, OmniValue)],
     ) -> Result<OmniValue, String> {
         if self.call_depth == 0 {
-            self.verified_fns = 0;
+            self.verified_fns = [0; 16];
+            self.start_instant = Some(Instant::now());
         }
         if self.call_depth >= MAX_VM_CALL_DEPTH {
             return Err(format!(
@@ -1398,21 +1485,55 @@ impl OmniBinaryVm {
                 .ok_or_else(|| format!("Function index {} not found", fn_idx))?
         };
 
-        let fn_bit = if (fn_idx as usize) < 64 { 1u64 << fn_idx } else { 0 };
-        if fn_bit == 0 || (self.verified_fns & fn_bit) == 0 {
+        let word_idx = (fn_idx as usize) >> 6;
+        let bit_mask = 1u64 << ((fn_idx as usize) & 63);
+        let already_verified = word_idx < self.verified_fns.len() && (self.verified_fns[word_idx] & bit_mask) != 0;
+        if !already_verified {
             let rep = verify_binary_function(func);
             if !rep.passed {
                 return Err(format!("Binary verification failed: {:?}", rep.errors));
             }
-            self.verified_fns |= fn_bit;
+            if word_idx < self.verified_fns.len() {
+                self.verified_fns[word_idx] |= bit_mask;
+            }
         }
 
-        let mut regs: [OmniValue; 224] = std::array::from_fn(|_| OmniValue::Void);
+        let mut regs: Box<[OmniValue; 224]> = self
+            .frame_pool
+            .pop()
+            .unwrap_or_else(|| Box::new(std::array::from_fn(|_| OmniValue::Void)));
+        let mut dirty: [u64; 4] = [0; 4];
         for (&(par_tok, _, _), val) in func.params.iter().zip(args.into_iter()) {
             if let Some(slot) = token_to_slot(par_tok) {
                 regs[slot] = val;
+                dirty[slot >> 6] |= 1u64 << (slot & 63);
             }
         }
+        let res = self.execute_function_body(module, func, owned_params, restore_borrowed, &mut regs, &mut dirty);
+        for (wi, &word) in dirty.iter().enumerate() {
+            let mut m = word;
+            while m != 0 {
+                let tz = m.trailing_zeros() as usize;
+                let slot = (wi << 6) + tz;
+                if slot < 224 {
+                    regs[slot] = OmniValue::Void;
+                }
+                m &= m - 1;
+            }
+        }
+        self.frame_pool.push(regs);
+        res
+    }
+
+    fn execute_function_body(
+        &mut self,
+        module: &BinModule,
+        func: &BinFunction,
+        owned_params: u32,
+        restore_borrowed: &mut [(usize, OmniValue)],
+        regs: &mut [OmniValue; 224],
+        dirty: &mut [u64; 4],
+    ) -> Result<OmniValue, String> {
 
         let mut label_pcs: Option<[usize; 256]> = None;
         let resolve_lbl = |lbl: u16, lp: &mut Option<[usize; 256]>| -> Option<usize> {
@@ -1448,7 +1569,33 @@ impl OmniBinaryVm {
                 }
                 return Err(format!("error[BUDGET_EXCEEDED]: VM fuel/step budget exceeded ({} > {})", self.steps_executed, self.step_limit));
             }
+            if (self.steps_executed & 0xFFF) == 0 {
+                if let Some(t0) = self.start_instant {
+                    let elapsed_ms = t0.elapsed().as_millis() as u64;
+                    if elapsed_ms > self.wall_timeout_ms {
+                        for &mut (p_idx, ref mut out_v) in restore_borrowed.iter_mut() {
+                            *out_v = std::mem::replace(&mut regs[192 + p_idx], OmniValue::Void);
+                        }
+                        return Err(format!(
+                            "error[BUDGET_EXCEEDED]: VM wall-clock timeout exceeded ({} ms > {} ms)",
+                            elapsed_ms, self.wall_timeout_ms
+                        ));
+                    }
+                }
+            }
             let ins = &func.instructions[pc];
+            let min_ops = vm_op_min_ops(ins.op_tok);
+            if ins.operands.len() < min_ops {
+                for &mut (p_idx, ref mut out_v) in restore_borrowed.iter_mut() {
+                    *out_v = std::mem::replace(&mut regs[192 + p_idx], OmniValue::Void);
+                }
+                return Err(format!(
+                    "error[BAD_ARITY]: opcode 0x{:04X} requires at least {} operands, got {}",
+                    ins.op_tok,
+                    min_ops,
+                    ins.operands.len()
+                ));
+            }
             match ins.op_tok {
                 0x7F00 | 0x7F40 | 0x7F46 => { pc += 1; continue; }
                 0x7F41 => {
@@ -1627,6 +1774,8 @@ impl OmniBinaryVm {
                     }
                 }
                 0x7F0E => {
+                    // Legacy 2-op IGET (arr[i] / buf[i]): explicitly lenient (returns Int(0) on OOB)
+                    // across Rust VM, Pure-M4 VM, Wasm, and x86 emitters (ISA-B 3-op IGET above is strict).
                     let idx_opt = Self::eval_as_i64(&ins.operands[1], &regs);
                     match (Self::eval_op_ref(&ins.operands[0], &regs), idx_opt) {
                         (Some(OmniValue::U16Array(arr)), Some(i)) if i >= 0 && (i as usize) < arr.len() => {
@@ -1691,25 +1840,21 @@ impl OmniBinaryVm {
                         if let Some(v) = Self::eval_as_i64(&ins.operands[2], &regs) {
                             buf.extend_from_slice(&v.to_le_bytes());
                         }
-                    } else if ins.operands.len() == 4 && ins.operands[1] == BinOperand::ImmInt(-9) {
-                        if let (Some(off), Some(v)) = (
-                            Self::eval_as_i64(&ins.operands[2], &regs),
-                            Self::eval_as_i64(&ins.operands[3], &regs),
-                        ) {
-                            if off >= 0 {
-                                let u_off = off as usize;
-                                if u_off.checked_add(8).map(|end| end <= buf.len()).unwrap_or(false) {
-                                    buf[u_off..u_off + 8].copy_from_slice(&(v as u64).to_le_bytes());
-                                }
-                            }
-                        }
                     } else if ins.operands.len() == 4
-                        && (ins.operands[1] == BinOperand::ImmInt(-2) || ins.operands[1] == BinOperand::ImmInt(-4))
+                        && (ins.operands[1] == BinOperand::ImmInt(-2)
+                            || ins.operands[1] == BinOperand::ImmInt(-4)
+                            || ins.operands[1] == BinOperand::ImmInt(-9))
                     {
-                        // ISA-B 4-op ISET buf, mode, off, val: LE patch of 2/4 bytes. Strict bounds
+                        // ISA-B 4-op ISET buf, mode, off, val: LE patch of 2/4/8 bytes (-2/-4/-9). Strict bounds
                         // (0 <= off && off + width <= len, checked add); out of bounds is a
                         // deterministic runtime error[OUT_OF_BOUNDS] (never a silent no-op).
-                        let width = if ins.operands[1] == BinOperand::ImmInt(-2) { 2usize } else { 4usize };
+                        let width = if ins.operands[1] == BinOperand::ImmInt(-2) {
+                            2usize
+                        } else if ins.operands[1] == BinOperand::ImmInt(-4) {
+                            4usize
+                        } else {
+                            8usize
+                        };
                         if let (Some(off), Some(v)) = (
                             Self::eval_as_i64(&ins.operands[2], &regs),
                             Self::eval_as_i64(&ins.operands[3], &regs),
@@ -1721,6 +1866,8 @@ impl OmniBinaryVm {
                             }
                             let o = off as usize;
                             buf[o..o + width].copy_from_slice(&(v as u64).to_le_bytes()[..width]);
+                        } else {
+                            return Err(String::from(OMNI_OOB_ERROR));
                         }
                     } else {
                         for op_b in &ins.operands[1..] {
@@ -1733,21 +1880,21 @@ impl OmniBinaryVm {
                     }
                     OmniValue::Bytes(buf)
                 }
-                0x7F10 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a.wrapping_add(b)) } else { OmniValue::Int(0) },
-                0x7F11 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a.wrapping_sub(b)) } else { OmniValue::Int(0) },
-                0x7F12 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a.wrapping_mul(b)) } else { OmniValue::Int(0) },
-                0x7F13 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(if b == 0 { 0 } else { a.wrapping_div(b) }) } else { OmniValue::Int(0) },
-                0x7F14 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(if b == 0 { 0 } else { a.wrapping_rem(b) }) } else { OmniValue::Int(0) },
-                0x7F15 => if let Some(a) = Self::eval_as_i64(&ins.operands[0], &regs) { OmniValue::Int(a.wrapping_neg()) } else { OmniValue::Int(0) },
-                0x7F16 => if let Some(a) = Self::eval_as_i64(&ins.operands[0], &regs) { OmniValue::Int(a.wrapping_abs()) } else { OmniValue::Int(0) },
-                0x7F17 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a.min(b)) } else { OmniValue::Int(0) },
-                0x7F18 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a.max(b)) } else { OmniValue::Int(0) },
-                0x7F1E => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a & b) } else { OmniValue::Int(0) },
-                0x7F1F => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a | b) } else { OmniValue::Int(0) },
-                0x7F20 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a ^ b) } else { OmniValue::Int(0) },
-                0x7F21 => if let Some(a) = Self::eval_as_i64(&ins.operands[0], &regs) { OmniValue::Int(!a) } else { OmniValue::Int(0) },
-                0x7F22 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a.wrapping_shl((b & 63) as u32)) } else { OmniValue::Int(0) },
-                0x7F23 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a.wrapping_shr((b & 63) as u32)) } else { OmniValue::Int(0) },
+                0x7F10 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0).wrapping_add(Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0))),
+                0x7F11 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0).wrapping_sub(Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0))),
+                0x7F12 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0).wrapping_mul(Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0))),
+                0x7F13 => { let a = Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0); let b = Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0); OmniValue::Int(if b == 0 { 0 } else { a.wrapping_div(b) }) }
+                0x7F14 => { let a = Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0); let b = Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0); OmniValue::Int(if b == 0 { 0 } else { a.wrapping_rem(b) }) }
+                0x7F15 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0).wrapping_neg()),
+                0x7F16 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0).wrapping_abs()),
+                0x7F17 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0).min(Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0))),
+                0x7F18 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0).max(Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0))),
+                0x7F1E => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0) & Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0)),
+                0x7F1F => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0) | Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0)),
+                0x7F20 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0) ^ Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0)),
+                0x7F21 => OmniValue::Int(!Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0)),
+                0x7F22 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0).wrapping_shl((Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0) & 63) as u32)),
+                0x7F23 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0).wrapping_shr((Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0) & 63) as u32)),
                 0x7F50 => match Self::eval_op_ref(&ins.operands[0], &regs) {
                     Some(OmniValue::Bytes(b)) => OmniValue::Int(b.len() as i64),
                     Some(OmniValue::Str(s)) => OmniValue::Int(s.len() as i64),
@@ -2126,6 +2273,7 @@ impl OmniBinaryVm {
             if let Some(d_tok) = ins.dest_reg {
                 if let Some(slot) = token_to_slot(d_tok) {
                     regs[slot] = out_val;
+                    dirty[slot >> 6] |= 1u64 << (slot & 63);
                 }
             }
             pc += 1;
@@ -4544,6 +4692,14 @@ impl SurfaceLowerCtx {
             self.packets.len()
         };
         if self.first_dest_name_in_range(region_start, end).as_deref() == Some(dst) {
+            return Ok(());
+        }
+        // A join dest bound to a named variable (`w = if_pos c {..} else {..}` assigning an existing
+        // variable, possibly through nested if tails) is live: the arm may read it, so it must never be
+        // clobbered with `CINT 0`. Only a fresh `let r = if_pos ..` join dest (not yet bound) gets the
+        // contiguity init, exactly as before. A write of a fresh dest in a sibling/nested branch does
+        // not dominate this arm, so it is deliberately not consulted here.
+        if self.var_map.values().any(|r| r == dst) {
             return Ok(());
         }
         let asm = format!("{} = CINT 0", dst);
@@ -8992,19 +9148,36 @@ pub fn serve_omni_http_via_narrow_host<H: OmniNarrowHost>(
     let mut responses = Vec::with_capacity(num_requests);
     for _ in 0..num_requests {
         let conn_h = host.host_tcp_accept(combined_caps, listener_h)?;
-        let req_bytes = host.host_tcp_read(combined_caps, conn_h, 4096)?;
-        let req_str = String::from_utf8_lossy(&req_bytes);
-        let first_line = req_str.lines().next().unwrap_or("GET / HTTP/1.1");
-        let mut parts = first_line.split_whitespace();
-        let method = parts.next().unwrap_or("GET");
-        let req_path = parts.next().unwrap_or("/");
-        let resp = handle_omni_http_request(src, method, req_path, &mut kv_store)?;
-        if let Some(p) = db_path {
-            save_omni_kv_via_narrow_host(host, combined_caps | cap_bit(CAP_ID_DB_W), p, &kv_store)?;
-        }
+        let resp = match host.host_tcp_read(combined_caps, conn_h, 4096) {
+            Ok(req_bytes) => {
+                let req_str = String::from_utf8_lossy(&req_bytes);
+                let first_line = req_str.lines().next().unwrap_or("GET / HTTP/1.1");
+                let mut parts = first_line.split_whitespace();
+                let method = parts.next().unwrap_or("GET");
+                let req_path = parts.next().unwrap_or("/");
+                match handle_omni_http_request(src, method, req_path, &mut kv_store) {
+                    Ok(r) => {
+                        if let Some(p) = db_path {
+                            let _ = save_omni_kv_via_narrow_host(host, combined_caps | cap_bit(CAP_ID_DB_W), p, &kv_store);
+                        }
+                        r
+                    }
+                    Err(e) => OmniHttpResponse {
+                        status: 500,
+                        content_type: String::from("text/plain; charset=utf-8"),
+                        body: format!("error[HTTP_REQUEST_ERROR]: {}", e),
+                    },
+                }
+            }
+            Err(e) => OmniHttpResponse {
+                status: 400,
+                content_type: String::from("text/plain; charset=utf-8"),
+                body: format!("error[HTTP_READ_ERROR]: {}", e),
+            },
+        };
         let wire = resp.to_http11_wire_bytes();
-        let _ = host.host_tcp_write(combined_caps, conn_h, &wire)?;
-        let _ = host.host_tcp_close(combined_caps, conn_h)?;
+        let _ = host.host_tcp_write(combined_caps, conn_h, &wire);
+        let _ = host.host_tcp_close(combined_caps, conn_h);
         responses.push(resp);
     }
     let _ = host.host_tcp_close(combined_caps, listener_h)?;
@@ -9325,24 +9498,41 @@ fn serve_omni_http_batch_inner(
         let mut responses = Vec::with_capacity(num_requests);
         for _ in 0..num_requests {
             let conn_h = host.host_tcp_accept(combined_caps, listener_h)?;
-            let req_buf = host.host_tcp_read(combined_caps, conn_h, 4096)?;
-            let req_str = String::from_utf8_lossy(&req_buf);
-            let first_line = req_str.lines().next().unwrap_or("GET / HTTP/1.1");
-            let mut parts = first_line.split_whitespace();
-            let method = parts.next().unwrap_or("GET");
-            let req_path = parts.next().unwrap_or("/");
-            let resp = handle_omni_http_request(&src_owned, method, req_path, &mut kv_store)?;
-            if let Some(ref p) = db_file {
-                save_omni_kv_via_narrow_host(
-                    &mut host,
-                    combined_caps | cap_bit(CAP_ID_DB_W),
-                    &p.to_string_lossy(),
-                    &kv_store,
-                )?;
-            }
+            let resp = match host.host_tcp_read(combined_caps, conn_h, 4096) {
+                Ok(req_buf) => {
+                    let req_str = String::from_utf8_lossy(&req_buf);
+                    let first_line = req_str.lines().next().unwrap_or("GET / HTTP/1.1");
+                    let mut parts = first_line.split_whitespace();
+                    let method = parts.next().unwrap_or("GET");
+                    let req_path = parts.next().unwrap_or("/");
+                    match handle_omni_http_request(&src_owned, method, req_path, &mut kv_store) {
+                        Ok(r) => {
+                            if let Some(ref p) = db_file {
+                                let _ = save_omni_kv_via_narrow_host(
+                                    &mut host,
+                                    combined_caps | cap_bit(CAP_ID_DB_W),
+                                    &p.to_string_lossy(),
+                                    &kv_store,
+                                );
+                            }
+                            r
+                        }
+                        Err(e) => OmniHttpResponse {
+                            status: 500,
+                            content_type: String::from("text/plain; charset=utf-8"),
+                            body: format!("error[HTTP_REQUEST_ERROR]: {}", e),
+                        },
+                    }
+                }
+                Err(e) => OmniHttpResponse {
+                    status: 400,
+                    content_type: String::from("text/plain; charset=utf-8"),
+                    body: format!("error[HTTP_READ_ERROR]: {}", e),
+                },
+            };
             let wire = resp.to_http11_wire_bytes();
-            let _ = host.host_tcp_write(combined_caps, conn_h, &wire)?;
-            let _ = host.host_tcp_close(combined_caps, conn_h)?;
+            let _ = host.host_tcp_write(combined_caps, conn_h, &wire);
+            let _ = host.host_tcp_close(combined_caps, conn_h);
             responses.push(resp);
         }
         let _ = host.host_tcp_close(combined_caps, listener_h)?;
@@ -9414,9 +9604,18 @@ pub fn run_omni_serve_cli(argv: &[String]) -> i32 {
         } else if argv[i] == "--db" && i + 1 < argv.len() {
             db_path = Some(std::path::PathBuf::from(&argv[i + 1]));
             i += 2;
+        } else if argv[i] == "--bind" && i + 1 < argv.len() {
+            bind_addr = argv[i + 1].clone();
+            i += 2;
+        } else if argv[i] == "--port" && i + 1 < argv.len() {
+            bind_addr = format!("127.0.0.1:{}", argv[i + 1]);
+            i += 2;
         } else {
-            bind_addr = argv[i].clone();
-            i += 1;
+            eprintln!(
+                "error[INVALID_ARG]: unexpected serve argument '{}' (use --bind <addr> or --port <port>)",
+                argv[i]
+            );
+            return 2;
         }
     }
     let serve_res = match db_path {
@@ -11972,7 +12171,7 @@ pub fn run_pure_core_phase4_selfhost_fixed_point_selftests() -> Result<usize, St
     // 3. Verify Phase D ELF64 fixed point and Stage-1 compiler stream remain bit-exact alongside the expanded suite
     let (g1_u16, g2_u16, g1_elf, g2_elf) = run_phase_d_pure_omni_selfhost_bootstrap()?;
     let s1_u16 = build_step7_stage1_compiler_stream();
-    if g1_u16.len() != 159 || g1_u16 != g2_u16 || g1_elf.len() != 824 || g1_elf != g2_elf || s1_u16.len() != 19731 {
+    if g1_u16.len() != FROZEN_PHASE_D_BC_WORDS || g1_u16 != g2_u16 || g1_elf.len() != FROZEN_PHASE_D_ELF_BYTES || g1_elf != g2_elf || s1_u16.len() != FROZEN_STAGE1_BC_WORDS {
         return Err(format!(
             "Phase 4 Stage-1 or Phase-D fixed-point regression detected: g1={}, g2={}, elf={}, s1={}",
             g1_u16.len(),
@@ -12470,7 +12669,13 @@ pub fn verifier_engine_error_name(code: i64) -> &'static str {
         1003 => "MISSING_CAP",
         1004 => "LINEAR_LEAK",
         1005 => "BORROW_CONFLICT",
+        1010 => "MISSING_CAP_TERNARY",
+        1011 => "TAINT_ON_CONSENSUS",
+        1012 => "LINEAR_REFLECT",
+        1013 => "CAP_NARROW_EXPAND",
         2009 => "UNRESOLVED_LABEL",
+        2010 => "BAD_CALL_TARGET",
+        2011 => "CALL_ARITY_MISMATCH",
         3001 => "UNKNOWN_OPCODE",
         3003 => "SSA_NONCANONICAL",
         3004 => "ARENA_OVERWRITE",
@@ -13900,32 +14105,93 @@ pub fn run_host_sandbox_selftests() -> Result<usize, String> {
 
 
 
+/// Audit §2.4: Private 0700 temp directory + O_EXCL (`create_new(true)`) executable file guard.
+/// Prevents predictable `/tmp` filename/symlink races on shared hosts and cleans up on Drop.
+pub struct PrivateTempElf {
+    pub dir: std::path::PathBuf,
+    pub path: std::path::PathBuf,
+}
+
+impl PrivateTempElf {
+    pub fn new(bytes: &[u8], tag: &str) -> Result<Self, String> {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let safe_tag: String = tag
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        let dir = std::env::temp_dir().join(format!(
+            "omni_priv_{}_{}_{}_{}",
+            std::process::id(),
+            seq,
+            nanos,
+            safe_tag
+        ));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&dir)
+                .map_err(|e| format!("PrivateTempElf create_dir {}: {}", dir.display(), e))?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir(&dir)
+                .map_err(|e| format!("PrivateTempElf create_dir {}: {}", dir.display(), e))?;
+        }
+        let path = dir.join("payload.elf");
+        #[cfg(unix)]
+        let mut f = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o700)
+                .open(&path)
+                .map_err(|e| format!("PrivateTempElf open O_EXCL {}: {}", path.display(), e))?
+        };
+        #[cfg(not(unix))]
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| format!("PrivateTempElf open O_EXCL {}: {}", path.display(), e))?;
+        f.write_all(bytes)
+            .map_err(|e| format!("PrivateTempElf write {}: {}", path.display(), e))?;
+        f.sync_all()
+            .map_err(|e| format!("PrivateTempElf sync {}: {}", path.display(), e))?;
+        drop(f);
+        Ok(Self { dir, path })
+    }
+}
+
+impl Drop for PrivateTempElf {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 /// Run a freshly emitted x86-64 ELF and decode the 8-byte little-endian stdout i64.
 pub fn execute_native_elf_i64(elf: &[u8], args: &[i64]) -> Result<i64, String> {
     #[cfg(all(unix, target_arch = "x86_64"))]
     {
-        use std::os::unix::fs::PermissionsExt;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let id = N.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "omni_native_{}_{}.elf",
-            std::process::id(),
-            id
-        ));
-        std::fs::write(&path, elf).map_err(|e| e.to_string())?;
-        let mut perms = std::fs::metadata(&path).map_err(|e| e.to_string())?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).map_err(|e| e.to_string())?;
+        let tmp_elf = PrivateTempElf::new(elf, "native_i64")?;
         let arg_strs: Vec<String> = args.iter().map(|n| n.to_string()).collect();
-        let out = std::process::Command::new(&path)
+        let out = std::process::Command::new(&tmp_elf.path)
             .args(&arg_strs)
             .output()
             .map_err(|e| format!("failed to run native ELF: {e}"))?;
-        let _ = std::fs::remove_file(&path);
         if out.status.code() == Some(OMNI_OOB_EXIT_STATUS)
             && out.stdout.is_empty()
-            && out.stderr == format!("{}\n", OMNI_OOB_ERROR).as_bytes()
+            && (out.stderr.is_empty() || out.stderr == format!("{}\n", OMNI_OOB_ERROR).as_bytes())
         {
             return Err(String::from(OMNI_OOB_ERROR));
         }
@@ -14389,6 +14655,124 @@ pub fn run_if_pos_join_slot_stage1_selftests() -> Result<usize, String> {
     Ok(checks)
 }
 
+/// Regression (lowerer live-dest clobber): `w = if_pos c { .. } else { .. }` / `w = match_trit ..`
+/// assigning an EXISTING variable must not get the fresh-join `w = CINT 0` init. Before the fix,
+/// `ensure_contiguous_join_slot` inserted it at the start of the first stream-order arm (the
+/// `else` / `neg` arm) whenever that arm emitted a temp before writing `w`, so the arm then read
+/// `w == 0` (e.g. `else { add2(w, 1024 + cur) }`). Fresh `let r = if_pos ..` joins keep the init.
+pub const JOIN_LIVE_DEST_CASES: &[(&str, &str, &[(i64, i64)])] = &[
+    (
+        "repro_9024_golden",
+        include_str!("spec/m3/join_live_dest_golden.omni"),
+        &[(0, 9024), (5, 8001), (-3, 9021)],
+    ),
+    (
+        "else_arm_binexpr_arg",
+        "fn add2(a: i64, b: i64) -> i64 { return a + b; }\nfn main(x: i64) -> i64 { let w: i64 = 7; let cur: i64 = x * 3; let c: trit = x <=> 0; w = if_pos c { add2(w, 1) } else { add2(w, 1024 + cur) }; return w; }",
+        &[(5, 8), (0, 1031), (-2, 1025)],
+    ),
+    (
+        "then_arm_binexpr_arg",
+        "fn add2(a: i64, b: i64) -> i64 { return a + b; }\nfn main(x: i64) -> i64 { let w: i64 = 7; let cur: i64 = x * 3; let c: trit = x <=> 0; w = if_pos c { let t: i64 = add2(w, 1024 + cur); t } else { add2(w, cur - 1) }; return w; }",
+        &[(5, 1046), (0, 6), (-2, 0)],
+    ),
+    (
+        "nested_if_else",
+        "fn add2(a: i64, b: i64) -> i64 { return a + b; }\nfn main(x: i64) -> i64 { let w: i64 = 7; let cur: i64 = x * 3; let c: trit = x <=> 0; w = if_pos c { add2(w, 1) } else { let d: trit = x <=> -3; if_pos d { add2(w, 1024 + cur) } else { add2(1024 + cur, w) * 2 } }; return w; }",
+        &[(5, 8), (0, 1031), (-2, 1025), (-3, 2044), (-4, 2038)],
+    ),
+    (
+        "result_used_after_if",
+        "fn main(x: i64) -> i64 { let w: i64 = 7; let cur: i64 = x * 3; let c: trit = x <=> 0; w = if_pos c { w * 2 } else { w + (cur - 1) }; let z: i64 = w * 10 + x; return z; }",
+        &[(5, 145), (0, 60), (-2, -2)],
+    ),
+    (
+        "match_trit_neg_arm",
+        "fn add2(a: i64, b: i64) -> i64 { return a + b; }\nfn main(x: i64) -> i64 { let w: i64 = 7; let cur: i64 = x * 3; let c: trit = x <=> 0; w = match_trit c { neg => add2(w, 1024 + cur), zero => w + 100, pos => add2(1024 + cur, w) }; return w; }",
+        &[(-2, 1025), (0, 107), (5, 1046)],
+    ),
+    (
+        // Fresh `let` join whose first stream-order write is nested in an inner if: every path
+        // still writes `r`, and the fresh-dest contiguity init behaviour is unchanged.
+        "fresh_nested_first_write",
+        "fn main(x: i64) -> i64 { let d: trit = x <=> -5; let c: trit = x <=> 0; let r: i64 = if_pos c { x * 2 } else { if_pos d { x + 30 } else { (x - 1) * 3 } }; return r * 10 + 1; }",
+        &[(5, 101), (0, 301), (-5, -179), (-6, -209)],
+    ),
+    (
+        "loop_carried_else",
+        "fn add2(a: i64, b: i64) -> i64 { return a + b; }\nfn main(x: i64) -> i64 { let acc: i64 = 1; let i: i64 = 0; while i < x { let c: trit = i <=> 1; acc = if_pos c { acc + 1 } else { add2(acc, 1000 + i) }; i = i + 1; } return acc; }",
+        &[(0, 1), (1, 1001), (3, 2003)],
+    ),
+];
+
+pub fn run_join_live_dest_selftests() -> Result<usize, String> {
+    let mut checks = 0usize;
+    for &(name, src, ios) in JOIN_LIVE_DEST_CASES {
+        let stream = compile_omni_surface_to_u16(src)
+            .map_err(|e| format!("join live-dest '{name}' failed to compile: {e}"))?;
+        for rep in verify_u16_stream(&stream)? {
+            if !rep.passed {
+                return Err(format!("join live-dest '{name}' failed binary verify (fn #{}): {:?}", rep.fn_idx, rep.errors));
+            }
+        }
+        let asm = compile_omni_surface_to_asm(src)
+            .map_err(|e| format!("join live-dest '{name}' asm lower failed: {e}"))?;
+        if assemble_omni_text_to_u16(&asm)? != stream {
+            return Err(format!("join live-dest '{name}': direct u16 != assembled asm"));
+        }
+        // Pure-Omni M3 must lower the same words as the Rust lowerer.
+        let pure_u16 = pure_default_compile_surface_to_u16(src, false)
+            .map_err(|e| format!("join live-dest '{name}' Pure-M3 compile failed: {e}"))?;
+        if pure_u16 != stream {
+            return Err(format!("join live-dest '{name}': Pure-M3 words != Rust lowerer words"));
+        }
+        checks += 1;
+        for &(inp, want) in ios {
+            let module = decode_omni_token_stream(&stream)?;
+            let mut vm = OmniBinaryVm::new();
+            let got = vm.execute_function(&module, 0, vec![OmniValue::Int(inp)])?;
+            if got != OmniValue::Int(want) {
+                return Err(format!("join live-dest '{name}' VM x={inp} got {got:?} want {want}"));
+            }
+            // Multi-function Wasm AOT (M2-10) on the same lowered stream.
+            let wasm = execute_wasm_module_i64(&compile_pure_u16_to_wasm_multi(&stream)?, &[inp])?;
+            if wasm != want {
+                return Err(format!("join live-dest '{name}' Wasm x={inp} got {wasm} want {want}"));
+            }
+            let (m4, _) = pure_default_run_u16(&stream, inp, 0, 0, false)?;
+            if m4 != want {
+                return Err(format!("join live-dest '{name}' Pure-M4 x={inp} got {m4} want {want}"));
+            }
+            checks += 1;
+            #[cfg(all(unix, target_arch = "x86_64"))]
+            {
+                let elf = compile_pure_u16_to_x86_64_elf_multi(&stream, inp, 0, 0)?;
+                let native = execute_native_elf_i64(&elf, &[inp])?;
+                if native != want {
+                    return Err(format!("join live-dest '{name}' Rust x86-64 x={inp} got {native} want {want}"));
+                }
+                let pure_elf = pure_default_compile_u16_to_elf(&stream, inp, 0, 0)?;
+                if pure_elf != elf {
+                    return Err(format!("join live-dest '{name}' x={inp}: Pure-M2 ELF != Rust multi x86-64 ELF"));
+                }
+                let pure_native = execute_native_elf_i64(&pure_elf, &[inp])?;
+                if pure_native != want {
+                    return Err(format!("join live-dest '{name}' Pure-M2 ELF x={inp} got {pure_native} want {want}"));
+                }
+                checks += 1;
+            }
+        }
+    }
+    // A fresh `let r = if_pos ..` join keeps its contiguity init (`%k = CINT 0`) unchanged.
+    let fresh = "fn main(x: i64) -> i64 { let c = x <=> 0; let r = if_pos c { 200 } else { (x + 1) * 2 }; return r; }";
+    let fresh_asm = compile_omni_surface_to_asm(fresh)?;
+    if !fresh_asm.lines().any(|l| l.trim() == "%1 = CINT 0") {
+        return Err(String::from("join live-dest: fresh let-join lost its `%1 = CINT 0` contiguity init"));
+    }
+    checks += 1;
+    Ok(checks)
+}
+
 pub fn run_if_pos_join_slot_selftests() -> Result<usize, String> {
     let mut checks = 0usize;
     let cases = IF_POS_JOIN_SLOT_CASES;
@@ -14493,21 +14877,15 @@ pub fn run_native_elf_for_diff(elf: &[u8], tag: &str) -> Result<Option<NativeElf
     #[cfg(all(unix, target_arch = "x86_64"))]
     {
         use std::io::Read;
-        use std::os::unix::fs::PermissionsExt;
         use std::os::unix::process::ExitStatusExt;
         use std::process::{Command, Stdio};
-        let safe_tag: String = tag.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
-        let path = std::env::temp_dir().join(format!("omni_diff4_{}_{}.elf", std::process::id(), safe_tag));
-        std::fs::write(&path, elf).map_err(|e| format!("diff4: write {}: {e}", path.display()))?;
-        let mut perms = std::fs::metadata(&path).map_err(|e| e.to_string())?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).map_err(|e| e.to_string())?;
-        let mut child = Command::new(&path)
+        let tmp_elf = PrivateTempElf::new(elf, tag)?;
+        let mut child = Command::new(&tmp_elf.path)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| format!("diff4: spawn {}: {e}", path.display()))?;
+            .map_err(|e| format!("diff4: spawn {}: {e}", tmp_elf.path.display()))?;
         let mut so = child.stdout.take().ok_or("diff4: no stdout pipe")?;
         let reader = std::thread::spawn(move || {
             let mut buf = Vec::new();
@@ -14530,7 +14908,7 @@ pub fn run_native_elf_for_diff(elf: &[u8], tag: &str) -> Result<Option<NativeElf
             }
         };
         let stdout = reader.join().unwrap_or_default();
-        let _ = std::fs::remove_file(&path);
+        drop(tmp_elf);
         return Ok(Some(NativeElfRun { exit_code: status.code(), signal: status.signal(), stdout, timed_out }));
     }
     #[allow(unreachable_code)]
@@ -14589,7 +14967,7 @@ impl DiffObs {
     }
 }
 
-pub const OMNI_DIFF4_BACKENDS: [&str; 4] = ["vm", "wasm", "x86", "stage1"];
+pub const OMNI_DIFF4_BACKENDS: [&str; 5] = ["vm", "wasm", "x86", "stage1", "m4"];
 
 #[derive(Clone, Debug)]
 pub struct FourBackendReport {
@@ -14758,11 +15136,105 @@ pub fn run_four_backend_differential(src: &str, args: &[i64], tag: &str) -> Resu
     };
     obs.push(("stage1", s1_obs));
 
+    let m4_obs = match diff4_catch(|| run_u16_on_pure_m4_for_diff(&u16_stream, a3[0], a3[1], a3[2], 200_000)) {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => DiffObs::RunErr(e),
+        Err(p) => DiffObs::Panic(p),
+    };
+    obs.push(("m4", m4_obs));
+
     let stage1_elf_eq_host = match (&host_elf, &s1_elf) {
         (Ok(Ok(h)), Ok(Ok(s))) => Some(h == s),
         _ => None,
     };
     Ok(FourBackendReport { u16_len: u16_stream.len(), obs, stage1_elf_eq_host })
+}
+
+/// Runs a verified `.omni_bc` u16 stream on the Pure-Omni M4 VM (`pure/m4/vm.omni::m4_vm_run_i64`)
+/// and converts the resulting VM_STATE / heap slice into a `DiffObs` for the 5th `backend-diff` column.
+pub fn run_u16_on_pure_m4_for_diff(
+    u16_stream: &[u16],
+    a0: i64,
+    a1: i64,
+    a2: i64,
+    fuel: i64,
+) -> Result<DiffObs, String> {
+    static M4_DIFF_MOD: std::sync::OnceLock<Result<BinModule, String>> = std::sync::OnceLock::new();
+    let m4_mod = M4_DIFF_MOD
+        .get_or_init(|| {
+            let u16s = with_lockstep_suspended(|| compile_omni_surface_to_u16(M4_VM_OMNI_SRC))?;
+            decode_omni_token_stream(&u16s)
+        })
+        .as_ref()
+        .map_err(|e| e.clone())?;
+    let m4_run_fn = m4_mod.functions[m4_mod.functions.len() - 2].fn_idx;
+    let decoded = decode_omni_token_stream(u16_stream)?;
+    // Pure-Omni M4 VM supports the same opcode subset as M2-multi (no legacy @PACK5 / DROP / FGET / FSET opcodes).
+    for func in &decoded.functions {
+        for ins in &func.instructions {
+            let ok_op = matches!(
+                ins.op_tok,
+                0x7F00..=0x7F06 | 0x7F09 | 0x7F0D | 0x7F0E | 0x7F0F
+                | 0x7F10..=0x7F18 | 0x7F1E..=0x7F31 | 0x7F34 | 0x7F35 | 0x7F3F
+                | 0x7F40..=0x7F45 | 0x7F48 | 0x7F4A | 0x7F50
+            );
+            if !ok_op {
+                return Ok(DiffObs::Unsupported(format!(
+                    "Pure-M4 does not implement opcode 0x{:04X}",
+                    ins.op_tok
+                )));
+            }
+        }
+    }
+    let entry_is_bytes = decoded
+        .functions
+        .iter()
+        .find(|f| f.fn_idx == 0)
+        .or_else(|| decoded.functions.last())
+        .map(|f| f.ret_ty_tok == TY_BYTES)
+        .unwrap_or(false);
+    let mut host_vm = OmniBinaryVm::with_budgets(100_000_000, 64 * 1024 * 1024);
+    let arena = match host_vm.execute_function(
+        m4_mod,
+        m4_run_fn,
+        vec![
+            OmniValue::Bytes(vec![0u8; 524_288]),
+            OmniValue::U16Array(u16_stream.to_vec()),
+            OmniValue::Int(a0),
+            OmniValue::Int(a1),
+            OmniValue::Int(a2),
+            OmniValue::Int(fuel),
+            OmniValue::Int(0),
+        ],
+    )? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("Pure-M4 returned {:?}", other)),
+    };
+    let st = 167_936usize;
+    let err_code = u32::from_le_bytes(arena[st + 28..st + 32].try_into().unwrap());
+    let ret_val = i64::from_le_bytes(arena[st + 32..st + 40].try_into().unwrap());
+    let ret_tag = u32::from_le_bytes(arena[st + 40..st + 44].try_into().unwrap());
+    if err_code == 2 {
+        return Ok(DiffObs::RunErr(String::from(OMNI_OOB_ERROR)));
+    }
+    if err_code != 0 {
+        return Ok(DiffObs::RunErr(format!(
+            "error[M4_TRAP_{}]: Pure-Omni M4 VM trapped",
+            err_code
+        )));
+    }
+    if entry_is_bytes || ret_tag == 3 {
+        let bbase = ((ret_val as u64) >> 32) as usize;
+        let blen = ((ret_val as u64) & 0xFFFF_FFFF) as usize;
+        let heap_base = 327_680usize;
+        if heap_base.saturating_add(bbase).saturating_add(blen) > arena.len() {
+            return Ok(DiffObs::RunErr(String::from(OMNI_OOB_ERROR)));
+        }
+        let slice = arena[heap_base + bbase..heap_base + bbase + blen].to_vec();
+        Ok(DiffObs::Out { exit: 0, stdout: slice })
+    } else {
+        Ok(DiffObs::Out { exit: 0, stdout: ret_val.to_le_bytes().to_vec() })
+    }
 }
 
 /// Independently derived expectation for one run of a differential golden.
@@ -14806,7 +15278,7 @@ pub struct DiffGolden {
     pub backends: &'static [&'static str],
 }
 
-const DIFF4_ALL: &[&str] = &["vm", "wasm", "x86", "stage1"];
+const DIFF4_ALL: &[&str] = &["vm", "wasm", "x86", "stage1", "m4"];
 
 pub const OMNI_DIFF4_GOLDENS: &[DiffGolden] = &[
     // --- P1: runtime-value byte readback (acceptance test for the IGET/ISET byte-storage fix) ---
@@ -15152,15 +15624,13 @@ pub const OMNI_DIFF4_GOLDENS: &[DiffGolden] = &[
         runs: &[(&[3], DiffExpect::OobErr), (&[-3], DiffExpect::OobErr)],
         backends: DIFF4_ALL,
     },
-    // --- P9: iset_patch_i64 with a negative offset (-8..-1) is a silent no-op on the VM ---
-    // Decided in HANDOFF.md 6.4 (no-op, not panic, not error): buf keeps its 8 bytes, slen = 8.
-    // AOT behaviour for this input is unspecified, so only the VM is asserted.
+    // --- P9 / Audit §1.3 & §5: iset_patch_i64 (-9) with a negative offset traps with OUT_OF_BOUNDS ---
     DiffGolden {
         id: "p9_vm_patch_negative_offset",
         proposal: "P9",
         src: "fn patchn(x: i64) -> i64 { let buf = anew(0); buf = iset_i64(buf, 5); let off = 0 - 3; buf = iset_patch_i64(buf, off, 77); let n = slen(buf); return n; }",
-        runs: &[(&[7], DiffExpect::I64(8))],
-        backends: &["vm"],
+        runs: &[(&[7], DiffExpect::OobErr)],
+        backends: &["vm", "m4"],
     },
     // --- M2-06 (D-1): 3-op RET buf, off, len / ret_slice(buf, off, len) ---
     DiffGolden {
@@ -15182,6 +15652,50 @@ pub const OMNI_DIFF4_GOLDENS: &[DiffGolden] = &[
         proposal: "M2-06",
         src: "fn rslice_oob(x: i64) -> Bytes { let buf = anew(0); buf = iset(buf, 10, 20); return ret_slice(buf, 1, 5); }",
         runs: &[(&[0], DiffExpect::OobErr)],
+        backends: DIFF4_ALL,
+    },
+    // --- Audit §1.1: INT_MIN division/modulo and shift-edge goldens ---
+    DiffGolden {
+        id: "s1_int_min_div",
+        proposal: "Audit-S1.1",
+        src: "fn s1_div(a: i64, b: i64) -> i64 { return a / b; }",
+        runs: &[
+            (&[i64::MIN, 2], DiffExpect::I64(-4611686018427387904)),
+            (&[i64::MIN, -1], DiffExpect::I64(i64::MIN)),
+            (&[5, i64::MIN], DiffExpect::I64(0)),
+            (&[i64::MIN, 1], DiffExpect::I64(i64::MIN)),
+            (&[0, i64::MIN], DiffExpect::I64(0)),
+            (&[i64::MIN, i64::MIN], DiffExpect::I64(1)),
+        ],
+        backends: DIFF4_ALL,
+    },
+    DiffGolden {
+        id: "s1_int_min_mod",
+        proposal: "Audit-S1.1",
+        src: "fn s1_mod(a: i64, b: i64) -> i64 { return a % b; }",
+        runs: &[
+            (&[i64::MIN, 3], DiffExpect::I64(-2)),
+            (&[i64::MIN, -1], DiffExpect::I64(0)),
+            (&[i64::MIN, 2], DiffExpect::I64(0)),
+            (&[i64::MIN, 1], DiffExpect::I64(0)),
+            (&[5, i64::MIN], DiffExpect::I64(5)),
+            (&[-5, i64::MIN], DiffExpect::I64(-5)),
+            (&[0, i64::MIN], DiffExpect::I64(0)),
+        ],
+        backends: DIFF4_ALL,
+    },
+    DiffGolden {
+        id: "s1_shift_edges",
+        proposal: "Audit-S1.1",
+        src: "fn s1_sh(a: i64, b: i64, dir: i64) -> i64 { let c: trit = dir <=> 0; return if_pos c { a << b } else { a >> b }; }",
+        runs: &[
+            (&[1, 63, 1], DiffExpect::I64(i64::MIN)),
+            (&[i64::MIN, 63, -1], DiffExpect::I64(-1)),
+            (&[i64::MIN, 1, -1], DiffExpect::I64(-4611686018427387904)),
+            (&[i64::MIN, 0, -1], DiffExpect::I64(i64::MIN)),
+            (&[7, 64, 1], DiffExpect::I64(7)),
+            (&[-1, -1, -1], DiffExpect::I64(-1)),
+        ],
         backends: DIFF4_ALL,
     },
 ];
@@ -15211,25 +15725,13 @@ pub const OMNI_DIFF4_KNOWN_DIVERGENCES: &[(&str, &str, &str)] = &[
     ("p11_pack5_direct_aot", "stage1", "Stage-1 is frozen; rejects TPACK5/TUNPACK5/TDOT/EGATE with error[UNSUPPORTED] (C2)"),
     ("p11_pack5_trit_vec", "stage1", "Stage-1 is frozen; rejects TPACK5/TDOT/EGATE with error[UNSUPPORTED] (C2)"),
     ("p11_decision_hook", "stage1", "Stage-1 is frozen; rejects EGATE 0x7F35 with error[UNSUPPORTED] (C2)"),
-    // P3: IMOD stale rdx / C2 up-front rejection on Stage-1.
-    ("p3_imod_rdx_clobber", "x86", "N1: IMOD guard (14667-14675) jumps over cqo/idiv for b==0 and MIN/-1, then mov rax,rdx copies a stale rdx (TCMP leaves rdx=trit)"),
+    // P3: C2 up-front rejection on Stage-1 (x86 IMOD stale rdx fixed in Audit §5).
     ("p3_imod_rdx_clobber", "stage1", "Stage-1 is frozen; rejects IMOD 0x7F14 with error[UNSUPPORTED] (C2)"),
-    ("p3_imod_zero_after_tcmp", "x86", "N1, see p3_imod_rdx_clobber/x86"),
     ("p3_imod_zero_after_tcmp", "stage1", "Stage-1 is frozen; rejects IMOD 0x7F14 with error[UNSUPPORTED] (C2)"),
-    ("p3_imod_min_neg1_after_tcmp", "x86", "N1, see p3_imod_rdx_clobber/x86"),
     ("p3_imod_min_neg1_after_tcmp", "stage1", "Stage-1 is frozen; rejects IMOD 0x7F14 with error[UNSUPPORTED] (C2)"),
     ("p3_imod_control_no_tcmp", "stage1", "Stage-1 is frozen; rejects IMOD 0x7F14 with error[UNSUPPORTED] (C2)"),
-    // P4: trit ops without clamping (spec.md:53).
-    ("p4_trit_clamp", "wasm", "N3: Wasm TNOT/TAND/TOR/TXOR/TMAJ do not clamp i64 operands (15332, 15352-15357)"),
-    ("p4_trit_clamp", "x86", "N3: x86 TAND/TOR share IMIN/IMAX (14714), TNOT shares INEG (14676); no clamp"),
-    ("p4_trit_clamp", "stage1", "N3: Stage-1 shares the same arms (16293, 16310); no clamp"),
-    // P5: BR_POS/BR_NEG compare == +-1 instead of clamping.
-    ("p5_if_pos_nontrit", "wasm", "N2: Wasm BR_POS compares == 1 (15451-15460); VM clamps via eval_as_trit (1115, 1213-1218)"),
-    ("p5_if_pos_nontrit", "x86", "N2: x86 BR_POS emits cmp rax,1; je (14793-14800)"),
-    ("p5_if_pos_nontrit", "stage1", "N2: Stage-1 BR_POS (lbl_br_pos 16504+) emits the same cmp rax,1"),
-    ("p5_if_neg_nontrit", "wasm", "N2: Wasm BR_NEG compares == -1 (15451-15460)"),
-    ("p5_if_neg_nontrit", "x86", "N2: x86 BR_NEG emits cmp rax,-1; je (14793-14800)"),
-    ("p5_if_neg_nontrit", "stage1", "N2: Stage-1 BR_NEG (lbl_br_neg 16513+) mirrors x86"),
+    ("s1_int_min_mod", "stage1", "Stage-1 is frozen; rejects IMOD 0x7F14 with error[UNSUPPORTED] (C2)"),
+    // (P4 trit clamping and P5 BR_POS/BR_NEG fixed on x86, Wasm, and Stage-1 in Audit §5.)
     // ISA-B shapes on Stage-1: Stage-1 is frozen and rejects ISA-B up front with error[UNSUPPORTED].
     ("isab_ld_u8_unsigned", "stage1", "Stage-1 is frozen; rejects ISA-B 3-op IGET with error[UNSUPPORTED]"),
     ("isab_oob_ld_u8_past_end", "stage1", "Stage-1 is frozen; rejects ISA-B 3-op IGET with error[UNSUPPORTED]"),
@@ -15379,7 +15881,7 @@ pub fn expect_native_elf_i64(elf: &[u8], tag: &str, want: i64, ctx: &str) -> Res
 
 /// `omnic backend-diff` / `omnic diff4` CLI.
 ///   backend-diff --suite                 run OMNI_DIFF4_GOLDENS, print PASS/XFAIL/XPASS/FAIL per backend
-///   backend-diff <file.omni|"src"> [a..] run one program on vm/wasm/x86/stage1, compare byte-for-byte
+///   backend-diff <file.omni|"src"> [a..] run one program on vm/wasm/x86/stage1/m4, compare byte-for-byte
 /// Exit: 0 = suite green / all comparable backends agree; 1 = FAIL/XPASS / divergence; 2 = usage/frontend error.
 pub fn run_omni_backend_diff_cli(argv: &[String]) -> i32 {
     if argv.first().map(|s| s.as_str()) == Some("--suite") {
@@ -16147,14 +16649,15 @@ fn main(x: i64, y: i64) -> i64 {
 
 pub const FROZEN_PHASE_D_BC_WORDS: usize = 159;
 pub const FROZEN_PHASE_D_BC_FNV1A64: u64 = 0x23B8D17257CCA9C4;
-pub const FROZEN_PHASE_D_ELF_BYTES: usize = 824;
-pub const FROZEN_PHASE_D_ELF_FNV1A64: u64 = 0xE221085777B8AC47;
+// Re-frozen in Audit §5 (single deliberate re-freeze: PT_GNU_STACK + strict ISET -9 + IMOD/trit-clamp/BR_POS/BR_NEG).
+pub const FROZEN_PHASE_D_ELF_BYTES: usize = 880;
+pub const FROZEN_PHASE_D_ELF_FNV1A64: u64 = 0x8D5AAAD22399A1EE;
 pub const FROZEN_CORE_SUITE_WORDS: usize = 14_559;
 pub const FROZEN_CORE_SUITE_FNV1A64: u64 = 0x78462AE4C81DF408;
-pub const FROZEN_STAGE1_ELF_BYTES: usize = 106_242;
-pub const FROZEN_STAGE1_ELF_FNV1A64: u64 = 0xEAFC81F46B482FF8;
-pub const FROZEN_STAGE1_BC_WORDS: usize = 19_731;
-pub const FROZEN_STAGE1_BC_FNV1A64: u64 = 0x677F57AE71D28FED;
+pub const FROZEN_STAGE1_ELF_BYTES: usize = 112_180;
+pub const FROZEN_STAGE1_ELF_FNV1A64: u64 = 0x62F14B335B52BECC;
+pub const FROZEN_STAGE1_BC_WORDS: usize = 20_443;
+pub const FROZEN_STAGE1_BC_FNV1A64: u64 = 0xED4C50AA79563EFF;
 
 /// 13BF. C1: Pin the 5 frozen FNV-1a64 hashes and exact sizes (`HANDOFF.md` §3).
 pub fn run_frozen_hash_pin_selftests() -> Result<usize, String> {
@@ -17808,18 +18311,28 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
                 }
                 if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
             }
-            0x7F13 | 0x7F14 => {
+            0x7F13 => {
                 emit_load_op(&mut code, &ins.operands[0], false);
                 emit_load_op(&mut code, &ins.operands[1], true);
                 code.extend_from_slice(&[0x49, 0x89, 0xC0, 0x48, 0x85, 0xC9, 0x74, 0x1E, 0x48, 0x83, 0xF9, 0xFF, 0x75, 0x11, 0x49, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x4D, 0x39, 0xC8, 0x75, 0x02, 0xEB, 0x0A, 0x48, 0x99, 0x48, 0xF7, 0xF9, 0xEB, 0x03, 0x48, 0x31, 0xC0]);
-                if ins.op_tok == 0x7F14 {
-                    code.extend_from_slice(&[0x48, 0x89, 0xD0]);
-                }
                 if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
             }
-            0x7F15 | 0x7F28 => {
+            0x7F14 => {
+                // Audit §5: IMOD guard lands on `xor rax, rax` for b==0 and INT_MIN%-1; `mov rax, rdx` runs only after idiv.
+                emit_load_op(&mut code, &ins.operands[0], false);
+                emit_load_op(&mut code, &ins.operands[1], true);
+                code.extend_from_slice(&[0x49, 0x89, 0xC0, 0x48, 0x85, 0xC9, 0x74, 0x21, 0x48, 0x83, 0xF9, 0xFF, 0x75, 0x11, 0x49, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x4D, 0x39, 0xC8, 0x75, 0x02, 0xEB, 0x0A, 0x48, 0x99, 0x48, 0xF7, 0xF9, 0x48, 0x89, 0xD0, 0xEB, 0x03, 0x48, 0x31, 0xC0]);
+                if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+            }
+            0x7F15 => {
                 emit_load_op(&mut code, &ins.operands[0], false);
                 code.extend_from_slice(&[0x48, 0xF7, 0xD8]);
+                if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+            }
+            0x7F28 => {
+                // Audit §5: TNOT clamps operand to [-1, 1] before negating.
+                emit_load_op(&mut code, &ins.operands[0], false);
+                code.extend_from_slice(&[0x48, 0x83, 0xF8, 0x00, 0x0F, 0x9F, 0xC0, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC0, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD0, 0x48, 0xF7, 0xD8]);
                 if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
             }
             0x7F16 => {
@@ -17855,29 +18368,54 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
                 ]);
                 if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
             }
-            0x7F29 | 0x7F17 => {
+            0x7F17 => {
                 emit_load_op(&mut code, &ins.operands[0], false);
                 emit_load_op(&mut code, &ins.operands[1], true);
                 code.extend_from_slice(&[0x48, 0x39, 0xC8, 0x48, 0x0F, 0x4F, 0xC1]);
                 if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
             }
-            0x7F2A | 0x7F18 => {
+            0x7F29 => {
+                // Audit §5: TAND clamps both operands to [-1, 1].
+                emit_load_op(&mut code, &ins.operands[0], false);
+                emit_load_op(&mut code, &ins.operands[1], true);
+                code.extend_from_slice(&[0x48, 0x83, 0xF8, 0x00, 0x0F, 0x9F, 0xC0, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC0, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD0]);
+                code.extend_from_slice(&[0x48, 0x83, 0xF9, 0x00, 0x0F, 0x9F, 0xC1, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC9, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD1]);
+                code.extend_from_slice(&[0x48, 0x39, 0xC8, 0x48, 0x0F, 0x4F, 0xC1]);
+                if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+            }
+            0x7F18 => {
                 emit_load_op(&mut code, &ins.operands[0], false);
                 emit_load_op(&mut code, &ins.operands[1], true);
                 code.extend_from_slice(&[0x48, 0x39, 0xC8, 0x48, 0x0F, 0x4C, 0xC1]);
                 if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
             }
-            0x7F2B => {
+            0x7F2A => {
+                // Audit §5: TOR clamps both operands to [-1, 1].
                 emit_load_op(&mut code, &ins.operands[0], false);
                 emit_load_op(&mut code, &ins.operands[1], true);
+                code.extend_from_slice(&[0x48, 0x83, 0xF8, 0x00, 0x0F, 0x9F, 0xC0, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC0, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD0]);
+                code.extend_from_slice(&[0x48, 0x83, 0xF9, 0x00, 0x0F, 0x9F, 0xC1, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC9, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD1]);
+                code.extend_from_slice(&[0x48, 0x39, 0xC8, 0x48, 0x0F, 0x4C, 0xC1]);
+                if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+            }
+            0x7F2B => {
+                // Audit §5: TXOR clamps both operands to [-1, 1].
+                emit_load_op(&mut code, &ins.operands[0], false);
+                emit_load_op(&mut code, &ins.operands[1], true);
+                code.extend_from_slice(&[0x48, 0x83, 0xF8, 0x00, 0x0F, 0x9F, 0xC0, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC0, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD0]);
+                code.extend_from_slice(&[0x48, 0x83, 0xF9, 0x00, 0x0F, 0x9F, 0xC1, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC9, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD1]);
                 code.extend_from_slice(&[0x48, 0x0F, 0xAF, 0xC1, 0x48, 0xF7, 0xD8]);
                 if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
             }
             0x7F2C => {
+                // Audit §5: TMAJ clamps all 3 operands to [-1, 1].
                 emit_load_op(&mut code, &ins.operands[0], false);
                 emit_load_op(&mut code, &ins.operands[1], true);
+                code.extend_from_slice(&[0x48, 0x83, 0xF8, 0x00, 0x0F, 0x9F, 0xC0, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC0, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD0]);
+                code.extend_from_slice(&[0x48, 0x83, 0xF9, 0x00, 0x0F, 0x9F, 0xC1, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC9, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD1]);
                 code.extend_from_slice(&[0x48, 0x01, 0xC8]);
                 emit_load_op(&mut code, &ins.operands[2], true);
+                code.extend_from_slice(&[0x48, 0x83, 0xF9, 0x00, 0x0F, 0x9F, 0xC1, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC9, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD1]);
                 code.extend_from_slice(&[
                     0x48, 0x01, 0xC8,
                     0x48, 0x83, 0xF8, 0x00,
@@ -17935,10 +18473,11 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
                 }
             }
             0x7F43 | 0x7F44 => {
+                // Audit §5: BR_POS compares > 0 (`jg`), BR_NEG compares < 0 (`jl`) to match VM trit clamping.
                 if let Some(lbl) = ins.operands.get(1).and_then(extract_label_id) {
                     emit_load_op(&mut code, &ins.operands[0], false);
-                    code.extend_from_slice(&[0x48, 0x83, 0xF8, if ins.op_tok == 0x7F43 { 0x01 } else { 0xFF }]);
-                    code.extend_from_slice(&[0x0F, 0x84]);
+                    code.extend_from_slice(&[0x48, 0x83, 0xF8, 0x00]);
+                    code.extend_from_slice(&[0x0F, if ins.op_tok == 0x7F43 { 0x8F } else { 0x8C }]);
                     relocs.push(RelocPatch { patch_offset: code.len(), target_label: lbl });
                     code.extend_from_slice(&[0, 0, 0, 0]);
                 }
@@ -18029,10 +18568,10 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
     }
 
     let base_vaddr: u64 = 0x400000;
-    let entry_vaddr: u64 = base_vaddr + 120;
-    let total_size: u64 = 120 + (code.len() as u64);
+    let entry_vaddr: u64 = base_vaddr + 176;
+    let total_size: u64 = 176 + (code.len() as u64);
 
-    let mut elf = vec![0u8; 120];
+    let mut elf = vec![0u8; 176];
     elf[0..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
     elf[4] = 2;
     elf[5] = 1;
@@ -18044,7 +18583,7 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
     elf[32..40].copy_from_slice(&64u64.to_le_bytes());
     elf[52..54].copy_from_slice(&64u16.to_le_bytes());
     elf[54..56].copy_from_slice(&56u16.to_le_bytes());
-    elf[56..58].copy_from_slice(&1u16.to_le_bytes());
+    elf[56..58].copy_from_slice(&2u16.to_le_bytes());
 
     elf[64..68].copy_from_slice(&1u32.to_le_bytes());
     elf[68..72].copy_from_slice(&5u32.to_le_bytes());
@@ -18053,6 +18592,10 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
     elf[96..104].copy_from_slice(&total_size.to_le_bytes());
     elf[104..112].copy_from_slice(&total_size.to_le_bytes());
     elf[112..120].copy_from_slice(&0x1000u64.to_le_bytes());
+    // PT_GNU_STACK (non-executable stack: PF_R | PF_W)
+    elf[120..124].copy_from_slice(&0x6474_E551u32.to_le_bytes());
+    elf[124..128].copy_from_slice(&6u32.to_le_bytes());
+    elf[168..176].copy_from_slice(&16u64.to_le_bytes());
 
     elf.extend_from_slice(&code);
     Ok(elf)
@@ -18203,15 +18746,19 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x20]); // add rsp, 32
 
     if entry_is_bytes {
-        // Bytes return ABI: rax = off, rdx = len -> write(1, rbx + rax, rdx); exit(0)
+        // Bytes return ABI: rax = descriptor (base << 32) | len.
+        // Extract base (rcx) and len (rdx); write(1, rbx+base, len); exit(0).
         code.extend_from_slice(&[
-            0x48, 0x8D, 0x34, 0x03,             // lea rsi, [rbx+rax]
-            0xBF, 0x01, 0x00, 0x00, 0x00,       // mov edi, 1
-            0xB8, 0x01, 0x00, 0x00, 0x00,       // mov eax, 1 (sys_write)
-            0x0F, 0x05,                         // syscall
-            0x31, 0xFF,                         // xor edi, edi
-            0xB8, 0x3C, 0x00, 0x00, 0x00,       // mov eax, 60 (sys_exit)
-            0x0F, 0x05,                         // syscall
+            0x48, 0x89, 0xC1,             // mov rcx, rax
+            0x48, 0xC1, 0xE9, 0x20,       // shr rcx, 32 (base)
+            0x89, 0xC2,                   // mov edx, eax (len)
+            0x48, 0x8D, 0x34, 0x0B,       // lea rsi, [rbx+rcx]
+            0xBF, 0x01, 0x00, 0x00, 0x00, // mov edi, 1
+            0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1 (sys_write)
+            0x0F, 0x05,                   // syscall
+            0x31, 0xFF,                   // xor edi, edi
+            0xB8, 0x3C, 0x00, 0x00, 0x00, // mov eax, 60 (sys_exit)
+            0x0F, 0x05,                   // syscall
         ]);
     } else {
         code.extend_from_slice(&[
@@ -18317,7 +18864,9 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
                     if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
                 }
                 0x7F0D => {
-                    code.extend_from_slice(&[0x45, 0x31, 0xDB]); // xor r11d, r11d
+                    // Descriptor model (VM parity): ANEW allocates at the top,
+                    // dest = (r11 << 32) | 0, r11 unchanged.
+                    code.extend_from_slice(&[0x4C, 0x89, 0xD8, 0x48, 0xC1, 0xE0, 0x20]); // mov rax, r11; shl rax, 32
                     if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
                 }
                 0x7F50 => {
@@ -18332,7 +18881,9 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
                     if is_arr_param {
                         code.extend_from_slice(&[0x48, 0x8B, 0x83, 0x00, 0x00, 0x12, 0x00]); // mov rax, [rbx+0x120000]
                     } else {
-                        code.extend_from_slice(&[0x4C, 0x89, 0xD8]); // mov rax, r11
+                        // Descriptor model: len = desc & 0xFFFFFFFF.
+                        emit_load_op(&mut code, &ins.operands[0], false); // rax = descriptor
+                        code.extend_from_slice(&[0x89, 0xC0]); // mov eax, eax (len)
                     }
                     if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
                 }
@@ -18345,8 +18896,13 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
                             BinOperand::ImmInt(-8) => 8,
                             _ => return Err(String::from("error[BAD_TYPE]: 3-op IGET mode must be -1, -2, -4, or -8")),
                         };
+                        // Descriptor model: load at [rbx + base + off], bounds-checked
+                        // against len (trap T_OOB). base = desc >> 32 (rsi), len = desc (rdx).
+                        emit_load_op(&mut code, &ins.operands[0], false); // rax = descriptor
+                        code.extend_from_slice(&[0x48, 0x89, 0xC6, 0x48, 0xC1, 0xEE, 0x20]); // mov rsi, rax; shr rsi, 32 (base)
+                        code.extend_from_slice(&[0x89, 0xC2]); // mov edx, eax (len)
                         emit_load_op(&mut code, &ins.operands[2], true); // rcx = off
-                        // Bounds check: off >= 0 && off + width <= r11 (no wrap)
+                        // Bounds check: off >= 0 && off + width <= len (no wrap)
                         code.extend_from_slice(&[0x48, 0x85, 0xC9, 0x0F, 0x88]); // test rcx,rcx; js T_OOB
                         trap_relocs.push((code.len(), 1));
                         code.extend_from_slice(&[0, 0, 0, 0]);
@@ -18354,26 +18910,56 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
                         code.extend_from_slice(&[0x48, 0x39, 0xC8, 0x0F, 0x82]); // cmp rax, rcx; jb T_OOB
                         trap_relocs.push((code.len(), 1));
                         code.extend_from_slice(&[0, 0, 0, 0]);
-                        code.extend_from_slice(&[0x4C, 0x39, 0xD8, 0x0F, 0x87]); // cmp rax, r11; ja T_OOB
+                        code.extend_from_slice(&[0x48, 0x39, 0xD0, 0x0F, 0x87]); // cmp rax, rdx; ja T_OOB
                         trap_relocs.push((code.len(), 1));
                         code.extend_from_slice(&[0, 0, 0, 0]);
+                        code.extend_from_slice(&[0x48, 0x01, 0xCE]); // add rsi, rcx (base+off)
                         match width {
-                            1 => code.extend_from_slice(&[0x0F, 0xB6, 0x04, 0x0B]),
-                            2 => code.extend_from_slice(&[0x0F, 0xB7, 0x04, 0x0B]),
-                            4 => code.extend_from_slice(&[0x8B, 0x04, 0x0B]),
-                            _ => code.extend_from_slice(&[0x48, 0x8B, 0x04, 0x0B]),
+                            1 => code.extend_from_slice(&[0x0F, 0xB6, 0x04, 0x1E]),
+                            2 => code.extend_from_slice(&[0x0F, 0xB7, 0x04, 0x1E]),
+                            4 => code.extend_from_slice(&[0x8B, 0x04, 0x1E]),
+                            _ => code.extend_from_slice(&[0x48, 0x8B, 0x04, 0x1E]),
                         }
                         if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
                     } else {
-                        // Bounded 2-op input-window u16 read: idx >= nwords (unsigned) -> 0
-                        emit_load_op(&mut code, &ins.operands[1], false);
-                        code.extend_from_slice(&[
-                            0x48, 0x3B, 0x83, 0x00, 0x00, 0x12, 0x00, // cmp rax, [rbx+0x120000]
-                            0x73, 0x0A,                               // jae +10
-                            0x0F, 0xB7, 0x84, 0x43, 0x00, 0x00, 0x10, 0x00, // movzx eax, word [rbx+rax*2+0x100000]
-                            0xEB, 0x02,                               // jmp +2
-                            0x31, 0xC0,                               // xor eax, eax
-                        ]);
+                        // 2-op IGET: (buf, idx) -> byte, lenient (0 on OOB). Descriptor
+                        // model: read [rbx + base + idx] (0 if idx >= len). A TY_ARRAY
+                        // param reads the stdin window (token input) as before.
+                        let is_arr_param = match ins.operands.first() {
+                            Some(BinOperand::Param(p_tok)) => func
+                                .params
+                                .get((*p_tok - PAR_BASE) as usize)
+                                .map(|&(_, ty, _)| ty == TY_ARRAY)
+                                .unwrap_or(false),
+                            _ => false,
+                        };
+                        if is_arr_param {
+                            // Bounded 2-op input-window u16 read: idx >= nwords (unsigned) -> 0
+                            emit_load_op(&mut code, &ins.operands[1], false);
+                            code.extend_from_slice(&[
+                                0x48, 0x3B, 0x83, 0x00, 0x00, 0x12, 0x00, // cmp rax, [rbx+0x120000]
+                                0x73, 0x0A,                               // jae +10
+                                0x0F, 0xB7, 0x84, 0x43, 0x00, 0x00, 0x10, 0x00, // movzx eax, word [rbx+rax*2+0x100000]
+                                0xEB, 0x02,                               // jmp +2
+                                0x31, 0xC0,                               // xor eax, eax
+                            ]);
+                        } else {
+                            emit_load_op(&mut code, &ins.operands[0], false); // rax = descriptor
+                            code.extend_from_slice(&[
+                                0x48, 0x89, 0xC1, // mov rcx, rax
+                                0x48, 0xC1, 0xE9, 0x20, // shr rcx, 32 (base)
+                                0x89, 0xC2, // mov edx, eax (len)
+                            ]);
+                            emit_load_op(&mut code, &ins.operands[1], false); // rax = idx
+                            code.extend_from_slice(&[
+                                0x48, 0x39, 0xD0, // cmp rax, rdx
+                                0x73, 0x09, // jae +9
+                                0x48, 0x01, 0xC8, // add rax, rcx (base+idx)
+                                0x0F, 0xB6, 0x04, 0x03, // movzx eax, byte [rbx+rax]
+                                0xEB, 0x02, // jmp +2
+                                0x31, 0xC0, // xor eax, eax
+                            ]);
+                        }
                         if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
                     }
                 }
@@ -18385,56 +18971,82 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
                         tr.push((c.len(), 2));
                         c.extend_from_slice(&[0, 0, 0, 0]);
                     };
+                    // Descriptor model: appends write at [rbx+r11] (at-top) and bump r11
+                    // as before, but the dest is the new descriptor (base<<32)|(len+k).
+                    // rsi holds the base across an append; the desc is rebuilt from it.
+                    let emit_save_base_rsi = |c: &mut Vec<u8>| {
+                        c.extend_from_slice(&[0x48, 0x89, 0xC6, 0x48, 0xC1, 0xEE, 0x20]); // mov rsi, rax; shr rsi, 32 (base)
+                    };
+                    let emit_desc_after_append = |c: &mut Vec<u8>| {
+                        c.extend_from_slice(&[0x48, 0x89, 0xF0, 0x48, 0xC1, 0xE0, 0x20]); // mov rax, rsi; shl rax, 32
+                        c.extend_from_slice(&[0x4C, 0x89, 0xDA, 0x48, 0x29, 0xF2, 0x48, 0x09, 0xD0]); // mov rdx, r11; sub rdx, rsi; or rax, rdx
+                    };
                     if ins.operands.len() == 3 && ins.operands[1] == BinOperand::ImmInt(-4) {
+                        emit_load_op(&mut code, &ins.operands[0], false); // rax = descriptor
+                        emit_save_base_rsi(&mut code);
                         emit_cap_guard(&mut code, &mut trap_relocs, 4);
                         emit_load_op(&mut code, &ins.operands[2], false);
                         code.extend_from_slice(&[0x42, 0x89, 0x04, 0x1B, 0x49, 0x83, 0xC3, 0x04]);
+                        emit_desc_after_append(&mut code);
+                        if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
                     } else if ins.operands.len() == 3 && ins.operands[1] == BinOperand::ImmInt(-8) {
+                        emit_load_op(&mut code, &ins.operands[0], false); // rax = descriptor
+                        emit_save_base_rsi(&mut code);
                         emit_cap_guard(&mut code, &mut trap_relocs, 8);
                         emit_load_op(&mut code, &ins.operands[2], false);
                         code.extend_from_slice(&[0x4A, 0x89, 0x04, 0x1B, 0x49, 0x83, 0xC3, 0x08]);
-                    } else if ins.operands.len() == 4 && ins.operands[1] == BinOperand::ImmInt(-9) {
-                        emit_load_op(&mut code, &ins.operands[2], true);
-                        emit_load_op(&mut code, &ins.operands[3], false);
-                        code.extend_from_slice(&[
-                            0x48, 0x85, 0xC9, 0x78, 0x0D,       // test rcx, rcx; js +13 (no-op)
-                            0x48, 0x8D, 0x71, 0x08,             // lea rsi, [rcx+8]
-                            0x4C, 0x39, 0xDE, 0x77, 0x04,       // cmp rsi, r11; ja +4 (no-op)
-                            0x48, 0x89, 0x04, 0x0B,             // mov [rbx+rcx], rax
-                        ]);
+                        emit_desc_after_append(&mut code);
+                        if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
                     } else if ins.operands.len() == 4
-                        && (ins.operands[1] == BinOperand::ImmInt(-2) || ins.operands[1] == BinOperand::ImmInt(-4))
+                        && (ins.operands[1] == BinOperand::ImmInt(-2)
+                            || ins.operands[1] == BinOperand::ImmInt(-4)
+                            || ins.operands[1] == BinOperand::ImmInt(-9))
                     {
-                        let width: u8 = if ins.operands[1] == BinOperand::ImmInt(-2) { 2 } else { 4 };
-                        emit_load_op(&mut code, &ins.operands[3], false);
-                        code.extend_from_slice(&[0x48, 0x89, 0xC2]); // mov rdx, rax
+                        let width: u8 = if ins.operands[1] == BinOperand::ImmInt(-2) {
+                            2
+                        } else if ins.operands[1] == BinOperand::ImmInt(-4) {
+                            4
+                        } else {
+                            8
+                        };
+                        emit_load_op(&mut code, &ins.operands[0], false); // rax = descriptor
+                        code.extend_from_slice(&[0x48, 0x89, 0xC7, 0x48, 0xC1, 0xEF, 0x20]); // mov rdi, rax; shr rdi, 32 (base)
+                        code.extend_from_slice(&[0x89, 0xC2]); // mov edx, eax (len)
+                        emit_load_op(&mut code, &ins.operands[3], false); // rax = val
+                        code.extend_from_slice(&[0x48, 0x89, 0xC6]); // mov rsi, rax (save val)
                         emit_load_op(&mut code, &ins.operands[2], true); // rcx = off
-                        code.extend_from_slice(&[0x48, 0x85, 0xC9, 0x0F, 0x88]); // js T_OOB
+                        code.extend_from_slice(&[0x48, 0x85, 0xC9, 0x0F, 0x88]); // test rcx, rcx; js T_OOB
                         trap_relocs.push((code.len(), 1));
                         code.extend_from_slice(&[0, 0, 0, 0]);
                         code.extend_from_slice(&[0x48, 0x8D, 0x41, width]); // lea rax, [rcx+width]
-                        code.extend_from_slice(&[0x48, 0x39, 0xC8, 0x0F, 0x82]); // jb T_OOB
+                        code.extend_from_slice(&[0x48, 0x39, 0xC8, 0x0F, 0x82]); // cmp rax, rcx; jb T_OOB
                         trap_relocs.push((code.len(), 1));
                         code.extend_from_slice(&[0, 0, 0, 0]);
-                        code.extend_from_slice(&[0x4C, 0x39, 0xD8, 0x0F, 0x87]); // ja T_OOB
+                        code.extend_from_slice(&[0x48, 0x39, 0xD0, 0x0F, 0x87]); // cmp rax, rdx; ja T_OOB
                         trap_relocs.push((code.len(), 1));
                         code.extend_from_slice(&[0, 0, 0, 0]);
+                        code.extend_from_slice(&[0x48, 0x01, 0xCF]); // add rdi, rcx (base+off)
+                        code.extend_from_slice(&[0x48, 0x89, 0xF0]); // mov rax, rsi (restore val)
                         if width == 2 {
-                            code.extend_from_slice(&[0x66, 0x89, 0x14, 0x0B]); // mov [rbx+rcx], dx
+                            code.extend_from_slice(&[0x66, 0x89, 0x04, 0x1F]); // mov [rbx+rdi], ax
+                        } else if width == 4 {
+                            code.extend_from_slice(&[0x89, 0x04, 0x1F]);       // mov [rbx+rdi], eax
                         } else {
-                            code.extend_from_slice(&[0x89, 0x14, 0x0B]);       // mov [rbx+rcx], edx
+                            code.extend_from_slice(&[0x48, 0x89, 0x04, 0x1F]); // mov [rbx+rdi], rax
                         }
+                        emit_load_op(&mut code, &ins.operands[0], false); // rax = descriptor (unchanged)
+                        if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
                     } else {
                         let k = ins.operands.len().saturating_sub(1) as u32;
+                        emit_load_op(&mut code, &ins.operands[0], false); // rax = descriptor
+                        emit_save_base_rsi(&mut code);
                         emit_cap_guard(&mut code, &mut trap_relocs, k);
                         for op_b in &ins.operands[1..] {
                             emit_load_op(&mut code, op_b, false);
                             code.extend_from_slice(&[0x42, 0x88, 0x04, 0x1B, 0x49, 0xFF, 0xC3]);
                         }
-                    }
-                    if let Some(d) = ins.dest_reg {
-                        code.extend_from_slice(&[0x4C, 0x89, 0xD8]);
-                        emit_store_rax(&mut code, d);
+                        emit_desc_after_append(&mut code);
+                        if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
                     }
                 }
                 0x7F10 | 0x7F11 | 0x7F12 | 0x7F1E | 0x7F1F | 0x7F20 => {
@@ -18671,6 +19283,9 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
                 0x7F4A => {
                     if func.ret_ty_tok == TY_BYTES {
                         if ins.operands.len() == 3 {
+                            // 3-op bytes RET `RET buf, off, len`: slice of op0's buffer.
+                            emit_load_op(&mut code, &ins.operands[0], false); // rax = buf descriptor
+                            code.extend_from_slice(&[0x49, 0x89, 0xC0]); // mov r8, rax
                             emit_load_op(&mut code, &ins.operands[1], false); // rax = off
                             emit_load_op(&mut code, &ins.operands[2], true);  // rcx = len
                             code.extend_from_slice(&[0x48, 0x85, 0xC0, 0x0F, 0x88]); // js T_OOB
@@ -18683,12 +19298,21 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
                             code.extend_from_slice(&[0x48, 0x39, 0xC6, 0x0F, 0x82]); // cmp rsi, rax; jb T_OOB
                             trap_relocs.push((code.len(), 1));
                             code.extend_from_slice(&[0, 0, 0, 0]);
-                            code.extend_from_slice(&[0x4C, 0x39, 0xDE, 0x0F, 0x87]); // cmp rsi, r11; ja T_OOB
+                            code.extend_from_slice(&[0x44, 0x89, 0xC2]); // mov edx, r8d (buf_len)
+                            code.extend_from_slice(&[0x48, 0x39, 0xD6, 0x0F, 0x87]); // cmp rsi, rdx; ja T_OOB
                             trap_relocs.push((code.len(), 1));
                             code.extend_from_slice(&[0, 0, 0, 0]);
+                            code.extend_from_slice(&[0x49, 0xC1, 0xE8, 0x20]); // shr r8, 32 (buf_base)
+                            code.extend_from_slice(&[0x4C, 0x01, 0xC0]); // add rax, r8
+                            // Return the slice as a descriptor in rax: ((base + off) << 32) | len.
+                            code.extend_from_slice(&[0x48, 0xC1, 0xE0, 0x20]); // shl rax, 32
+                            code.extend_from_slice(&[0x48, 0x09, 0xC8]); // or rax, rcx
                             code.extend_from_slice(&[0x48, 0x89, 0xCA, 0xC9, 0xC3]); // mov rdx, rcx; leave; ret
                         } else {
-                            code.extend_from_slice(&[0x31, 0xC0, 0x4C, 0x89, 0xDA, 0xC9, 0xC3]); // xor eax,eax; mov rdx,r11; leave; ret
+                            // 1-op bytes RET: return the descriptor itself in rax
+                            // (rax = (base << 32) | len).
+                            emit_load_op(&mut code, &ins.operands[0], false); // rax = descriptor
+                            code.extend_from_slice(&[0xC9, 0xC3]); // leave; ret
                         }
                     } else if ins.operands.len() == 3 {
                         return Err(String::from("error[BAD_TYPE]: 3-op RET requires Bytes return type"));
@@ -18731,10 +19355,10 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
     }
 
     let base_vaddr: u64 = 0x400000;
-    let entry_vaddr: u64 = base_vaddr + 120;
-    let total_size: u64 = 120 + (code.len() as u64);
+    let entry_vaddr: u64 = base_vaddr + 176;
+    let total_size: u64 = 176 + (code.len() as u64);
 
-    let mut elf = vec![0u8; 120];
+    let mut elf = vec![0u8; 176];
     elf[0..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
     elf[4] = 2;
     elf[5] = 1;
@@ -18746,7 +19370,7 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
     elf[32..40].copy_from_slice(&64u64.to_le_bytes());
     elf[52..54].copy_from_slice(&64u16.to_le_bytes());
     elf[54..56].copy_from_slice(&56u16.to_le_bytes());
-    elf[56..58].copy_from_slice(&1u16.to_le_bytes());
+    elf[56..58].copy_from_slice(&2u16.to_le_bytes());
     elf[64..68].copy_from_slice(&1u32.to_le_bytes());
     elf[68..72].copy_from_slice(&5u32.to_le_bytes());
     elf[80..88].copy_from_slice(&base_vaddr.to_le_bytes());
@@ -18754,6 +19378,10 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
     elf[96..104].copy_from_slice(&total_size.to_le_bytes());
     elf[104..112].copy_from_slice(&total_size.to_le_bytes());
     elf[112..120].copy_from_slice(&0x1000u64.to_le_bytes());
+    // PT_GNU_STACK (non-executable stack: PF_R | PF_W)
+    elf[120..124].copy_from_slice(&0x6474_E551u32.to_le_bytes());
+    elf[124..128].copy_from_slice(&6u32.to_le_bytes());
+    elf[168..176].copy_from_slice(&16u64.to_le_bytes());
 
     elf.extend_from_slice(&code);
     Ok(elf)
@@ -19066,6 +19694,19 @@ fn compile_wasm_single_func_body(
     }
 
     let num_params = func.params.len();
+    // Audit Round 2 L3: arity-check every instruction before Wasm lowering so crafted streams
+    // (e.g. 1-operand 0x7F17 or 2-operand 0x7F2C TMAJ) return Err(BAD_ARITY) instead of panicking.
+    for ins in &func.instructions {
+        let min_ops = vm_op_min_ops(ins.op_tok);
+        if ins.operands.len() < min_ops {
+            return Err(format!(
+                "error[BAD_ARITY]: Wasm AOT opcode 0x{:04X} requires at least {} operands, got {}",
+                ins.op_tok,
+                min_ops,
+                ins.operands.len()
+            ));
+        }
+    }
     let max_reg_used = func
         .instructions
         .iter()
@@ -19370,20 +20011,16 @@ fn compile_wasm_single_func_body(
                     _ => 0,
                 };
                 if patch_width > 0 {
-                    // Patch in place, length unchanged. -9 (8 bytes): silent no-op unless
-                    // 0 <= off && off + 8 <= len. ISA-B -4/-2 (4/2 bytes): out of bounds traps.
+                    // Patch in place, length unchanged. ISA-B strict bounds: -9/-4/-2 all
+                    // trap (OUT_OF_BOUNDS) unless 0 <= off && off + width <= len.
                     emit_src(b);
                     wasm_buf_split(b, &bl);
                     emit_wasm_op(b, &ops[2]);
                     wasm_lset(b, scratch0);
                     emit_wasm_op(b, &ops[3]);
                     wasm_lset(b, scratch1);
-                    if patch_width == 8 {
-                        wasm_buf_in_bounds(b, &bl, scratch0, patch_width);
-                    } else {
-                        wasm_trap_unless_in_bounds(b, &bl, scratch0, patch_width);
-                        wasm_buf_in_bounds(b, &bl, scratch0, patch_width); // now always true
-                    }
+                    wasm_trap_unless_in_bounds(b, &bl, scratch0, patch_width);
+                    wasm_buf_in_bounds(b, &bl, scratch0, patch_width); // now always true
                     b.extend_from_slice(&[0x04, 0x40]);
                     wasm_lget(b, bl.bbase);
                     wasm_lget(b, scratch0);
@@ -19498,10 +20135,19 @@ fn compile_wasm_single_func_body(
                 }
                 emit_wasm_set_dest(b, ins.dest_reg);
             }
-            0x7F15 | 0x7F28 => {
+            0x7F15 => {
                 b.extend_from_slice(&[0x42, 0x00]);
                 emit_wasm_op(b, &ins.operands[0]);
                 b.push(0x7D);
+                emit_wasm_set_dest(b, ins.dest_reg);
+            }
+            0x7F28 => {
+                // Audit §5: TNOT clamps operand to [-1, 1] via (x < 0) - (x > 0).
+                emit_wasm_op(b, &ins.operands[0]);
+                b.push(0x22); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x53, 0xAD]);
+                b.push(0x20); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x55, 0xAD, 0x7D]);
                 emit_wasm_set_dest(b, ins.dest_reg);
             }
             0x7F16 => {
@@ -19518,19 +20164,50 @@ fn compile_wasm_single_func_body(
                 b.extend_from_slice(&[0x42, 0x7F, 0x85]);
                 emit_wasm_set_dest(b, ins.dest_reg);
             }
-            0x7F17 | 0x7F29 | 0x7F18 | 0x7F2A => {
+            0x7F17 | 0x7F18 => {
                 emit_wasm_op(b, &ins.operands[0]);
                 emit_wasm_op(b, &ins.operands[1]);
                 emit_wasm_op(b, &ins.operands[0]);
                 emit_wasm_op(b, &ins.operands[1]);
-                b.push(if matches!(ins.op_tok, 0x7F17 | 0x7F29) { 0x53 } else { 0x55 });
+                b.push(if ins.op_tok == 0x7F17 { 0x53 } else { 0x55 });
+                b.push(0x1B);
+                emit_wasm_set_dest(b, ins.dest_reg);
+            }
+            0x7F29 | 0x7F2A => {
+                // Audit §5: TAND/TOR clamp both operands to [-1, 1] before min/max.
+                emit_wasm_op(b, &ins.operands[0]);
+                b.push(0x22); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x55, 0xAD]);
+                b.push(0x20); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x53, 0xAD, 0x7D]);
+                b.push(0x21); b.extend(encode_uleb128(scratch0));
+                emit_wasm_op(b, &ins.operands[1]);
+                b.push(0x22); b.extend(encode_uleb128(scratch1));
+                b.extend_from_slice(&[0x42, 0x00, 0x55, 0xAD]);
+                b.push(0x20); b.extend(encode_uleb128(scratch1));
+                b.extend_from_slice(&[0x42, 0x00, 0x53, 0xAD, 0x7D]);
+                b.push(0x21); b.extend(encode_uleb128(scratch1));
+                b.push(0x20); b.extend(encode_uleb128(scratch0));
+                b.push(0x20); b.extend(encode_uleb128(scratch1));
+                b.push(0x20); b.extend(encode_uleb128(scratch0));
+                b.push(0x20); b.extend(encode_uleb128(scratch1));
+                b.push(if ins.op_tok == 0x7F29 { 0x53 } else { 0x55 });
                 b.push(0x1B);
                 emit_wasm_set_dest(b, ins.dest_reg);
             }
             0x7F2B => {
+                // Audit §5: TXOR clamps both operands to [-1, 1] before -(a*b).
                 b.extend_from_slice(&[0x42, 0x00]);
                 emit_wasm_op(b, &ins.operands[0]);
+                b.push(0x22); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x55, 0xAD]);
+                b.push(0x20); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x53, 0xAD, 0x7D]);
                 emit_wasm_op(b, &ins.operands[1]);
+                b.push(0x22); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x55, 0xAD]);
+                b.push(0x20); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x53, 0xAD, 0x7D]);
                 b.extend_from_slice(&[0x7E, 0x7D]);
                 emit_wasm_set_dest(b, ins.dest_reg);
             }
@@ -19547,10 +20224,23 @@ fn compile_wasm_single_func_body(
                 emit_wasm_set_dest(b, ins.dest_reg);
             }
             0x7F2C => {
+                // Audit §5: TMAJ clamps all 3 operands to [-1, 1] before summing.
                 emit_wasm_op(b, &ins.operands[0]);
+                b.push(0x22); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x55, 0xAD]);
+                b.push(0x20); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x53, 0xAD, 0x7D]);
                 emit_wasm_op(b, &ins.operands[1]);
+                b.push(0x22); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x55, 0xAD]);
+                b.push(0x20); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x53, 0xAD, 0x7D]);
                 b.push(0x7C);
                 emit_wasm_op(b, &ins.operands[2]);
+                b.push(0x22); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x55, 0xAD]);
+                b.push(0x20); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x53, 0xAD, 0x7D]);
                 b.push(0x7C);
                 b.push(0x22); b.extend(encode_uleb128(scratch0));
                 b.extend_from_slice(&[0x42, 0x00, 0x55, 0xAD]);
@@ -19697,8 +20387,8 @@ fn compile_wasm_single_func_body(
                     body.extend(encode_sleb128((ins_idx + 1) as i64));
                     emit_wasm_op(&mut body, &ins.operands[0]);
                     body.push(0x42);
-                    body.extend(encode_sleb128(if ins.op_tok == 0x7F43 { 1 } else { -1 }));
-                    body.extend_from_slice(&[0x51, 0x1B]);
+                    body.push(0x00);
+                    body.extend_from_slice(&[if ins.op_tok == 0x7F43 { 0x55 } else { 0x53 }, 0x1B]);
                     body.push(0x21);
                     body.extend(encode_uleb128(pc_local));
                     body.extend_from_slice(&[0x0C, 0x01]);
@@ -20376,7 +21066,7 @@ pub fn build_step7_stage1_compiler_stream() -> Vec<u16> {
     let r_loff     = alloc_ssa_ins(&mut ins, &mut next_reg, tc_safe, 0x7F06, TY_I64,   vec![TOK_IMM_I16, 0]);
     let r_retty    = alloc_ssa_ins(&mut ins, &mut next_reg, tc_safe, 0x7F06, TY_I64,   vec![TOK_IMM_I16, 0]);
 
-    const MAX_LABELS: usize = 83;
+    const MAX_LABELS: usize = 85;
     let mut r_lbl = [0u16; MAX_LABELS];
     for k in 0..MAX_LABELS {
         r_lbl[k] = alloc_ssa_ins(&mut ins, &mut next_reg, tc_safe, 0x7F06, TY_I64, vec![TOK_IMM_I16, 0]);
@@ -20410,15 +21100,18 @@ pub fn build_step7_stage1_compiler_stream() -> Vec<u16> {
     set_ssa_reg(&mut ins, tc_safe, r_retty, 0x7F0E, TY_I64, vec![0x7EC0, r_tmp2]);
     set_ssa_reg(&mut ins, tc_safe, r_pos,   0x7F10, TY_I64, vec![r_tmp2, TOK_IMM_I16, 3]);
 
-    let mut elf_hdr = [0u8; 120];
+    let mut elf_hdr = [0u8; 176];
     elf_hdr[0..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
     elf_hdr[4] = 2; elf_hdr[5] = 1; elf_hdr[6] = 1;
     elf_hdr[16] = 2; elf_hdr[18] = 0x3E; elf_hdr[20] = 1;
-    elf_hdr[24] = 0x78; elf_hdr[25] = 0x00; elf_hdr[26] = 0x40;
-    elf_hdr[32] = 64; elf_hdr[52] = 64; elf_hdr[54] = 56; elf_hdr[56] = 1;
+    elf_hdr[24] = 0xB0; elf_hdr[25] = 0x00; elf_hdr[26] = 0x40;
+    elf_hdr[32] = 64; elf_hdr[52] = 64; elf_hdr[54] = 56; elf_hdr[56] = 2;
     elf_hdr[64] = 1; elf_hdr[68] = 5;
     elf_hdr[82] = 0x40; elf_hdr[90] = 0x40;
     elf_hdr[113] = 0x10;
+    elf_hdr[120..124].copy_from_slice(&0x6474_E551u32.to_le_bytes());
+    elf_hdr[124..128].copy_from_slice(&6u32.to_le_bytes());
+    elf_hdr[168..176].copy_from_slice(&16u64.to_le_bytes());
     emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &elf_hdr);
 
     emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x55, 0x48, 0x89, 0xE5, 0x48, 0x81, 0xEC, 0x00, 0x00, 0x03, 0x00]);
@@ -20646,15 +21339,18 @@ pub fn build_step7_stage1_compiler_stream() -> Vec<u16> {
         (0x7F1F, 0x09, 0xC8),
         (0x7F20, 0x31, 0xC8),
         (0x7F15, 0xF7, 0xD8),
-        (0x7F28, 0xF7, 0xD8),
         (0x7F21, 0xF7, 0xD0),
         (0x7F22, 0xD3, 0xE0),
         (0x7F23, 0xD3, 0xF8),
     ];
+    let lbl_tnot = next_lbl; next_lbl += 1;
+    let lbl_tand_tor = next_lbl; next_lbl += 1;
     for &(op_c, _, _) in ops_3b {
         set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, op_c]);
         emit_br_pos_ins(&mut ins, r_cond, lbl_emit_3b);
     }
+    set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, 0x7F28]);
+    emit_br_pos_ins(&mut ins, r_cond, lbl_tnot);
     set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, 0x7F12]);
     emit_br_pos_ins(&mut ins, r_cond, lbl_imul);
     set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, 0x7F13]);
@@ -20663,9 +21359,13 @@ pub fn build_step7_stage1_compiler_stream() -> Vec<u16> {
     emit_br_pos_ins(&mut ins, r_cond, lbl_imod);
     set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, 0x7F16]);
     emit_br_pos_ins(&mut ins, r_cond, lbl_iabs);
-    for op_mm in [0x7F17u16, 0x7F29, 0x7F18, 0x7F2A] {
+    for op_mm in [0x7F17u16, 0x7F18] {
         set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, op_mm]);
         emit_br_pos_ins(&mut ins, r_cond, lbl_imin_imax);
+    }
+    for op_mm in [0x7F29u16, 0x7F2A] {
+        set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, op_mm]);
+        emit_br_pos_ins(&mut ins, r_cond, lbl_tand_tor);
     }
     set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, 0x7F2B]);
     emit_br_pos_ins(&mut ins, r_cond, lbl_txor);
@@ -20675,6 +21375,10 @@ pub fn build_step7_stage1_compiler_stream() -> Vec<u16> {
     }
     set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, 0x7F2D]);
     emit_br_pos_ins(&mut ins, r_cond, lbl_tcmp);
+    emit_jmp_ins(&mut ins, lbl_store_dst);
+
+    emit_lbl_ins(&mut ins, lbl_tnot);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x83, 0xF8, 0x00, 0x0F, 0x9F, 0xC0, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC0, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD0, 0x48, 0xF7, 0xD8]);
     emit_jmp_ins(&mut ins, lbl_store_dst);
 
     emit_lbl_ins(&mut ins, lbl_emit_3b);
@@ -20697,12 +21401,15 @@ pub fn build_step7_stage1_compiler_stream() -> Vec<u16> {
     emit_jmp_ins(&mut ins, lbl_store_dst);
 
     emit_lbl_ins(&mut ins, lbl_imod);
-    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x49, 0x89, 0xC0, 0x48, 0x85, 0xC9, 0x74, 0x1E, 0x48, 0x83, 0xF9, 0xFF, 0x75, 0x11, 0x49, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x4D, 0x39, 0xC8, 0x75, 0x02, 0xEB, 0x0A, 0x48, 0x99, 0x48, 0xF7, 0xF9, 0xEB, 0x03, 0x48, 0x31, 0xC0, 0x48, 0x89, 0xD0]);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x49, 0x89, 0xC0, 0x48, 0x85, 0xC9, 0x74, 0x21, 0x48, 0x83, 0xF9, 0xFF, 0x75, 0x11, 0x49, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x4D, 0x39, 0xC8, 0x75, 0x02, 0xEB, 0x0A, 0x48, 0x99, 0x48, 0xF7, 0xF9, 0x48, 0x89, 0xD0, 0xEB, 0x03, 0x48, 0x31, 0xC0]);
     emit_jmp_ins(&mut ins, lbl_store_dst);
 
     emit_lbl_ins(&mut ins, lbl_iabs);
     emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x89, 0xC2, 0x48, 0xF7, 0xD8, 0x48, 0x0F, 0x48, 0xC2]);
     emit_jmp_ins(&mut ins, lbl_store_dst);
+
+    emit_lbl_ins(&mut ins, lbl_tand_tor);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x83, 0xF8, 0x00, 0x0F, 0x9F, 0xC0, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC0, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD0, 0x48, 0x83, 0xF9, 0x00, 0x0F, 0x9F, 0xC1, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC9, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD1]);
 
     emit_lbl_ins(&mut ins, lbl_imin_imax);
     set_ssa_reg(&mut ins, tc_safe, r_tmp,  0x7F06, TY_I64,  vec![TOK_IMM_I16, 0x4F]);
@@ -20714,7 +21421,7 @@ pub fn build_step7_stage1_compiler_stream() -> Vec<u16> {
     emit_jmp_ins(&mut ins, lbl_store_dst);
 
     emit_lbl_ins(&mut ins, lbl_txor);
-    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x0F, 0xAF, 0xC1, 0x48, 0xF7, 0xD8]);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x83, 0xF8, 0x00, 0x0F, 0x9F, 0xC0, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC0, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD0, 0x48, 0x83, 0xF9, 0x00, 0x0F, 0x9F, 0xC1, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC9, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD1, 0x48, 0x0F, 0xAF, 0xC1, 0x48, 0xF7, 0xD8]);
     emit_jmp_ins(&mut ins, lbl_store_dst);
 
     emit_lbl_ins(&mut ins, lbl_cmp4);
@@ -20737,9 +21444,10 @@ pub fn build_step7_stage1_compiler_stream() -> Vec<u16> {
     emit_jmp_ins(&mut ins, lbl_store_dst);
 
     emit_lbl_ins(&mut ins, lbl_tmaj);
-    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x01, 0xC8]);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x83, 0xF8, 0x00, 0x0F, 0x9F, 0xC0, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC0, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD0, 0x48, 0x83, 0xF9, 0x00, 0x0F, 0x9F, 0xC1, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC9, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD1, 0x48, 0x01, 0xC8]);
     emit_decode_operand(&mut ins, &mut next_lbl, true);
     emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[
+        0x48, 0x83, 0xF9, 0x00, 0x0F, 0x9F, 0xC1, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC9, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD1,
         0x48, 0x01, 0xC8, 0x48, 0x83, 0xF8, 0x00,
         0x0F, 0x9F, 0xC0, 0x0F, 0x9C, 0xC2,
         0x0F, 0xB6, 0xC0, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD0,
@@ -20860,7 +21568,7 @@ pub fn build_step7_stage1_compiler_stream() -> Vec<u16> {
     emit_lbl_ins(&mut ins, lbl_br_pos);
     set_ssa_reg(&mut ins, tc_safe, r_cur, 0x7F10, TY_I64, vec![r_pos, TOK_IMM_I16, 1]);
     emit_decode_operand(&mut ins, &mut next_lbl, false);
-    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x83, 0xF8, 0x01, 0x0F, 0x84]);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x83, 0xF8, 0x00, 0x0F, 0x8F]);
     emit_read_label_id(&mut ins);
     emit_rel32_for_lid(&mut ins);
     set_ssa_reg(&mut ins, tc_safe, r_pos, 0x7F10, TY_I64, vec![r_cur, TOK_IMM_I16, 1]);
@@ -20869,7 +21577,7 @@ pub fn build_step7_stage1_compiler_stream() -> Vec<u16> {
     emit_lbl_ins(&mut ins, lbl_br_neg);
     set_ssa_reg(&mut ins, tc_safe, r_cur, 0x7F10, TY_I64, vec![r_pos, TOK_IMM_I16, 1]);
     emit_decode_operand(&mut ins, &mut next_lbl, false);
-    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x83, 0xF8, 0xFF, 0x0F, 0x84]);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x83, 0xF8, 0x00, 0x0F, 0x8C]);
     emit_read_label_id(&mut ins);
     emit_rel32_for_lid(&mut ins);
     set_ssa_reg(&mut ins, tc_safe, r_pos, 0x7F10, TY_I64, vec![r_cur, TOK_IMM_I16, 1]);
@@ -22073,6 +22781,44 @@ RET %4
     }
     checks_passed += 1;
 
+    // 5b. Audit Round-3 R3-3: the zero-copy liveness walk (`tok_dead_after`) must explore the
+    //     BR_TRIT fall-through even when all three labels resolve (a non-trit condition falls
+    //     through at runtime), so a buffer read only on the fall-through path stays live.
+    {
+        let mk = |op_tok: u16, dest_reg: Option<u16>, operands: Vec<BinOperand>| BinInstruction {
+            offset: 0,
+            dest_reg,
+            op_tok,
+            ty_tok: 0,
+            tc_tok: 0,
+            operands,
+        };
+        let buf_tok: u16 = REG_BASE + 1;
+        let insns = vec![
+            mk(0x7F0D, Some(buf_tok), vec![]),
+            mk(0x7F42, None, vec![BinOperand::Reg(REG_BASE), BinOperand::Label(1), BinOperand::Label(2), BinOperand::Label(3)]),
+            mk(0x7F4A, None, vec![BinOperand::Reg(buf_tok)]),
+            mk(0x7F40, None, vec![BinOperand::Label(1)]),
+            mk(0x7F4A, None, vec![BinOperand::ImmInt(0)]),
+            mk(0x7F40, None, vec![BinOperand::Label(2)]),
+            mk(0x7F4A, None, vec![BinOperand::ImmInt(0)]),
+            mk(0x7F40, None, vec![BinOperand::Label(3)]),
+            mk(0x7F4A, None, vec![BinOperand::ImmInt(0)]),
+        ];
+        if OmniBinaryVm::tok_dead_after(&insns, 0, buf_tok) {
+            return Err(String::from(
+                "R3-3 tok_dead_after treated a buffer read on the BR_TRIT fall-through path as dead",
+            ));
+        }
+        // Control: with no fall-through read the buffer is still dead (precision kept elsewhere).
+        let mut insns_dead = insns.clone();
+        insns_dead[2] = mk(0x7F4A, None, vec![BinOperand::ImmInt(0)]);
+        if !OmniBinaryVm::tok_dead_after(&insns_dead, 0, buf_tok) {
+            return Err(String::from("R3-3 tok_dead_after control: unread buffer must be dead"));
+        }
+    }
+    checks_passed += 1;
+
     // 6. Verifier / AOT Consistency Test: All 8 seed kinds verified against both AOT backends
     for &num_seed in &[0usize, 4, 6] {
         let (_, num_u16, _, _) = build_transpiled_seed_stream(num_seed);
@@ -22920,6 +23666,7 @@ fn main(a: i64) -> i64 {
         // count check (omni-cli main.rs:870-873) still compares like with like.
         checks_passed += run_cross_backend_effect_golden_selftests()?;
         checks_passed += run_if_pos_join_slot_stage1_selftests()?;
+        checks_passed += run_join_live_dest_selftests()?;
 
         // 13AZ. Port-plan step 9 KV slice: `pure/host_kv.omni` vs Rust VM KV lockstep (VM-only)
         checks_passed += run_host_kv_lockstep_selftests()?;
@@ -22962,9 +23709,9 @@ fn print_artifact_manifest(paths: &[&str]) {
 /// Lengths are in u16 words for streams and in bytes for ELF images.
 pub const M2_FROZEN_HASHES: [(&str, usize, u64); 4] = [
     ("phase_d_omni_bc_words", 159, 0x23B8D17257CCA9C4),
-    ("phase_d_elf_bytes", 824, 0xE221085777B8AC47),
+    ("phase_d_elf_bytes", 880, 0x8D5AAAD22399A1EE),
     ("pure_core_suite_words", 14559, 0x78462AE4C81DF408),
-    ("stage1_elf_bytes", 106242, 0xEAFC81F46B482FF8),
+    ("stage1_elf_bytes", 112180, 0x62F14B335B52BECC),
 ];
 
 /// Committed single-mode byte-lock manifest (regenerate with `m2-lock`, review the diff).
@@ -23523,6 +24270,11 @@ pub fn run_m2_foundation_selftests() -> Result<usize, String> {
         ("a2_pure_include", selftest_a2_pure_include_count),
         ("a3_macro_quarantine", selftest_a3_macro_quarantine_count),
         ("b2_pure_verifier", selftest_b2_pure_verifier_count),
+        ("s2_security", selftest_s2_security),
+        ("s4_honesty", selftest_s4_honesty),
+        ("s3_perf", selftest_s3_performance),
+        ("s5_refreeze", selftest_s5_refreeze),
+        ("s6_cleanup", selftest_s6_cleanup),
         ("b4_pure_launcher", selftest_b4_pure_launcher_count),
     ];
     let mut n = run_selftest_tasks_in_lanes(parallel_tasks)?;
@@ -23796,7 +24548,7 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
         },
         "m2-compile" => match selftest_m2_13_stage1_anchor() {
             Ok(n) => {
-                println!("[M2-COMPILE PASS] {} checks passed (including 19,731-word Stage-1 anchor -> 106,242 B, FNV-1a64=0xEAFC81F46B482FF8, 0-byte diff!)", n);
+                println!("[M2-COMPILE PASS] {} checks passed (including 20,443-word Stage-1 anchor -> 112,180 B, FNV-1a64=0x62F14B335B52BECC, 0-byte diff!)", n);
                 0
             }
             Err(e) => {
@@ -24085,6 +24837,112 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
                 1
             }
         },
+        "s2-security" => match selftest_s2_security() {
+            Ok(n) => {
+                println!(
+                    "[S2-SECURITY PASS] {} checks | M2 standalone verifier + 412B fuel/wall-clock cap + p4-exec verify + VM_STATE layout & unified OOB + private 0700 temp ELF + serve --bind",
+                    n
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("[S2-SECURITY FAIL] {}", e);
+                1
+            }
+        },
+        "s4-honesty" => {
+            if args.get(1).map(|s| s.as_str()) == Some("--print-pins") {
+                let m3_b = std::fs::read("pure/m3/m3.omni_bc").unwrap_or_default();
+                let m2_b = std::fs::read("pure/m2/m2.omni_bc").unwrap_or_default();
+                let m4_b = std::fs::read("pure/m4/m4.omni_bc").unwrap_or_default();
+                println!("| Seed | Words | FNV-1a64 |");
+                println!("|---|---:|---|");
+                println!("| `pure/m3/m3.omni_bc` | {} | `0x{:016X}` |", m3_b.len() / 2, fnv1a_64_hash(&m3_b));
+                println!("| `pure/m2/m2.omni_bc` | {} | `0x{:016X}` |", m2_b.len() / 2, fnv1a_64_hash(&m2_b));
+                println!("| `pure/m4/m4.omni_bc` | {} | `0x{:016X}` |", m4_b.len() / 2, fnv1a_64_hash(&m4_b));
+                return 0;
+            }
+            if args.get(1).map(|s| s.as_str()) == Some("--strict-readme") {
+                std::env::set_var("OMNI_STRICT_README", "1");
+            }
+            match selftest_s4_honesty() {
+                Ok(n) => {
+                    println!(
+                        "[S4-HONESTY PASS] {} checks | compile-elf 0/0/0 default args + live wc -l doc drift lock + honest 236-line classified seed vs runtime Rust + M5 237-B validator/entry stub",
+                        n
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("[S4-HONESTY FAIL] {}", e);
+                    1
+                }
+            }
+        }
+        "s3-perf" => {
+            if args.get(1).map(|s| s.as_str()) == Some("--write-verifier-seed") {
+                let ve_sa_src = verifier_standalone_source();
+                let ve_sa_u16 = match with_lockstep_suspended(|| {
+                    compile_omni_surface_strict_to_u16(&ve_sa_src)
+                }) {
+                    Ok(u) => u,
+                    Err(e) => {
+                        eprintln!("[L6 VERIFIER SEED FAIL] {}", e);
+                        return 1;
+                    }
+                };
+                let ve_sa_bytes = encode_u16_stream_to_bytes(&ve_sa_u16);
+                if let Err(e) = std::fs::write("pure/verifier_standalone.omni_bc", &ve_sa_bytes) {
+                    eprintln!("[L6 VERIFIER SEED FAIL] error[IO_ERROR]: write pure/verifier_standalone.omni_bc: {}", e);
+                    return 1;
+                }
+                println!(
+                    "[L6 VERIFIER SEED] Wrote {} words (FNV-1a64=0x{:016X}) to pure/verifier_standalone.omni_bc",
+                    ve_sa_u16.len(),
+                    fnv1a_64_hash(&ve_sa_bytes)
+                );
+                return 0;
+            }
+            match selftest_s3_performance() {
+                Ok(n) => {
+                    println!(
+                        "[S3-PERF PASS] {} checks | hash-pinned native m3.elf/m2.elf/m4.elf/verifier.elf default path (0-word/0-byte parity + native latency bounds + 5 frozen hashes)",
+                        n
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("[S3-PERF FAIL] {}", e);
+                    1
+                }
+            }
+        }
+        "s5-refreeze" => match selftest_s5_refreeze() {
+            Ok(n) => {
+                println!(
+                    "[S5-REFREEZE PASS] {} checks | strict ISET -9 OOB + PT_GNU_STACK non-exec stack + 9 burned-down backend-diff xfails + 5 re-frozen hashes",
+                    n
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("[S5-REFREEZE FAIL] {}", e);
+                1
+            }
+        },
+        "s6-cleanup" => match selftest_s6_cleanup() {
+            Ok(n) => {
+                println!(
+                    "[S6-CLEANUP PASS] {} checks | host_runtime/pure_default.rs extracted + duplicate workspace archived + CI fuzz-smoke job + m2-lint foreign note deduplicated + 5 re-frozen hashes",
+                    n
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("[S6-CLEANUP FAIL] {}", e);
+                1
+            }
+        },
         "p5-sys" => match selftest_p5_2_zero_shim_sys() {
             Ok((n, sz, h, native)) => {
                 println!(
@@ -24200,7 +25058,7 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
         "m3-4backend" => match selftest_m3_15_four_backend_parity() {
             Ok(n) => {
                 println!(
-                    "[M3-4BACKEND PASS] {} programs verified across VM == Wasm-multi == Rust-x86-multi == Pure-Omni-M2-ELF64 (0-byte diff; Stage-1 N/A legacy exemption)",
+                    "[M3-4BACKEND PASS] {} programs verified across 5 backends: VM == Wasm-multi == Rust-x86-multi == Pure-Omni-M2-ELF64 == Pure-Omni-M4-VM (0-byte diff; Stage-1 N/A legacy exemption)",
                     n
                 );
                 0
@@ -24481,7 +25339,6 @@ pub fn selftest_m2_label_reference() -> Result<usize, String> {
         "L3_mixed_imm_def_lbl_use",
         "L4_alias_imm7EF1_def_lbl_use",
         "L5_duplicate_def",
-        "L6_imm83",
         "L6_imm254",
         "L6_imm255",
         "L6_imm256",
@@ -24505,6 +25362,7 @@ pub fn selftest_m2_label_reference() -> Result<usize, String> {
         "L7_imm4080",
         "L7_imm5000",
         "L7_imm_minus1",
+        "L8_br_trit_2_labels", // Audit Round 2 N1: pure verifier enforces BR_TRIT min_ops=4
     ];
     for (who, got, want) in [("Stage-1", &s1_div, &want_s1[..]), ("Omni verifier", &ov_div, &want_ov[..])] {
         for w in want {
@@ -24528,9 +25386,21 @@ pub fn selftest_m2_label_reference() -> Result<usize, String> {
 // M2-03+: host-side M2 tooling lives in m2_host/ (kept out of the monolith to avoid main-line collisions).
 include!("m2_host/lint.rs");
 include!("m2_host/decode_diff.rs");
+include!("host_runtime/pure_default.rs");
 include!("p4_shim/mod.rs");
 
 // ==== END M2 FOUNDATION ====
+
+/// Audit Round-3 L-D: native-toolchain cache errors (every one carries a `CACHE_` marker from
+/// `host_runtime/pure_default.rs`) print as `[NATIVE-CACHE FAIL] <err>`; all other errors keep
+/// their verifier/compiler label, so a cache problem is never reported as a verifier failure.
+fn cli_fail_label(label: &str, err: &str) -> String {
+    if err.contains("CACHE_") {
+        format!("[NATIVE-CACHE FAIL] {}", err)
+    } else {
+        format!("[{}] {}", label, err)
+    }
+}
 
 fn main() {
     let cli_args: Vec<String> = env::args().collect();
@@ -24551,7 +25421,7 @@ fn main() {
                 println!("  pure-bootstrap                    Verify Phase D & 18-module core suite FNV-1a64 hashes");
                 println!("  pure-omni-diff                    Run 49 Pure-Omni differential checks");
                 println!("  acceptance-diff                   Run 41 executable acceptance goldens");
-                println!("  backend-diff --suite              Run 4-backend differential suite (vm/wasm/x86/stage1)");
+                println!("  backend-diff --suite              Run 5-backend differential suite (vm/wasm/x86/stage1/m4)");
                 println!("  m2-lint [file.omni]...            Lint registered pure/m2, m3, m4, m5 & isa modules");
                 println!("  m2-elf | m2-compile | m2-multi | m2-multi-pure | m2-wasm-multi | m2-verify | m2-fixed-point [--write-seed]");
                 println!("  m2-frozen | m2-lock | m2-census | m2-labels | m2-decode [file.omni_bc]");
@@ -24571,7 +25441,7 @@ fn main() {
                 println!("  a2-pure-include                   Seed-Shrink A2: Pure-Omni O-5 include expander (pure/m3/include.omni) & cycle gate");
                 println!("  a3-macro-quarantine               Seed-Shrink A3: quarantine macros behind --rust oracle & verify pure replacement golden");
                 println!("  b2-pure-verifier                  Seed-Shrink B2: Pure-Omni verifier_engine.omni on default hot path gate");
-                println!("  b4-pure-launcher                  Seed-Shrink B4: Pure-Omni M5 181-B zero-shim launcher ELF64 & native chain gate");
+                println!("  b4-pure-launcher                  Seed-Shrink B4: Pure-Omni M5 237-B zero-shim launcher ELF64 & native chain gate");
                 println!("  compile [--rust|--oracle] <in> <out>     Compile .omni to .omni_bc via Pure M3 by default");
                 println!("  self-host [--rust|--oracle]              Run Pure M3->M4->M2 self-host chain by default");
                 println!();
@@ -24601,7 +25471,7 @@ fn main() {
             "harness" | "--harness" => {
                 std::process::exit(run_omni_harness_cli(&cli_args[2..]));
             }
-            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" | "p7-heal" | "p7-adapt" | "p7-learn" | "a1-pure-default" | "a2-pure-include" | "a3-macro-quarantine" | "b2-pure-verifier" | "b4-pure-launcher" | "api-stage1" | "api-stage2" | "api-stage2-emit" | "api-stage2-5" => {
+            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" | "p7-heal" | "p7-adapt" | "p7-learn" | "a1-pure-default" | "a2-pure-include" | "a3-macro-quarantine" | "b2-pure-verifier" | "b4-pure-launcher" | "s2-security" | "s4-honesty" | "s3-perf" | "s5-refreeze" | "s6-cleanup" | "api-stage1" | "api-stage2" | "api-stage2-emit" | "api-stage2-5" => {
                 std::process::exit(run_m2_cli(&cli_args[1..]));
             }
             "agent-driver" | "--agent-driver" => {
@@ -24711,21 +25581,39 @@ fn main() {
                 }
             }
             "--debug-lens" | "debug-lens" if cli_args.len() >= 3 => {
-                let raw = fs::read(&cli_args[2]).expect("Failed to read .omni_bc file");
+                let raw = match fs::read(&cli_args[2]) {
+                    Ok(b) => b,
+                    Err(e) => { eprintln!("error[IO_ERROR]: {}: {}", cli_args[2], e); std::process::exit(1); }
+                };
                 let u16_stream = decode_bytes_to_u16_stream(&raw);
-                println!("{}", format_debug_lens(&u16_stream).expect("Failed to decode stream"));
+                match format_debug_lens(&u16_stream) {
+                    Ok(s) => println!("{}", s),
+                    Err(e) => { eprintln!("{}", e); std::process::exit(1); }
+                }
                 return;
             }
             "hex" if cli_args.len() >= 3 => {
-                let raw = fs::read(&cli_args[2]).expect("Failed to read .omni_bc file");
+                let raw = match fs::read(&cli_args[2]) {
+                    Ok(b) => b,
+                    Err(e) => { eprintln!("error[IO_ERROR]: {}: {}", cli_args[2], e); std::process::exit(1); }
+                };
                 let u16_stream = decode_bytes_to_u16_stream(&raw);
                 println!("{}", format_non_human_token_stream(&u16_stream));
                 return;
             }
             "assemble" if cli_args.len() >= 4 => {
-                let src = fs::read_to_string(&cli_args[2]).expect("Failed to read source file");
-                let u16_stream = assemble_omni_text_to_u16(&src).expect("Assembly failed");
-                fs::write(&cli_args[3], encode_u16_stream_to_bytes(&u16_stream)).expect("Failed to write .omni_bc");
+                let src = match fs::read_to_string(&cli_args[2]) {
+                    Ok(s) => s,
+                    Err(e) => { eprintln!("error[IO_ERROR]: {}: {}", cli_args[2], e); std::process::exit(1); }
+                };
+                let u16_stream = match assemble_omni_text_to_u16(&src) {
+                    Ok(u) => u,
+                    Err(e) => { eprintln!("{}", e); std::process::exit(1); }
+                };
+                if let Err(e) = fs::write(&cli_args[3], encode_u16_stream_to_bytes(&u16_stream)) {
+                    eprintln!("error[IO_ERROR]: {}: {}", cli_args[3], e);
+                    std::process::exit(1);
+                }
                 println!("[ASSEMBLE PASS] Wrote {} u16 tokens to '{}'", u16_stream.len(), cli_args[3]);
                 return;
             }
@@ -24756,116 +25644,201 @@ fn main() {
             }
             "compile" | "compile-surface" if cli_args.len() >= 4 => {
                 let use_rust = cli_args[2..].iter().any(|a| a == "--rust" || a == "--oracle");
+                let use_interp = cli_args[2..].iter().any(|a| a == "--interpreted");
                 let pos: Vec<&str> = cli_args[2..]
                     .iter()
-                    .filter(|a| *a != "--rust" && *a != "--oracle")
+                    .filter(|a| *a != "--rust" && *a != "--oracle" && *a != "--interpreted")
                     .map(|s| s.as_str())
                     .collect();
                 if pos.len() < 2 {
-                    eprintln!("Usage: omni compile [--rust|--oracle] <in.omni> <out.omni_bc>");
+                    eprintln!("Usage: omni compile [--rust|--oracle|--interpreted] <in.omni> <out.omni_bc>");
                     std::process::exit(2);
                 }
                 if use_rust {
-                    let u16_stream = compile_omni_surface_file_to_u16(pos[0]).expect("Rust oracle surface compilation failed");
-                    fs::write(pos[1], encode_u16_stream_to_bytes(&u16_stream)).expect("Failed to write .omni_bc");
+                    let u16_stream = match compile_omni_surface_file_to_u16(pos[0]) {
+                        Ok(u) => u,
+                        Err(e) => {
+                            eprintln!("[RUST-ORACLE COMPILE FAIL] {}", e);
+                            std::process::exit(1);
+                        }
+                    };
+                    if let Err(e) = fs::write(pos[1], encode_u16_stream_to_bytes(&u16_stream)) {
+                        eprintln!("[RUST-ORACLE COMPILE FAIL] error[IO_ERROR]: failed to write '{}': {}", pos[1], e);
+                        std::process::exit(1);
+                    }
                     println!("[RUST-ORACLE COMPILE PASS] Wrote {} u16 tokens to '{}'", u16_stream.len(), pos[1]);
                     return;
                 }
-                let raw_src = fs::read_to_string(pos[0]).expect("Failed to read .omni file");
+                let raw_src = match fs::read_to_string(pos[0]) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[PURE-M3 COMPILE FAIL] error[IO_ERROR]: failed to read '{}': {}", pos[0], e);
+                        std::process::exit(1);
+                    }
+                };
                 let parent_dir = std::path::Path::new(pos[0]).parent();
                 let expanded = match pure_default_expand_includes(&raw_src, parent_dir, None) {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("[PURE-M3 COMPILE FAIL] {}", e);
+                        eprintln!("{}", cli_fail_label("PURE-M3 COMPILE FAIL", &e));
                         std::process::exit(1);
                     }
                 };
-                match pure_default_compile_surface_to_u16(&expanded, expanded.contains("#[strict]")) {
+                let compile_res = if use_interp {
+                    with_pure_default_interpreted(|| {
+                        pure_default_compile_surface_to_u16(&expanded, expanded.contains("#[strict]"))
+                    })
+                } else {
+                    pure_default_compile_surface_to_u16(&expanded, expanded.contains("#[strict]"))
+                };
+                match compile_res {
                     Ok(u16_stream) => {
                         if let Err(ve) = pure_default_verify_u16(&u16_stream, true) {
-                            eprintln!("[PURE-VERIFY FAIL] {}", ve);
+                            eprintln!("{}", cli_fail_label("PURE-VERIFY FAIL", &ve));
                             std::process::exit(1);
                         }
-                        fs::write(pos[1], encode_u16_stream_to_bytes(&u16_stream)).expect("Failed to write .omni_bc");
+                        if let Err(e) = fs::write(pos[1], encode_u16_stream_to_bytes(&u16_stream)) {
+                            eprintln!("[PURE-M3 COMPILE FAIL] error[IO_ERROR]: failed to write '{}': {}", pos[1], e);
+                            std::process::exit(1);
+                        }
                         println!("[PURE-M3 COMPILE PASS] Wrote {} u16 tokens to '{}' (Pure-Omni verified)", u16_stream.len(), pos[1]);
                         return;
                     }
                     Err(e) => {
-                        eprintln!("[PURE-M3 COMPILE FAIL] {}", e);
+                        eprintln!("{}", cli_fail_label("PURE-M3 COMPILE FAIL", &e));
                         std::process::exit(1);
                     }
                 }
             }
             "compile-stage1" if cli_args.len() >= 4 => {
-                let raw_src = fs::read_to_string(&cli_args[2]).expect("Failed to read .omni file");
+                let raw_src = match fs::read_to_string(&cli_args[2]) {
+                    Ok(s) => s,
+                    Err(e) => { eprintln!("error[IO_ERROR]: {}: {}", cli_args[2], e); std::process::exit(1); }
+                };
                 let parent_dir = std::path::Path::new(&cli_args[2]).parent();
-                let expanded = resolve_omni_surface_includes(&raw_src, parent_dir, None).expect("Include resolution failed");
+                let expanded = match resolve_omni_surface_includes(&raw_src, parent_dir, None) {
+                    Ok(s) => s,
+                    Err(e) => { eprintln!("[STAGE-1 ELF FAIL] {}", e); std::process::exit(1); }
+                };
                 let a0 = cli_args.get(4).and_then(|s| s.parse::<i64>().ok()).unwrap_or(45);
                 let a1 = cli_args.get(5).and_then(|s| s.parse::<i64>().ok()).unwrap_or(40);
                 let a2 = cli_args.get(6).and_then(|s| s.parse::<i64>().ok()).unwrap_or(90);
-                let elf = compile_omni_surface_via_stage1_to_elf(&expanded, a0, a1, a2)
-                    .expect("Stage-1 self-compiler ELF lowering failed");
-                fs::write(&cli_args[3], &elf).expect("Failed to write .elf");
+                let elf = match compile_omni_surface_via_stage1_to_elf(&expanded, a0, a1, a2) {
+                    Ok(e) => e,
+                    Err(e) => { eprintln!("[STAGE-1 ELF FAIL] {}", e); std::process::exit(1); }
+                };
+                if let Err(e) = fs::write(&cli_args[3], &elf) {
+                    eprintln!("error[IO_ERROR]: {}: {}", cli_args[3], e);
+                    std::process::exit(1);
+                }
                 println!("[STAGE-1 ELF PASS] Wrote {} bytes to '{}' (FNV-1a64=0x{:016X})", elf.len(), cli_args[3], fnv1a_64_hash(&elf));
                 return;
             }
             "compile-elf" if cli_args.len() >= 4 => {
                 let use_rust = cli_args[2..].iter().any(|a| a == "--rust" || a == "--oracle");
+                let use_interp = cli_args[2..].iter().any(|a| a == "--interpreted");
                 let pos: Vec<&str> = cli_args[2..]
                     .iter()
-                    .filter(|a| *a != "--rust" && *a != "--oracle")
+                    .filter(|a| *a != "--rust" && *a != "--oracle" && *a != "--interpreted")
                     .map(|s| s.as_str())
                     .collect();
                 if pos.len() < 2 {
-                    eprintln!("Usage: omni compile-elf [--rust|--oracle] <in.omni|.omni_bc> <out.elf> [a0 a1 a2]");
+                    eprintln!("Usage: omni compile-elf [--rust|--oracle|--interpreted] <in.omni|.omni_bc> <out.elf> [a0 a1 a2]");
                     std::process::exit(2);
                 }
                 let path = pos[0];
                 let out_path = pos[1];
-                let a0 = pos.get(2).and_then(|s| s.parse::<i64>().ok()).unwrap_or(45);
-                let a1 = pos.get(3).and_then(|s| s.parse::<i64>().ok()).unwrap_or(40);
-                let a2 = pos.get(4).and_then(|s| s.parse::<i64>().ok()).unwrap_or(90);
+                let (a0, a1, a2) = parse_compile_elf_args(&pos);
                 if use_rust {
                     let u16_stream = if path.ends_with(".omni") {
-                        compile_omni_surface_file_to_u16(path).expect("Rust oracle surface compilation failed")
+                        match compile_omni_surface_file_to_u16(path) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                eprintln!("[RUST-ORACLE ELF FAIL] {}", e);
+                                std::process::exit(1);
+                            }
+                        }
                     } else {
-                        let raw = fs::read(path).expect("Failed to read .omni_bc");
+                        let raw = match fs::read(path) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                eprintln!("[RUST-ORACLE ELF FAIL] error[IO_ERROR]: failed to read '{}': {}", path, e);
+                                std::process::exit(1);
+                            }
+                        };
                         decode_bytes_to_u16_stream(&raw)
                     };
-                    let elf = compile_pure_u16_to_x86_64_elf_with_args(&u16_stream, a0, a1, a2)
-                        .expect("Rust oracle x86-64 ELF AOT compilation failed");
-                    fs::write(out_path, &elf).expect("Failed to write .elf");
+                    let elf = match compile_pure_u16_to_x86_64_elf_with_args(&u16_stream, a0, a1, a2) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            eprintln!("[RUST-ORACLE ELF FAIL] {}", e);
+                            std::process::exit(1);
+                        }
+                    };
+                    if let Err(e) = fs::write(out_path, &elf) {
+                        eprintln!("[RUST-ORACLE ELF FAIL] error[IO_ERROR]: failed to write '{}': {}", out_path, e);
+                        std::process::exit(1);
+                    }
                     println!("[RUST-ORACLE ELF PASS] Wrote {} bytes to '{}' (FNV-1a64=0x{:016X})", elf.len(), out_path, fnv1a_64_hash(&elf));
                     return;
                 }
                 let u16_stream = if path.ends_with(".omni") {
-                    let raw_src = fs::read_to_string(path).expect("Failed to read .omni file");
+                    let raw_src = match fs::read_to_string(path) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[PURE-M2 ELF FAIL] error[IO_ERROR]: failed to read '{}': {}", path, e);
+                            std::process::exit(1);
+                        }
+                    };
                     let parent_dir = std::path::Path::new(path).parent();
                     let expanded = match pure_default_expand_includes(&raw_src, parent_dir, None) {
                         Ok(s) => s,
                         Err(e) => {
-                            eprintln!("[PURE-M2 ELF FAIL] {}", e);
+                            eprintln!("{}", cli_fail_label("PURE-M2 ELF FAIL", &e));
                             std::process::exit(1);
                         }
                     };
-                    pure_default_compile_surface_to_u16(&expanded, expanded.contains("#[strict]"))
-                        .expect("Pure-M3 surface compilation failed")
+                    let c_res = if use_interp {
+                        with_pure_default_interpreted(|| {
+                            pure_default_compile_surface_to_u16(&expanded, expanded.contains("#[strict]"))
+                        })
+                    } else {
+                        pure_default_compile_surface_to_u16(&expanded, expanded.contains("#[strict]"))
+                    };
+                    match c_res {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("{}", cli_fail_label("PURE-M2 ELF FAIL", &e));
+                            std::process::exit(1);
+                        }
+                    }
                 } else {
-                    let raw = fs::read(path).expect("Failed to read .omni_bc");
+                    let raw = match fs::read(path) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            eprintln!("[PURE-M2 ELF FAIL] error[IO_ERROR]: failed to read '{}': {}", path, e);
+                            std::process::exit(1);
+                        }
+                    };
                     decode_bytes_to_u16_stream(&raw)
                 };
                 if let Err(ve) = pure_default_verify_u16(&u16_stream, true) {
-                    eprintln!("[PURE-VERIFY FAIL] {}", ve);
+                    eprintln!("{}", cli_fail_label("PURE-VERIFY FAIL", &ve));
                     std::process::exit(1);
                 }
-                match pure_default_compile_u16_to_elf(&u16_stream, a0, a1, a2) {
+                let elf_res = if use_interp {
+                    with_pure_default_interpreted(|| pure_default_compile_u16_to_elf(&u16_stream, a0, a1, a2))
+                } else {
+                    pure_default_compile_u16_to_elf(&u16_stream, a0, a1, a2)
+                };
+                match elf_res {
                     Ok(elf) => {
                         fs::write(out_path, &elf).expect("Failed to write .elf");
                         println!("[PURE-M2 ELF PASS] Wrote {} bytes to '{}' (FNV-1a64=0x{:016X})", elf.len(), out_path, fnv1a_64_hash(&elf));
                         return;
                     }
                     Err(e) => {
-                        eprintln!("[PURE-M2 ELF FAIL] {}", e);
+                        eprintln!("{}", cli_fail_label("PURE-M2 ELF FAIL", &e));
                         std::process::exit(1);
                     }
                 }
@@ -24873,13 +25846,33 @@ fn main() {
             "compile-wasm" if cli_args.len() >= 4 => {
                 let path = &cli_args[2];
                 let u16_stream = if path.ends_with(".omni") {
-                    compile_omni_surface_file_to_u16(path).expect("Surface compilation failed")
+                    match compile_omni_surface_file_to_u16(path) {
+                        Ok(u) => u,
+                        Err(e) => {
+                            eprintln!("[WASM AOT FAIL] {}", e);
+                            std::process::exit(1);
+                        }
+                    }
                 } else {
-                    let raw = fs::read(path).expect("Failed to read .omni_bc");
-                    decode_bytes_to_u16_stream(&raw)
+                    match fs::read(path) {
+                        Ok(raw) => decode_bytes_to_u16_stream(&raw),
+                        Err(e) => {
+                            eprintln!("[WASM AOT FAIL] error[IO_ERROR]: failed to read '{}': {}", path, e);
+                            std::process::exit(1);
+                        }
+                    }
                 };
-                let wasm = compile_pure_u16_to_wasm(&u16_stream).expect("WebAssembly AOT compilation failed");
-                fs::write(&cli_args[3], &wasm).expect("Failed to write .wasm");
+                let wasm = match compile_pure_u16_to_wasm(&u16_stream) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        eprintln!("[WASM AOT FAIL] {}", e);
+                        std::process::exit(1);
+                    }
+                };
+                if let Err(e) = fs::write(&cli_args[3], &wasm) {
+                    eprintln!("[WASM AOT FAIL] error[IO_ERROR]: failed to write '{}': {}", cli_args[3], e);
+                    std::process::exit(1);
+                }
                 println!("[WASM AOT PASS] Wrote {} bytes to '{}' (FNV-1a64=0x{:016X})", wasm.len(), cli_args[3], fnv1a_64_hash(&wasm));
                 return;
             }
@@ -24894,30 +25887,70 @@ fn main() {
                     })
                     .collect();
                 if path.ends_with(".omni") {
-                    let raw_src = fs::read_to_string(path).expect("Failed to read .omni surface file");
+                    let raw_src = match fs::read_to_string(path) {
+                        Ok(s) => s,
+                        Err(e) => { eprintln!("error[IO_ERROR]: {}: {}", path, e); std::process::exit(1); }
+                    };
                     let parent_dir = std::path::Path::new(path).parent();
-                    let expanded = resolve_omni_surface_includes(&raw_src, parent_dir, None)
-                        .expect("Include resolution failed");
-                    let res = execute_omni_surface_wasm_i64(&expanded, &i64_args).expect("Wasm execution failed");
-                    println!("{}", res);
+                    let expanded = match resolve_omni_surface_includes(&raw_src, parent_dir, None) {
+                        Ok(s) => s,
+                        Err(e) => { eprintln!("[WASM FAIL] {}", e); std::process::exit(1); }
+                    };
+                    match execute_omni_surface_wasm_i64(&expanded, &i64_args) {
+                        Ok(res) => println!("{}", res),
+                        Err(e) => { eprintln!("[WASM FAIL] {}", e); std::process::exit(1); }
+                    }
                     return;
                 }
                 let wasm_bytes = if path.ends_with(".wasm") {
-                    fs::read(path).expect("Failed to read .wasm")
+                    match fs::read(path) {
+                        Ok(b) => b,
+                        Err(e) => { eprintln!("error[IO_ERROR]: {}: {}", path, e); std::process::exit(1); }
+                    }
                 } else {
-                    let raw = fs::read(path).expect("Failed to read .omni_bc");
+                    let raw = match fs::read(path) {
+                        Ok(b) => b,
+                        Err(e) => { eprintln!("error[IO_ERROR]: {}: {}", path, e); std::process::exit(1); }
+                    };
                     let u16_stream = decode_bytes_to_u16_stream(&raw);
-                    compile_pure_u16_to_wasm(&u16_stream).expect("WebAssembly AOT compilation failed")
+                    if let Err(ve) = pure_default_verify_u16(&u16_stream, true) {
+                        eprintln!("{}", cli_fail_label("PURE-VERIFY FAIL", &ve));
+                        std::process::exit(1);
+                    }
+                    match compile_pure_u16_to_wasm(&u16_stream) {
+                        Ok(w) => w,
+                        Err(e) => { eprintln!("[WASM FAIL] {}", e); std::process::exit(1); }
+                    }
                 };
-                let res = execute_wasm_module_i64(&wasm_bytes, &i64_args).expect("Wasm execution failed");
-                println!("{}", res);
+                match execute_wasm_module_i64(&wasm_bytes, &i64_args) {
+                    Ok(res) => println!("{}", res),
+                    Err(e) => { eprintln!("[WASM FAIL] {}", e); std::process::exit(1); }
+                }
                 return;
             }
             "surface-to-asm" if cli_args.len() >= 3 => {
-                let raw_src = fs::read_to_string(&cli_args[2]).expect("Failed to read .omni surface file");
+                let raw_src = match fs::read_to_string(&cli_args[2]) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[SURFACE-TO-ASM FAIL] error[IO_ERROR]: failed to read '{}': {}", cli_args[2], e);
+                        std::process::exit(1);
+                    }
+                };
                 let parent_dir = std::path::Path::new(&cli_args[2]).parent();
-                let expanded = resolve_omni_surface_includes(&raw_src, parent_dir, None).expect("Include resolution failed");
-                let asm = compile_omni_surface_to_asm(&expanded).expect("Surface-to-asm lowering failed");
+                let expanded = match resolve_omni_surface_includes(&raw_src, parent_dir, None) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[SURFACE-TO-ASM FAIL] {}", e);
+                        std::process::exit(1);
+                    }
+                };
+                let asm = match compile_omni_surface_to_asm(&expanded) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        eprintln!("[SURFACE-TO-ASM FAIL] {}", e);
+                        std::process::exit(1);
+                    }
+                };
                 print!("{}", asm);
                 return;
             }
@@ -24959,60 +25992,124 @@ fn main() {
                 return;
             }
             "run" | "run-surface" if cli_args.len() >= 3 => {
-                let use_rust = cli_args[2..].iter().any(|a| a == "--rust" || a == "--oracle");
-                let pos: Vec<&str> = cli_args[2..]
-                    .iter()
-                    .filter(|a| *a != "--rust" && *a != "--oracle")
-                    .map(|s| s.as_str())
-                    .collect();
+                let mut use_rust = false;
+                let mut use_interp = false;
+                let mut fuel: i64 = PURE_DEFAULT_FUEL;
+                let mut pos: Vec<&str> = Vec::new();
+                let mut ai = 2usize;
+                while ai < cli_args.len() {
+                    let arg = cli_args[ai].as_str();
+                    if arg == "--rust" || arg == "--oracle" {
+                        use_rust = true;
+                    } else if arg == "--interpreted" {
+                        use_interp = true;
+                    } else if arg == "--fuel" {
+                        ai += 1;
+                        let val_s = match cli_args.get(ai) {
+                            Some(s) => s.as_str(),
+                            None => {
+                                eprintln!("error[INVALID_ARG]: --fuel requires an integer in 1..={}", PURE_MAX_FUEL);
+                                std::process::exit(2);
+                            }
+                        };
+                        fuel = match val_s.parse::<i64>() {
+                            Ok(n) if n > 0 && n <= PURE_MAX_FUEL => n,
+                            _ => {
+                                eprintln!("error[INVALID_ARG]: --fuel must be in 1..={} (got '{}')", PURE_MAX_FUEL, val_s);
+                                std::process::exit(2);
+                            }
+                        };
+                    } else if let Some(val_s) = arg.strip_prefix("--fuel=") {
+                        fuel = match val_s.parse::<i64>() {
+                            Ok(n) if n > 0 && n <= PURE_MAX_FUEL => n,
+                            _ => {
+                                eprintln!("error[INVALID_ARG]: --fuel must be in 1..={} (got '{}')", PURE_MAX_FUEL, val_s);
+                                std::process::exit(2);
+                            }
+                        };
+                    } else {
+                        pos.push(arg);
+                    }
+                    ai += 1;
+                }
                 if pos.is_empty() {
-                    eprintln!("Usage: omni run [--rust|--oracle] <file.omni|file.omni_bc> [args...]");
+                    eprintln!("Usage: omni run [--rust|--oracle|--interpreted] [--fuel N] <file.omni|file.omni_bc> [args...]");
                     std::process::exit(2);
                 }
                 let path = pos[0];
                 if !use_rust {
                     let u16_stream = if path.ends_with(".omni") {
-                        let raw_src = fs::read_to_string(path).expect("Failed to read .omni file");
+                        let raw_src = match fs::read_to_string(path) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                eprintln!("[PURE-RUN FAIL] error[IO_ERROR]: failed to read '{}': {}", path, e);
+                                std::process::exit(1);
+                            }
+                        };
                         let parent_dir = std::path::Path::new(path).parent();
                         let expanded = match pure_default_expand_includes(&raw_src, parent_dir, None) {
                             Ok(s) => s,
                             Err(e) => {
-                                eprintln!("[PURE-RUN FAIL] {}", e);
+                                eprintln!("{}", cli_fail_label("PURE-RUN FAIL", &e));
                                 std::process::exit(1);
                             }
                         };
-                        match pure_default_compile_surface_to_u16(&expanded, expanded.contains("#[strict]")) {
+                        let c_res = if use_interp {
+                            with_pure_default_interpreted(|| {
+                                pure_default_compile_surface_to_u16(&expanded, expanded.contains("#[strict]"))
+                            })
+                        } else {
+                            pure_default_compile_surface_to_u16(&expanded, expanded.contains("#[strict]"))
+                        };
+                        match c_res {
                             Ok(u) => u,
                             Err(e) => {
-                                eprintln!("[PURE-RUN FAIL] {}", e);
+                                eprintln!("{}", cli_fail_label("PURE-RUN FAIL", &e));
                                 std::process::exit(1);
                             }
                         }
                     } else {
-                        let raw = fs::read(path).expect("Failed to read .omni_bc file");
+                        let raw = match fs::read(path) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                eprintln!("[PURE-RUN FAIL] error[IO_ERROR]: failed to read '{}': {}", path, e);
+                                std::process::exit(1);
+                            }
+                        };
                         decode_bytes_to_u16_stream(&raw)
                     };
                     let a0 = pos.get(1).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
                     let a1 = pos.get(2).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
                     let a2 = pos.get(3).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
                     if let Err(ve) = pure_default_verify_u16(&u16_stream, true) {
-                        eprintln!("[PURE-VERIFY FAIL] {}", ve);
+                        eprintln!("{}", cli_fail_label("PURE-VERIFY FAIL", &ve));
                         std::process::exit(1);
                     }
-                    match pure_default_run_u16(&u16_stream, a0, a1, a2, false) {
+                    let run_res = if use_interp {
+                        with_pure_default_interpreted(|| pure_default_run_u16_with_fuel(&u16_stream, a0, a1, a2, fuel, false))
+                    } else {
+                        pure_default_run_u16_with_fuel(&u16_stream, a0, a1, a2, fuel, false)
+                    };
+                    match run_res {
                         Ok((ret, _steps)) => {
                             println!("Int({})", ret);
                             return;
                         }
                         Err(e) => {
-                            eprintln!("[PURE-RUN FAIL] {}", e);
+                            eprintln!("{}", cli_fail_label("PURE-RUN FAIL", &e));
                             std::process::exit(1);
                         }
                     }
                 }
                 let vm_args: Vec<OmniValue> = pos[1..].iter().map(|s| parse_cli_omni_value(s)).collect();
                 if path.ends_with(".omni") {
-                    let raw_src = fs::read_to_string(path).expect("Failed to read .omni file");
+                    let raw_src = match fs::read_to_string(path) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[RUN FAIL] error[IO_ERROR]: failed to read '{}': {}", path, e);
+                            std::process::exit(1);
+                        }
+                    };
                     let parent_dir = std::path::Path::new(path).parent();
                     let expanded = match resolve_omni_surface_includes(&raw_src, parent_dir, None) {
                         Ok(s) => s,
@@ -25033,12 +26130,30 @@ fn main() {
                     }
                 }
                 let u16_stream = {
-                    let raw = fs::read(path).expect("Failed to read input file");
+                    let raw = match fs::read(path) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            eprintln!("[RUN FAIL] error[IO_ERROR]: failed to read '{}': {}", path, e);
+                            std::process::exit(1);
+                        }
+                    };
                     if let Ok(txt) = std::str::from_utf8(&raw) {
                         if txt.contains("fn ") {
                             let parent_dir = std::path::Path::new(path).parent();
-                            let expanded = resolve_omni_surface_includes(txt, parent_dir, None).expect("Include resolution failed");
-                            compile_omni_surface_to_u16(&expanded).expect("Surface compilation failed")
+                            let expanded = match resolve_omni_surface_includes(txt, parent_dir, None) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    eprintln!("[RUN FAIL] {}", e);
+                                    std::process::exit(1);
+                                }
+                            };
+                            match compile_omni_surface_to_u16(&expanded) {
+                                Ok(u) => u,
+                                Err(e) => {
+                                    eprintln!("[RUN FAIL] {}", e);
+                                    std::process::exit(1);
+                                }
+                            }
                         } else {
                             decode_bytes_to_u16_stream(&raw)
                         }
@@ -25046,7 +26161,10 @@ fn main() {
                         decode_bytes_to_u16_stream(&raw)
                     }
                 };
-                let module = decode_omni_token_stream(&u16_stream).expect("Decode failed");
+                let module = match decode_omni_token_stream(&u16_stream) {
+                    Ok(m) => m,
+                    Err(e) => { eprintln!("[DECODE FAIL] {}", e); std::process::exit(1); }
+                };
                 for f in &module.functions {
                     let rep = verify_binary_function(f);
                     if !rep.passed {
@@ -25057,11 +26175,16 @@ fn main() {
                 let entry_fn_idx = if module.functions.iter().any(|f| f.fn_idx == 0) {
                     0
                 } else {
-                    module.functions.last().map(|f| f.fn_idx).expect("No functions in module")
+                    match module.functions.last().map(|f| f.fn_idx) {
+                        Some(id) => id,
+                        None => { eprintln!("error[EMPTY_MODULE]: No functions in module"); std::process::exit(1); }
+                    }
                 };
                 let mut vm = OmniBinaryVm::new();
-                let res = vm.execute_function(&module, entry_fn_idx, vm_args).expect("VM execution failed");
-                println!("{:?}", res);
+                match vm.execute_function(&module, entry_fn_idx, vm_args) {
+                    Ok(res) => println!("{:?}", res),
+                    Err(e) => { eprintln!("[RUN FAIL] {}", e); std::process::exit(1); }
+                }
                 return;
             }
             _ => {}

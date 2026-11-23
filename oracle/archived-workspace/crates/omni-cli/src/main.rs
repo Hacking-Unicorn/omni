@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{self, BufRead, Write};
 
 #[allow(dead_code, unused_imports)]
-#[path = "../../../../omni_rust_bootstrap.rs"]
+#[path = "../../../../../omni_rust_bootstrap.rs"]
 mod monolith;
 
 use omni_aot::{
@@ -1052,7 +1052,7 @@ fn main() {
                 println!("  a2-pure-include                   Seed-Shrink A2: Pure-Omni O-5 include expander (pure/m3/include.omni) & cycle gate");
                 println!("  a3-macro-quarantine               Seed-Shrink A3: quarantine macros behind --rust oracle & verify pure replacement golden");
                 println!("  b2-pure-verifier                  Seed-Shrink B2: Pure-Omni verifier_engine.omni on default hot path gate");
-                println!("  b4-pure-launcher                  Seed-Shrink B4: Pure-Omni M5 181-B zero-shim launcher ELF64 & native chain gate");
+                println!("  b4-pure-launcher                  Seed-Shrink B4: Pure-Omni M5 237-B zero-shim launcher ELF64 & native chain gate");
                 println!();
                 println!("Compilation, Execution & Tooling:");
                 println!("  run <file.omni|file.omni_bc> [args...]   Compile/verify and execute on VM");
@@ -1167,9 +1167,9 @@ fn main() {
                     let raw = fs::read(path).expect("Failed to read .omni_bc");
                     decode_bytes_to_u16_stream(&raw)
                 };
-                let a0 = args.get(4).and_then(|s| s.parse::<i64>().ok()).unwrap_or(45);
-                let a1 = args.get(5).and_then(|s| s.parse::<i64>().ok()).unwrap_or(40);
-                let a2 = args.get(6).and_then(|s| s.parse::<i64>().ok()).unwrap_or(90);
+                let a0 = args.get(4).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                let a1 = args.get(5).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                let a2 = args.get(6).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
                 let elf = compile_pure_u16_to_x86_64_elf_with_args(&u16s, a0, a1, a2)
                     .expect("x86-64 ELF AOT compilation failed");
                 fs::write(&args[3], &elf).expect("Write failed");
@@ -1232,9 +1232,9 @@ fn main() {
                 let parent_dir = std::path::Path::new(&args[2]).parent();
                 let merged = resolve_omni_surface_includes(&raw_src, parent_dir, None)
                     .expect("Failed to resolve .omni surface file");
-                let a0 = args.get(4).and_then(|s| s.parse::<i64>().ok()).unwrap_or(45);
-                let a1 = args.get(5).and_then(|s| s.parse::<i64>().ok()).unwrap_or(40);
-                let a2 = args.get(6).and_then(|s| s.parse::<i64>().ok()).unwrap_or(90);
+                let a0 = args.get(4).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                let a1 = args.get(5).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                let a2 = args.get(6).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
                 let elf = compile_omni_surface_via_stage1_to_elf(&merged, a0, a1, a2)
                     .expect("Stage-1 ELF compilation failed");
                 fs::write(&args[3], &elf).expect("Write failed");
@@ -1346,7 +1346,7 @@ mod tests {
     static REPO_CWD: Mutex<()> = Mutex::new(());
 
     fn repo_root() -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..")
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../..")
     }
 
     fn with_repo_root<T>(f: impl FnOnce() -> T) -> T {
@@ -1418,5 +1418,53 @@ mod tests {
                 .expect("verifier engine differential failed");
             assert!(n >= 40, "expected at least 40 verifier-diff cases, got {n}");
         });
+    }
+
+    /// A token packed with an undefined cap id (11..=31, including the former
+    /// overflow ids 17 and 31) must yield structured MISSING_CAP from the
+    /// path-included monolith verifier, even if the function holds every defined
+    /// cap. Before this fix, debug `cargo test` panicked in `cap_bit` and
+    /// release aliased cap 17 to DB_R.
+    #[test]
+    fn monolith_undefined_cap_token_reports_missing_cap() {
+        const ALL_DEFINED_CAPS: monolith::CapMask = 0x03FF;
+        let make = |cap_id: u16, fn_cap_mask: monolith::CapMask| monolith::BinFunction {
+            fn_idx: 0,
+            params: vec![],
+            ret_ty_tok: monolith::TY_I64,
+            cap_mask: fn_cap_mask,
+            instructions: vec![monolith::BinInstruction {
+                offset: 0,
+                dest_reg: Some(monolith::REG_BASE),
+                op_tok: 0x7F06, // CINT
+                ty_tok: monolith::TY_I64,
+                tc_tok: monolith::pack_tc(false, cap_id),
+                operands: vec![monolith::BinOperand::ImmInt(0)],
+            }],
+        };
+        // Defined-cap controls: PURE is accepted; DB_R is accepted only when granted.
+        let ok = monolith::verify_binary_function(&make(monolith::CAP_ID_PURE, 0));
+        assert!(ok.passed, "PURE CINT should pass: {:?}", ok.errors);
+        let granted = monolith::verify_binary_function(&make(
+            monolith::CAP_ID_DB_R,
+            monolith::cap_bit(monolith::CAP_ID_DB_R),
+        ));
+        assert!(granted.passed, "DB_R CINT on a DB_R fn should pass: {:?}", granted.errors);
+        let denied = monolith::verify_binary_function(&make(monolith::CAP_ID_DB_R, 0));
+        assert!(
+            !denied.passed && denied.errors.iter().any(|e| e.contains("MISSING_CAP")),
+            "DB_R CINT on a PURE fn should be MISSING_CAP: {:?}",
+            denied.errors
+        );
+        for cap_id in 11u16..=31 {
+            for fn_mask in [0, ALL_DEFINED_CAPS] {
+                let rep = monolith::verify_binary_function(&make(cap_id, fn_mask));
+                assert!(
+                    !rep.passed && rep.errors.iter().any(|e| e.contains("MISSING_CAP")),
+                    "cap_id {cap_id} on fn mask 0x{fn_mask:04X} should be MISSING_CAP, not a panic or alias; errors={:?}",
+                    rep.errors
+                );
+            }
+        }
     }
 }

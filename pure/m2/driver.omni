@@ -46,7 +46,7 @@ fn m2d_emit_one_ins(arena: bytes, arr: array, n: i64, cur: i64, pass: i64, is_by
     let c_br: trit = m2u_in(op, 32576, 32580) <=> 0;
     let c_sr: trit = (m2u_eq(op, 32581) + m2u_eq(op, 32586)) <=> 0;
     let r1: bytes = if_pos c_basic { m2x_emit_basic(arena, op, d, p0) } else { arena };
-    let r2: bytes = if_pos c_iget { m2x_emit_iget(r1, p1, d) } else { r1 };
+    let r2: bytes = if_pos c_iget { m2x_emit_iget(r1, p0, p1, d) } else { r1 };
     let r3: bytes = if_pos c_iset { m2x_emit_iset(r2, arr, n, ops_start, nops, d) } else { r2 };
     let r4: bytes = if_pos c_alu { m2d_emit_alu_group(r3, op, d, p0, p1, p2) } else { r3 };
     let r5: bytes = if_pos c_br { m2x_emit_branch(r4, op, p0, p1, p2, p3, pass) } else { r4 };
@@ -57,7 +57,7 @@ fn m2d_emit_one_ins(arena: bytes, arr: array, n: i64, cur: i64, pass: i64, is_by
 // Runs one full pass (pass=1 collects labels, pass=2 patches rel32) over all instructions.
 #[strict]
 fn m2_run_pass(arena: bytes, arr: array, n: i64, ins_start: i64, ins_cnt: i64, pass: i64, is_bytes: i64) -> bytes {
-    let w: bytes = arena;
+    let w: bytes = m2x_bufreg_scan(arena, arr, n, ins_start, ins_cnt);
     let cur: i64 = ins_start;
     let ii: i64 = 0;
     while ins_cnt - ii <=> 0 {
@@ -81,7 +81,7 @@ fn m2_compile_single_x86(arena: bytes, arr: array, arg0: i64, arg1: i64, arg2: i
     let ins_start: i64 = sig_pos + 3;
     let w: bytes = m2a_init(arena, n, 0, is_bytes);
     // Pass 1: emit placeholder header + prologue + body, recording every LABEL byte offset.
-    w = m2e_emit_elf64_hdr(w, 120);
+    w = m2e_emit_elf64_hdr(w, 176);
     w = m2x_single_prologue(w, is_bytes, arg0, arg1, arg2);
     w = m2_run_pass(w, arr, n, ins_start, ins_cnt, 1, is_bytes);
     let total_size: i64 = ld_u64(w, m2l_regs());

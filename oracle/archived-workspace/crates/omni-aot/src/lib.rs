@@ -560,18 +560,26 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
                 }
                 if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
             }
-            0x7F13 | 0x7F14 => {
+            0x7F13 => {
                 emit_load_op(&mut code, &ins.operands[0], false);
                 emit_load_op(&mut code, &ins.operands[1], true);
                 code.extend_from_slice(&[0x49, 0x89, 0xC0, 0x48, 0x85, 0xC9, 0x74, 0x1E, 0x48, 0x83, 0xF9, 0xFF, 0x75, 0x11, 0x49, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x4D, 0x39, 0xC8, 0x75, 0x02, 0xEB, 0x0A, 0x48, 0x99, 0x48, 0xF7, 0xF9, 0xEB, 0x03, 0x48, 0x31, 0xC0]);
-                if ins.op_tok == 0x7F14 {
-                    code.extend_from_slice(&[0x48, 0x89, 0xD0]);
-                }
                 if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
             }
-            0x7F15 | 0x7F28 => {
+            0x7F14 => {
+                emit_load_op(&mut code, &ins.operands[0], false);
+                emit_load_op(&mut code, &ins.operands[1], true);
+                code.extend_from_slice(&[0x49, 0x89, 0xC0, 0x48, 0x85, 0xC9, 0x74, 0x21, 0x48, 0x83, 0xF9, 0xFF, 0x75, 0x11, 0x49, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x4D, 0x39, 0xC8, 0x75, 0x02, 0xEB, 0x0A, 0x48, 0x99, 0x48, 0xF7, 0xF9, 0x48, 0x89, 0xD0, 0xEB, 0x03, 0x48, 0x31, 0xC0]);
+                if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+            }
+            0x7F15 => {
                 emit_load_op(&mut code, &ins.operands[0], false);
                 code.extend_from_slice(&[0x48, 0xF7, 0xD8]);
+                if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+            }
+            0x7F28 => {
+                emit_load_op(&mut code, &ins.operands[0], false);
+                code.extend_from_slice(&[0x48, 0x83, 0xF8, 0x00, 0x0F, 0x9F, 0xC0, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC0, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD0, 0x48, 0xF7, 0xD8]);
                 if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
             }
             0x7F16 => {
@@ -607,29 +615,50 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
                 ]);
                 if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
             }
-            0x7F29 | 0x7F17 => {
+            0x7F17 => {
                 emit_load_op(&mut code, &ins.operands[0], false);
                 emit_load_op(&mut code, &ins.operands[1], true);
                 code.extend_from_slice(&[0x48, 0x39, 0xC8, 0x48, 0x0F, 0x4F, 0xC1]);
                 if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
             }
-            0x7F2A | 0x7F18 => {
+            0x7F29 => {
                 emit_load_op(&mut code, &ins.operands[0], false);
                 emit_load_op(&mut code, &ins.operands[1], true);
+                code.extend_from_slice(&[0x48, 0x83, 0xF8, 0x00, 0x0F, 0x9F, 0xC0, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC0, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD0]);
+                code.extend_from_slice(&[0x48, 0x83, 0xF9, 0x00, 0x0F, 0x9F, 0xC1, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC9, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD1]);
+                code.extend_from_slice(&[0x48, 0x39, 0xC8, 0x48, 0x0F, 0x4F, 0xC1]);
+                if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+            }
+            0x7F18 => {
+                emit_load_op(&mut code, &ins.operands[0], false);
+                emit_load_op(&mut code, &ins.operands[1], true);
+                code.extend_from_slice(&[0x48, 0x39, 0xC8, 0x48, 0x0F, 0x4C, 0xC1]);
+                if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+            }
+            0x7F2A => {
+                emit_load_op(&mut code, &ins.operands[0], false);
+                emit_load_op(&mut code, &ins.operands[1], true);
+                code.extend_from_slice(&[0x48, 0x83, 0xF8, 0x00, 0x0F, 0x9F, 0xC0, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC0, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD0]);
+                code.extend_from_slice(&[0x48, 0x83, 0xF9, 0x00, 0x0F, 0x9F, 0xC1, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC9, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD1]);
                 code.extend_from_slice(&[0x48, 0x39, 0xC8, 0x48, 0x0F, 0x4C, 0xC1]);
                 if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
             }
             0x7F2B => {
                 emit_load_op(&mut code, &ins.operands[0], false);
                 emit_load_op(&mut code, &ins.operands[1], true);
+                code.extend_from_slice(&[0x48, 0x83, 0xF8, 0x00, 0x0F, 0x9F, 0xC0, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC0, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD0]);
+                code.extend_from_slice(&[0x48, 0x83, 0xF9, 0x00, 0x0F, 0x9F, 0xC1, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC9, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD1]);
                 code.extend_from_slice(&[0x48, 0x0F, 0xAF, 0xC1, 0x48, 0xF7, 0xD8]);
                 if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
             }
             0x7F2C => {
                 emit_load_op(&mut code, &ins.operands[0], false);
                 emit_load_op(&mut code, &ins.operands[1], true);
+                code.extend_from_slice(&[0x48, 0x83, 0xF8, 0x00, 0x0F, 0x9F, 0xC0, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC0, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD0]);
+                code.extend_from_slice(&[0x48, 0x83, 0xF9, 0x00, 0x0F, 0x9F, 0xC1, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC9, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD1]);
                 code.extend_from_slice(&[0x48, 0x01, 0xC8]);
                 emit_load_op(&mut code, &ins.operands[2], true);
+                code.extend_from_slice(&[0x48, 0x83, 0xF9, 0x00, 0x0F, 0x9F, 0xC1, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC9, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD1]);
                 code.extend_from_slice(&[
                     0x48, 0x01, 0xC8,
                     0x48, 0x83, 0xF8, 0x00,
@@ -689,8 +718,8 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
             0x7F43 | 0x7F44 => {
                 if let Some(lbl) = ins.operands.get(1).and_then(extract_label_id) {
                     emit_load_op(&mut code, &ins.operands[0], false);
-                    code.extend_from_slice(&[0x48, 0x83, 0xF8, if ins.op_tok == 0x7F43 { 0x01 } else { 0xFF }]);
-                    code.extend_from_slice(&[0x0F, 0x84]);
+                    code.extend_from_slice(&[0x48, 0x83, 0xF8, 0x00]);
+                    code.extend_from_slice(&[0x0F, if ins.op_tok == 0x7F43 { 0x8F } else { 0x8C }]);
                     relocs.push(RelocPatch { patch_offset: code.len(), target_label: lbl });
                     code.extend_from_slice(&[0, 0, 0, 0]);
                 }
@@ -779,10 +808,10 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
     }
 
     let base_vaddr: u64 = 0x400000;
-    let entry_vaddr: u64 = base_vaddr + 120;
-    let total_size: u64 = 120 + (code.len() as u64);
+    let entry_vaddr: u64 = base_vaddr + 176;
+    let total_size: u64 = 176 + (code.len() as u64);
 
-    let mut elf = vec![0u8; 120];
+    let mut elf = vec![0u8; 176];
     elf[0..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
     elf[4] = 2;
     elf[5] = 1;
@@ -794,7 +823,7 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
     elf[32..40].copy_from_slice(&64u64.to_le_bytes());
     elf[52..54].copy_from_slice(&64u16.to_le_bytes());
     elf[54..56].copy_from_slice(&56u16.to_le_bytes());
-    elf[56..58].copy_from_slice(&1u16.to_le_bytes());
+    elf[56..58].copy_from_slice(&2u16.to_le_bytes());
 
     elf[64..68].copy_from_slice(&1u32.to_le_bytes());
     elf[68..72].copy_from_slice(&5u32.to_le_bytes());
@@ -803,6 +832,10 @@ pub fn compile_pure_u16_to_x86_64_elf_with_args(
     elf[96..104].copy_from_slice(&total_size.to_le_bytes());
     elf[104..112].copy_from_slice(&total_size.to_le_bytes());
     elf[112..120].copy_from_slice(&0x1000u64.to_le_bytes());
+    // PT_GNU_STACK (non-executable stack: PF_R | PF_W)
+    elf[120..124].copy_from_slice(&0x6474_E551u32.to_le_bytes());
+    elf[124..128].copy_from_slice(&6u32.to_le_bytes());
+    elf[168..176].copy_from_slice(&16u64.to_le_bytes());
 
     elf.extend_from_slice(&code);
     Ok(elf)
@@ -1107,19 +1140,18 @@ pub fn compile_pure_u16_to_x86_64_elf_multi(
                         emit_cap_guard(&mut code, &mut trap_relocs, 8);
                         emit_load_op(&mut code, &ins.operands[2], false);
                         code.extend_from_slice(&[0x4A, 0x89, 0x04, 0x1B, 0x49, 0x83, 0xC3, 0x08]);
-                    } else if ins.operands.len() == 4 && ins.operands[1] == BinOperand::ImmInt(-9) {
-                        emit_load_op(&mut code, &ins.operands[2], true);
-                        emit_load_op(&mut code, &ins.operands[3], false);
-                        code.extend_from_slice(&[
-                            0x48, 0x85, 0xC9, 0x78, 0x0D,
-                            0x48, 0x8D, 0x71, 0x08,
-                            0x4C, 0x39, 0xDE, 0x77, 0x04,
-                            0x48, 0x89, 0x04, 0x0B,
-                        ]);
                     } else if ins.operands.len() == 4
-                        && (ins.operands[1] == BinOperand::ImmInt(-2) || ins.operands[1] == BinOperand::ImmInt(-4))
+                        && (ins.operands[1] == BinOperand::ImmInt(-2)
+                            || ins.operands[1] == BinOperand::ImmInt(-4)
+                            || ins.operands[1] == BinOperand::ImmInt(-9))
                     {
-                        let width: u8 = if ins.operands[1] == BinOperand::ImmInt(-2) { 2 } else { 4 };
+                        let width: u8 = if ins.operands[1] == BinOperand::ImmInt(-2) {
+                            2
+                        } else if ins.operands[1] == BinOperand::ImmInt(-4) {
+                            4
+                        } else {
+                            8
+                        };
                         emit_load_op(&mut code, &ins.operands[3], false);
                         code.extend_from_slice(&[0x48, 0x89, 0xC2]);
                         emit_load_op(&mut code, &ins.operands[2], true);
@@ -1135,8 +1167,10 @@ pub fn compile_pure_u16_to_x86_64_elf_multi(
                         code.extend_from_slice(&[0, 0, 0, 0]);
                         if width == 2 {
                             code.extend_from_slice(&[0x66, 0x89, 0x14, 0x0B]);
-                        } else {
+                        } else if width == 4 {
                             code.extend_from_slice(&[0x89, 0x14, 0x0B]);
+                        } else {
+                            code.extend_from_slice(&[0x48, 0x89, 0x14, 0x0B]);
                         }
                     } else {
                         let k = ins.operands.len().saturating_sub(1) as u32;
@@ -1437,10 +1471,10 @@ pub fn compile_pure_u16_to_x86_64_elf_multi(
     }
 
     let base_vaddr: u64 = 0x400000;
-    let entry_vaddr: u64 = base_vaddr + 120;
-    let total_size: u64 = 120 + (code.len() as u64);
+    let entry_vaddr: u64 = base_vaddr + 176;
+    let total_size: u64 = 176 + (code.len() as u64);
 
-    let mut elf = vec![0u8; 120];
+    let mut elf = vec![0u8; 176];
     elf[0..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
     elf[4] = 2;
     elf[5] = 1;
@@ -1452,7 +1486,7 @@ pub fn compile_pure_u16_to_x86_64_elf_multi(
     elf[32..40].copy_from_slice(&64u64.to_le_bytes());
     elf[52..54].copy_from_slice(&64u16.to_le_bytes());
     elf[54..56].copy_from_slice(&56u16.to_le_bytes());
-    elf[56..58].copy_from_slice(&1u16.to_le_bytes());
+    elf[56..58].copy_from_slice(&2u16.to_le_bytes());
     elf[64..68].copy_from_slice(&1u32.to_le_bytes());
     elf[68..72].copy_from_slice(&5u32.to_le_bytes());
     elf[80..88].copy_from_slice(&base_vaddr.to_le_bytes());
@@ -1460,6 +1494,10 @@ pub fn compile_pure_u16_to_x86_64_elf_multi(
     elf[96..104].copy_from_slice(&total_size.to_le_bytes());
     elf[104..112].copy_from_slice(&total_size.to_le_bytes());
     elf[112..120].copy_from_slice(&0x1000u64.to_le_bytes());
+    // PT_GNU_STACK (non-executable stack: PF_R | PF_W)
+    elf[120..124].copy_from_slice(&0x6474_E551u32.to_le_bytes());
+    elf[124..128].copy_from_slice(&6u32.to_le_bytes());
+    elf[168..176].copy_from_slice(&16u64.to_le_bytes());
 
     elf.extend_from_slice(&code);
     Ok(elf)
@@ -2080,12 +2118,8 @@ fn compile_wasm_single_func_body(
                     wasm_lset(b, scratch0);
                     emit_wasm_op(b, &ops[3]);
                     wasm_lset(b, scratch1);
-                    if patch_width == 8 {
-                        wasm_buf_in_bounds(b, &bl, scratch0, patch_width);
-                    } else {
-                        wasm_trap_unless_in_bounds(b, &bl, scratch0, patch_width);
-                        wasm_buf_in_bounds(b, &bl, scratch0, patch_width); // now always true
-                    }
+                    wasm_trap_unless_in_bounds(b, &bl, scratch0, patch_width);
+                    wasm_buf_in_bounds(b, &bl, scratch0, patch_width); // now always true
                     b.extend_from_slice(&[0x04, 0x40]);
                     wasm_lget(b, bl.bbase);
                     wasm_lget(b, scratch0);
@@ -2200,10 +2234,18 @@ fn compile_wasm_single_func_body(
                 }
                 emit_wasm_set_dest(b, ins.dest_reg);
             }
-            0x7F15 | 0x7F28 => {
+            0x7F15 => {
                 b.extend_from_slice(&[0x42, 0x00]);
                 emit_wasm_op(b, &ins.operands[0]);
                 b.push(0x7D);
+                emit_wasm_set_dest(b, ins.dest_reg);
+            }
+            0x7F28 => {
+                emit_wasm_op(b, &ins.operands[0]);
+                b.push(0x22); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x53, 0xAD]);
+                b.push(0x20); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x55, 0xAD, 0x7D]);
                 emit_wasm_set_dest(b, ins.dest_reg);
             }
             0x7F16 => {
@@ -2220,19 +2262,48 @@ fn compile_wasm_single_func_body(
                 b.extend_from_slice(&[0x42, 0x7F, 0x85]);
                 emit_wasm_set_dest(b, ins.dest_reg);
             }
-            0x7F17 | 0x7F29 | 0x7F18 | 0x7F2A => {
+            0x7F17 | 0x7F18 => {
                 emit_wasm_op(b, &ins.operands[0]);
                 emit_wasm_op(b, &ins.operands[1]);
                 emit_wasm_op(b, &ins.operands[0]);
                 emit_wasm_op(b, &ins.operands[1]);
-                b.push(if matches!(ins.op_tok, 0x7F17 | 0x7F29) { 0x53 } else { 0x55 });
+                b.push(if ins.op_tok == 0x7F17 { 0x53 } else { 0x55 });
+                b.push(0x1B);
+                emit_wasm_set_dest(b, ins.dest_reg);
+            }
+            0x7F29 | 0x7F2A => {
+                emit_wasm_op(b, &ins.operands[0]);
+                b.push(0x22); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x55, 0xAD]);
+                b.push(0x20); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x53, 0xAD, 0x7D]);
+                b.push(0x21); b.extend(encode_uleb128(scratch0));
+                emit_wasm_op(b, &ins.operands[1]);
+                b.push(0x22); b.extend(encode_uleb128(scratch1));
+                b.extend_from_slice(&[0x42, 0x00, 0x55, 0xAD]);
+                b.push(0x20); b.extend(encode_uleb128(scratch1));
+                b.extend_from_slice(&[0x42, 0x00, 0x53, 0xAD, 0x7D]);
+                b.push(0x21); b.extend(encode_uleb128(scratch1));
+                b.push(0x20); b.extend(encode_uleb128(scratch0));
+                b.push(0x20); b.extend(encode_uleb128(scratch1));
+                b.push(0x20); b.extend(encode_uleb128(scratch0));
+                b.push(0x20); b.extend(encode_uleb128(scratch1));
+                b.push(if ins.op_tok == 0x7F29 { 0x53 } else { 0x55 });
                 b.push(0x1B);
                 emit_wasm_set_dest(b, ins.dest_reg);
             }
             0x7F2B => {
                 b.extend_from_slice(&[0x42, 0x00]);
                 emit_wasm_op(b, &ins.operands[0]);
+                b.push(0x22); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x55, 0xAD]);
+                b.push(0x20); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x53, 0xAD, 0x7D]);
                 emit_wasm_op(b, &ins.operands[1]);
+                b.push(0x22); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x55, 0xAD]);
+                b.push(0x20); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x53, 0xAD, 0x7D]);
                 b.extend_from_slice(&[0x7E, 0x7D]);
                 emit_wasm_set_dest(b, ins.dest_reg);
             }
@@ -2250,9 +2321,21 @@ fn compile_wasm_single_func_body(
             }
             0x7F2C => {
                 emit_wasm_op(b, &ins.operands[0]);
+                b.push(0x22); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x55, 0xAD]);
+                b.push(0x20); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x53, 0xAD, 0x7D]);
                 emit_wasm_op(b, &ins.operands[1]);
+                b.push(0x22); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x55, 0xAD]);
+                b.push(0x20); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x53, 0xAD, 0x7D]);
                 b.push(0x7C);
                 emit_wasm_op(b, &ins.operands[2]);
+                b.push(0x22); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x55, 0xAD]);
+                b.push(0x20); b.extend(encode_uleb128(scratch0));
+                b.extend_from_slice(&[0x42, 0x00, 0x53, 0xAD, 0x7D]);
                 b.push(0x7C);
                 b.push(0x22); b.extend(encode_uleb128(scratch0));
                 b.extend_from_slice(&[0x42, 0x00, 0x55, 0xAD]);
@@ -2396,8 +2479,8 @@ fn compile_wasm_single_func_body(
                     body.extend(encode_sleb128((ins_idx + 1) as i64));
                     emit_wasm_op(&mut body, &ins.operands[0]);
                     body.push(0x42);
-                    body.extend(encode_sleb128(if ins.op_tok == 0x7F43 { 1 } else { -1 }));
-                    body.extend_from_slice(&[0x51, 0x1B]);
+                    body.push(0x00);
+                    body.extend_from_slice(&[if ins.op_tok == 0x7F43 { 0x55 } else { 0x53 }, 0x1B]);
                     body.push(0x21);
                     body.extend(encode_uleb128(pc_local));
                     body.extend_from_slice(&[0x0C, 0x01]);
@@ -3075,7 +3158,7 @@ pub fn build_step7_stage1_compiler_stream() -> Vec<u16> {
     let r_loff     = alloc_ssa_ins(&mut ins, &mut next_reg, tc_safe, 0x7F06, TY_I64,   vec![TOK_IMM_I16, 0]);
     let r_retty    = alloc_ssa_ins(&mut ins, &mut next_reg, tc_safe, 0x7F06, TY_I64,   vec![TOK_IMM_I16, 0]);
 
-    const MAX_LABELS: usize = 83;
+    const MAX_LABELS: usize = 85;
     let mut r_lbl = [0u16; MAX_LABELS];
     for k in 0..MAX_LABELS {
         r_lbl[k] = alloc_ssa_ins(&mut ins, &mut next_reg, tc_safe, 0x7F06, TY_I64, vec![TOK_IMM_I16, 0]);
@@ -3109,15 +3192,18 @@ pub fn build_step7_stage1_compiler_stream() -> Vec<u16> {
     set_ssa_reg(&mut ins, tc_safe, r_retty, 0x7F0E, TY_I64, vec![0x7EC0, r_tmp2]);
     set_ssa_reg(&mut ins, tc_safe, r_pos,   0x7F10, TY_I64, vec![r_tmp2, TOK_IMM_I16, 3]);
 
-    let mut elf_hdr = [0u8; 120];
+    let mut elf_hdr = [0u8; 176];
     elf_hdr[0..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
     elf_hdr[4] = 2; elf_hdr[5] = 1; elf_hdr[6] = 1;
     elf_hdr[16] = 2; elf_hdr[18] = 0x3E; elf_hdr[20] = 1;
-    elf_hdr[24] = 0x78; elf_hdr[25] = 0x00; elf_hdr[26] = 0x40;
-    elf_hdr[32] = 64; elf_hdr[52] = 64; elf_hdr[54] = 56; elf_hdr[56] = 1;
+    elf_hdr[24] = 0xB0; elf_hdr[25] = 0x00; elf_hdr[26] = 0x40;
+    elf_hdr[32] = 64; elf_hdr[52] = 64; elf_hdr[54] = 56; elf_hdr[56] = 2;
     elf_hdr[64] = 1; elf_hdr[68] = 5;
     elf_hdr[82] = 0x40; elf_hdr[90] = 0x40;
     elf_hdr[113] = 0x10;
+    elf_hdr[120..124].copy_from_slice(&0x6474_E551u32.to_le_bytes());
+    elf_hdr[124..128].copy_from_slice(&6u32.to_le_bytes());
+    elf_hdr[168..176].copy_from_slice(&16u64.to_le_bytes());
     emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &elf_hdr);
 
     emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x55, 0x48, 0x89, 0xE5, 0x48, 0x81, 0xEC, 0x00, 0x00, 0x03, 0x00]);
@@ -3345,15 +3431,18 @@ pub fn build_step7_stage1_compiler_stream() -> Vec<u16> {
         (0x7F1F, 0x09, 0xC8),
         (0x7F20, 0x31, 0xC8),
         (0x7F15, 0xF7, 0xD8),
-        (0x7F28, 0xF7, 0xD8),
         (0x7F21, 0xF7, 0xD0),
         (0x7F22, 0xD3, 0xE0),
         (0x7F23, 0xD3, 0xF8),
     ];
+    let lbl_tnot = next_lbl; next_lbl += 1;
+    let lbl_tand_tor = next_lbl; next_lbl += 1;
     for &(op_c, _, _) in ops_3b {
         set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, op_c]);
         emit_br_pos_ins(&mut ins, r_cond, lbl_emit_3b);
     }
+    set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, 0x7F28]);
+    emit_br_pos_ins(&mut ins, r_cond, lbl_tnot);
     set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, 0x7F12]);
     emit_br_pos_ins(&mut ins, r_cond, lbl_imul);
     set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, 0x7F13]);
@@ -3362,9 +3451,13 @@ pub fn build_step7_stage1_compiler_stream() -> Vec<u16> {
     emit_br_pos_ins(&mut ins, r_cond, lbl_imod);
     set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, 0x7F16]);
     emit_br_pos_ins(&mut ins, r_cond, lbl_iabs);
-    for op_mm in [0x7F17u16, 0x7F29, 0x7F18, 0x7F2A] {
+    for op_mm in [0x7F17u16, 0x7F18] {
         set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, op_mm]);
         emit_br_pos_ins(&mut ins, r_cond, lbl_imin_imax);
+    }
+    for op_mm in [0x7F29u16, 0x7F2A] {
+        set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, op_mm]);
+        emit_br_pos_ins(&mut ins, r_cond, lbl_tand_tor);
     }
     set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, 0x7F2B]);
     emit_br_pos_ins(&mut ins, r_cond, lbl_txor);
@@ -3374,6 +3467,10 @@ pub fn build_step7_stage1_compiler_stream() -> Vec<u16> {
     }
     set_ssa_reg(&mut ins, tc_safe, r_cond, 0x7F24, TY_TRIT, vec![r_op, TOK_IMM_I16, 0x7F2D]);
     emit_br_pos_ins(&mut ins, r_cond, lbl_tcmp);
+    emit_jmp_ins(&mut ins, lbl_store_dst);
+
+    emit_lbl_ins(&mut ins, lbl_tnot);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x83, 0xF8, 0x00, 0x0F, 0x9F, 0xC0, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC0, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD0, 0x48, 0xF7, 0xD8]);
     emit_jmp_ins(&mut ins, lbl_store_dst);
 
     emit_lbl_ins(&mut ins, lbl_emit_3b);
@@ -3396,12 +3493,15 @@ pub fn build_step7_stage1_compiler_stream() -> Vec<u16> {
     emit_jmp_ins(&mut ins, lbl_store_dst);
 
     emit_lbl_ins(&mut ins, lbl_imod);
-    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x49, 0x89, 0xC0, 0x48, 0x85, 0xC9, 0x74, 0x1E, 0x48, 0x83, 0xF9, 0xFF, 0x75, 0x11, 0x49, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x4D, 0x39, 0xC8, 0x75, 0x02, 0xEB, 0x0A, 0x48, 0x99, 0x48, 0xF7, 0xF9, 0xEB, 0x03, 0x48, 0x31, 0xC0, 0x48, 0x89, 0xD0]);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x49, 0x89, 0xC0, 0x48, 0x85, 0xC9, 0x74, 0x21, 0x48, 0x83, 0xF9, 0xFF, 0x75, 0x11, 0x49, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x4D, 0x39, 0xC8, 0x75, 0x02, 0xEB, 0x0A, 0x48, 0x99, 0x48, 0xF7, 0xF9, 0x48, 0x89, 0xD0, 0xEB, 0x03, 0x48, 0x31, 0xC0]);
     emit_jmp_ins(&mut ins, lbl_store_dst);
 
     emit_lbl_ins(&mut ins, lbl_iabs);
     emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x89, 0xC2, 0x48, 0xF7, 0xD8, 0x48, 0x0F, 0x48, 0xC2]);
     emit_jmp_ins(&mut ins, lbl_store_dst);
+
+    emit_lbl_ins(&mut ins, lbl_tand_tor);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x83, 0xF8, 0x00, 0x0F, 0x9F, 0xC0, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC0, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD0, 0x48, 0x83, 0xF9, 0x00, 0x0F, 0x9F, 0xC1, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC9, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD1]);
 
     emit_lbl_ins(&mut ins, lbl_imin_imax);
     set_ssa_reg(&mut ins, tc_safe, r_tmp,  0x7F06, TY_I64,  vec![TOK_IMM_I16, 0x4F]);
@@ -3413,7 +3513,7 @@ pub fn build_step7_stage1_compiler_stream() -> Vec<u16> {
     emit_jmp_ins(&mut ins, lbl_store_dst);
 
     emit_lbl_ins(&mut ins, lbl_txor);
-    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x0F, 0xAF, 0xC1, 0x48, 0xF7, 0xD8]);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x83, 0xF8, 0x00, 0x0F, 0x9F, 0xC0, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC0, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD0, 0x48, 0x83, 0xF9, 0x00, 0x0F, 0x9F, 0xC1, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC9, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD1, 0x48, 0x0F, 0xAF, 0xC1, 0x48, 0xF7, 0xD8]);
     emit_jmp_ins(&mut ins, lbl_store_dst);
 
     emit_lbl_ins(&mut ins, lbl_cmp4);
@@ -3436,9 +3536,10 @@ pub fn build_step7_stage1_compiler_stream() -> Vec<u16> {
     emit_jmp_ins(&mut ins, lbl_store_dst);
 
     emit_lbl_ins(&mut ins, lbl_tmaj);
-    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x01, 0xC8]);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x83, 0xF8, 0x00, 0x0F, 0x9F, 0xC0, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC0, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD0, 0x48, 0x83, 0xF9, 0x00, 0x0F, 0x9F, 0xC1, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC9, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD1, 0x48, 0x01, 0xC8]);
     emit_decode_operand(&mut ins, &mut next_lbl, true);
     emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[
+        0x48, 0x83, 0xF9, 0x00, 0x0F, 0x9F, 0xC1, 0x0F, 0x9C, 0xC2, 0x0F, 0xB6, 0xC9, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD1,
         0x48, 0x01, 0xC8, 0x48, 0x83, 0xF8, 0x00,
         0x0F, 0x9F, 0xC0, 0x0F, 0x9C, 0xC2,
         0x0F, 0xB6, 0xC0, 0x0F, 0xB6, 0xD2, 0x48, 0x29, 0xD0,
@@ -3559,7 +3660,7 @@ pub fn build_step7_stage1_compiler_stream() -> Vec<u16> {
     emit_lbl_ins(&mut ins, lbl_br_pos);
     set_ssa_reg(&mut ins, tc_safe, r_cur, 0x7F10, TY_I64, vec![r_pos, TOK_IMM_I16, 1]);
     emit_decode_operand(&mut ins, &mut next_lbl, false);
-    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x83, 0xF8, 0x01, 0x0F, 0x84]);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x83, 0xF8, 0x00, 0x0F, 0x8F]);
     emit_read_label_id(&mut ins);
     emit_rel32_for_lid(&mut ins);
     set_ssa_reg(&mut ins, tc_safe, r_pos, 0x7F10, TY_I64, vec![r_cur, TOK_IMM_I16, 1]);
@@ -3568,7 +3669,7 @@ pub fn build_step7_stage1_compiler_stream() -> Vec<u16> {
     emit_lbl_ins(&mut ins, lbl_br_neg);
     set_ssa_reg(&mut ins, tc_safe, r_cur, 0x7F10, TY_I64, vec![r_pos, TOK_IMM_I16, 1]);
     emit_decode_operand(&mut ins, &mut next_lbl, false);
-    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x83, 0xF8, 0xFF, 0x0F, 0x84]);
+    emit_iset_bytes_in_place(&mut ins, tc_safe, r_buf, &[0x48, 0x83, 0xF8, 0x00, 0x0F, 0x8C]);
     emit_read_label_id(&mut ins);
     emit_rel32_for_lid(&mut ins);
     set_ssa_reg(&mut ins, tc_safe, r_pos, 0x7F10, TY_I64, vec![r_cur, TOK_IMM_I16, 1]);

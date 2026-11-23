@@ -5,9 +5,9 @@
 // Zero external crates, zero HTTP/KV, zero Rust frontend, zero Rust verifier,
 // zero Rust AOT. Its ONLY responsibilities are:
 //   1. Embed & verify exact FNV-1a64 hashes of the 3 committed Pure-Omni seeds:
-//      - `pure/m3/m3.omni_bc` (59,474 words, 0x0668919FB4378D88)
-//      - `pure/m2/m2.omni_bc` (33,551 words, 0xC30924711C8C95E9)
-//      - `pure/m4/m4.omni_bc` (26,076 words, 0x00299F8C0BB3F88A)
+//      - `pure/m3/m3.omni_bc` (59,685 words, 0x6209BB280E70BD5F)
+//      - `pure/m2/m2.omni_bc` (41,289 words, 0x1DE7EDF361BB3626)
+//      - `pure/m4/m4.omni_bc` (27,819 words, 0x99567F6F5D0E8F32)
 //   2. Extract seeds to disk (`emit-seeds <out_dir>`).
 //   3. Provide the thin 3-op ELF/seed loader shim (`run-elf <path> [args...]`)
 //      and report mandatory Stage-0 Rust line count (`line-audit`).
@@ -19,13 +19,13 @@ const SEED_M3_BYTES: &[u8] = include_bytes!("../pure/m3/m3.omni_bc");
 const SEED_M2_BYTES: &[u8] = include_bytes!("../pure/m2/m2.omni_bc");
 const SEED_M4_BYTES: &[u8] = include_bytes!("../pure/m4/m4.omni_bc");
 
-const SEED_M3_FNV: u64 = 0x0668919FB4378D88;
-const SEED_M2_FNV: u64 = 0x04A83A6E91820FB2;
-const SEED_M4_FNV: u64 = 0x00299F8C0BB3F88A;
+const SEED_M3_FNV: u64 = 0x6209BB280E70BD5F;
+const SEED_M2_FNV: u64 = 0x1DE7EDF361BB3626;
+const SEED_M4_FNV: u64 = 0x99567F6F5D0E8F32;
 
-const SEED_M3_WORDS: usize = 59_474;
-const SEED_M2_WORDS: usize = 34_168;
-const SEED_M4_WORDS: usize = 26_076;
+const SEED_M3_WORDS: usize = 59_685;
+const SEED_M2_WORDS: usize = 41_289;
+const SEED_M4_WORDS: usize = 27_819;
 
 fn fnv1a_64(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
@@ -64,7 +64,7 @@ fn main() {
             println!("  verify-seeds              Verify embedded M3/M2/M4 .omni_bc FNV-1a64 pins");
             println!("  emit-seeds <out_dir>      Write embedded M3/M2/M4 seeds to <out_dir>");
             println!("  run-elf <elf> [args...]   Execute native ELF via 3-op OmniThinShim");
-            println!("  line-audit                Report mandatory Stage-0 Rust line count vs 48,590 baseline");
+            println!("  line-audit                Report classified Stage-0 seed Rust line count (236 lines) vs 48,590 baseline");
         }
         "verify-seeds" => match verify_all_seeds() {
             Ok(()) => println!(
@@ -119,7 +119,7 @@ fn main() {
             let shim_lines = include_str!("../p4_shim/mod.rs").lines().count();
             let total = seed0_lines + shim_lines;
             println!(
-                "[SEED0 LINE-AUDIT] mandatory_rust={} lines (seed0/omni_seed0.rs={} + p4_shim/mod.rs={}) vs baseline=48590 lines ({:.2}% reduction)",
+                "[SEED0 LINE-AUDIT] classified_seed_rust={} lines (seed0/omni_seed0.rs={} + p4_shim/mod.rs={}; runtime VM/host in omni_rust_bootstrap.rs + m2_host) vs baseline=48590 lines ({:.2}% classified seed reduction)",
                 total,
                 seed0_lines,
                 shim_lines,

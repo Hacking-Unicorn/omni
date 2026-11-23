@@ -520,6 +520,9 @@ pub fn m2_lint_cli(paths: &[String]) -> i32 {
             items.push((String::from(name), String::from(src)));
         }
     }
+    // Audit §6.3: deduplicate repeated foreign-module notes (e.g. fn#53 LINEAR_BYTES across linked modules).
+    let mut seen_foreign_notes: std::collections::BTreeSet<(String, u16, usize, String)> =
+        std::collections::BTreeSet::new();
     for (path, src) in &items {
         let asm = path.ends_with(".omni_asm");
         let (cap, producer) = if asm { (M2_LABEL_CAP_ASM, "asm") } else { (M2_LABEL_CAP_FRONTEND, "frontend") };
@@ -527,7 +530,10 @@ pub fn m2_lint_cli(paths: &[String]) -> i32 {
         match res {
             Ok((findings, notes, budget)) => {
                 for f in &notes {
-                    println!("{}	note[M2_LINT_FOREIGN:{}] fn#{} @{}: {} (foreign module, not gated)", path, f.rule, f.fn_idx, f.offset, f.msg);
+                    let key = (f.rule.to_string(), f.fn_idx, f.offset, f.msg.clone());
+                    if seen_foreign_notes.insert(key) {
+                        println!("{}	note[M2_LINT_FOREIGN:{}] fn#{} @{}: {} (foreign module, not gated; deduplicated)", path, f.rule, f.fn_idx, f.offset, f.msg);
+                    }
                 }
                 for r in &budget {
                     println!("{}", m2_render_budget_row(path, r, cap, producer));
@@ -557,6 +563,7 @@ pub const M2_PURE_MODULES: &[(&str, &str)] = &[
     ("pure/m2/util.omni+pure/isa/table.omni+pure/m2/decode.omni+pure/m2/labels.omni+spec/m2/labels_harness.omni", M2_LABELS_OMNI_SRC),
     ("pure/m2/util.omni+pure/isa/table.omni+pure/m2/decode.omni+pure/m2/labels.omni+pure/m2/verify/mod_check.omni+spec/m2/verify_harness.omni", M2_VERIFY_OMNI_SRC),
     ("pure/m2/util.omni+pure/isa/table.omni+pure/m2/decode.omni+pure/m2/labels.omni+pure/m4/arena.omni+pure/m4/ops_core.omni+pure/m4/vm.omni+spec/m4/vm_harness.omni", M4_VM_OMNI_SRC),
+    ("pure/m2/util.omni+pure/isa/table.omni+pure/m2/decode.omni+pure/m2/labels.omni+pure/m4/arena.omni+pure/m4/ops_core.omni+pure/m4/vm.omni+pure/m4/m4_standalone.omni", M4_STANDALONE_OMNI_SRC),
     ("pure/m2/util.omni+pure/isa/table.omni+pure/m2/decode.omni+pure/m2/labels.omni+pure/m2/arena.omni+pure/m2/elf.omni+pure/m5/elf_sys.omni+spec/m5/sys_harness.omni", M5_SYS_OMNI_SRC),
     ("pure/m2/util.omni+pure/isa/table.omni+pure/m2/decode.omni+pure/m2/labels.omni+pure/m2/arena.omni+pure/m2/elf.omni+spec/m2/elf_harness.omni", M2_ELF_OMNI_SRC),
     ("pure/m2/util.omni+pure/isa/table.omni+pure/m2/decode.omni+pure/m2/labels.omni+pure/m2/arena.omni+pure/m2/elf.omni+pure/m2/emit_x86.omni+pure/m2/driver.omni+spec/m2/compiler_harness.omni", M2_COMPILER_OMNI_SRC),
@@ -566,6 +573,7 @@ pub const M2_PURE_MODULES: &[(&str, &str)] = &[
     ("pure/m3/expr.omni+spec/m3/expr_harness.omni", M3_EXPR_OMNI_SRC),
     ("pure/m3/stmt.omni+spec/m3/stmt_harness.omni", M3_STMT_OMNI_SRC),
     ("pure/m3/lower.omni+spec/m3/lower_harness.omni", M3_LOWER_OMNI_SRC),
+    ("pure/m3/lower.omni+pure/m3/m3_standalone.omni", M3_STANDALONE_OMNI_SRC),
     ("pure/m7/judge.omni+spec/m7/judge_harness.omni", P7_JUDGE_OMNI_SRC),
     ("pure/m7/heal.omni+spec/m7/heal_harness.omni", P7_HEAL_OMNI_SRC),
     ("pure/m7/judge.omni+pure/api/ternary.omni+pure/api/api_main.omni", API_STAGE1_OMNI_SRC),

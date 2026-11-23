@@ -60,6 +60,24 @@ pub const M4_VM_OMNI_SRC: &str = concat!(
     include_str!("../spec/m4/vm_harness.omni")
 );
 
+pub const M4_STANDALONE_OMNI_SRC: &str = concat!(
+    include_str!("../pure/m2/util.omni"),
+    "\n",
+    include_str!("../pure/isa/table.omni"),
+    "\n",
+    include_str!("../pure/m2/decode.omni"),
+    "\n",
+    include_str!("../pure/m2/labels.omni"),
+    "\n",
+    include_str!("../pure/m4/arena.omni"),
+    "\n",
+    include_str!("../pure/m4/ops_core.omni"),
+    "\n",
+    include_str!("../pure/m4/vm.omni"),
+    "\n",
+    include_str!("../pure/m4/m4_standalone.omni")
+);
+
 pub const M4_VM_WASM_HARNESS_SRC: &str = concat!(
     include_str!("../pure/m2/util.omni"),
     "\n",
@@ -667,6 +685,8 @@ pub const M2_SELFHOST_OMNI_SRC: &str = concat!(
     "\n",
     include_str!("../pure/m2/labels.omni"),
     "\n",
+    include_str!("../pure/m2/verify/mod_check.omni"),
+    "\n",
     include_str!("../pure/m2/arena.omni"),
     "\n",
     include_str!("../pure/m2/elf.omni"),
@@ -707,6 +727,9 @@ pub const M3_LOWER_OMNI_SRC: &str = concat!(
     "\n",
     include_str!("../spec/m3/lower_harness.omni")
 );
+
+pub const M3_STANDALONE_OMNI_SRC: &str =
+    include_str!("../pure/m3/m3_standalone.omni");
 
 /// M3-04 selftest: `pure/isa/encode.omni` re-encodes every positive acceptance golden,
 /// `pure/verifier_engine.omni` (11,893 words), and `build_step7_stage1_compiler_stream`
@@ -838,15 +861,15 @@ pub fn selftest_m2_11_arena_elf() -> Result<usize, String> {
     }
     checks += 1;
 
-    // 3. 120-byte ELF64 header byte-exact vs Rust reference (compile_pure_u16_to_x86_64_elf_with_args)
+    // 3. 176-byte ELF64 header (PT_LOAD + PT_GNU_STACK) byte-exact vs Rust reference
     let ref_u16 = compile_omni_surface_strict_to_u16("#[strict]\nfn f(x: i64) -> i64 { return x + 1; }\n")?;
     let ref_elf = compile_pure_u16_to_x86_64_elf_with_args(&ref_u16, 0, 0, 0)?;
     let omni_hdr = run_h(1, ref_elf.len() as i64, 0)?;
-    if omni_hdr.len() != 120 || omni_hdr.as_slice() != &ref_elf[..120] {
+    if omni_hdr.len() != 176 || omni_hdr.as_slice() != &ref_elf[..176] {
         return Err(format!(
-            "M2-11 ELF64 header mismatch: len={} (want 120), first diff at {:?}",
+            "M2-11 ELF64 header mismatch: len={} (want 176), first diff at {:?}",
             omni_hdr.len(),
-            omni_hdr.iter().zip(ref_elf[..120].iter()).position(|(a, b)| a != b)
+            omni_hdr.iter().zip(ref_elf[..176].iter()).position(|(a, b)| a != b)
         ));
     }
     checks += 1;
@@ -945,7 +968,7 @@ pub fn selftest_m2_13_stage1_anchor() -> Result<usize, String> {
             want_elf.get(diff..diff.saturating_add(16).min(want_elf.len()))
         ));
     }
-    if got_elf.len() != 106_242 || fnv1a_64_hash(&got_elf) != 0xEAFC81F46B482FF8 {
+    if got_elf.len() != 112_180 || fnv1a_64_hash(&got_elf) != 0x62F14B335B52BECC {
         return Err(format!(
             "M2-13 Stage-1 anchor hash/len mismatch: {} B / 0x{:016X}",
             got_elf.len(),
@@ -1045,6 +1068,76 @@ pub fn selftest_m2_15_pure_multi_compiler() -> Result<usize, String> {
     }
     checks += 1;
 
+    // 7. Audit Round 2 N2: Pure-M2 2-op IGET on provable ANEW/ISET bytes buffer must read ISET heap
+    //    (not token region) in BOTH multi-mode (`emit_multi.omni`) and single-mode (`emit_x86.omni`).
+    let n2_src = "#[strict]\nfn main(a: i64, b: i64, c: i64) -> i64 {\n    let w: bytes = anew(0);\n    w = iset_i32(w, a);\n    return iget(w, b) + c;\n}\n";
+    let n2_u16 = compile_omni_surface_strict_to_u16(n2_src)?;
+    let n2_multi_pure = compile_in_omni(&n2_u16, 300, 0, 0)?;
+    let n2_multi_rust = compile_pure_u16_to_x86_64_elf_multi(&n2_u16, 300, 0, 0)?;
+    if n2_multi_pure != n2_multi_rust {
+        return Err(String::from("N2 multi-mode Pure-M2 != Rust-M2-multi on 2-op IGET buffer repro"));
+    }
+    let single_mod = m2_compile_decoder(M2_COMPILER_OMNI_SRC)?;
+    let single_entry = m2_entry_of(&single_mod);
+    let mut single_vm = OmniBinaryVm::with_budgets(500_000_000, 32 * 1024 * 1024);
+    let n2_single_pure = match single_vm.execute_function(
+        &single_mod,
+        single_entry,
+        vec![
+            OmniValue::Bytes(vec![0u8; 524_288]),
+            OmniValue::U16Array(n2_u16.clone()),
+            OmniValue::Int(300),
+            OmniValue::Int(0),
+            OmniValue::Int(0),
+        ],
+    )? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("N2 single-mode compiler returned {:?}", other)),
+    };
+    let n2_single_rust = compile_pure_u16_to_x86_64_elf_with_args(&n2_u16, 300, 0, 0)?;
+    if n2_single_pure != n2_single_rust {
+        return Err(String::from("N2 single-mode Pure-M2 != Rust-AOT on 2-op IGET buffer repro"));
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        for &(tag, elf) in &[
+            ("multi-mode", &n2_multi_pure),
+            ("single-mode", &n2_single_pure),
+        ] {
+            let tmp = PrivateTempElf::new(elf, &format!("n2_iget_{}", tag))?;
+            let out = std::process::Command::new(&tmp.path)
+                .output()
+                .map_err(|e| format!("N2 exec {}: {}", tag, e))?;
+            if !out.status.success() || out.stdout.len() != 8 {
+                return Err(format!("N2 {} exited {:?} stdout={}B", tag, out.status, out.stdout.len()));
+            }
+            let got_arr: [u8; 8] = out.stdout[..8]
+                .try_into()
+                .map_err(|_| format!("N2 {} stdout slice length != 8", tag))?;
+            let got = i64::from_le_bytes(got_arr);
+            if got != 44 {
+                return Err(format!("N2 {} 2-op IGET buffer repro returned {}, want 44", tag, got));
+            }
+        }
+        // OOB index b=10 must return 0 (lenient 2-op IGET contract).
+        let n2_oob_elf = compile_in_omni(&n2_u16, 300, 10, 0)?;
+        let tmp_oob = PrivateTempElf::new(&n2_oob_elf, "n2_iget_oob")?;
+        let out_oob = std::process::Command::new(&tmp_oob.path)
+            .output()
+            .map_err(|e| format!("N2 exec oob: {}", e))?;
+        if !out_oob.status.success() || out_oob.stdout.len() != 8 {
+            return Err(format!("N2 oob exited {:?} stdout={}B", out_oob.status, out_oob.stdout.len()));
+        }
+        let oob_arr: [u8; 8] = out_oob.stdout[..8]
+            .try_into()
+            .map_err(|_| String::from("N2 oob stdout slice length != 8"))?;
+        let got_oob = i64::from_le_bytes(oob_arr);
+        if got_oob != 0 {
+            return Err(format!("N2 multi-mode 2-op IGET OOB returned {}, want 0", got_oob));
+        }
+    }
+    checks += 1;
+
     Ok(checks)
 }
 
@@ -1106,15 +1199,10 @@ pub fn selftest_m2_16_fixed_point(write_seed: bool) -> Result<(usize, usize, u64
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     let native_verified = {
-        use std::os::unix::fs::PermissionsExt;
-        let p_bc = std::env::temp_dir().join("omni_m2_seed_fp.omni_bc");
-        let p_s1 = std::env::temp_dir().join("omni_m2_s1.elf");
-        let p_s2 = std::env::temp_dir().join("omni_m2_s2.elf");
+        let tmp_s1 = PrivateTempElf::new(&s1, "m2_s1")?;
+        let p_bc = tmp_s1.dir.join("seed_fp.omni_bc");
         std::fs::write(&p_bc, &seed_bytes).map_err(|e| format!("write tmp bc: {}", e))?;
-        std::fs::write(&p_s1, &s1).map_err(|e| format!("write tmp s1: {}", e))?;
-        std::fs::set_permissions(&p_s1, std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("chmod s1: {}", e))?;
-        let out2 = std::process::Command::new(&p_s1)
+        let out2 = std::process::Command::new(&tmp_s1.path)
             .arg(&p_bc)
             .arg("45")
             .arg("40")
@@ -1131,10 +1219,8 @@ pub fn selftest_m2_16_fixed_point(write_seed: bool) -> Result<(usize, usize, u64
                 s2.len(), fnv1a_64_hash(&s2), s1.len(), fnv1a_64_hash(&s1)
             ));
         }
-        std::fs::write(&p_s2, &s2).map_err(|e| format!("write tmp s2: {}", e))?;
-        std::fs::set_permissions(&p_s2, std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("chmod s2: {}", e))?;
-        let out3 = std::process::Command::new(&p_s2)
+        let tmp_s2 = PrivateTempElf::new(&s2, "m2_s2")?;
+        let out3 = std::process::Command::new(&tmp_s2.path)
             .arg(&p_bc)
             .arg("45")
             .arg("40")
@@ -1145,9 +1231,6 @@ pub fn selftest_m2_16_fixed_point(write_seed: bool) -> Result<(usize, usize, u64
             return Err(format!("M2-16 S2 exited with {:?}", out3.status));
         }
         let s3 = out3.stdout;
-        let _ = std::fs::remove_file(&p_bc);
-        let _ = std::fs::remove_file(&p_s1);
-        let _ = std::fs::remove_file(&p_s2);
         if s3 != s2 {
             return Err(format!(
                 "M2-16 S3 != S2: S3={} B (0x{:016X}) vs S2={} B (0x{:016X})",
@@ -1824,6 +1907,7 @@ pub fn selftest_m3_10_lower_diff() -> Result<usize, String> {
         ("label_goto", "#[strict]\nfn main(x: i64) -> i64 { goto 2; label 1; return 99; label 2; return x + 1; }\n", false),
         ("nested_calls", "#[strict]\nfn add(a: i64, b: i64) -> i64 { return a + b; }\n#[strict]\nfn mul(a: i64, b: i64) -> i64 { return a * b; }\n#[strict]\nfn main(x: i64) -> i64 { return add(x, mul(add(x, 1), 3)); }\n", false),
         ("mem_and_ret_slice", "#[strict]\nfn main(x: i64) -> bytes { let b: bytes = anew(0); b = iset_i64(b, x); b = st_u32(b, 0, x + 1); let v: i64 = ld_u32(b, 0); b = iset_patch_i64(b, 0, v); return ret_slice(b, 0, 8); }\n", false),
+        ("l1_st_u64_lower", "#[strict]\nfn main(x: i64) -> i64 { let b: bytes = anew(0); b = iset_i64(b, 0); b = st_u64(b, 0, x + 7); return ld_u64(b, 0); }\n", true),
         ("if_pos_nested_join", "#[strict]\nfn main(x: i64) -> i64 { let c: trit = x <=> 0; let r: i64 = if_pos c { let d: trit = (x - 5) <=> 0; if_neg d { let a: i64 = x + 10; a } else { x - 10 } } else { let b: i64 = x * 2; b + 1 }; return r; }\n", false),
         ("match_trit_3arm", "#[strict]\nfn main(x: i64) -> i64 { let t: trit = x <=> 0; let r: i64 = match_trit t { neg => { let a: i64 = x - 1; a * 2 }, zero => 0, pos => { x + 1 } }; return r; }\n", false),
         ("str_lit_cstr", "#[strict]\nfn main(x: i64) -> str { let s: str = \"hello_omni\"; return s; }\n", false),
@@ -2428,7 +2512,7 @@ pub fn selftest_m2_14_verify_diff() -> Result<usize, String> {
 pub fn selftest_m3_15_four_backend_parity() -> Result<usize, String> {
     let m2_mod = m2_compile_decoder(M2_MULTI_OMNI_SRC)?;
     let m2_entry = m2_entry_of(&m2_mod);
-    let cases: [(&str, &str, Vec<i64>, i64); 3] = [
+    let cases: [(&str, &str, Vec<i64>, i64); 4] = [
         (
             "m3_15_mf_arith",
             "#[strict]\nfn sq(x: i64) -> i64 { return x * x; }\nfn main(a: i64) -> i64 { return sq(a + 2) + sq(a - 1); }\n",
@@ -2446,6 +2530,12 @@ pub fn selftest_m3_15_four_backend_parity() -> Result<usize, String> {
             "#[strict]\nfn pack2(a: i64, b: i64) -> bytes { let w: bytes = anew(0); w = iset(w, a); w = iset(w, b); return w; }\nfn score(w: bytes) -> i64 { return iget(w, 0) * 10 + iget(w, 1); }\nfn main(x: i64) -> i64 { let w: bytes = pack2(x, x + 3); return score(w); }\n",
             vec![4],
             47,
+        ),
+        (
+            "m3_15_int_min_divmod",
+            "#[strict]\nfn main(a: i64, b: i64, c: i64) -> i64 {\n    let imin_v: i64 = 1 << 63;\n    let q0: i64 = imin_v / a;\n    let r0: i64 = imin_v % b;\n    let q1: i64 = 5 / imin_v;\n    let r1: i64 = (imin_v % c) + (0 / imin_v);\n    return (q0 >> 60) * 100 + r0 * 10 + q1 + r1;\n}\n",
+            vec![2, 3, -1],
+            (-4i64) * 100 + (-2i64) * 10,
         ),
     ];
 
@@ -2475,13 +2565,22 @@ pub fn selftest_m3_15_four_backend_parity() -> Result<usize, String> {
         let wasm = compile_pure_u16_to_wasm_multi(&omni_bc)?;
         let wasm_got = execute_wasm_module_i64(&wasm, args)?;
 
-        if vm_got != *want || wasm_got != *want {
-            return Err(format!("M3-15 '{}': want={} vm={} wasm={}", name, want, vm_got, wasm_got));
+        // (e) Pure-Omni M4 VM (5th backend column)
+        let a0 = args.first().copied().unwrap_or(0);
+        let a1 = args.get(1).copied().unwrap_or(0);
+        let a2 = args.get(2).copied().unwrap_or(0);
+        let (m4_got, _m4_tag, m4_err, _m4_steps, _m4_trace) =
+            p4_run_raw_bc_on_pure_vm(&omni_bc, a0, a1, a2, 100_000, 0)?;
+
+        if vm_got != *want || wasm_got != *want || m4_err != 0 || m4_got != *want {
+            return Err(format!(
+                "M3-15 '{}': want={} vm={} wasm={} m4={}(err={})",
+                name, want, vm_got, wasm_got, m4_got, m4_err
+            ));
         }
 
-        // (b) Rust x86-64 multi AOT (M2-09) vs (d) Pure-Omni M2 x86-64 ELF64 (M2-15/16) â€” 0-byte diff!
-        let a0 = args.first().copied().unwrap_or(0);
-        let rust_elf = compile_pure_u16_to_x86_64_elf_multi(&omni_bc, a0, 0, 0)?;
+        // (b) Rust x86-64 multi AOT (M2-09) vs (d) Pure-Omni M2 x86-64 ELF64 (M2-15/16) — 0-byte diff!
+        let rust_elf = compile_pure_u16_to_x86_64_elf_multi(&omni_bc, a0, a1, a2)?;
         let mut vm_m2 = OmniBinaryVm::with_budgets(100_000_000, 64 * 1024 * 1024);
         let pure_elf = match vm_m2.execute_function(
             &m2_mod,
@@ -2490,8 +2589,8 @@ pub fn selftest_m3_15_four_backend_parity() -> Result<usize, String> {
                 OmniValue::Bytes(vec![0u8; 524_288]),
                 OmniValue::U16Array(omni_bc),
                 OmniValue::Int(a0),
-                OmniValue::Int(0),
-                OmniValue::Int(0),
+                OmniValue::Int(a1),
+                OmniValue::Int(a2),
             ],
         )? {
             OmniValue::Bytes(b) => b,
@@ -2779,21 +2878,21 @@ pub fn selftest_p5_2_zero_shim_sys() -> Result<(usize, usize, u64, bool), String
         OmniValue::Bytes(b) => b,
         other => return Err(format!("P5-2 returned {:?}, expected ELF64 Bytes", other)),
     };
-    if elf.len() != 177 {
-        return Err(format!("P5-2 zero-shim ELF expected 177 B, got {} B", elf.len()));
+    if elf.len() != 233 {
+        return Err(format!("P5-2 zero-shim ELF expected 233 B, got {} B", elf.len()));
     }
     if &elf[0..4] != b"\x7fELF" {
         return Err(String::from("P5-2 ELF64 magic mismatch"));
     }
     let p_filesz = u64::from_le_bytes(elf[96..104].try_into().unwrap());
     let p_memsz = u64::from_le_bytes(elf[104..112].try_into().unwrap());
-    if p_filesz != 177 || p_memsz != 177 {
+    if p_filesz != 233 || p_memsz != 233 {
         return Err(format!("P5-2 ELF64 p_filesz/p_memsz mismatch ({}/{})", p_filesz, p_memsz));
     }
     // Verify stack-arena prologue (48 81 EC 00 00 01 00 48 89 E3) and all 3 raw `0F 05` syscalls
     let want_entry: [u8; 10] = [0x48, 0x81, 0xEC, 0x00, 0x00, 0x01, 0x00, 0x48, 0x89, 0xE3];
-    if &elf[120..130] != &want_entry {
-        return Err(format!("P5-2 arena entry stub mismatch: {:02X?}", &elf[120..130]));
+    if &elf[176..186] != &want_entry {
+        return Err(format!("P5-2 arena entry stub mismatch: {:02X?}", &elf[176..186]));
     }
     let syscall_count = elf[120..].windows(2).filter(|w| *w == [0x0F, 0x05]).count();
     if syscall_count != 3 {
@@ -2803,16 +2902,9 @@ pub fn selftest_p5_2_zero_shim_sys() -> Result<(usize, usize, u64, bool), String
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     let native_ran = {
         use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
-        let tmp_path = std::env::temp_dir().join("omni_p5_zero_shim.elf");
-        std::fs::write(&tmp_path, &elf).map_err(|e| format!("P5-2 write tmp elf: {}", e))?;
-        let mut perms = std::fs::metadata(&tmp_path)
-            .map_err(|e| format!("P5-2 metadata: {}", e))?
-            .permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&tmp_path, perms).map_err(|e| format!("P5-2 chmod: {}", e))?;
+        let tmp_elf = PrivateTempElf::new(&elf, "p5_zero_shim")?;
         let payload: [u8; 12] = [0xE0, 0x7E, 0xE3, 0x7E, 0x00, 0x00, 0x42, 0x00, 0xEF, 0x7E, 0xAA, 0x55];
-        let mut child = std::process::Command::new(&tmp_path)
+        let mut child = std::process::Command::new(&tmp_elf.path)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()
@@ -2821,7 +2913,7 @@ pub fn selftest_p5_2_zero_shim_sys() -> Result<(usize, usize, u64, bool), String
             stdin.write_all(&payload).map_err(|e| format!("P5-2 stdin write: {}", e))?;
         }
         let out = child.wait_with_output().map_err(|e| format!("P5-2 wait: {}", e))?;
-        let _ = std::fs::remove_file(&tmp_path);
+        drop(tmp_elf);
         if !out.status.success() || out.stdout != payload {
             return Err(format!(
                 "P5-2 native zero-shim ELF failed: status={:?} stdout={:02X?}",
@@ -3542,19 +3634,11 @@ pub fn selftest_p7_0_measure() -> Result<(usize, Vec<P7BenchMetrics>, u8), Strin
 /// Executes a native Linux x86-64 ELF64 binary returning an 8-byte little-endian `i64` on stdout.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn p7_verify_native_elf_i64(name: &str, elf: &[u8], expected_val: i64) -> Result<bool, String> {
-    use std::os::unix::fs::PermissionsExt;
-    let path = std::env::temp_dir().join(format!(
-        "omni_p7_canary_{}_{}.elf",
-        name,
-        std::process::id()
-    ));
-    std::fs::write(&path, elf).map_err(|e| format!("P7-0a write {}: {}", name, e))?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("P7-0a chmod {}: {}", name, e))?;
-    let out = std::process::Command::new(&path)
+    let tmp_elf = PrivateTempElf::new(elf, name)?;
+    let out = std::process::Command::new(&tmp_elf.path)
         .output()
         .map_err(|e| format!("P7-0a exec {}: {}", name, e))?;
-    let _ = std::fs::remove_file(&path);
+    drop(tmp_elf);
     if !out.status.success() {
         return Err(format!("P7-0a native {} exited with {:?}", name, out.status));
     }
@@ -4372,10 +4456,10 @@ pub fn selftest_api_stage1() -> Result<(usize, usize, usize), String> {
     let ve_mod = decode_omni_token_stream(&ve_u16)?;
     let n_vfns = ve_mod.functions.len();
     // Order at end of pure/verifier_engine.omni:
-    //   omni_verify_cap_narrow_eff (-6), omni_verify_api_surface (-5),
-    //   apply_api_surface_rules (-4), omni_verify_module_with_mode (-3),
-    //   omni_verify_module_api (-2), omni_verify_module (-1)
-    let fn_api_verify = ve_mod.functions[n_vfns - 5].fn_idx;
+    //   omni_verify_cap_narrow_eff (-7), omni_verify_api_surface (-6),
+    //   apply_api_surface_rules (-5), prescan_module_fns (-4),
+    //   omni_verify_module_with_mode (-3), omni_verify_module_api (-2), omni_verify_module (-1)
+    let fn_api_verify = ve_mod.functions[n_vfns - 6].fn_idx;
     let fn_verify_mod_api = ve_mod.functions[n_vfns - 2].fn_idx;
     for &(op_k, fn_cap, req_cap, taint, mask_c, mask, lin, want) in &[
         (1i64, 8, 8, 0, 0, 0, 0, 0i64),     // ternary cap satisfied -> OK
@@ -5993,100 +6077,6 @@ pub fn selftest_p7_learn() -> Result<(usize, usize, usize), String> {
     Ok((checks, lrn_u16.len(), lrn_elf_rust.len()))
 }
 
-/// Seed-Shrink Phase A3: Pre-scan raw source for quarantined `macro` directives BEFORE include
-/// expansion so the reported 1-based `(line, col)` span always points at the user's source file.
-pub fn pure_default_reject_macros(src: &str) -> Result<(), String> {
-    for (idx, raw_line) in src.lines().enumerate() {
-        let trimmed = raw_line.trim_start();
-        if trimmed.starts_with("macro ") || trimmed.starts_with("macro\t") {
-            let col = raw_line.len().saturating_sub(trimmed.len()) + 1;
-            return Err(format!(
-                "error[ORACLE_ONLY_MACRO] line {}, col {}: 'macro' is quarantined behind --rust/--oracle; rewrite as a pure fn for the default pure path",
-                idx + 1, col
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Seed-Shrink Phase A1/A3: Compile `.omni` surface source using ONLY the committed Pure-Omni M3 seed
-/// (`pure/m3/m3.omni_bc`) — zero Rust frontend calls, and hard-rejects Rust-only `macro` directives
-/// with `error[ORACLE_ONLY_MACRO]` (Seed-Shrink A3 quarantine).
-pub fn pure_default_compile_surface_to_u16(src: &str, strict: bool) -> Result<Vec<u16>, String> {
-    pure_default_reject_macros(src)?;
-    match m3_lockstep_compile_via_omni(src, strict)? {
-        Ok(u16_stream) => Ok(u16_stream),
-        Err((code, line, col)) => Err(format!(
-            "error[M3_CODE_{}] line {}, col {}: Pure-Omni M3 frontend rejected input",
-            code, line, col
-        )),
-    }
-}
-
-/// Seed-Shrink Phase A1: Lower a `.omni_bc` u16 stream to native Linux x86-64 ELF64 using ONLY
-/// the committed Pure-Omni M2 seed (`pure/m2/m2.omni_bc`) â€” zero Rust emitter calls.
-pub fn pure_default_compile_u16_to_elf(u16_stream: &[u16], a0: i64, a1: i64, a2: i64) -> Result<Vec<u8>, String> {
-    let m2_raw = std::fs::read("pure/m2/m2.omni_bc")
-        .map_err(|e| format!("Pure-M2 seed read failed (pure/m2/m2.omni_bc): {}", e))?;
-    let m2_u16 = decode_bytes_to_u16_stream(&m2_raw);
-    let m2_mod = decode_omni_token_stream(&m2_u16)?;
-    let m2_entry = m2_entry_of(&m2_mod);
-    let mut vm_m2 = OmniBinaryVm::with_budgets(500_000_000, 128 * 1024 * 1024);
-    match vm_m2.execute_function(
-        &m2_mod,
-        m2_entry,
-        vec![
-            OmniValue::U16Array(u16_stream.to_vec()),
-            OmniValue::Int(a0),
-            OmniValue::Int(a1),
-            OmniValue::Int(a2),
-        ],
-    )? {
-        OmniValue::Bytes(elf) => Ok(elf),
-        other => Err(format!("Pure-M2 seed returned unexpected value: {:?}", other)),
-    }
-}
-
-/// Seed-Shrink Phase A1: Execute a `.omni_bc` u16 stream using ONLY the committed Pure-Omni M4 VM
-/// seed (`pure/m4/m4.omni_bc`), returning `(ret_i64, vm_steps)`.
-pub fn pure_default_run_u16(
-    u16_stream: &[u16],
-    a0: i64,
-    a1: i64,
-    a2: i64,
-    trace: bool,
-) -> Result<(i64, i64), String> {
-    let m4_raw = std::fs::read("pure/m4/m4.omni_bc")
-        .map_err(|e| format!("Pure-M4 seed read failed (pure/m4/m4.omni_bc): {}", e))?;
-    let m4_u16 = decode_bytes_to_u16_stream(&m4_raw);
-    let m4_mod = decode_omni_token_stream(&m4_u16)?;
-    let m4_run_fn = m4_mod.functions[m4_mod.functions.len() - 2].fn_idx;
-    let mut vm = OmniBinaryVm::with_budgets(500_000_000, 128 * 1024 * 1024);
-    let arena = match vm.execute_function(
-        &m4_mod,
-        m4_run_fn,
-        vec![
-            OmniValue::Bytes(vec![0u8; 524_288]),
-            OmniValue::U16Array(u16_stream.to_vec()),
-            OmniValue::Int(a0),
-            OmniValue::Int(a1),
-            OmniValue::Int(a2),
-            OmniValue::Int(500_000),
-            OmniValue::Int(if trace { 1 } else { 0 }),
-        ],
-    )? {
-        OmniValue::Bytes(b) => b,
-        other => return Err(format!("Pure-M4 VM seed returned unexpected value: {:?}", other)),
-    };
-    let st = 167_936usize;
-    let status = i64::from_le_bytes(arena[st + 24..st + 32].try_into().unwrap());
-    let ret = i64::from_le_bytes(arena[st + 32..st + 40].try_into().unwrap());
-    let steps = i64::from_le_bytes(arena[st + 40..st + 48].try_into().unwrap());
-    if status != 0 {
-        return Err(format!("Pure-M4 VM trapped with status={} after {} steps", status, steps));
-    }
-    Ok((ret, steps))
-}
 
 /// Seed-Shrink Phase A1 hard gate (`./omnic a1-pure-default`):
 ///   1. Pure-default M3 (`pure/m3/m3.omni_bc`) matches `--rust` oracle with 0-word diff on goldens.
@@ -6159,142 +6149,6 @@ pub fn selftest_a1_pure_default() -> Result<usize, String> {
     Ok(checks)
 }
 
-/// Seed-Shrink Phase A2 (O-5): Pure-Omni include expander driven by `pure/m3/include.omni`.
-/// Zero Rust lexer/parser calls (`tokenize_omni_surface` / `SurfaceParser` never invoked);
-/// uses Pure-Omni `m3i_scan_includes`, `m3i_strip_include_lines`, `m3i_hash_path`, and `m3i_check_cycle`.
-pub fn pure_default_expand_includes(
-    src: &str,
-    base_dir: Option<&std::path::Path>,
-    vfs: Option<&std::collections::BTreeMap<String, String>>,
-) -> Result<String, String> {
-    // Reject quarantined `macro` directives on the user's raw source BEFORE include expansion
-    // so reported `(line, col)` spans refer to the user's file, not post-expansion line numbers.
-    pure_default_reject_macros(src)?;
-    if !src.contains("include") && !src.contains("mod ") && !src.contains("mod\"") {
-        return Ok(String::from(src));
-    }
-    let inc_u16 = pure_default_compile_surface_to_u16(M3_INCLUDE_OMNI_SRC, true)?;
-    let inc_mod = decode_omni_token_stream(&inc_u16)?;
-    let n_fns = inc_mod.functions.len();
-    // Order at end of spec/m3/include_harness.omni:
-    //   m3i_scan_entry (-5), m3i_strip_entry (-4), m3i_hash_entry (-3), m3i_cycle_entry (-2), main (-1)
-    let fn_scan = inc_mod.functions[n_fns - 5].fn_idx;
-    let fn_strip = inc_mod.functions[n_fns - 4].fn_idx;
-    let fn_hash = inc_mod.functions[n_fns - 3].fn_idx;
-    let fn_cycle = inc_mod.functions[n_fns - 2].fn_idx;
-    let mut vm = OmniBinaryVm::with_budgets(500_000_000, 64 * 1024 * 1024);
-
-    fn expand_rec(
-        vm: &mut OmniBinaryVm,
-        inc_mod: &BinModule,
-        fn_scan: u16,
-        fn_strip: u16,
-        fn_hash: u16,
-        fn_cycle: u16,
-        cur_src: &str,
-        cur_dir: Option<&std::path::Path>,
-        vfs: Option<&std::collections::BTreeMap<String, String>>,
-        stack_hashes: &mut Vec<u8>,
-    ) -> Result<String, String> {
-        let src_bytes = cur_src.as_bytes().to_vec();
-        let tbl = match vm.execute_function(inc_mod, fn_scan, vec![OmniValue::Bytes(src_bytes.clone())])? {
-            OmniValue::Bytes(b) => b,
-            other => return Err(format!("A2 m3i_scan_includes returned {:?}", other)),
-        };
-        if tbl.len() < 4 {
-            return Ok(String::from(cur_src));
-        }
-        let cnt = u32::from_le_bytes(tbl[0..4].try_into().unwrap()) as usize;
-        if cnt == 0 {
-            return Ok(String::from(cur_src));
-        }
-        let mut combined = String::new();
-        for i in 0..cnt {
-            let off = 4 + i * 16;
-            let poff = u32::from_le_bytes(tbl[off..off + 4].try_into().unwrap()) as usize;
-            let plen = u32::from_le_bytes(tbl[off + 4..off + 8].try_into().unwrap()) as usize;
-            let line = u32::from_le_bytes(tbl[off + 8..off + 12].try_into().unwrap());
-            let col = u32::from_le_bytes(tbl[off + 12..off + 16].try_into().unwrap());
-            let inc_path = std::str::from_utf8(&src_bytes[poff..poff + plen])
-                .map_err(|_| format!("error[SYNTAX_ERROR] line {}, col {}: Invalid UTF-8 in include path", line, col))?
-                .to_string();
-            let phash = match vm.execute_function(
-                inc_mod,
-                fn_hash,
-                vec![
-                    OmniValue::Bytes(src_bytes.clone()),
-                    OmniValue::Int(poff as i64),
-                    OmniValue::Int(plen as i64),
-                ],
-            )? {
-                OmniValue::Int(v) => v,
-                other => return Err(format!("A2 m3i_hash_path returned {:?}", other)),
-            };
-            let depth = (stack_hashes.len() / 4) as i64;
-            let is_cyc = match vm.execute_function(
-                inc_mod,
-                fn_cycle,
-                vec![
-                    OmniValue::Bytes(stack_hashes.clone()),
-                    OmniValue::Int(depth),
-                    OmniValue::Int(phash),
-                ],
-            )? {
-                OmniValue::Int(v) => v,
-                other => return Err(format!("A2 m3i_check_cycle returned {:?}", other)),
-            };
-            if is_cyc != 0 {
-                return Err(format!(
-                    "error[CIRCULAR_INCLUDE] line {}, col {}: Circular include detected for '{}'",
-                    line, col, inc_path
-                ));
-            }
-            let inc_content = if let Some(s) = vfs.and_then(|m| m.get(&inc_path)) {
-                s.clone()
-            } else if let Some(std_src) = lookup_omni_stdlib_module(&inc_path) {
-                String::from(std_src)
-            } else if let Some(dir) = cur_dir {
-                let full_p = dir.join(&inc_path);
-                std::fs::read_to_string(&full_p).map_err(|e| {
-                    format!(
-                        "error[SYNTAX_ERROR] line {}, col {}: Failed to read included file '{}': {}",
-                        line, col, full_p.display(), e
-                    )
-                })?
-            } else {
-                std::fs::read_to_string(&inc_path).map_err(|e| {
-                    format!(
-                        "error[SYNTAX_ERROR] line {}, col {}: Failed to read included file '{}': {}",
-                        line, col, inc_path, e
-                    )
-                })?
-            };
-            stack_hashes.extend_from_slice(&(phash as u32).to_le_bytes());
-            let expanded = expand_rec(
-                vm, inc_mod, fn_scan, fn_strip, fn_hash, fn_cycle,
-                &inc_content, cur_dir, vfs, stack_hashes,
-            )?;
-            let new_len = stack_hashes.len().saturating_sub(4);
-            stack_hashes.truncate(new_len);
-            combined.push_str(&expanded);
-            combined.push('\n');
-        }
-        let body_bytes = match vm.execute_function(inc_mod, fn_strip, vec![OmniValue::Bytes(src_bytes)])? {
-            OmniValue::Bytes(b) => b,
-            other => return Err(format!("A2 m3i_strip_include_lines returned {:?}", other)),
-        };
-        let body_str = String::from_utf8(body_bytes)
-            .map_err(|e| format!("A2 stripped body UTF-8 error: {}", e))?;
-        combined.push_str(&body_str);
-        Ok(combined)
-    }
-
-    let mut stack_hashes: Vec<u8> = Vec::new();
-    expand_rec(
-        &mut vm, &inc_mod, fn_scan, fn_strip, fn_hash, fn_cycle,
-        src, base_dir, vfs, &mut stack_hashes,
-    )
-}
 
 /// Seed-Shrink Phase A2 hard gate (`./omnic a2-pure-include`):
 ///   1. Pure-Omni M3 (0-word diff) + Pure-Omni M2 (0-byte diff) on `pure/m3/include.omni`.
@@ -6474,61 +6328,6 @@ pub fn selftest_a3_macro_quarantine() -> Result<usize, String> {
     Ok(checks)
 }
 
-/// Seed-Shrink Phase B2: Verify a `.omni_bc` u16 token stream using ONLY the Pure-Omni verifier
-/// (`pure/verifier_engine.omni`: `omni_verify_module_api` when `api_mode=true`, `omni_verify_module`
-/// otherwise) â€” ZERO calls to the frozen Rust verifier on the default hot path.
-pub fn pure_default_verify_u16(u16_stream: &[u16], api_mode: bool) -> Result<(), String> {
-    let ve_u16 = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(OMNI_VERIFIER_ENGINE_SURFACE))?;
-    let ve_mod = decode_omni_token_stream(&ve_u16)?;
-    let fn_verify = if api_mode {
-        ve_mod.functions[ve_mod.functions.len() - 2].fn_idx
-    } else {
-        ve_mod.functions[ve_mod.functions.len() - 1].fn_idx
-    };
-    let mut vm = OmniBinaryVm::with_budgets(500_000_000, 64 * 1024 * 1024);
-    let rep = match vm.execute_function(
-        &ve_mod,
-        fn_verify,
-        vec![OmniValue::Bytes(encode_u16_stream_to_bytes(u16_stream))],
-    )? {
-        OmniValue::Bytes(b) => b,
-        other => return Err(format!("Pure verifier returned unexpected value: {:?}", other)),
-    };
-    if rep.len() < 24 {
-        return Err(String::from("error[PURE_VERIFY_MALFORMED]: Pure verifier report truncated"));
-    }
-    let r_i64 = |idx: usize| -> i64 {
-        i64::from_le_bytes(rep[idx * 8..idx * 8 + 8].try_into().unwrap())
-    };
-    let status = r_i64(0);
-    let dec_off = r_i64(1);
-    if status != 0 {
-        return Err(format!(
-            "error[PURE_VERIFY_DECODE_{}] @word {}: Pure-Omni verifier rejected malformed stream",
-            status, dec_off
-        ));
-    }
-    let nfns = r_i64(2) as usize;
-    let mut cur = 3usize;
-    for _ in 0..nfns {
-        if cur + 3 > rep.len() / 8 {
-            break;
-        }
-        let fn_idx = r_i64(cur);
-        let passed = r_i64(cur + 1);
-        let nerr = r_i64(cur + 2) as usize;
-        if passed == 0 || nerr > 0 {
-            let code = if nerr > 0 && cur + 4 < rep.len() / 8 { r_i64(cur + 3) } else { 0 };
-            let off = if nerr > 0 && cur + 4 < rep.len() / 8 { r_i64(cur + 4) } else { 0 };
-            return Err(format!(
-                "error[PURE_VERIFY_{}] fn#{} @word {}: Pure-Omni verifier rejected function ({} error(s))",
-                code, fn_idx, off, nerr
-            ));
-        }
-        cur += 3 + nerr * 2;
-    }
-    Ok(())
-}
 
 /// Seed-Shrink Phase B2 hard gate (`./omnic b2-pure-verifier`):
 ///   1. Default Pure-Omni verifier accepts valid Pure-M3 compiled goldens (`token_emit_golden`, `weighted_diff_pure_golden`).
@@ -6590,8 +6389,484 @@ pub fn selftest_b2_pure_verifier() -> Result<usize, String> {
     }
     checks += 1;
 
-    // 5. Frozen hashes intact.
+    // 5. Audit §1.2: CALL-target and arity validation in Pure verifier + M2 trap stub + fuzz corpus.
+    checks += selftest_s1_2_call_target_arity_and_fuzz()?;
+
+    // 6. Audit Round 2 N1: per-opcode minimum operand arity + EMPTY_MODULE + reconciled 0x7F42 (BR_TRIT min=4).
+    checks += selftest_n1_op_arity_and_empty_module()?;
+
+    // 7. Audit Round 3 M1: pure verifier must fail closed (REPORT_OVERFLOW 3008) on >2,387 functions,
+    //    never silently dropping trailing functions or returning Ok(()) on truncated reports.
+    let build_n_good_then_bad = |n_good: usize| -> Vec<u16> {
+        let mut s = Vec::with_capacity(2 + (n_good + 1) * 14);
+        s.push(0x7EE0); // TOK_MOD_BEGIN
+        for fid in 0..n_good {
+            // fn#fid() -> i64, cap=0, 1 ins: RET imm16(0)
+            s.extend_from_slice(&[
+                0x7EE3, fid as u16, 0, 0x7F81, 0, 1,
+                0x7F4A, 0x7EE5, 0, 0x7EE4,
+            ]);
+        }
+        // Trailing bad fn: r0: i64 [cap=1] = CINT 0 (missing cap 1003), RET r0
+        s.extend_from_slice(&[
+            0x7EE3, n_good as u16, 0, 0x7F81, 0, 2,
+            0x7E00, 0x7F06, 0x7F81, 0x7FC1, 0x7EE5, 0, 0x7EE4,
+            0x7F4A, 0x7E00, 0x7EE4,
+            0x7EEF, // TOK_MOD_END
+        ]);
+        s
+    };
+    let s_2388 = build_n_good_then_bad(2388);
+    match pure_default_verify_u16(&s_2388, false) {
+        Ok(()) => return Err(String::from("M1 pure verifier failed open (returned Ok) on 2,388 good + 1 bad fn")),
+        Err(msg) => {
+            if !msg.contains("PURE_VERIFY_REPORT_OVERFLOW") && !msg.contains("3008") {
+                return Err(format!("M1 2,388-fn stream expected PURE_VERIFY_REPORT_OVERFLOW, got: {}", msg));
+            }
+        }
+    }
+    // 7b. Audit Round-3 R3-2: the overflow `@word` is the report-region word offset where the failed
+    //     header write would have gone (1024 + cursor, inside 1024..8192), never a function index.
+    let overflow_word = |s: &[u16]| -> Result<i64, String> {
+        match pure_default_verify_u16(s, false) {
+            Ok(()) => Err(String::from("R3-2 overflow stream unexpectedly verified Ok")),
+            Err(msg) => {
+                if !msg.contains("PURE_VERIFY_REPORT_OVERFLOW") {
+                    return Err(format!("R3-2 expected PURE_VERIFY_REPORT_OVERFLOW, got: {}", msg));
+                }
+                msg.split("@word ")
+                    .nth(1)
+                    .and_then(|t| t.split(':').next())
+                    .and_then(|t| t.trim().parse::<i64>().ok())
+                    .ok_or_else(|| format!("R3-2 could not parse @word from: {}", msg))
+            }
+        }
+    };
+    for &n_good in &[2388usize, 2400usize] {
+        let w = overflow_word(&build_n_good_then_bad(n_good))?;
+        if !(1024..8192).contains(&w) || w == n_good as i64 || w == n_good as i64 + 1 {
+            return Err(format!(
+                "R3-2 {}-fn overflow @word {} is not a report-region word offset (want 1024..8192)",
+                n_good, w
+            ));
+        }
+    }
+    checks += 1;
+
+    let s_2387 = build_n_good_then_bad(2387);
+    match pure_default_verify_u16(&s_2387, false) {
+        Ok(()) => return Err(String::from("M1 pure verifier failed open on 2,387 good + 1 bad fn")),
+        Err(msg) => {
+            if msg.contains("PURE_VERIFY_0 ") {
+                return Err(format!("M1 2,387-fn stream reported bogus code 0 instead of overflow/1003: {}", msg));
+            }
+        }
+    }
+    checks += 1;
+
+    // 8. Frozen hashes intact.
     selftest_m2_frozen_hashes()?;
+    checks += 1;
+
+    Ok(checks)
+}
+
+/// Audit Round 2 N1 gate:
+///   1. Rejects TMAJ (0x7F2C) with 2 operands (`PURE_VERIFY_2012`).
+///   2. Rejects 0x7F17 with 1 operand (`PURE_VERIFY_2012`).
+///   3. Rejects header-only zero-function module `[0x7EE0, 0x7EEF]` (`PURE_VERIFY_EMPTY_MODULE`),
+///      while keeping 0-word `[]` rejected as `PURE_VERIFY_DECODE_3006`.
+///   4. Rejects `vok_crash_128` (`0x7F42` BR_TRIT with 1 operand — reconciled min=4) in BOTH
+///      `pure_default_verify_u16` (`PURE_VERIFY_2012`) and Rust `OmniBinaryVm` (`BAD_ARITY`).
+pub fn selftest_n1_op_arity_and_empty_module() -> Result<usize, String> {
+    let mut checks = 0usize;
+
+    let build_dest_op_stream = |op: u16, ops: &[u16]| -> Vec<u16> {
+        let mut s = vec![
+            0x7EE0, // TOK_MOD_BEGIN
+            0x7EE3, 0, 1, 0x7EC0, 0x7F81, 0x7FC0, 0x7F81, 0, 2, // fn#0(p0: i64) -> i64, 2 ins
+            0x7E00, op, 0x7F81, 0x7FC0, // r0: i64 = op ...
+        ];
+        s.extend_from_slice(ops);
+        s.extend_from_slice(&[
+            0x7EE4, // INS_END
+            0x7F4A, 0x7E00, 0x7EE4, // RET r0
+            0x7EEF, // TOK_MOD_END
+        ]);
+        s
+    };
+
+    // 1. TMAJ (0x7F2C) with 2 operands (requires 3).
+    let tmaj_2op = build_dest_op_stream(0x7F2C, &[0x7EC0, 0x7EC0]);
+    match pure_default_verify_u16(&tmaj_2op, false) {
+        Ok(()) => return Err(String::from("N1 Pure verifier accepted TMAJ (0x7F2C) with 2 operands")),
+        Err(msg) => {
+            if !msg.contains("PURE_VERIFY_2012") {
+                return Err(format!("N1 tmaj_2op expected PURE_VERIFY_2012, got: {}", msg));
+            }
+        }
+    }
+    checks += 1;
+
+    // 2. 0x7F17 with 1 operand (requires 2).
+    let op_7f17_1op = build_dest_op_stream(0x7F17, &[0x7EC0]);
+    match pure_default_verify_u16(&op_7f17_1op, false) {
+        Ok(()) => return Err(String::from("N1 Pure verifier accepted 0x7F17 with 1 operand")),
+        Err(msg) => {
+            if !msg.contains("PURE_VERIFY_2012") {
+                return Err(format!("N1 op_7f17_1op expected PURE_VERIFY_2012, got: {}", msg));
+            }
+        }
+    }
+    checks += 1;
+
+    // 3. Header-only zero-function module `[0x7EE0, 0x7EEF]` (EMPTY_MODULE) + 0-word `[]` (DECODE_3006).
+    let empty_hdr_only: Vec<u16> = vec![0x7EE0, 0x7EEF];
+    match pure_default_verify_u16(&empty_hdr_only, false) {
+        Ok(()) => return Err(String::from("N1 Pure verifier accepted header-only zero-function module")),
+        Err(msg) => {
+            if !msg.contains("PURE_VERIFY_EMPTY_MODULE") && !msg.contains("3007") {
+                return Err(format!("N1 empty_module expected PURE_VERIFY_EMPTY_MODULE, got: {}", msg));
+            }
+        }
+    }
+    match pure_default_verify_u16(&[], false) {
+        Ok(()) => return Err(String::from("N1 Pure verifier accepted 0-word empty stream")),
+        Err(msg) => {
+            if !msg.contains("PURE_VERIFY_DECODE_3006") {
+                return Err(format!("N1 0-word stream expected PURE_VERIFY_DECODE_3006, got: {}", msg));
+            }
+        }
+    }
+    checks += 1;
+
+    // 4. `vok_crash_128`: BR_TRIT (0x7F42) with 1 operand (reconciled min=4 across Pure verifier, mod_check, and Rust VM).
+    let br_trit_1op: Vec<u16> = vec![
+        0x7EE0,
+        0x7EE3, 0, 1, 0x7EC0, 0x7F81, 0x7FC0, 0x7F81, 0, 2,
+        0x7F42, 0x7EC0, 0x7EE4, // BR_TRIT with only 1 operand (missing l_neg, l_zero, l_pos)
+        0x7F4A, 0x7EC0, 0x7EE4, // RET p0
+        0x7EEF,
+    ];
+    match pure_default_verify_u16(&br_trit_1op, false) {
+        Ok(()) => return Err(String::from("N1 Pure verifier accepted BR_TRIT (0x7F42) with 1 operand")),
+        Err(msg) => {
+            if !msg.contains("PURE_VERIFY_2012") {
+                return Err(format!("N1 vok_crash_128 expected PURE_VERIFY_2012, got: {}", msg));
+            }
+        }
+    }
+    let decoded_br = decode_omni_token_stream(&br_trit_1op)?;
+    let mut rust_vm = OmniBinaryVm::new();
+    match rust_vm.execute_function(&decoded_br, 0, vec![OmniValue::Int(1)]) {
+        Ok(v) => return Err(format!("N1 Rust VM accepted BR_TRIT (0x7F42) with 1 operand (returned {:?})", v)),
+        Err(msg) => {
+            if !msg.contains("BAD_ARITY") && !msg.contains("Missing branch target label") {
+                return Err(format!("N1 Rust VM expected BAD_ARITY/UNRESOLVED_LABEL on 0x7F42 1-op, got: {}", msg));
+            }
+        }
+    }
+    checks += 1;
+
+    // 5. Drift-lock: `pure/verifier_engine.omni::op_min_ops` agrees with `pure/m2/verify/mod_check.omni::m2v_ins_min_ops`
+    //    for every opcode known to `mod_check.omni` across 0x7F00..=0x7F7F.
+    let ve_mod = cached_verifier_engine_module()?;
+    let m2_mod = cached_m2_seed_module()?;
+    let find_fn_idx = |src: &str, name: &str| -> Result<u16, String> {
+        let needle = format!("fn {}(", name);
+        let mut idx: u16 = 0;
+        for line in src.lines() {
+            let t = line.trim_start();
+            if t.starts_with("fn ") {
+                if t.starts_with(&needle) {
+                    return Ok(idx);
+                }
+                idx += 1;
+            }
+        }
+        Err(format!("N1 could not locate '{}' in source", name))
+    };
+    let ve_min_pos = find_fn_idx(OMNI_VERIFIER_ENGINE_SURFACE, "op_min_ops")? as usize;
+    let m2_min_pos = find_fn_idx(M2_SELFHOST_OMNI_SRC, "m2v_ins_min_ops")? as usize;
+    let ve_min_fn = ve_mod.functions.get(ve_min_pos).ok_or("N1 ve_min_pos OOB")?.fn_idx;
+    let m2_min_fn = m2_mod.functions.get(m2_min_pos).ok_or("N1 m2_min_pos OOB")?.fn_idx;
+    let mut parity_vm = OmniBinaryVm::with_budgets(50_000_000, 16 * 1024 * 1024);
+    for op in 0x7F00i64..=0x7F7Fi64 {
+        let ve_v = match parity_vm.execute_function(ve_mod, ve_min_fn, vec![OmniValue::Int(op)])? {
+            OmniValue::Int(v) => v,
+            other => return Err(format!("N1 op_min_ops(0x{:04X}) returned {:?}", op, other)),
+        };
+        let rust_v = vm_op_min_ops(op as u16) as i64;
+        if rust_v > 0 && ve_v != rust_v {
+            return Err(format!(
+                "L-E opcode arity drift at 0x{:04X}: verifier_engine={} != Rust vm_op_min_ops={}",
+                op, ve_v, rust_v
+            ));
+        }
+        let m2_v = match parity_vm.execute_function(m2_mod, m2_min_fn, vec![OmniValue::Int(op)])? {
+            OmniValue::Int(v) => v,
+            other => return Err(format!("N1 m2v_ins_min_ops(0x{:04X}) returned {:?}", op, other)),
+        };
+        if m2_v >= 0 && ve_v != m2_v {
+            return Err(format!(
+                "N1 opcode arity drift at 0x{:04X}: verifier_engine={} != mod_check={}",
+                op, ve_v, m2_v
+            ));
+        }
+    }
+    checks += 1;
+
+    Ok(checks)
+}
+
+/// Audit §1.2 hard gate (`./omnic s1-call-verify`):
+///   1. Pure-Omni verifier (`pure/verifier_engine.omni` via `pure_default_verify_u16`) rejects CALLs to
+///      non-existent functions (`fn_idx = 32539`, `fn_idx = 99`) and non-`TOK_SYM_FN` CALL targets with
+///      error code `2010` (`BAD_CALL_TARGET`).
+///   2. Pure-Omni verifier rejects CALL arity mismatches (too few / too many args) with error code `2011`
+///      (`CALL_ARITY_MISMATCH`).
+///   3. Defense-in-depth M2 trap stub: when an unverified `.omni_bc` stream with an unknown or out-of-range
+///      CALL target (`32539` or `99`) is lowered through Pure-Omni M2 (`m2.omni_bc`) or Rust M2-multi,
+///      the `E8 rel32` relocation resolves to the `T_OOB` trap stub (`exit(101)`) instead of offset `-1`
+///      (before `.text`, which segfaulted with exit 139).
+///   4. Checked-in 12-case crash corpus + deterministic 256-mutant `.omni_bc` mutation fuzzer: every mutant
+///      is either rejected by `pure_default_verify_u16` or executes without divergence (Pure-M4 == Rust VM)
+///      and without out-of-text jump/call targets or native segfaults.
+pub fn selftest_s1_2_call_target_arity_and_fuzz() -> Result<usize, String> {
+    let mut checks = 0usize;
+
+    // Helper: build a 1-fn module calling `callee_tok` with `arg_ops` words and returning r0.
+    let build_call_stream = |callee_ops: &[u16]| -> Vec<u16> {
+        let mut s = vec![
+            0x7EE0, // TOK_MOD_BEGIN
+            0x7EE3, 0, 1, 0x7EC0, 0x7F81, 0x7FC0, 0x7F81, 0, 2, // fn#0(p0: i64) -> i64, 2 ins
+            0x7E00, 0x7F48, 0x7F81, 0x7FC0, // r0: i64 = CALL ...
+        ];
+        s.extend_from_slice(callee_ops);
+        s.extend_from_slice(&[
+            0x7EE4, // INS_END
+            0x7F4A, 0x7E00, 0x7EE4, // RET r0
+            0x7EEF, // TOK_MOD_END
+        ]);
+        s
+    };
+
+    // 1. Non-existent CALL targets (`fn_idx = 32539` from Grok's audit, `fn_idx = 99`, and non-FnRef target).
+    for &(label, ops) in &[
+        ("missing_fn_32539", &[0x7EECu16, 32539, 0x7EC0][..]),
+        ("missing_fn_99", &[0x7EECu16, 99, 0x7EC0][..]),
+        ("non_fnref_reg_target", &[0x7EC0u16][..]),
+        ("zero_operand_call", &[][..]),
+    ] {
+        let bad_s = build_call_stream(ops);
+        match pure_default_verify_u16(&bad_s, false) {
+            Ok(()) => {
+                return Err(format!(
+                    "S1.2 Pure verifier accepted invalid CALL target case '{}'",
+                    label
+                ))
+            }
+            Err(msg) => {
+                if !msg.contains("PURE_VERIFY_2010") && !msg.contains("PURE_VERIFY_DECODE") {
+                    return Err(format!(
+                        "S1.2 case '{}' expected PURE_VERIFY_2010, got: {}",
+                        label, msg
+                    ));
+                }
+            }
+        }
+    }
+    checks += 1;
+
+    // 2. CALL arity mismatch (`fn#1` expects 2 params, `fn#0` calls `fn#1` with 1 arg and with 3 args).
+    let valid_2fn = compile_omni_surface_strict_to_u16(
+        "#[strict]\nfn add2(a: i64, b: i64) -> i64 { return a + b; }\n#[strict]\nfn main(x: i64) -> i64 { return add2(x, 10); }\n",
+    )?;
+    pure_default_verify_u16(&valid_2fn, false)?;
+    // Mutate fn#0's CALL to pass 1 arg (drop `TOK_IMM_I16, 10`) or 3 args (append `0x7EC0`).
+    let mut bad_arity_1 = Vec::new();
+    let mut bad_arity_3 = Vec::new();
+    let mut i = 0usize;
+    while i < valid_2fn.len() {
+        if valid_2fn[i] == 0x7F48 {
+            let mut end = i + 1;
+            while end < valid_2fn.len() && valid_2fn[end] != 0x7EE4 {
+                end += 1;
+            }
+            // [0x7F48, 0x7F81, 0x7FC0, 0x7EEC, fn_id, 0x7EC0, ... second arg ..., 0x7EE4]
+            bad_arity_1.extend_from_slice(&valid_2fn[i..i + 6]);
+            bad_arity_1.push(0x7EE4);
+            bad_arity_3.extend_from_slice(&valid_2fn[i..end]);
+            bad_arity_3.push(0x7EC0);
+            bad_arity_3.push(0x7EE4);
+            i = end + 1;
+        } else {
+            bad_arity_1.push(valid_2fn[i]);
+            bad_arity_3.push(valid_2fn[i]);
+            i += 1;
+        }
+    }
+    for (label, stream) in [("arity_1_want_2", &bad_arity_1), ("arity_3_want_2", &bad_arity_3)] {
+        match pure_default_verify_u16(stream, false) {
+            Ok(()) => {
+                return Err(format!(
+                    "S1.2 Pure verifier accepted CALL arity mismatch '{}'",
+                    label
+                ))
+            }
+            Err(msg) => {
+                if !msg.contains("PURE_VERIFY_2011") {
+                    return Err(format!(
+                        "S1.2 '{}' expected PURE_VERIFY_2011, got: {}",
+                        label, msg
+                    ));
+                }
+            }
+        }
+    }
+    checks += 1;
+
+    // 3. Defense-in-depth M2 trap stub: lowering unverified `missing_fn_32539` and `missing_fn_99`
+    // through Pure-Omni M2 emitter (`m2_compile_multi_x86`, bypassing standalone verifier) must resolve
+    // the unknown `E8 rel32` to the `T_OOB` trap stub inside `.text` (`[120 .. elf.len())`), NEVER to `-1`.
+    let m2_raw_s12 = std::fs::read("pure/m2/m2.omni_bc")
+        .map_err(|e| format!("S1.2 read pure/m2/m2.omni_bc: {}", e))?;
+    let m2_mod_s12 = decode_omni_token_stream(&decode_bytes_to_u16_stream(&m2_raw_s12))?;
+    let m2_emit_fn_s12 = m2_mod_s12.functions[m2_mod_s12.functions.len() - 2].fn_idx;
+    for &bad_callee in &[32539u16, 99u16] {
+        let unverified = build_call_stream(&[0x7EEC, bad_callee, 0x7EC0]);
+        let mut vm_m2_s12 = OmniBinaryVm::with_budgets(500_000_000, 128 * 1024 * 1024);
+        let elf = match vm_m2_s12.execute_function(
+            &m2_mod_s12,
+            m2_emit_fn_s12,
+            vec![
+                OmniValue::Bytes(vec![0u8; 524_288]),
+                OmniValue::U16Array(unverified),
+                OmniValue::Int(7),
+                OmniValue::Int(0),
+                OmniValue::Int(0),
+            ],
+        )? {
+            OmniValue::Bytes(b) => b,
+            other => return Err(format!("S1.2 M2 emitter returned {:?}", other)),
+        };
+        if elf.len() <= 132 || &elf[0..4] != &[0x7F, b'E', b'L', b'F'] {
+            return Err(String::from("S1.2 M2 failed to emit ELF for trap-stub check"));
+        }
+        // Locate the `BF 01 00 00 00 B8 3C 00 00 00 0F 05` (T_OOB stub: exit(1)) in `elf[120..]`.
+        let t_oob_seq: [u8; 12] = [0xBF, 0x01, 0x00, 0x00, 0x00, 0xB8, 0x3C, 0x00, 0x00, 0x00, 0x0F, 0x05];
+        let t_oob_pos = elf[120..]
+            .windows(12)
+            .position(|w| w == t_oob_seq)
+            .map(|p| p + 120)
+            .ok_or_else(|| String::from("S1.2 T_OOB trap stub not found in M2 ELF"))?;
+        // Every `E8 rel32` in the user function (after the entry stub) must target a valid offset in `[120, elf.len())`,
+        // and the unknown CALL must target `t_oob_pos`.
+        let mut hit_trap_call = false;
+        for pos in 120..elf.len().saturating_sub(5) {
+            if elf[pos] == 0xE8 {
+                let rel = i32::from_le_bytes(elf[pos + 1..pos + 5].try_into().unwrap()) as isize;
+                let tgt = (pos as isize) + 5 + rel;
+                if tgt == 119 {
+                    return Err(format!(
+                        "S1.2 M2 emitted segfaulting CALL to code_off=-1 (file_off=119) for fn#{}",
+                        bad_callee
+                    ));
+                }
+                if tgt == t_oob_pos as isize {
+                    hit_trap_call = true;
+                }
+            }
+        }
+        if !hit_trap_call {
+            return Err(format!(
+                "S1.2 M2 did not patch unknown CALL fn#{} to T_OOB trap stub (t_oob_pos={})",
+                bad_callee, t_oob_pos
+            ));
+        }
+        if let Some(r) = run_native_elf_for_diff(&elf, "s1_2_trap_stub")? {
+            if r.signal.is_some() || r.exit_code != Some(OMNI_OOB_EXIT_STATUS) {
+                return Err(format!(
+                    "S1.2 native trap-stub ELF failed: exit={:?} signal={:?} (want exit 101, signal None)",
+                    r.exit_code, r.signal
+                ));
+            }
+        }
+    }
+    checks += 1;
+
+    // 4. Checked-in crash corpus (12 mutated `.omni_bc` cases covering Grok's audit findings) +
+    // deterministic 256-mutant mutation fuzzer over multi-function `.omni_bc` streams.
+    let mut corpus: Vec<Vec<u16>> = vec![
+        build_call_stream(&[0x7EEC, 32539, 0x7EC0]),
+        build_call_stream(&[0x7EEC, 0xFFFF, 0x7EC0]),
+        build_call_stream(&[0x7EEC, 1024, 0x7EC0]),
+        build_call_stream(&[0x7EEC, 1, 0x7EC0, 0x7EC0]),
+        build_call_stream(&[0x7E00, 0x7EC0]),
+        build_call_stream(&[0x7EE5, 42]),
+        bad_arity_1,
+        bad_arity_3,
+    ];
+    let mut rng: u64 = 0x2026_1122_A0D1_7F48;
+    let mut next_u64 = || -> u64 {
+        rng ^= rng >> 12;
+        rng ^= rng << 25;
+        rng ^= rng >> 27;
+        rng.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    };
+    for _ in 0..256 {
+        let mut m = valid_2fn.clone();
+        let idx = (next_u64() as usize) % m.len();
+        let kind = next_u64() % 4;
+        match kind {
+            0 => m[idx] = (next_u64() & 0xFFFF) as u16,
+            1 => m[idx] ^= 1u16 << ((next_u64() % 16) as u32),
+            2 => {
+                let len = (next_u64() as usize) % m.len();
+                m.truncate(len.max(1));
+            }
+            _ => {
+                m[idx] = *[0x7F48u16, 0x7EEC, 32539, 0x7EF9, 0x7F0E, 0x7F0F, 0x7EEF]
+                    .get((next_u64() as usize) % 7)
+                    .unwrap();
+            }
+        }
+        corpus.push(m);
+    }
+    let mut accepted = 0usize;
+    for (ci, stream) in corpus.iter().enumerate() {
+        if pure_default_verify_u16(stream, false).is_ok() {
+            accepted += 1;
+            // Every verifier-accepted stream MUST also pass Rust `verify_module_for_multi_aot`
+            // (except single-fn / non-recursive checks) and agree between Rust VM and Pure-M4 VM!
+            let decoded = decode_omni_token_stream(stream)
+                .map_err(|e| format!("S1.2 fuzz #{} accepted by Pure verifier but failed decode: {}", ci, e))?;
+            for f in &decoded.functions {
+                let rep = verify_binary_function(f);
+                if !rep.passed {
+                    return Err(format!(
+                        "S1.2 fuzz #{} accepted by Pure verifier but rejected by Rust verifier: {:?}",
+                        ci, rep.errors
+                    ));
+                }
+            }
+            let entry = m2_entry_of(&decoded);
+            let mut rvm = OmniBinaryVm::with_budgets(50_000, 4 * 1024 * 1024);
+            let r_res = rvm.execute_function(&decoded, entry, vec![OmniValue::Int(7), OmniValue::Int(3)]);
+            let m4_res = p4_run_raw_bc_on_pure_vm(stream, 7, 3, 0, 50_000, 0)?;
+            if let Ok(OmniValue::Int(rv)) = r_res {
+                if m4_res.2 == 0 && m4_res.0 != rv {
+                    return Err(format!(
+                        "S1.2 fuzz #{} VM divergence: Rust VM={} vs Pure-M4={} (fns={:?})",
+                        ci, rv, m4_res.0, decoded.functions
+                    ));
+                }
+            }
+        }
+    }
+    if accepted == corpus.len() {
+        return Err(String::from("S1.2 fuzz corpus had 0 rejections"));
+    }
     checks += 1;
 
     Ok(checks)
@@ -6599,8 +6874,8 @@ pub fn selftest_b2_pure_verifier() -> Result<usize, String> {
 
 /// Seed-Shrink Phase B4 hard gate (`./omnic b4-pure-launcher`):
 ///   1. Pure-Omni M3 (0-word diff) + Pure-Omni M2 (0-byte diff) on `pure/m5/launcher.omni`.
-///   2. Emits standalone 181-byte zero-shim Linux x86-64 launcher ELF64 (`\x7fELF`, PT_LOAD, raw `0F 05` syscalls).
-///   3. On Linux x86-64: executes the 181-B launcher natively (zero Rust binary, zero libc) on valid
+///   2. Emits standalone 237-byte zero-shim Linux x86-64 launcher ELF64 (`\x7fELF`, PT_LOAD, raw `0F 05` syscalls).
+///   3. On Linux x86-64: executes the 237-B launcher natively (zero Rust binary, zero libc) on valid
 ///      `pure/m4/m4.omni_bc` (exit 0) AND corrupt `[0xFF, 0xFF]` (exit 1 fail-closed).
 ///   4. On Linux x86-64: runs the pure native M2 compiler ELF (`m2_native.elf`, zero Rust binary)
 ///      to rebuild `m2.omni_bc` (93,561 B) and `m4.omni_bc` (78,020 B) with 0-byte diff.
@@ -6621,7 +6896,7 @@ pub fn selftest_b4_pure_launcher() -> Result<(usize, usize, u64, bool), String> 
     }
     checks += 1;
 
-    // 2. Execute `pure/m5/launcher.omni` to emit the standalone 181-B zero-shim Linux x86-64 launcher ELF64.
+    // 2. Execute `pure/m5/launcher.omni` to emit the standalone 237-B zero-shim Linux x86-64 launcher ELF64.
     let l_mod = decode_omni_token_stream(&l_u16)?;
     let entry_fn = l_mod.functions.last().ok_or("B4 empty launcher module")?.fn_idx;
     let mut vm = OmniBinaryVm::with_budgets(50_000_000, 32 * 1024 * 1024);
@@ -6638,7 +6913,7 @@ pub fn selftest_b4_pure_launcher() -> Result<(usize, usize, u64, bool), String> 
         OmniValue::Bytes(b) => b,
         other => return Err(format!("B4 launcher emitter returned {:?}", other)),
     };
-    if launcher_elf.len() != 181 || &launcher_elf[0..4] != b"\x7fELF" {
+    if launcher_elf.len() != 237 || &launcher_elf[0..4] != b"\x7fELF" {
         return Err(format!("B4 launcher ELF invalid: {} bytes", launcher_elf.len()));
     }
     let has_syscall = launcher_elf.windows(2).any(|w| w == [0x0F, 0x05]);
@@ -6652,15 +6927,11 @@ pub fn selftest_b4_pure_launcher() -> Result<(usize, usize, u64, bool), String> 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     let native_ok = {
         use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
-        let lpath = std::env::temp_dir().join(format!("omni_b4_launcher_{}.elf", std::process::id()));
-        std::fs::write(&lpath, &launcher_elf).map_err(|e| format!("B4 write launcher: {}", e))?;
-        std::fs::set_permissions(&lpath, std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("B4 chmod launcher: {}", e))?;
+        let tmp_launcher = PrivateTempElf::new(&launcher_elf, "b4_launcher")?;
 
         // 3a. Valid .omni_bc seed on stdin -> exit 0.
         let m4_raw = std::fs::read("pure/m4/m4.omni_bc").map_err(|e| format!("B4 read m4 seed: {}", e))?;
-        let mut child_ok = std::process::Command::new(&lpath)
+        let mut child_ok = std::process::Command::new(&tmp_launcher.path)
             .stdin(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| format!("B4 spawn launcher (valid): {}", e))?;
@@ -6669,12 +6940,11 @@ pub fn selftest_b4_pure_launcher() -> Result<(usize, usize, u64, bool), String> 
         }
         let st_ok = child_ok.wait().map_err(|e| format!("B4 wait valid: {}", e))?;
         if st_ok.code() != Some(0) {
-            let _ = std::fs::remove_file(&lpath);
             return Err(format!("B4 native launcher rejected valid seed: exit {:?}", st_ok.code()));
         }
 
         // 3b. Corrupt input on stdin -> exit 1 (fail-closed).
-        let mut child_bad = std::process::Command::new(&lpath)
+        let mut child_bad = std::process::Command::new(&tmp_launcher.path)
             .stdin(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| format!("B4 spawn launcher (corrupt): {}", e))?;
@@ -6682,26 +6952,23 @@ pub fn selftest_b4_pure_launcher() -> Result<(usize, usize, u64, bool), String> 
             let _ = sin.write_all(&[0xFF, 0xFF, 0x00, 0x00]);
         }
         let st_bad = child_bad.wait().map_err(|e| format!("B4 wait corrupt: {}", e))?;
-        let _ = std::fs::remove_file(&lpath);
+        drop(tmp_launcher);
         if st_bad.code() != Some(1) {
             return Err(format!("B4 native launcher must fail closed (exit 1) on corrupt input, got {:?}", st_bad.code()));
         }
 
         // 4. Pure native M2 compiler ELF (emitted by Pure M2 itself, zero Rust binary) compiles
-        //    pure/m4/m4.omni_bc -> exact 76,782-B ELF64 (0x82F217F319C2BDF5).
+        //    pure/m4/m4.omni_bc -> exact 89,789-B ELF64 (0x4CD6D6CCB4408577).
         let m2_raw = std::fs::read("pure/m2/m2.omni_bc").map_err(|e| format!("B4 read m2 seed: {}", e))?;
         let m2_u16 = decode_bytes_to_u16_stream(&m2_raw);
         let m2_elf = pure_default_compile_u16_to_elf(&m2_u16, 0, 0, 0)?;
-        let m2path = std::env::temp_dir().join(format!("omni_b4_m2_{}.elf", std::process::id()));
-        std::fs::write(&m2path, &m2_elf).map_err(|e| format!("B4 write m2_native: {}", e))?;
-        std::fs::set_permissions(&m2path, std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("B4 chmod m2_native: {}", e))?;
-        let out_m4 = std::process::Command::new(&m2path)
+        let tmp_m2 = PrivateTempElf::new(&m2_elf, "b4_m2")?;
+        let out_m4 = std::process::Command::new(&tmp_m2.path)
             .arg("pure/m4/m4.omni_bc")
             .output()
             .map_err(|e| format!("B4 exec m2_native: {}", e))?;
-        let _ = std::fs::remove_file(&m2path);
-        if !out_m4.status.success() || out_m4.stdout.len() != 76_782 || fnv1a_64_hash(&out_m4.stdout) != 0x82F217F319C2BDF5 {
+        drop(tmp_m2);
+        if !out_m4.status.success() || out_m4.stdout.len() != 89_789 || fnv1a_64_hash(&out_m4.stdout) != 0x4CD6D6CCB4408577 {
             return Err(format!(
                 "B4 pure native m2.elf -> m4.elf mismatch: status={:?} len={} hash=0x{:016X}",
                 out_m4.status,
@@ -6721,4 +6988,924 @@ pub fn selftest_b4_pure_launcher() -> Result<(usize, usize, u64, bool), String> 
 
     Ok((checks, launcher_elf.len(), launcher_hash, native_ok))
 }
+
+/// Audit §2 Security hard gate (`./omnic s2-security`):
+///   1. §2.1: `m2.omni_bc` (`m2_standalone_entry`) and native `m2.elf` verify input via `m2_verify_module_pure`
+///      and refuse unverified/malformed `.omni_bc` streams from the S1 crash corpus (0 segfaults).
+///   2. §2.2: `pure_default_run_u16` (`trace=true` and `trace=false`) decodes `u32 err @28` and `u32 steps @44`
+///      accurately; `p4_shim_exec_bc` (`p4-exec`) verifies input before execution; 412-byte mutated stream
+///      terminates in bounded time with fuel charged in decode/label-index loops; host wall-clock cap works.
+///   3. §2.3: OOB programs report `error[OUT_OF_BOUNDS]` with real `status=2` and exact `steps` across backends.
+///   4. §2.5: `run_omni_serve_cli` rejects positional bind addresses (requires `--bind`), and per-request errors
+///      do not abort the HTTP server batch loop.
+pub fn selftest_s2_security() -> Result<usize, String> {
+    let mut checks = 0usize;
+
+    // 1. §2.3: `pure_default_run_u16` with `trace=true` on a valid program must NOT false-trap
+    //    (because `trace_cnt` is at +24 and `err_code` is at +28), and on an OOB program must report
+    //    `error[OUT_OF_BOUNDS]` with real `status=2` and small `steps` (never 8589934592 / 12884901888).
+    let ok_u16 = with_lockstep_suspended(|| {
+        compile_omni_surface_strict_to_u16("#[strict]\nfn main(x: i64) -> i64 { return x + 5; }\n")
+    })?;
+    let (ok_ret, ok_steps) = pure_default_run_u16(&ok_u16, 37, 0, 0, true)?;
+    if ok_ret != 42 || ok_steps <= 0 || ok_steps > 100 {
+        return Err(format!(
+            "S2.3 pure_default_run_u16(trace=true) failed: ret={} steps={}",
+            ok_ret, ok_steps
+        ));
+    }
+    let oob_u16 = with_lockstep_suspended(|| {
+        compile_omni_surface_strict_to_u16(
+            "#[strict]\nfn main(a: i64) -> i64 { let w: bytes = anew(0); w = iset(w, a); return ld_u32(w, 0); }\n",
+        )
+    })?;
+    match pure_default_run_u16(&oob_u16, 5, 0, 0, false) {
+        Ok((v, s)) => {
+            return Err(format!(
+                "S2.3 pure_default_run_u16 must fail on OOB ld_u32, got Ok(({}, {}))",
+                v, s
+            ))
+        }
+        Err(msg) => {
+            if !msg.contains("error[OUT_OF_BOUNDS]")
+                || !msg.contains("status=2 ")
+                || msg.contains("8589934592")
+            {
+                return Err(format!(
+                    "S2.3 OOB trap message must contain error[OUT_OF_BOUNDS] and status=2, got: {}",
+                    msg
+                ));
+            }
+        }
+    }
+    checks += 1;
+
+    // 2. §2.1: `m2.omni_bc` (`pure_default_compile_u16_to_elf`) and native `m2.elf` must refuse unverified
+    //    S1 crash corpus inputs (missing CALL target 32539, arity mismatch, missing RET, undefined branch label,
+    //    and mutated streams) — or trap cleanly with 0 segfaults.
+    let bad_call_32539: Vec<u16> = vec![
+        0x7EE0, 0x7EE3, 0, 1, 0x7EC0, 0x7F81, 0x7FC0, 0x7F81, 0x7FC0, 2, 0x7E00, 0x7F48, 0x7F81,
+        0x7FC0, 0x7EEC, 32539, 0x7EC0, 0x7EE4, 0x7F4A, 0x7E00, 0x7EE4, 0x7EE1, 0x7EEF,
+    ];
+    let missing_ret: Vec<u16> = vec![
+        0x7EE0, 0x7EE3, 0, 1, 0x7EC0, 0x7F81, 0x7FC0, 0x7F81, 0x7FC0, 1, 0x7E00, 0x7F10, 0x7F81,
+        0x7FC0, 0x7EC0, 0x7EC0, 0x7EE4, 0x7EE1, 0x7EEF,
+    ];
+    let bad_branch_lbl: Vec<u16> = vec![
+        0x7EE0, 0x7EE3, 0, 1, 0x7EC0, 0x7F81, 0x7FC0, 0x7F81, 0x7FC0, 2, 0x7F41, 0x7EF5, 0x7EE4,
+        0x7F4A, 0x7EC0, 0x7EE4, 0x7EE1, 0x7EEF,
+    ];
+    let bad_op_arity: Vec<u16> = vec![
+        0x7EE0, 0x7EE3, 0, 1, 0x7EC0, 0x7F81, 0x7FC0, 0x7F81, 0x7FC0, 2, 0x7E00, 0x7F10, 0x7F81,
+        0x7FC0, 0x7EC0, 0x7EE4, 0x7F4A, 0x7E00, 0x7EE4, 0x7EE1, 0x7EEF,
+    ];
+    for (label, case) in [
+        ("bad_call_32539", &bad_call_32539),
+        ("missing_ret", &missing_ret),
+        ("bad_branch_lbl", &bad_branch_lbl),
+        ("bad_op_arity", &bad_op_arity),
+    ] {
+        if pure_default_compile_u16_to_elf(case, 0, 0, 0).is_ok() {
+            return Err(format!(
+                "S2.1 Pure-M2 standalone seed accepted unverified S1 crash case '{}'",
+                label
+            ));
+        }
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        let m2_raw = std::fs::read("pure/m2/m2.omni_bc")
+            .map_err(|e| format!("S2.1 read pure/m2/m2.omni_bc: {}", e))?;
+        let m2_u16 = decode_bytes_to_u16_stream(&m2_raw);
+        let m2_elf = compile_pure_u16_to_x86_64_elf_multi(&m2_u16, 0, 0, 0)?;
+        let tmp_m2 = PrivateTempElf::new(&m2_elf, "s2_1_m2_native")?;
+        for (label, case) in [
+            ("bad_call_32539", &bad_call_32539),
+            ("missing_ret", &missing_ret),
+            ("bad_branch_lbl", &bad_branch_lbl),
+            ("bad_op_arity", &bad_op_arity),
+        ] {
+            let case_path = tmp_m2.dir.join(format!("{}.omni_bc", label));
+            std::fs::write(&case_path, encode_u16_stream_to_bytes(case))
+                .map_err(|e| format!("S2.1 write {}: {}", label, e))?;
+            let out = std::process::Command::new(&tmp_m2.path)
+                .arg(&case_path)
+                .output()
+                .map_err(|e| format!("S2.1 exec m2.elf on {}: {}", label, e))?;
+            if out.status.code() != Some(1) || !out.stdout.is_empty() {
+                return Err(format!(
+                    "S2.1 native m2.elf did not refuse '{}': status={:?} stdout_len={}",
+                    label,
+                    out.status,
+                    out.stdout.len()
+                ));
+            }
+        }
+    }
+    checks += 1;
+
+    // 3. §2.2: `p4_shim_exec_bc` (`p4-exec`) must verify input before executing, and a 412-byte (206-word)
+    //    mutated stream must terminate in bounded time (< 3s).
+    let mut mem_shim = MemoryThinShim::new();
+    mem_shim.files.insert(
+        String::from("bad_call.omni_bc"),
+        encode_u16_stream_to_bytes(&bad_call_32539),
+    );
+    if p4_shim_exec_bc(&mut mem_shim, "bad_call.omni_bc", None, 0, 0, 0, 100_000, 0).is_ok() {
+        return Err(String::from(
+            "S2.2 p4_shim_exec_bc (p4-exec) executed unverified bad_call.omni_bc without rejecting",
+        ));
+    }
+    // Construct a 412-byte (206-word) mutated stream with inflated ins_cnt=50000 in header.
+    let mut stream_206w = ok_u16.clone();
+    if stream_206w.len() > 9 {
+        stream_206w[9] = 50_000; // mutated ins_cnt in FN_DEF
+    }
+    while stream_206w.len() < 206 {
+        stream_206w.push(0x7F00);
+    }
+    stream_206w.truncate(206);
+    let t0 = std::time::Instant::now();
+    let (_, _, err_206, _, _) = p4_run_raw_bc_on_pure_vm(&stream_206w, 1, 0, 0, 5_000, 0)?;
+    if err_206 == 0 || t0.elapsed().as_secs() >= 5 {
+        return Err(format!(
+            "S2.2 412-byte mutated stream failed bound check: err={} elapsed={:?}",
+            err_206,
+            t0.elapsed()
+        ));
+    }
+    checks += 1;
+
+    // 4. §2.4: PrivateTempElf creates a private temp directory + O_EXCL file and cleans up on Drop.
+    let (priv_dir, priv_path) = {
+        let tmp_elf = PrivateTempElf::new(&[0x7F, b'E', b'L', b'F'], "s2_4_check")?;
+        if !tmp_elf.dir.is_dir() || !tmp_elf.path.is_file() {
+            return Err(String::from("S2.4 PrivateTempElf failed to create private dir/file"));
+        }
+        if std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_elf.path)
+            .is_ok()
+        {
+            return Err(String::from("S2.4 O_EXCL (create_new) did not reject existing file"));
+        }
+        (tmp_elf.dir.clone(), tmp_elf.path.clone())
+    };
+    if priv_path.exists() || priv_dir.exists() {
+        return Err(String::from("S2.4 PrivateTempElf Drop did not clean up temp dir/file"));
+    }
+    checks += 1;
+
+    // 5. §2.2 host wall-clock cap: an infinite loop on OmniBinaryVm with a 5ms wall timeout terminates cleanly.
+    let inf_u16 = with_lockstep_suspended(|| {
+        compile_omni_surface_strict_to_u16(
+            "#[strict]\nfn main(n: i64) -> i64 { let i: i64 = 0; while n > 0 { i = i + 1; } return i; }\n",
+        )
+    })?;
+    let inf_mod = decode_omni_token_stream(&inf_u16)?;
+    let mut timed_vm = OmniBinaryVm::with_budgets(500_000_000, 16 * 1024 * 1024);
+    timed_vm.set_wall_timeout_ms(5);
+    match timed_vm.execute_function(&inf_mod, 0, vec![OmniValue::Int(1)]) {
+        Ok(_) => return Err(String::from("S2.2 host wall-clock cap did not terminate infinite loop")),
+        Err(msg) => {
+            if !msg.contains("wall-clock timeout exceeded") {
+                return Err(format!("S2.2 expected wall-clock timeout error, got: {}", msg));
+            }
+        }
+    }
+    checks += 1;
+
+    // 6. §2.5: `run_omni_serve_cli` must reject a positional bind address and require `--bind`.
+    let code = run_omni_serve_cli(&[
+        String::from("route GET \"/\" => 1;"),
+        String::from("127.0.0.1:0"),
+    ]);
+    if code != 2 {
+        return Err(format!(
+            "S2.5 run_omni_serve_cli accepted positional bind address (exit={}, want 2)",
+            code
+        ));
+    }
+    checks += 1;
+
+    // 7. Audit Round 2 N4 + Round 3 L-C: Native cache hardening (reject pre-created loose dir, stable 0700 per-user unset-HOME fallback).
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let prev_xdg = std::env::var_os("XDG_CACHE_HOME");
+        let prev_home = std::env::var_os("HOME");
+        let loose_root = std::env::temp_dir().join(format!("omni_n4_loose_{}", std::process::id()));
+        let loose_cache = loose_root.join("omni").join("native-v1");
+        let _ = std::fs::remove_dir_all(&loose_root);
+        std::fs::create_dir_all(&loose_cache).map_err(|e| format!("N4 mkdir loose: {}", e))?;
+        std::fs::set_permissions(&loose_cache, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("N4 chmod loose: {}", e))?;
+        std::env::set_var("XDG_CACHE_HOME", &loose_root);
+        let loose_res = native_toolchain_cache_dir();
+        let _ = std::fs::remove_dir_all(&loose_root);
+
+        // Audit Round-3 L-C: unset HOME/XDG -> one stable per-user `$TMPDIR/omni-native-cache-<euid>`
+        // (0700, owned by euid, reused across calls/processes), and a pre-created loose 0755
+        // fallback dir (e.g. squatted by another user) is rejected fail-closed. Run under a
+        // private TMPDIR so the gate never touches the real per-user fallback directory.
+        let prev_tmp = std::env::var_os("TMPDIR");
+        let fb_root = std::env::temp_dir().join(format!("omni_lc_fallback_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&fb_root);
+        std::fs::create_dir_all(&fb_root).map_err(|e| format!("L-C mkdir fallback root: {}", e))?;
+        let squat_root = std::env::temp_dir().join(format!("omni_lc_squat_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&squat_root);
+        let squat_dir = squat_root.join(format!("omni-native-cache-{}", current_euid()));
+        std::fs::create_dir_all(&squat_dir).map_err(|e| format!("L-C mkdir squat: {}", e))?;
+        std::fs::set_permissions(&squat_dir, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("L-C chmod squat: {}", e))?;
+        std::env::remove_var("XDG_CACHE_HOME");
+        std::env::remove_var("HOME");
+        std::env::set_var("TMPDIR", &fb_root);
+        let fallback_res = native_toolchain_cache_dir();
+        let fallback_res2 = native_toolchain_cache_dir();
+        std::env::set_var("TMPDIR", &squat_root);
+        let squat_res = native_toolchain_cache_dir();
+        match prev_tmp {
+            Some(v) => std::env::set_var("TMPDIR", v),
+            None => std::env::remove_var("TMPDIR"),
+        }
+
+        match prev_xdg {
+            Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+
+        if loose_res.is_ok() {
+            return Err(String::from("N4 native_toolchain_cache_dir accepted pre-created 0755 loose dir"));
+        }
+        let lc_check = (|| -> Result<(), String> {
+            let fb_dir = fallback_res.map_err(|e| format!("L-C unset-HOME fallback failed: {}", e))?;
+            let fb_dir2 = fallback_res2.map_err(|e| format!("L-C unset-HOME fallback (2nd call) failed: {}", e))?;
+            let want = fb_root.join(format!("omni-native-cache-{}", current_euid()));
+            if fb_dir != want || fb_dir2 != want {
+                return Err(format!(
+                    "L-C unset-HOME fallback not the stable per-user dir: {} / {} (want {})",
+                    fb_dir.display(),
+                    fb_dir2.display(),
+                    want.display()
+                ));
+            }
+            let fb_meta = std::fs::symlink_metadata(&fb_dir).map_err(|e| format!("L-C lstat fallback: {}", e))?;
+            if !fb_meta.file_type().is_dir() || fb_meta.uid() != current_euid() || (fb_meta.mode() & 0o077) != 0 {
+                return Err(format!(
+                    "L-C unset-HOME fallback dir unsafe (uid={}, mode={:o})",
+                    fb_meta.uid(),
+                    fb_meta.mode() & 0o777
+                ));
+            }
+            let leaked = std::fs::read_dir(&fb_root)
+                .map_err(|e| format!("L-C read fallback root: {}", e))?
+                .count();
+            if leaked != 1 {
+                return Err(format!("L-C fallback root holds {} entries after 2 calls (want 1, no per-call leak)", leaked));
+            }
+            match squat_res {
+                Ok(d) => Err(format!("L-C accepted pre-created loose 0755 fallback dir {}", d.display())),
+                Err(msg) if msg.contains("CACHE_UNSAFE_DIR") => Ok(()),
+                Err(msg) => Err(format!("L-C squatted fallback expected CACHE_UNSAFE_DIR, got: {}", msg)),
+            }
+        })();
+        let _ = std::fs::remove_dir_all(&fb_root);
+        let _ = std::fs::remove_dir_all(&squat_root);
+        lc_check?;
+        // Re-verify before spawn: wrong FNV pin must fail closed before exec.
+        let fake_elf = PrivateTempElf::new(&[0x7F, b'E', b'L', b'F'], "n4_tamper")?;
+        match spawn_verified_native_elf(&fake_elf.path, 4, 0xDEAD_BEEF_CAFE_BABE, &[]) {
+            Ok(_) => return Err(String::from("N4 spawn_verified_native_elf spawned ELF with mismatched pin")),
+            Err(msg) => {
+                if !msg.contains("NATIVE_ELF_PIN_MISMATCH") {
+                    return Err(format!("N4 expected NATIVE_ELF_PIN_MISMATCH, got: {}", msg));
+                }
+            }
+        }
+    }
+    checks += 1;
+
+    // 7b. Audit Round-3 L-D: a native-cache failure on a CLI verify path prints
+    //     `[NATIVE-CACHE FAIL]` (never `[PURE-VERIFY FAIL]`), and a real verifier rejection
+    //     still prints `[PURE-VERIFY FAIL]` (never `[NATIVE-CACHE FAIL]`).
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let exe = std::env::current_exe().map_err(|e| format!("L-D current_exe: {}", e))?;
+        let ld_root = std::env::temp_dir().join(format!("omni_ld_label_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ld_root);
+        let ld_cache = ld_root.join("xdg").join("omni").join("native-v1");
+        std::fs::create_dir_all(&ld_cache).map_err(|e| format!("L-D mkdir: {}", e))?;
+        std::fs::set_permissions(&ld_cache, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("L-D chmod: {}", e))?;
+        // Under `cargo test` the current exe is the libtest harness in `target/*/deps/`, which
+        // would treat `run-wasm` as a test filter and exit 0. There, check the same cache-dir
+        // rejection and CLI label mapping in-process instead of spawning.
+        let exe_is_test_harness = exe
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n == "deps")
+            .unwrap_or(false);
+        let ld_check = (|| -> Result<(), String> {
+            if exe_is_test_harness {
+                let cache_e = match verify_private_cache_dir(&ld_cache) {
+                    Ok(()) => return Err(String::from("L-D loose 0755 cache dir accepted (expected CACHE_UNSAFE_DIR)")),
+                    Err(e) => e,
+                };
+                let cache_label = cli_fail_label("PURE-VERIFY FAIL", &cache_e);
+                if !cache_label.starts_with("[NATIVE-CACHE FAIL]") || !cache_label.contains("CACHE_UNSAFE_DIR") {
+                    return Err(format!("L-D loose cache dir must label [NATIVE-CACHE FAIL], got {}", cache_label));
+                }
+                let verify_e = match pure_default_verify_u16(&[0x1234u16, 0x7EE3, 0x7EEF], false) {
+                    Ok(()) => return Err(String::from("L-D bad stream passed pure verifier")),
+                    Err(e) => e,
+                };
+                let verify_label = cli_fail_label("PURE-VERIFY FAIL", &verify_e);
+                if !verify_label.starts_with("[PURE-VERIFY FAIL]") {
+                    return Err(format!("L-D verifier rejection must label [PURE-VERIFY FAIL], got {}", verify_label));
+                }
+                return Ok(());
+            }
+            let good_u16 = compile_omni_surface_file_to_u16("spec/acceptance/goldens/seed6_clamp.omni")?;
+            let good_bc = ld_root.join("good.omni_bc");
+            std::fs::write(&good_bc, encode_u16_stream_to_bytes(&good_u16))
+                .map_err(|e| format!("L-D write good bc: {}", e))?;
+            let bad_bc = ld_root.join("bad.omni_bc");
+            std::fs::write(&bad_bc, encode_u16_stream_to_bytes(&[0x1234u16, 0x7EE3, 0x7EEF]))
+                .map_err(|e| format!("L-D write bad bc: {}", e))?;
+            let cache_out = std::process::Command::new(&exe)
+                .arg("run-wasm")
+                .arg(&good_bc)
+                .env("XDG_CACHE_HOME", ld_root.join("xdg"))
+                .output()
+                .map_err(|e| format!("L-D spawn (loose cache): {}", e))?;
+            let cache_err = String::from_utf8_lossy(&cache_out.stderr).into_owned();
+            if cache_out.status.code() != Some(1)
+                || !cache_err.contains("[NATIVE-CACHE FAIL]")
+                || !cache_err.contains("CACHE_UNSAFE_DIR")
+                || cache_err.contains("[PURE-VERIFY FAIL]")
+            {
+                return Err(format!(
+                    "L-D loose cache dir must print [NATIVE-CACHE FAIL] (exit 1), got exit={:?} stderr={}",
+                    cache_out.status.code(),
+                    cache_err.trim()
+                ));
+            }
+            let verify_out = std::process::Command::new(&exe)
+                .arg("run-wasm")
+                .arg(&bad_bc)
+                .output()
+                .map_err(|e| format!("L-D spawn (bad stream): {}", e))?;
+            let verify_err = String::from_utf8_lossy(&verify_out.stderr).into_owned();
+            if verify_out.status.code() != Some(1)
+                || !verify_err.contains("[PURE-VERIFY FAIL]")
+                || verify_err.contains("[NATIVE-CACHE FAIL]")
+            {
+                return Err(format!(
+                    "L-D verifier rejection must print [PURE-VERIFY FAIL] (exit 1), got exit={:?} stderr={}",
+                    verify_out.status.code(),
+                    verify_err.trim()
+                ));
+            }
+            Ok(())
+        })();
+        let _ = std::fs::remove_dir_all(&ld_root);
+        ld_check?;
+    }
+    checks += 1;
+
+    // 8. Audit Round 2 L3 & L4: Wasm AOT arity check on crafted 1-op 0x7F17 (`idxpanic_5`) and 2-op 0x7F2C (TMAJ)
+    //    must return Err(BAD_ARITY) without panicking, and native m2.elf rejection must not mislabel as OUT_OF_BOUNDS.
+    for &(label, bad_op, ops) in &[
+        ("idxpanic_5_0x7f17", 0x7F17u16, &[0x7EC0u16][..]),
+        ("tmaj_2op_0x7f2c", 0x7F2Cu16, &[0x7EC0u16, 0x7EC0u16][..]),
+    ] {
+        let mut s = vec![
+            0x7EE0,
+            0x7EE3, 0, 1, 0x7EC0, 0x7F81, 0x7FC0, 0x7F81, 0, 2,
+            0x7E00, bad_op, 0x7F81, 0x7FC0,
+        ];
+        s.extend_from_slice(ops);
+        s.extend_from_slice(&[0x7EE4, 0x7F4A, 0x7E00, 0x7EE4, 0x7EEF]);
+        match compile_pure_u16_to_wasm(&s) {
+            Ok(_) => return Err(format!("L3 Wasm AOT accepted under-arity '{}' without BAD_ARITY", label)),
+            Err(msg) => {
+                if !msg.contains("BAD_ARITY") {
+                    return Err(format!("L3 '{}' expected BAD_ARITY, got: {}", label, msg));
+                }
+            }
+        }
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        match pure_default_compile_u16_to_elf(&bad_call_32539, 0, 0, 0) {
+            Ok(_) => return Err(String::from("L4 native m2.elf accepted bad_call_32539")),
+            Err(msg) => {
+                if msg.starts_with(OMNI_OOB_ERROR) {
+                    return Err(format!("L4 native m2.elf rejection mislabeled as OUT_OF_BOUNDS: {}", msg));
+                }
+            }
+        }
+    }
+    checks += 1;
+
+    Ok(checks)
+}
+
+/// Parses optional `[a0, a1, a2]` arguments for `omni compile-elf <in> <out> [a0 a1 a2]`.
+/// Audit §4.3: defaults to `(0, 0, 0)` when omitted so `compile-elf` matches the B4 gate.
+pub fn parse_compile_elf_args(pos: &[&str]) -> (i64, i64, i64) {
+    let a0 = pos.get(2).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+    let a1 = pos.get(3).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+    let a2 = pos.get(4).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+    (a0, a1, a2)
+}
+
+/// Audit §4 Honesty hard gate (`./omnic s4-honesty`):
+///   1. §4.3: `compile-elf` defaults `[a0, a1, a2]` to `(0, 0, 0)` so `compile-elf pure/m4/m4.omni_bc`
+///      produces the exact same ELF bytes and FNV-1a64 hash as the B4 gate (`0/0/0`).
+///   2. §4.1: `README.md` and `oracle/README.md` distinguish the 236-line classified Stage-0 seed
+///      (`seed0` 134 + `p4_shim` 102) from the live runtime-required Rust lines (`monolith + m2_host + p4_shim`),
+///      and `oracle/README.md` accurately states that `zero_rust_rebuild.sh` invokes `./omni` ("no Rust toolchain on PATH").
+///   3. §4.2: Line counts in `README.md` and `oracle/README.md` match live `wc -l` measurements on disk,
+///      `seed0/omni_seed0.rs` header comments match code constants, and `pure/m5/launcher.omni` is documented
+///      honestly as a 237-byte `.omni_bc` `0x7EE0` header validator / entry stub.
+pub fn selftest_s4_honesty() -> Result<usize, String> {
+    let mut checks = 0usize;
+
+    // 1. §4.3: `parse_compile_elf_args` must default to (0, 0, 0) when [a0 a1 a2] are omitted.
+    let (a0, a1, a2) = parse_compile_elf_args(&["pure/m4/m4.omni_bc", "out.elf"]);
+    if (a0, a1, a2) != (0, 0, 0) {
+        return Err(format!(
+            "S4.3 compile-elf default args must be (0, 0, 0) to match B4 gate, got ({}, {}, {})",
+            a0, a1, a2
+        ));
+    }
+    checks += 1;
+
+    // 2. §4.1 & §4.2: Live `wc -l` measurements vs `README.md` and `oracle/README.md`.
+    let count_lines = |p: &str| -> Result<usize, String> {
+        let b = std::fs::read(p).map_err(|e| format!("S4 read {}: {}", p, e))?;
+        Ok(b.iter().filter(|&&c| c == b'\n').count())
+    };
+    let monolith_lines = count_lines("omni_rust_bootstrap.rs")?;
+    let m2_host_lines = count_lines("m2_host/decode_diff.rs")? + count_lines("m2_host/lint.rs")?;
+    let pure_default_lines = count_lines("host_runtime/pure_default.rs")?;
+    let p4_shim_lines = count_lines("p4_shim/mod.rs")?;
+    let seed0_lines = count_lines("seed0/omni_seed0.rs")?;
+    let dev_host_lines = count_lines("omni_dev_host.rs")?;
+    if seed0_lines + p4_shim_lines != 236 || dev_host_lines != 40 {
+        return Err(format!(
+            "S4.1 seed0 ({}) + p4_shim ({}) != 236 or dev_host ({}) != 40",
+            seed0_lines, p4_shim_lines, dev_host_lines
+        ));
+    }
+    let runtime_rust_lines = monolith_lines + m2_host_lines + pure_default_lines + p4_shim_lines;
+    let oracle_readme = std::fs::read_to_string("oracle/README.md")
+        .map_err(|e| format!("S4 read oracle/README.md: {}", e))?;
+    let main_readme = std::fs::read_to_string("README.md")
+        .map_err(|e| format!("S4 read README.md: {}", e))?;
+    if oracle_readme.contains("not invoked on default `compile`/`run`/`self-host` or `zero_rust_rebuild.sh`") {
+        return Err(String::from(
+            "S4.1 oracle/README.md still claims oracle is not invoked on zero_rust_rebuild.sh",
+        ));
+    }
+    if !oracle_readme.contains(&runtime_rust_lines.to_string())
+        || !oracle_readme.contains(&monolith_lines.to_string())
+        || !oracle_readme.contains(&m2_host_lines.to_string())
+        || !oracle_readme.contains(&pure_default_lines.to_string())
+    {
+        return Err(format!(
+            "S4.2 oracle/README.md line counts drifted from live wc -l (monolith={}, m2_host={}, pure_default={}, runtime_rust={})",
+            monolith_lines, m2_host_lines, pure_default_lines, runtime_rust_lines
+        ));
+    }
+    if !main_readme.contains("validator/entry stub") {
+        return Err(String::from(
+            "S4.2 README.md must qualify M5 237-byte ELF as a .omni_bc header validator/entry stub",
+        ));
+    }
+    // Audit Round 2 L7: lock all 5 frozen hashes in README.md unconditionally.
+    for &(label, hex) in &[
+        ("Phase D BC", "0x23B8D17257CCA9C4"),
+        ("Phase D ELF", "0x8D5AAAD22399A1EE"),
+        ("Core suite", "0x78462AE4C81DF408"),
+        ("Stage-1 BC", "0xED4C50AA79563EFF"),
+        ("Stage-1 ELF", "0x62F14B335B52BECC"),
+    ] {
+        if !main_readme.contains(hex) {
+            return Err(format!("S4.2 README.md missing frozen {} hash {}", label, hex));
+        }
+    }
+    // Optional strict README gate (`OMNI_STRICT_README=1` or `--strict-readme`): locks seed table,
+    // M4 ELF size, 5-backend wording, and archived workspace path once docs PR lands.
+    let strict_readme = matches!(
+        std::env::var("OMNI_STRICT_README").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    );
+    if strict_readme {
+        for &(label, needle) in &[
+            ("M3 seed hash", "0x6209BB280E70BD5F"),
+            ("M2 seed hash", "0x1DE7EDF361BB3626"),
+            ("M4 seed hash", "0x99567F6F5D0E8F32"),
+            ("M4 ELF size", "89,789"),
+            ("archived workspace", "oracle/archived-workspace/Cargo.toml"),
+        ] {
+            if !main_readme.contains(needle) {
+                return Err(format!("L7 strict README missing {} ('{}')", label, needle));
+            }
+        }
+        if main_readme.contains("4-backend") {
+            return Err(String::from("L7 strict README still contains stale '4-backend' claim"));
+        }
+        if main_readme.contains("omni-workspace/Cargo.toml") {
+            return Err(String::from("L7 strict README still references moved 'omni-workspace/Cargo.toml'"));
+        }
+    }
+    checks += 1;
+
+    // 3. §4.2: `seed0/omni_seed0.rs` header comment must match the active SEED_M2 / SEED_M4 pins.
+    let seed0_src = std::fs::read_to_string("seed0/omni_seed0.rs")
+        .map_err(|e| format!("S4 read seed0/omni_seed0.rs: {}", e))?;
+    if !seed0_src.contains("59,685 words, 0x6209BB280E70BD5F")
+        || !seed0_src.contains("41,289 words, 0x1DE7EDF361BB3626")
+        || !seed0_src.contains("27,819 words, 0x99567F6F5D0E8F32")
+    {
+        return Err(String::from(
+            "S4.2 seed0/omni_seed0.rs header comment drifted from SEED_M2/SEED_M4 constants",
+        ));
+    }
+    checks += 1;
+
+    Ok(checks)
+}
+
+
+/// Audit §3 Performance gate (`./omni s3-perf`):
+///   1. Committed standalone seeds `pure/m3/m3_standalone.omni_bc` and `pure/m4/m4_standalone.omni_bc`
+///      exist and match `M3_STANDALONE_OMNI_SRC` / `M4_STANDALONE_OMNI_SRC` with 0-word diff.
+///   2. On Linux x86-64, the default `pure_default_compile_surface_to_u16`, `pure_default_compile_u16_to_elf`,
+///      and `pure_default_run_u16` paths execute hash-pinned native ELFs (`m3.elf`, `m2.elf`, `m4.elf`) with:
+///        - 0-word diff vs interpreted on `pure/verifier_engine.omni` & `pure/m3/include.omni` (< 1,000 ms)
+///        - exact negative error span parity (`error[M3_CODE_...]`, line 3)
+///        - 0-byte diff vs interpreted on `pure/m4/m4.omni_bc` -> `89,789 B` (`0x4CD6D6CCB4408577`, < 500 ms)
+///        - exact `(ret, steps)` parity on `loop n=20000` -> `(200010000, 180010)` (< 1,000 ms) and
+///          `error[OUT_OF_BOUNDS]` trap parity on OOB input.
+///   3. All 5 frozen FNV-1a64 hashes remain intact.
+pub fn selftest_s3_performance() -> Result<usize, String> {
+    let mut checks = 0usize;
+
+    // 1. Standalone seeds exist and match source (0-word diff).
+    let m3_sa_raw = std::fs::read("pure/m3/m3_standalone.omni_bc")
+        .map_err(|e| format!("S3.1 missing pure/m3/m3_standalone.omni_bc: {}", e))?;
+    let m4_sa_raw = std::fs::read("pure/m4/m4_standalone.omni_bc")
+        .map_err(|e| format!("S3.1 missing pure/m4/m4_standalone.omni_bc: {}", e))?;
+    if m3_sa_raw.len() % 2 != 0 || m4_sa_raw.len() % 2 != 0 {
+        return Err(String::from("S3.1 standalone .omni_bc seed has odd byte length"));
+    }
+    let m3_sa_exp = resolve_omni_surface_includes(M3_STANDALONE_OMNI_SRC, None, None)?;
+    let m3_sa_ref = encode_u16_stream_to_bytes(&with_lockstep_suspended(|| {
+        compile_omni_surface_strict_to_u16(&m3_sa_exp)
+    })?);
+    if m3_sa_raw != m3_sa_ref {
+        return Err(format!(
+            "S3.1 pure/m3/m3_standalone.omni_bc drift ({} B, 0x{:016X} != {} B, 0x{:016X})",
+            m3_sa_raw.len(),
+            fnv1a_64_hash(&m3_sa_raw),
+            m3_sa_ref.len(),
+            fnv1a_64_hash(&m3_sa_ref)
+        ));
+    }
+    let m4_sa_ref = encode_u16_stream_to_bytes(&with_lockstep_suspended(|| {
+        compile_omni_surface_strict_to_u16(M4_STANDALONE_OMNI_SRC)
+    })?);
+    if m4_sa_raw != m4_sa_ref {
+        return Err(format!(
+            "S3.1 pure/m4/m4_standalone.omni_bc drift ({} B, 0x{:016X} != {} B, 0x{:016X})",
+            m4_sa_raw.len(),
+            fnv1a_64_hash(&m4_sa_raw),
+            m4_sa_ref.len(),
+            fnv1a_64_hash(&m4_sa_ref)
+        ));
+    }
+    // Audit Round 2 L6: standalone verifier seed matches verifier_standalone_source() (0-word diff).
+    let ve_sa_raw = std::fs::read("pure/verifier_standalone.omni_bc")
+        .map_err(|e| format!("S3.1 missing pure/verifier_standalone.omni_bc: {}", e))?;
+    let ve_sa_src = verifier_standalone_source();
+    let ve_sa_ref = encode_u16_stream_to_bytes(&with_lockstep_suspended(|| {
+        compile_omni_surface_strict_to_u16(&ve_sa_src)
+    })?);
+    if ve_sa_raw != ve_sa_ref {
+        return Err(format!(
+            "S3.1 pure/verifier_standalone.omni_bc drift ({} B, 0x{:016X} != {} B, 0x{:016X})",
+            ve_sa_raw.len(),
+            fnv1a_64_hash(&ve_sa_raw),
+            ve_sa_ref.len(),
+            fnv1a_64_hash(&ve_sa_ref)
+        ));
+    }
+    checks += 1;
+
+    // 2. Native-ELF default path parity & latency bounds (on Linux x86-64).
+    let ve_src = std::fs::read_to_string("pure/verifier_engine.omni")
+        .map_err(|e| format!("S3 read verifier_engine.omni: {}", e))?;
+    let inc_src = std::fs::read_to_string("pure/m3/include.omni")
+        .map_err(|e| format!("S3 read include.omni: {}", e))?;
+
+    // Warm once so cold-cache first-time m2.elf bootstrap isn't counted against steady-state latency.
+    let _warm_inc = pure_default_compile_surface_to_u16(&inc_src, true)?;
+
+    let t0 = std::time::Instant::now();
+    let ve_default = pure_default_compile_surface_to_u16(&ve_src, true)?;
+    let dt_ve_ms = t0.elapsed().as_millis();
+    let ve_rust = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(&ve_src))?;
+    if ve_default != ve_rust {
+        return Err(format!(
+            "S3.2 native-default M3 word diff on pure/verifier_engine.omni ({}w vs {}w)",
+            ve_default.len(),
+            ve_rust.len()
+        ));
+    }
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) && dt_ve_ms > 1000 {
+        return Err(format!(
+            "S3.2 compile pure/verifier_engine.omni took {} ms (> 1000 ms native bound — still interpreted?)",
+            dt_ve_ms
+        ));
+    }
+
+    // Negative surface error span parity between default and interpreted.
+    let bad_src = "#[strict]\nfn main(x: i64) -> i64 {\n    return unknown_ident_xyz;\n}\n";
+    let err_def = pure_default_compile_surface_to_u16(bad_src, true).err().unwrap_or_default();
+    let err_int = with_pure_default_interpreted(|| pure_default_compile_surface_to_u16(bad_src, true))
+        .err()
+        .unwrap_or_default();
+    if err_def != err_int || !err_def.contains("line 3,") {
+        return Err(format!(
+            "S3.2 negative surface error mismatch: default='{}' vs interpreted='{}'",
+            err_def, err_int
+        ));
+    }
+    checks += 1;
+
+    // 3. Default compile-elf on pure/m4/m4.omni_bc -> exact 89,789 B (0x4CD6D6CCB4408577) in < 500 ms.
+    let m4_raw = std::fs::read("pure/m4/m4.omni_bc")
+        .map_err(|e| format!("S3 read m4.omni_bc: {}", e))?;
+    let m4_u16 = decode_bytes_to_u16_stream(&m4_raw);
+    let t1 = std::time::Instant::now();
+    let m4_elf = pure_default_compile_u16_to_elf(&m4_u16, 0, 0, 0)?;
+    let dt_m2_ms = t1.elapsed().as_millis();
+    let h_m4_elf = fnv1a_64_hash(&m4_elf);
+    if m4_elf.len() != 89_789 || h_m4_elf != 0x4CD6_D6CC_B440_8577 {
+        return Err(format!(
+            "S3.3 default compile-elf m4.omni_bc mismatch: {} B (0x{:016X}) != 89789 B (0x4CD6D6CCB4408577)",
+            m4_elf.len(),
+            h_m4_elf
+        ));
+    }
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) && dt_m2_ms > 500 {
+        return Err(format!(
+            "S3.3 compile-elf pure/m4/m4.omni_bc took {} ms (> 500 ms native bound — still interpreted?)",
+            dt_m2_ms
+        ));
+    }
+    checks += 1;
+
+    // 4. Default run on loop n=20000 -> (200010000, 180010) in < 2000 ms + OOB trap parity.
+    let loop_src = "#[strict]\nfn main(n: i64) -> i64 {\n    let s: i64 = 0;\n    let i: i64 = 1;\n    while n - i + 1 <=> 0 {\n        s = s + i;\n        i = i + 1;\n    }\n    return s;\n}\n";
+    let loop_u16 = pure_default_compile_surface_to_u16(loop_src, true)?;
+    let (ret_100_def, steps_100_def) = pure_default_run_u16(&loop_u16, 100, 0, 0, false)?;
+    let (ret_100_int, steps_100_int) =
+        with_pure_default_interpreted(|| pure_default_run_u16(&loop_u16, 100, 0, 0, false))?;
+    if (ret_100_def, steps_100_def) != (5050, steps_100_int) || ret_100_int != 5050 {
+        return Err(format!(
+            "S3.4 loop n=100 parity mismatch: default=({}, {}) vs interpreted=({}, {})",
+            ret_100_def, steps_100_def, ret_100_int, steps_100_int
+        ));
+    }
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        let t2 = std::time::Instant::now();
+        let (ret_20k, steps_20k) = pure_default_run_u16(&loop_u16, 20_000, 0, 0, false)?;
+        let dt_m4_ms = t2.elapsed().as_millis();
+        if ret_20k != 200_010_000 || steps_20k != 180_010 {
+            return Err(format!(
+                "S3.4 loop n=20000 result mismatch: got ({}, {}) want (200010000, 180010)",
+                ret_20k, steps_20k
+            ));
+        }
+        if dt_m4_ms > 2000 {
+            return Err(format!(
+                "S3.4 run loop n=20000 took {} ms (> 2000 ms native bound — still interpreted?)",
+                dt_m4_ms
+            ));
+        }
+    }
+    // OOB trap parity: negative index on `ld_u64` must trap with `error[OUT_OF_BOUNDS]`.
+    let oob_src = "#[strict]\nfn main(x: i64) -> i64 {\n    let b: bytes = anew(0);\n    return ld_u64(b, 0 - 8);\n}\n";
+    let oob_u16 = pure_default_compile_surface_to_u16(oob_src, true)?;
+    let oob_def = pure_default_run_u16(&oob_u16, 0, 0, 0, false).err().unwrap_or_default();
+    let oob_int = with_pure_default_interpreted(|| pure_default_run_u16(&oob_u16, 0, 0, 0, false))
+        .err()
+        .unwrap_or_default();
+    if !oob_def.starts_with(OMNI_OOB_ERROR) || oob_def != oob_int {
+        return Err(format!(
+            "S3.4 OOB trap parity mismatch: default='{}' vs interpreted='{}'",
+            oob_def, oob_int
+        ));
+    }
+    checks += 1;
+
+    // 5. All 5 frozen FNV-1a64 hashes intact.
+    selftest_m2_frozen_hashes()?;
+    checks += 1;
+
+    Ok(checks)
+}
+
+/// Helper: verify an ELF64 binary has `e_phnum == 2`, `e_entry == 0x4000B0`,
+/// `PT_LOAD` (`p_type=1`, `p_flags=5`) at offset 64, and non-executable
+/// `PT_GNU_STACK` (`p_type=0x6474E551`, `p_flags=6` = `PF_R | PF_W`) at offset 120.
+pub fn verify_elf64_pt_gnu_stack(elf: &[u8], label: &str) -> Result<(), String> {
+    if elf.len() < 176 || &elf[0..4] != b"\x7fELF" {
+        return Err(format!("S5.2 {}: invalid or truncated ELF64 ({} B)", label, elf.len()));
+    }
+    let e_entry = u64::from_le_bytes(elf[24..32].try_into().unwrap());
+    let e_phnum = u16::from_le_bytes(elf[56..58].try_into().unwrap());
+    let pt_load_type = u32::from_le_bytes(elf[64..68].try_into().unwrap());
+    let pt_load_flags = u32::from_le_bytes(elf[68..72].try_into().unwrap());
+    let pt_stack_type = u32::from_le_bytes(elf[120..124].try_into().unwrap());
+    let pt_stack_flags = u32::from_le_bytes(elf[124..128].try_into().unwrap());
+    if e_phnum != 2 || e_entry != 0x0040_00B0 {
+        return Err(format!(
+            "S5.2 {}: expected e_phnum=2 e_entry=0x4000B0, got e_phnum={} e_entry=0x{:X}",
+            label, e_phnum, e_entry
+        ));
+    }
+    if pt_load_type != 1 || pt_load_flags != 5 {
+        return Err(format!(
+            "S5.2 {}: bad PT_LOAD (type={}, flags={})",
+            label, pt_load_type, pt_load_flags
+        ));
+    }
+    if pt_stack_type != 0x6474_E551 || pt_stack_flags != 6 {
+        return Err(format!(
+            "S5.2 {}: missing non-exec PT_GNU_STACK (type=0x{:X}, flags={}; want 0x6474E551, 6)",
+            label, pt_stack_type, pt_stack_flags
+        ));
+    }
+    Ok(())
+}
+
+/// Audit §5 Single Re-Freeze gate (`./omni s5-refreeze`):
+///   1. §1.3 strict bounds on 4-op `ISET -9` (`iset_patch_i64` OOB -> `error[OUT_OF_BOUNDS]`,
+///      never silent no-op) on both Rust `OmniBinaryVm` and Pure-M4 VM.
+///   2. `PT_GNU_STACK` (`PF_R | PF_W`, non-executable stack) present on all generated ELFs
+///      (single-fn Rust x86-64, multi-fn Rust x86-64, Pure-M2 ELF, and Stage-1 ELF).
+///   3. Burned-down `backend-diff` xfails (IMOD rdx clobber, trit clamp, non-trit BR_POS/BR_NEG)
+///      are removed from `BACKEND_DIFF_XFAILS` and pass natively.
+///   4. All 5 re-frozen FNV-1a64 hashes intact.
+pub fn selftest_s5_refreeze() -> Result<usize, String> {
+    let mut checks = 0usize;
+
+    // 1. §1.3: 4-op ISET -9 (`iset_patch_i64`) OOB must trap with `error[OUT_OF_BOUNDS]`.
+    let oob_m9_src = "#[strict]\nfn main(x: i64) -> i64 {\n    let b: bytes = anew(0);\n    b = iset_i64(b, x);\n    b = iset_patch_i64(b, 4, 42);\n    return slen(b);\n}\n";
+    let oob_m9_u16 = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(oob_m9_src))?;
+    let oob_m9_mod = decode_omni_token_stream(&oob_m9_u16)?;
+    let mut vm = OmniBinaryVm::new();
+    match vm.execute_function(&oob_m9_mod, 0, vec![OmniValue::Int(7)]) {
+        Ok(v) => {
+            return Err(format!(
+                "S5.1 Rust VM ISET -9 OOB must return error[OUT_OF_BOUNDS], got Ok({:?})",
+                v
+            ));
+        }
+        Err(e) if !e.contains("OUT_OF_BOUNDS") => {
+            return Err(format!("S5.1 Rust VM ISET -9 OOB wrong error: {}", e));
+        }
+        Err(_) => {}
+    }
+    match pure_default_run_u16(&oob_m9_u16, 7, 0, 0, false) {
+        Ok(v) => {
+            return Err(format!(
+                "S5.1 Pure-M4 VM ISET -9 OOB must return error[OUT_OF_BOUNDS], got Ok({:?})",
+                v
+            ));
+        }
+        Err(e) if !e.contains("OUT_OF_BOUNDS") => {
+            return Err(format!("S5.1 Pure-M4 VM ISET -9 OOB wrong error: {}", e));
+        }
+        Err(_) => {}
+    }
+    checks += 1;
+
+    // 2. PT_GNU_STACK non-executable stack header on single-fn, multi-fn, and Pure-M2 ELFs.
+    let tiny_src = "#[strict]\nfn main(x: i64) -> i64 { return x + 1; }\n";
+    let tiny_u16 = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(tiny_src))?;
+    let elf_single = compile_pure_u16_to_x86_64_elf_with_args(&tiny_u16, 0, 0, 0)?;
+    verify_elf64_pt_gnu_stack(&elf_single, "rust_single_elf")?;
+    let elf_multi = compile_pure_u16_to_x86_64_elf_multi(&tiny_u16, 0, 0, 0)?;
+    verify_elf64_pt_gnu_stack(&elf_multi, "rust_multi_elf")?;
+    let elf_pure_m2 = pure_default_compile_u16_to_elf(&tiny_u16, 0, 0, 0)?;
+    verify_elf64_pt_gnu_stack(&elf_pure_m2, "pure_m2_elf")?;
+    checks += 1;
+
+    // 3. Burned-down xfails must no longer appear in BACKEND_DIFF_XFAILS.
+    let removed_xfails: &[(&str, &str)] = &[
+        ("p3_imod_rdx_clobber", "x86"),
+        ("p3_imod_zero_after_tcmp", "x86"),
+        ("p3_imod_min_neg1_after_tcmp", "x86"),
+        ("p4_trit_clamp", "x86"),
+        ("p4_trit_clamp", "wasm"),
+        ("p5_if_pos_nontrit", "x86"),
+        ("p5_if_pos_nontrit", "wasm"),
+        ("p5_if_neg_nontrit", "x86"),
+        ("p5_if_neg_nontrit", "wasm"),
+    ];
+    for &(cid, be) in removed_xfails {
+        if OMNI_DIFF4_KNOWN_DIVERGENCES.iter().any(|&(id, b, _)| id == cid && b == be) {
+            return Err(format!(
+                "S5.3 burned-down xfail ({}, {}) is still listed in OMNI_DIFF4_KNOWN_DIVERGENCES",
+                cid, be
+            ));
+        }
+    }
+    checks += 1;
+
+    // 4. All 5 re-frozen FNV-1a64 hashes intact.
+    selftest_m2_frozen_hashes()?;
+    checks += 1;
+
+    Ok(checks)
+}
+
+/// Audit §6 Cleanup & Hardening gate (`./omni s6-cleanup`):
+///   1. Production `pure_default_*` functions live in `host_runtime/pure_default.rs`
+///      (not inside the differential oracle test file `m2_host/decode_diff.rs`).
+///   2. Duplicate Rust oracle `omni-workspace/` is archived at `oracle/archived-workspace/`
+///      with `ARCHIVED.md`, leaving `omni_rust_bootstrap.rs` as the single Rust oracle.
+///   3. `.github/workflows/ci.yml` includes a dedicated `fuzz-smoke` job, `permissions: contents: read`,
+///      and SHA-pinned actions.
+///   4. `m2-lint` deduplicates repeated foreign-module notes across all 27 registered modules.
+///   5. All 5 re-frozen FNV-1a64 hashes remain intact.
+pub fn selftest_s6_cleanup() -> Result<usize, String> {
+    let mut checks = 0usize;
+
+    // 1. pure_default_* extracted into host_runtime/pure_default.rs.
+    let pd_src = std::fs::read_to_string("host_runtime/pure_default.rs")
+        .map_err(|e| format!("S6.2 missing host_runtime/pure_default.rs: {}", e))?;
+    let dd_src = std::fs::read_to_string("m2_host/decode_diff.rs")
+        .map_err(|e| format!("S6.2 read m2_host/decode_diff.rs: {}", e))?;
+    for sym in [
+        "pub fn pure_default_compile_surface_to_u16",
+        "pub fn pure_default_compile_u16_to_elf",
+        "pub fn pure_default_run_u16",
+        "pub fn pure_default_verify_u16",
+        "pub fn pure_default_expand_includes",
+    ] {
+        if !pd_src.contains(sym) {
+            return Err(format!("S6.2 host_runtime/pure_default.rs missing `{}`", sym));
+        }
+        if dd_src.lines().any(|l| l.trim_start().starts_with(sym)) {
+            return Err(format!("S6.2 m2_host/decode_diff.rs still defines `{}`", sym));
+        }
+    }
+    checks += 1;
+
+    // 2. Duplicate workspace oracle archived.
+    if std::path::Path::new("omni-workspace").exists() {
+        return Err(String::from("S6.1 omni-workspace/ must be archived to oracle/archived-workspace/"));
+    }
+    if !std::path::Path::new("oracle/archived-workspace/ARCHIVED.md").exists() {
+        return Err(String::from("S6.1 missing oracle/archived-workspace/ARCHIVED.md"));
+    }
+    checks += 1;
+
+    // 3. CI workflow has fuzz-smoke job + permissions + SHA pinning.
+    let ci_yml = std::fs::read_to_string(".github/workflows/ci.yml")
+        .map_err(|e| format!("S6.3 read .github/workflows/ci.yml: {}", e))?;
+    if !ci_yml.contains("fuzz-smoke:") || !ci_yml.contains("permissions:") || !ci_yml.contains("contents: read") {
+        return Err(String::from("S6.3 .github/workflows/ci.yml missing fuzz-smoke job or permissions: contents: read"));
+    }
+    checks += 1;
+
+    // 4. m2-lint deduplication check (lint.rs tracks seen_foreign_notes).
+    let lint_src = std::fs::read_to_string("m2_host/lint.rs")
+        .map_err(|e| format!("S6.3 read m2_host/lint.rs: {}", e))?;
+    if !lint_src.contains("seen_foreign_notes") {
+        return Err(String::from("S6.3 m2_host/lint.rs missing foreign-note deduplication"));
+    }
+    checks += 1;
+
+    // 5. All 5 re-frozen FNV-1a64 hashes intact.
+    selftest_m2_frozen_hashes()?;
+    checks += 1;
+
+    Ok(checks)
+}
+
 

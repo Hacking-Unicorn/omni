@@ -33,6 +33,7 @@ pub const OMNI_DB_GET_MISS: i64 = -1;
 /// Fixed KV key cap (Boss Lady 2026-11-14): 8192 distinct keys, the `pure/host_kv.omni` arena size
 /// (0x1B0000..0x1EFFFF at 32 B). The 8193rd new key is `BUDGET_EXCEEDED`; overwrites still succeed.
 pub const OMNI_VM_KV_MAX_KEYS: usize = 8192;
+pub const DEFAULT_VM_WALL_TIMEOUT_MS: u64 = 600_000;
 
 pub struct OmniBinaryVm {
     pub tables: HashMap<u16, Vec<BTreeMap<u16, OmniValue>>>,
@@ -44,7 +45,10 @@ pub struct OmniBinaryVm {
     pub memory_budget_bytes: usize,
     pub allocated_bytes: usize,
     pub call_depth: usize,
-    pub verified_fns: u64,
+    pub verified_fns: [u64; 16],
+    pub wall_timeout_ms: u64,
+    pub start_instant: Option<std::time::Instant>,
+    frame_pool: Vec<Box<[OmniValue; 224]>>,
 }
 
 impl OmniBinaryVm {
@@ -59,7 +63,10 @@ impl OmniBinaryVm {
             memory_budget_bytes: DEFAULT_VM_MEMORY_BUDGET_BYTES,
             allocated_bytes: 0,
             call_depth: 0,
-            verified_fns: 0,
+            verified_fns: [0; 16],
+            wall_timeout_ms: DEFAULT_VM_WALL_TIMEOUT_MS,
+            start_instant: None,
+            frame_pool: Vec::new(),
         }
     }
 
@@ -74,8 +81,15 @@ impl OmniBinaryVm {
             memory_budget_bytes,
             allocated_bytes: 0,
             call_depth: 0,
-            verified_fns: 0,
+            verified_fns: [0; 16],
+            wall_timeout_ms: DEFAULT_VM_WALL_TIMEOUT_MS,
+            start_instant: None,
+            frame_pool: Vec::new(),
         }
+    }
+
+    pub fn set_wall_timeout_ms(&mut self, timeout_ms: u64) {
+        self.wall_timeout_ms = timeout_ms;
     }
 
     pub fn clear_tables(&mut self) {
@@ -86,7 +100,8 @@ impl OmniBinaryVm {
         self.steps_executed = 0;
         self.allocated_bytes = 0;
         self.call_depth = 0;
-        self.verified_fns = 0;
+        self.verified_fns = [0; 16];
+        self.start_instant = None;
     }
 
     #[inline]
@@ -172,7 +187,8 @@ impl OmniBinaryVm {
         restore_borrowed: &mut [(usize, OmniValue)],
     ) -> Result<OmniValue, String> {
         if self.call_depth == 0 {
-            self.verified_fns = 0;
+            self.verified_fns = [0; 16];
+            self.start_instant = Some(std::time::Instant::now());
         }
         let func = if let Some(f) = module.functions.get(fn_idx as usize).filter(|f| f.fn_idx == fn_idx) {
             f
@@ -184,21 +200,55 @@ impl OmniBinaryVm {
                 .ok_or_else(|| format!("Function index {} not found", fn_idx))?
         };
 
-        let fn_bit = if (fn_idx as usize) < 64 { 1u64 << fn_idx } else { 0 };
-        if fn_bit == 0 || (self.verified_fns & fn_bit) == 0 {
+        let word_idx = (fn_idx as usize) >> 6;
+        let bit_mask = 1u64 << ((fn_idx as usize) & 63);
+        let already_verified = word_idx < self.verified_fns.len() && (self.verified_fns[word_idx] & bit_mask) != 0;
+        if !already_verified {
             let rep = verify_binary_function(func);
             if !rep.passed {
                 return Err(format!("Binary verification failed: {:?}", rep.errors));
             }
-            self.verified_fns |= fn_bit;
+            if word_idx < self.verified_fns.len() {
+                self.verified_fns[word_idx] |= bit_mask;
+            }
         }
 
-        let mut regs: [OmniValue; 224] = std::array::from_fn(|_| OmniValue::Void);
+        let mut regs: Box<[OmniValue; 224]> = self
+            .frame_pool
+            .pop()
+            .unwrap_or_else(|| Box::new(std::array::from_fn(|_| OmniValue::Void)));
+        let mut dirty: [u64; 4] = [0; 4];
         for (&(par_tok, _, _), val) in func.params.iter().zip(args.into_iter()) {
             if let Some(slot) = token_to_slot(par_tok) {
                 regs[slot] = val;
+                dirty[slot >> 6] |= 1u64 << (slot & 63);
             }
         }
+        let res = self.execute_function_body(module, func, owned_params, restore_borrowed, &mut regs, &mut dirty);
+        for (wi, &word) in dirty.iter().enumerate() {
+            let mut m = word;
+            while m != 0 {
+                let tz = m.trailing_zeros() as usize;
+                let slot = (wi << 6) + tz;
+                if slot < 224 {
+                    regs[slot] = OmniValue::Void;
+                }
+                m &= m - 1;
+            }
+        }
+        self.frame_pool.push(regs);
+        res
+    }
+
+    fn execute_function_body(
+        &mut self,
+        module: &BinModule,
+        func: &BinFunction,
+        owned_params: u32,
+        restore_borrowed: &mut [(usize, OmniValue)],
+        regs: &mut [OmniValue; 224],
+        dirty: &mut [u64; 4],
+    ) -> Result<OmniValue, String> {
 
         let mut label_pcs: Option<[usize; 256]> = None;
         let resolve_lbl = |lbl: u16, lp: &mut Option<[usize; 256]>| -> Option<usize> {
@@ -234,7 +284,43 @@ impl OmniBinaryVm {
                 }
                 return Err(format!("error[BUDGET_EXCEEDED]: VM fuel/step budget exceeded ({} > {})", self.steps_executed, self.step_limit));
             }
+            if (self.steps_executed & 0xFFF) == 0 {
+                if let Some(t0) = self.start_instant {
+                    let elapsed_ms = t0.elapsed().as_millis() as u64;
+                    if elapsed_ms > self.wall_timeout_ms {
+                        for &mut (p_idx, ref mut out_v) in restore_borrowed.iter_mut() {
+                            *out_v = std::mem::replace(&mut regs[192 + p_idx], OmniValue::Void);
+                        }
+                        return Err(format!(
+                            "error[BUDGET_EXCEEDED]: VM wall-clock timeout exceeded ({} ms > {} ms)",
+                            elapsed_ms, self.wall_timeout_ms
+                        ));
+                    }
+                }
+            }
             let ins = &func.instructions[pc];
+            let min_ops = match ins.op_tok {
+                0x7F45 => 4,
+                0x7F2C | 0x7F39 => 3,
+                0x7F0E | 0x7F0F | 0x7F10..=0x7F14 | 0x7F17..=0x7F20 | 0x7F22..=0x7F27
+                | 0x7F29..=0x7F2B | 0x7F2D..=0x7F2F | 0x7F31 | 0x7F34 | 0x7F51 | 0x7F6A
+                | 0x7F7F => 2,
+                0x7F01..=0x7F04 | 0x7F06 | 0x7F08 | 0x7F09 | 0x7F15 | 0x7F16 | 0x7F21
+                | 0x7F28 | 0x7F30 | 0x7F35 | 0x7F3F | 0x7F42..=0x7F44 | 0x7F48 | 0x7F4A
+                | 0x7F50 | 0x7F55..=0x7F59 | 0x7F5D | 0x7F63 | 0x7F76 | 0x7F7D | 0x7F7E => 1,
+                _ => 0,
+            };
+            if ins.operands.len() < min_ops {
+                for &mut (p_idx, ref mut out_v) in restore_borrowed.iter_mut() {
+                    *out_v = std::mem::replace(&mut regs[192 + p_idx], OmniValue::Void);
+                }
+                return Err(format!(
+                    "error[BAD_ARITY]: opcode 0x{:04X} requires at least {} operands, got {}",
+                    ins.op_tok,
+                    min_ops,
+                    ins.operands.len()
+                ));
+            }
             match ins.op_tok {
                 0x7F00 | 0x7F40 | 0x7F46 => { pc += 1; continue; }
                 0x7F41 => {
@@ -478,25 +564,21 @@ impl OmniBinaryVm {
                         if let Some(v) = Self::eval_as_i64(&ins.operands[2], &regs) {
                             buf.extend_from_slice(&v.to_le_bytes());
                         }
-                    } else if ins.operands.len() == 4 && ins.operands[1] == BinOperand::ImmInt(-9) {
-                        if let (Some(off), Some(v)) = (
-                            Self::eval_as_i64(&ins.operands[2], &regs),
-                            Self::eval_as_i64(&ins.operands[3], &regs),
-                        ) {
-                            if off >= 0 {
-                                let u_off = off as usize;
-                                if u_off.checked_add(8).map(|end| end <= buf.len()).unwrap_or(false) {
-                                    buf[u_off..u_off + 8].copy_from_slice(&(v as u64).to_le_bytes());
-                                }
-                            }
-                        }
                     } else if ins.operands.len() == 4
-                        && (ins.operands[1] == BinOperand::ImmInt(-2) || ins.operands[1] == BinOperand::ImmInt(-4))
+                        && (ins.operands[1] == BinOperand::ImmInt(-2)
+                            || ins.operands[1] == BinOperand::ImmInt(-4)
+                            || ins.operands[1] == BinOperand::ImmInt(-9))
                     {
-                        // ISA-B 4-op ISET buf, mode, off, val: LE patch of 2/4 bytes. Strict bounds
+                        // ISA-B 4-op ISET buf, mode, off, val: LE patch of 2/4/8 bytes (-2/-4/-9). Strict bounds
                         // (0 <= off && off + width <= len, checked add); out of bounds is a
                         // deterministic runtime error[OUT_OF_BOUNDS] (never a silent no-op).
-                        let width = if ins.operands[1] == BinOperand::ImmInt(-2) { 2usize } else { 4usize };
+                        let width = if ins.operands[1] == BinOperand::ImmInt(-2) {
+                            2usize
+                        } else if ins.operands[1] == BinOperand::ImmInt(-4) {
+                            4usize
+                        } else {
+                            8usize
+                        };
                         if let (Some(off), Some(v)) = (
                             Self::eval_as_i64(&ins.operands[2], &regs),
                             Self::eval_as_i64(&ins.operands[3], &regs),
@@ -508,6 +590,8 @@ impl OmniBinaryVm {
                             }
                             let o = off as usize;
                             buf[o..o + width].copy_from_slice(&(v as u64).to_le_bytes()[..width]);
+                        } else {
+                            return Err(String::from(OMNI_OOB_ERROR));
                         }
                     } else {
                         self.charge_memory(ins.operands.len().saturating_sub(1))?;
@@ -518,21 +602,21 @@ impl OmniBinaryVm {
                     }
                     OmniValue::Bytes(buf)
                 }
-                0x7F10 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a.wrapping_add(b)) } else { OmniValue::Int(0) },
-                0x7F11 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a.wrapping_sub(b)) } else { OmniValue::Int(0) },
-                0x7F12 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a.wrapping_mul(b)) } else { OmniValue::Int(0) },
-                0x7F13 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(if b == 0 { 0 } else { a.wrapping_div(b) }) } else { OmniValue::Int(0) },
-                0x7F14 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(if b == 0 { 0 } else { a.wrapping_rem(b) }) } else { OmniValue::Int(0) },
-                0x7F15 => if let Some(a) = Self::eval_as_i64(&ins.operands[0], &regs) { OmniValue::Int(a.wrapping_neg()) } else { OmniValue::Int(0) },
-                0x7F16 => if let Some(a) = Self::eval_as_i64(&ins.operands[0], &regs) { OmniValue::Int(a.wrapping_abs()) } else { OmniValue::Int(0) },
-                0x7F17 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a.min(b)) } else { OmniValue::Int(0) },
-                0x7F18 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a.max(b)) } else { OmniValue::Int(0) },
-                0x7F1E => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a & b) } else { OmniValue::Int(0) },
-                0x7F1F => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a | b) } else { OmniValue::Int(0) },
-                0x7F20 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a ^ b) } else { OmniValue::Int(0) },
-                0x7F21 => if let Some(a) = Self::eval_as_i64(&ins.operands[0], &regs) { OmniValue::Int(!a) } else { OmniValue::Int(0) },
-                0x7F22 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a.wrapping_shl((b & 63) as u32)) } else { OmniValue::Int(0) },
-                0x7F23 => if let (Some(a), Some(b)) = (Self::eval_as_i64(&ins.operands[0], &regs), Self::eval_as_i64(&ins.operands[1], &regs)) { OmniValue::Int(a.wrapping_shr((b & 63) as u32)) } else { OmniValue::Int(0) },
+                0x7F10 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0).wrapping_add(Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0))),
+                0x7F11 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0).wrapping_sub(Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0))),
+                0x7F12 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0).wrapping_mul(Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0))),
+                0x7F13 => { let a = Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0); let b = Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0); OmniValue::Int(if b == 0 { 0 } else { a.wrapping_div(b) }) }
+                0x7F14 => { let a = Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0); let b = Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0); OmniValue::Int(if b == 0 { 0 } else { a.wrapping_rem(b) }) }
+                0x7F15 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0).wrapping_neg()),
+                0x7F16 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0).wrapping_abs()),
+                0x7F17 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0).min(Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0))),
+                0x7F18 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0).max(Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0))),
+                0x7F1E => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0) & Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0)),
+                0x7F1F => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0) | Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0)),
+                0x7F20 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0) ^ Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0)),
+                0x7F21 => OmniValue::Int(!Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0)),
+                0x7F22 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0).wrapping_shl((Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0) & 63) as u32)),
+                0x7F23 => OmniValue::Int(Self::eval_as_i64(&ins.operands[0], &regs).unwrap_or(0).wrapping_shr((Self::eval_as_i64(&ins.operands[1], &regs).unwrap_or(0) & 63) as u32)),
                 0x7F50 => match Self::eval_op_ref(&ins.operands[0], &regs) {
                     Some(OmniValue::Bytes(b)) => OmniValue::Int(b.len() as i64),
                     Some(OmniValue::Str(s)) => OmniValue::Int(s.len() as i64),
@@ -918,6 +1002,7 @@ impl OmniBinaryVm {
             if let Some(d_tok) = ins.dest_reg {
                 if let Some(slot) = token_to_slot(d_tok) {
                     regs[slot] = out_val;
+                    dirty[slot >> 6] |= 1u64 << (slot & 63);
                 }
             }
             pc += 1;

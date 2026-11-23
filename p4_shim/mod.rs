@@ -88,8 +88,8 @@ pub fn p4_shim_exec_bc(
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
-    let (val, tag, err, steps, tcnt) =
-        p4_run_raw_bc_on_pure_vm(&words, a0, a1, a2, fuel, trace_mode)?;
+    pure_default_verify_u16(&words, false)?;
+    let (val, tag, err, steps, tcnt) = p4_run_raw_bc_on_pure_vm(&words, a0, a1, a2, fuel, trace_mode)?;
     if let Some(op) = out_path {
         let mut summary = Vec::with_capacity(20);
         summary.extend_from_slice(&val.to_le_bytes());

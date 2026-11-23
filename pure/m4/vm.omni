@@ -42,7 +42,7 @@ fn m4v_record_lbl_slot(w: bytes, arr: array, n: i64, base: i64, cur: i64) -> byt
 }
 
 // Pre-index up to 16 local label slots for `fn_slot` (< 256) into `0x20000..0x23FFF`
-// (each entry stores `word_off + 1`; 0 = unset -> falls back to m4v_find_label_off).
+// (each entry stores `word_off + 1`; 0 = unset). Charges 1 fuel unit per decoded instruction.
 #[strict]
 fn m4v_index_fn_labels(w_in: bytes, arr: array, n: i64, fn_slot: i64, ins_start: i64, ins_cnt: i64) -> bytes {
     let out: bytes = if_pos m2u_lt(fn_slot, 256) <=> 0 {
@@ -53,9 +53,11 @@ fn m4v_index_fn_labels(w_in: bytes, arr: array, n: i64, fn_slot: i64, ins_start:
             w = st_u32(w, base + z * 4, 0);
             z = z + 1;
         }
+        let rem: i64 = ld_u64(w, m4s_fuel());
         let cur: i64 = ins_start;
         let i: i64 = 0;
-        while m2u_lt(i, ins_cnt) <=> 0 {
+        let go: i64 = m2u_lt(i, ins_cnt) * m2u_lt(cur, n) * m2u_lt(0, rem);
+        while go <=> 0 {
             let op: i64 = m2d_ins_op(arr, n, cur);
             let wn: bytes = if_pos m2u_eq(op, 32576) <=> 0 {
                 m4v_record_lbl_slot(w, arr, n, base, cur)
@@ -64,10 +66,18 @@ fn m4v_index_fn_labels(w_in: bytes, arr: array, n: i64, fn_slot: i64, ins_start:
             };
             w = wn;
             let nxt: i64 = m2d_decode_at(arr, n, cur);
-            cur = m2u_sel(m2d_is_err(nxt), n, nxt);
+            let bad: i64 = m2d_is_err(nxt);
+            cur = m2u_sel(bad, n, nxt);
+            rem = rem - 1;
             i = i + 1;
+            go = (1 - bad) * m2u_lt(i, ins_cnt) * m2u_lt(cur, n) * m2u_lt(0, rem);
         }
-        w
+        let w_f: bytes = iset_patch_i64(w, m4s_fuel(), rem);
+        if_pos m2u_lt(i, ins_cnt) * m2u_eq(rem, 0) <=> 0 {
+            m4_set_err(w_f, 3)
+        } else {
+            w_f
+        }
     } else {
         w_in
     };
@@ -119,7 +129,7 @@ fn m4v_find_label_off(arr: array, n: i64, ins_start: i64, ins_cnt: i64, target_s
     let cur: i64 = ins_start;
     let i: i64 = 0;
     let found: i64 = 0 - 1;
-    let go: i64 = m2u_lt(0, ins_cnt);
+    let go: i64 = m2u_lt(0, ins_cnt) * m2u_lt(cur, n);
     while go <=> 0 {
         let op: i64 = m2d_ins_op(arr, n, cur);
         let is_lbl: i64 = m2u_eq(op, 32576);
@@ -131,9 +141,10 @@ fn m4v_find_label_off(arr: array, n: i64, ins_start: i64, ins_cnt: i64, target_s
         };
         found = m2u_sel(hit, cur, found);
         let nxt: i64 = m2d_decode_at(arr, n, cur);
-        cur = m2u_sel(m2d_is_err(nxt), n, nxt);
+        let bad: i64 = m2d_is_err(nxt);
+        cur = m2u_sel(bad, n, nxt);
         i = i + 1;
-        go = (1 - hit) * m2u_lt(i, ins_cnt);
+        go = (1 - hit) * (1 - bad) * m2u_lt(i, ins_cnt) * m2u_lt(cur, n);
     }
     return found;
 }
@@ -142,7 +153,7 @@ fn m4v_find_label_off(arr: array, n: i64, ins_start: i64, ins_cnt: i64, target_s
 // m4o_arith, m4o_bit_cmp, and m4o_trit all at once on every ALU/MOV/CMP/TRIT instruction).
 #[strict]
 fn m4v_exec_pure_val(op: i64, v0: i64, v1: i64, v2: i64, v3: i64) -> i64 {
-    let is_mov: i64 = m2u_eq(op, 32516) + m2u_eq(op, 32518) + m2u_eq(op, 32521);
+    let is_mov: i64 = m2u_in(op, 32513, 32516) + m2u_eq(op, 32518) + m2u_eq(op, 32521);
     let res: i64 = if_pos is_mov <=> 0 {
         v0
     } else {
@@ -161,7 +172,12 @@ fn m4v_exec_pure_val(op: i64, v0: i64, v1: i64, v2: i64, v3: i64) -> i64 {
                     let is_sel: i64 = m2u_eq(op, 32581);
                     let sel_r: i64 = m2u_sel(m2u_lt(v0, 0), v1, m2u_sel(m2u_eq(v0, 0), v2, v3));
                     let is_slen: i64 = m2u_eq(op, 32592);
-                    is_sel * sel_r + is_slen * (v0 & m4a_mask32())
+                    let is_tp5: i64 = m2u_eq(op, 32560);
+                    let is_tup5: i64 = m2u_eq(op, 32561);
+                    let bbase_hi: i64 = (v0 >> 32) << 32;
+                    let tp5_r: i64 = bbase_hi | m4o_divmod((v0 & m4a_mask32()) + 4, 5, 0);
+                    let tup5_r: i64 = bbase_hi | (v1 & m4a_mask32());
+                    is_sel * sel_r + is_slen * (v0 & m4a_mask32()) + is_tp5 * tp5_r + is_tup5 * tup5_r
                 };
                 r3
             };
@@ -206,15 +222,21 @@ fn m4v_exec_alu_mem(w: bytes, arr: array, n: i64, sp: i64, off: i64, op: i64, no
     let v1: i64 = m4v_opt_eval(w, sp, nops, 1, p1);
     let v2: i64 = m4v_opt_eval(w, sp, nops, 2, p2);
     let v3: i64 = m4v_opt_eval(w, sp, nops, 3, p3);
-    let is_mem: i64 = m2u_eq(op, 32525) + m2u_eq(op, 32526) + m2u_eq(op, 32527);
+    let t0: i64 = if_pos m2u_lt(0, nops) <=> 0 { m4o_eval_tag(w, sp, p0) } else { 1 };
+    let is_p5v: i64 = m2u_eq(op, 32564) + (m2u_eq(op, 32565) + m2u_eq(op, 32575)) * m2u_ge(t0, 3);
+    let is_mem: i64 = m2u_eq(op, 32525) + m2u_eq(op, 32526) + m2u_eq(op, 32527) + is_p5v;
     let out: bytes = if_pos is_mem <=> 0 {
-        m4v_dispatch_mem(w, sp, dslot, op, nops, v0, v1, v2, v3)
+        m4v_dispatch_mem(w, sp, dslot, op, nops, v0, t0, v1, v2, v3)
     } else {
         let w2: bytes = if_pos m2u_ge(dslot, 0) <=> 0 {
             let rv: i64 = m4v_exec_pure_val(op, v0, v1, v2, v3);
-            let t0: i64 = if_pos m2u_eq(op, 32516) <=> 0 { m4o_eval_tag(w, sp, p0) } else { 1 };
+            let rtag: i64 = m2u_sel(
+                m2u_in(op, 32513, 32516),
+                t0,
+                m2u_sel(m2u_eq(op, 32560), 3, m2u_sel(m2u_eq(op, 32561), 4, 1))
+            );
             let wa: bytes = m4f_set_slot_val(w, sp, dslot, rv);
-            m4f_set_slot_tag(wa, sp, dslot, t0)
+            m4f_set_slot_tag(wa, sp, dslot, rtag)
         } else {
             w
         };
@@ -224,17 +246,22 @@ fn m4v_exec_alu_mem(w: bytes, arr: array, n: i64, sp: i64, off: i64, op: i64, no
 }
 
 #[strict]
-fn m4v_dispatch_mem(w: bytes, sp: i64, dslot: i64, op: i64, nops: i64, v0: i64, v1: i64, v2: i64, v3: i64) -> bytes {
+fn m4v_dispatch_mem(w: bytes, sp: i64, dslot: i64, op: i64, nops: i64, v0: i64, t0: i64, v1: i64, v2: i64, v3: i64) -> bytes {
     let out: bytes = if_pos m2u_eq(op, 32525) <=> 0 {
         m4o_exec_anew(w, sp, dslot)
     } else {
         let w2: bytes = if_pos m2u_eq(op, 32526) <=> 0 {
-            m4o_exec_iget(w, sp, dslot, nops, v0, v1, v2)
+            m4o_exec_iget(w, sp, dslot, nops, v0, t0, v1, v2)
         } else {
-            let w3: bytes = if_pos m2u_eq(nops, 4) <=> 0 {
-                m4o_exec_iset_patch(w, sp, dslot, v0, v1, v2, v3)
+            let w3: bytes = if_pos m2u_eq(op, 32527) <=> 0 {
+                let is_patch: i64 = m2u_eq(nops, 4) * (m2u_eq(v1, 0 - 2) + m2u_eq(v1, 0 - 4) + m2u_eq(v1, 0 - 9));
+                if_pos is_patch <=> 0 {
+                    m4o_exec_iset_patch(w, sp, dslot, v0, v1, v2, v3)
+                } else {
+                    m4o_exec_iset_append(w, sp, dslot, nops, v0, v1, v2, v3)
+                }
             } else {
-                m4o_exec_iset_append(w, sp, dslot, nops, v0, v1, v2)
+                m4o_exec_pack5_vec(w, sp, dslot, op, v0, t0, v1)
             };
             w3
         };
@@ -243,18 +270,15 @@ fn m4v_dispatch_mem(w: bytes, sp: i64, dslot: i64, op: i64, nops: i64, v0: i64, 
     return out;
 }
 
-// O(1) pre-indexed label lookup in `0x20000..0x23FFF`, falling back to linear scan if uncached.
+// O(1) pre-indexed label lookup in `0x20000..0x23FFF` (authoritative for `fslot < 256` and `0 <= loc < 16`;
+// only falls back to linear scan when `in_cache == 0`).
 #[strict]
 fn m4v_lookup_label(w: bytes, arr: array, n: i64, fslot: i64, ins_start: i64, ins_cnt: i64, target_slot: i64) -> i64 {
     let loc: i64 = m2u_sel(m2u_ge(target_slot, 4080), target_slot - 4080, target_slot);
     let in_cache: i64 = m2u_lt(fslot, 256) * m2u_ge(loc, 0) * m2u_lt(loc, 16);
-    let cached: i64 = if_pos in_cache <=> 0 {
-        ld_u32(w, m4a_lbl_cache() + fslot * 64 + loc * 4)
-    } else {
-        0
-    };
-    let res: i64 = if_pos cached <=> 0 {
-        cached - 1
+    let res: i64 = if_pos in_cache <=> 0 {
+        let cached: i64 = ld_u32(w, m4a_lbl_cache() + fslot * 64 + loc * 4);
+        m2u_sel(m2u_lt(0, cached), cached - 1, 0 - 1)
     } else {
         m4v_find_label_off(arr, n, ins_start, ins_cnt, target_slot)
     };
@@ -280,7 +304,7 @@ fn m4v_branch_next_off(w: bytes, arr: array, n: i64, sp: i64, off: i64, op: i64,
             let chosen: i64 = m2u_sel(m2u_lt(cond, 0), p1, m2u_sel(m2u_eq(cond, 0), p2, p3));
             m2lbl_slot_of(chosen)
         } else {
-            let take: i64 = m2u_eq(op, 32579) * m2u_eq(cond, 1) + m2u_eq(op, 32580) * m2u_eq(cond, 0 - 1);
+            let take: i64 = m2u_eq(op, 32579) * m2u_lt(0, cond) + m2u_eq(op, 32580) * m2u_lt(cond, 0);
             m2u_sel(take, m2lbl_slot_of(p1), 0 - 1)
         };
         ts
@@ -402,7 +426,8 @@ fn m4v_exec_ret(w: bytes, arr: array, n: i64, sp: i64, off: i64, nops: i64) -> b
     } else {
         m2u_eq(k0, m2k_imm()) * 1 + m2u_eq(k0, m2k_trit()) * 2
     };
-    let rval: i64 = if_pos m2u_eq(nops, 3) <=> 0 {
+    let is3: i64 = m2u_eq(nops, 3);
+    let rval: i64 = if_pos is3 <=> 0 {
         let p1: i64 = m2d_operand(arr, n, m2d_next(p0));
         let p2: i64 = m2d_operand(arr, n, m2d_next(p1));
         let sl1: i64 = m4_tok_to_slot(m2d_kind(p1), m2d_uval(p1));
@@ -410,17 +435,24 @@ fn m4v_exec_ret(w: bytes, arr: array, n: i64, sp: i64, off: i64, nops: i64) -> b
         let soff: i64 = if_pos m2u_ge(sl1, 0) <=> 0 { ld_u64(w, fbase + sl1 * 8) } else { m2d_ival(p1) };
         let slen_v: i64 = if_pos m2u_ge(sl2, 0) <=> 0 { ld_u64(w, fbase + sl2 * 8) } else { m2d_ival(p2) };
         let bbase: i64 = (v0 >> 32) & m4a_mask32();
-        ((bbase + soff) << 32) | (slen_v & m4a_mask32())
+        let blen: i64 = v0 & m4a_mask32();
+        let ok_sl: i64 = m2u_ge(soff, 0) * m2u_ge(slen_v, 0) * m2u_ge(blen, soff + slen_v);
+        m2u_sel(ok_sl, ((bbase + soff) << 32) | (slen_v & m4a_mask32()), 0 - 1)
     } else {
         v0
     };
-    let rtag: i64 = m2u_sel(m2u_eq(nops, 3), 3, t0);
-    return m4v_ret_apply(w, sp, rval, rtag);
+    let rtag: i64 = m2u_sel(is3, 3, t0);
+    let out: bytes = if_pos is3 * m2u_lt(rval, 0) <=> 0 {
+        m4_set_err(w, 2)
+    } else {
+        m4v_ret_apply(w, sp, rval, rtag)
+    };
+    return out;
 }
 
 #[strict]
 fn m4v_step_noncall(w0: bytes, arr: array, n: i64, sp: i64, off: i64, op: i64, fall: i64, fb: i64, nops: i64) -> bytes {
-    let is_skip: i64 = m2u_eq(op, 32576) + m2u_eq(op, 32512);
+    let is_skip: i64 = m2u_eq(op, 32576) + m2u_eq(op, 32512) + m2u_eq(op, 32517);
     let out: bytes = if_pos is_skip <=> 0 {
         st_u32(w0, fb + 4, fall)
     } else {
@@ -452,15 +484,18 @@ fn m4v_step_one(w_in: bytes, arr: array, n: i64) -> bytes {
     let steps: i64 = ld_u32(w_in, m4s_steps());
     let fid: i64 = ld_u32(w_in, m4a_fn_tbl() + fslot * 16);
     let w0: bytes = st_u32(w_in, m4s_steps(), steps + 1);
-    let w: bytes = if_pos m2u_eq(op, 32586) <=> 0 {
-        m4v_exec_ret(w0, arr, n, sp, off, nops)
+    let w: bytes = if_pos bad_sc <=> 0 {
+        m4_set_err(w0, 1)
     } else {
-        let w_nc: bytes = if_pos m2u_eq(op, 32584) <=> 0 {
-            m4v_exec_call(w0, arr, n, sp, off, fall, nops)
+        if_pos m2u_eq(op, 32586) <=> 0 {
+            m4v_exec_ret(w0, arr, n, sp, off, nops)
         } else {
-            m4v_step_noncall(w0, arr, n, sp, off, op, fall, fb, nops)
-        };
-        w_nc
+            if_pos m2u_eq(op, 32584) <=> 0 {
+                m4v_exec_call(w0, arr, n, sp, off, fall, nops)
+            } else {
+                m4v_step_noncall(w0, arr, n, sp, off, op, fall, fb, nops)
+            }
+        }
     };
     let tmode: i64 = ld_u32(w, m4s_trace_mode());
     let out: bytes = if_pos tmode <=> 0 {
@@ -486,7 +521,7 @@ fn m4v_setup_entry(w1: bytes, a0: i64, a1: i64, a2: i64) -> bytes {
         i = i + 1;
         go = (1 - hit) * m2u_lt(i, fn_cnt);
     }
-    let eslot: i64 = m2u_sel(m2u_ge(eslot_raw, 0), eslot_raw, 0);
+    let eslot: i64 = m2u_sel(m2u_ge(eslot_raw, 0), eslot_raw, fn_cnt - 1);
     let ft: i64 = m4a_fn_tbl() + eslot * 16;
     let e_start: i64 = ld_u32(w1, ft + 8);
     let e_cnt: i64 = ld_u32(w1, ft + 12);
@@ -512,9 +547,10 @@ fn m4_vm_run_i64(w_in: bytes, arr: array, a0: i64, a1: i64, a2: i64, fuel: i64, 
     } else {
         let w1: bytes = m4v_load_fns(w0, arr, n);
         let fn_cnt: i64 = ld_u32(w1, m4s_fn_cnt());
+        let err_init: i64 = ld_u32(w1, m4s_err());
         let w: bytes = m4v_setup_entry(w1, a0, a1, a2);
-        let rem: i64 = fuel;
-        let go: i64 = m2u_lt(0, fn_cnt) * m2u_lt(0, rem);
+        let rem: i64 = ld_u64(w, m4s_fuel());
+        let go: i64 = m2u_eq(err_init, 0) * m2u_lt(0, fn_cnt) * m2u_lt(0, rem);
         while go <=> 0 {
             w = m4v_step_one(w, arr, n);
             rem = rem - 1;
@@ -523,12 +559,13 @@ fn m4_vm_run_i64(w_in: bytes, arr: array, a0: i64, a1: i64, a2: i64, fuel: i64, 
             let halted: i64 = m2u_eq(sp, 65535);
             go = (1 - halted) * m2u_eq(err, 0) * m2u_lt(0, rem);
         }
-        let sp_end: i64 = ld_u32(w, m4s_sp());
-        let err_end: i64 = ld_u32(w, m4s_err());
-        let w_fin: bytes = if_pos m2u_eq(err_end, 0) * (1 - m2u_eq(sp_end, 65535)) * m2u_eq(rem, 0) <=> 0 {
-            m4_set_err(w, 3)
+        let w_rem: bytes = iset_patch_i64(w, m4s_fuel(), rem);
+        let sp_end: i64 = ld_u32(w_rem, m4s_sp());
+        let err_end: i64 = ld_u32(w_rem, m4s_err());
+        let w_fin: bytes = if_pos m2u_eq(err_end, 0) * (1 - m2u_eq(sp_end, 65535)) * m2u_ge(0, rem) <=> 0 {
+            m4_set_err(w_rem, 3)
         } else {
-            w
+            w_rem
         };
         w_fin
     };
