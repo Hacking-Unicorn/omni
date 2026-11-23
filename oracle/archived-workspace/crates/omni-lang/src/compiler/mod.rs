@@ -2060,25 +2060,6 @@ impl SurfaceLowerCtx {
         }
     }
 
-    /// True if any instruction in `start..end` writes `dst` as its destination register.
-    fn dest_defined_in_range(&self, start: usize, end: usize, dst: &str) -> bool {
-        if self.emit_asm {
-            self.lines[start..end].iter().any(|line| {
-                let mut it = line.split_whitespace();
-                it.next() == Some(dst) && it.next() == Some("=")
-            })
-        } else {
-            let want: Option<u16> = dst
-                .strip_prefix('%')
-                .and_then(|n| n.parse::<u16>().ok())
-                .map(|n| REG_BASE + n);
-            match want {
-                Some(tok) => self.packets[start..end].iter().any(|pkt| pkt.first() == Some(&tok)),
-                None => false,
-            }
-        }
-    }
-
     /// If a value-returning branch would emit temps before writing the join dest,
     /// define that dest first so SSA numbering stays a single contiguous join slot.
     /// Programs whose first branch already writes the dest (existing goldens) are unchanged.
@@ -2097,10 +2078,12 @@ impl SurfaceLowerCtx {
         if self.first_dest_name_in_range(region_start, end).as_deref() == Some(dst) {
             return Ok(());
         }
-        // A join dest that is already defined earlier in this function (e.g. `w = if_pos c {..} else {..}`
-        // assigning an existing variable) is live: the arm may read it, so it must not be clobbered with
-        // `CINT 0`. Only a fresh join dest (from `let r = if_pos ..`) gets the contiguity init.
-        if self.dest_defined_in_range(0, region_start, dst) {
+        // A join dest bound to a named variable (`w = if_pos c {..} else {..}` assigning an existing
+        // variable, possibly through nested if tails) is live: the arm may read it, so it must never be
+        // clobbered with `CINT 0`. Only a fresh `let r = if_pos ..` join dest (not yet bound) gets the
+        // contiguity init, exactly as before. A write of a fresh dest in a sibling/nested branch does
+        // not dominate this arm, so it is deliberately not consulted here.
+        if self.var_map.values().any(|r| r == dst) {
             return Ok(());
         }
         let asm = format!("{} = CINT 0", dst);
