@@ -7257,7 +7257,34 @@ pub fn selftest_s2_security() -> Result<usize, String> {
         std::fs::create_dir_all(&ld_cache).map_err(|e| format!("L-D mkdir: {}", e))?;
         std::fs::set_permissions(&ld_cache, std::fs::Permissions::from_mode(0o755))
             .map_err(|e| format!("L-D chmod: {}", e))?;
+        // Under `cargo test` the current exe is the libtest harness in `target/*/deps/`, which
+        // would treat `run-wasm` as a test filter and exit 0. There, check the same cache-dir
+        // rejection and CLI label mapping in-process instead of spawning.
+        let exe_is_test_harness = exe
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n == "deps")
+            .unwrap_or(false);
         let ld_check = (|| -> Result<(), String> {
+            if exe_is_test_harness {
+                let cache_e = match verify_private_cache_dir(&ld_cache) {
+                    Ok(()) => return Err(String::from("L-D loose 0755 cache dir accepted (expected CACHE_UNSAFE_DIR)")),
+                    Err(e) => e,
+                };
+                let cache_label = cli_fail_label("PURE-VERIFY FAIL", &cache_e);
+                if !cache_label.starts_with("[NATIVE-CACHE FAIL]") || !cache_label.contains("CACHE_UNSAFE_DIR") {
+                    return Err(format!("L-D loose cache dir must label [NATIVE-CACHE FAIL], got {}", cache_label));
+                }
+                let verify_e = match pure_default_verify_u16(&[0x1234u16, 0x7EE3, 0x7EEF], false) {
+                    Ok(()) => return Err(String::from("L-D bad stream passed pure verifier")),
+                    Err(e) => e,
+                };
+                let verify_label = cli_fail_label("PURE-VERIFY FAIL", &verify_e);
+                if !verify_label.starts_with("[PURE-VERIFY FAIL]") {
+                    return Err(format!("L-D verifier rejection must label [PURE-VERIFY FAIL], got {}", verify_label));
+                }
+                return Ok(());
+            }
             let good_u16 = compile_omni_surface_file_to_u16("spec/acceptance/goldens/seed6_clamp.omni")?;
             let good_bc = ld_root.join("good.omni_bc");
             std::fs::write(&good_bc, encode_u16_stream_to_bytes(&good_u16))
