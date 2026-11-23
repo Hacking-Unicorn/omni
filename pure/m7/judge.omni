@@ -180,12 +180,14 @@ fn p7_unpack5_trit(packed_byte: i64, idx: i64) -> trit {
 fn p7_verify_trace_ring(w: bytes) -> i64 {
     let trace_cnt: i64 = ld_u32(w, 167960);
     let cap: i64 = if_pos (trace_cnt - 4096) <=> 0 { 4096 } else { trace_cnt };
+    let start: i64 = sel_trit((trace_cnt - 4096) <=> 0, 0, 0, trace_cnt & 4095);
     let i: i64 = 0;
     let prev_step: i64 = -1;
     let ok: i64 = 1;
     let csum: i64 = 0;
     while i < cap {
-        let off: i64 = 458752 + i * 16;
+        let slot: i64 = (start + i) & 4095;
+        let off: i64 = 458752 + slot * 16;
         let step_idx: i64 = ld_u32(w, off);
         let op_tok: i64 = ld_u16(w, off + 6);
         let mono: i64 = if_pos step_idx <=> prev_step { 1 } else { 0 };
