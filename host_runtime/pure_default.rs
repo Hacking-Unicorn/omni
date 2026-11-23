@@ -706,7 +706,17 @@ pub fn pure_default_expand_includes(
     // Reject quarantined `macro` directives on the user's raw source BEFORE include expansion
     // so reported `(line, col)` spans refer to the user's file, not post-expansion line numbers.
     pure_default_reject_macros(src)?;
-    if !src.contains("include") && !src.contains("mod ") && !src.contains("mod\"") {
+    // Audit Round-3 L-F: only invoke the Pure-Omni include scanner when a line actually starts
+    // with an `include ` / `include"` / `mod ` / `mod"` directive (matching `m3i_scan_includes`),
+    // avoiding false positives on identifiers like `empty_mod ` or comments mentioning `include`.
+    let has_inc_or_mod = src.lines().any(|line| {
+        let t = line.trim_start();
+        t.starts_with("include ")
+            || t.starts_with("include\"")
+            || t.starts_with("mod ")
+            || t.starts_with("mod\"")
+    });
+    if !has_inc_or_mod {
         return Ok(String::from(src));
     }
     let inc_u16 = pure_default_compile_surface_to_u16(M3_INCLUDE_OMNI_SRC, true)?;
