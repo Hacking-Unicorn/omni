@@ -13,7 +13,7 @@ With `rustc` and `cargo` absent from `PATH`, run:
 ```bash
 bash scripts/zero_rust_rebuild.sh
 ```
-This verifies all 3 embedded seeds via `./omni-seed0`, runs the 181-byte zero-shim M5 launcher ELF64 (`0x87E30A9BB58BB3C4`), executes the native zero-Rust-binary `m2.elf -> m4.elf` chain (`76,782 B`, `0x82F217F319C2BDF5`), and checks `m2-fixed-point`, `m3-fixed-point`, `p5-sys`, `p7-measure`, and `p7-canary`.
+This verifies all 3 embedded seeds via `./omni-seed0`, runs the 181-byte zero-shim M5 launcher ELF64 (`0x87E30A9BB58BB3C4`), executes the native zero-Rust-binary `m2.elf -> m4.elf` chain (`84,554 B`, `0xA3DEFBD2EC36A7B8`), and checks `m2-fixed-point`, `m3-fixed-point`, `p5-sys`, `p7-measure`, and `p7-canary`.
 
 ## Independent Verifier Checker (Phase C2)
 Run the zero-dependency Python 3 checker over the published verifier traces:

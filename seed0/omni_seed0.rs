@@ -6,7 +6,7 @@
 // zero Rust AOT. Its ONLY responsibilities are:
 //   1. Embed & verify exact FNV-1a64 hashes of the 3 committed Pure-Omni seeds:
 //      - `pure/m3/m3.omni_bc` (59,474 words, 0x0668919FB4378D88)
-//      - `pure/m2/m2.omni_bc` (33,551 words, 0xC30924711C8C95E9)
+//      - `pure/m2/m2.omni_bc` (35,529 words, 0x51C0E67C68F1D13A)
 //      - `pure/m4/m4.omni_bc` (26,076 words, 0x00299F8C0BB3F88A)
 //   2. Extract seeds to disk (`emit-seeds <out_dir>`).
 //   3. Provide the thin 3-op ELF/seed loader shim (`run-elf <path> [args...]`)
@@ -20,11 +20,11 @@ const SEED_M2_BYTES: &[u8] = include_bytes!("../pure/m2/m2.omni_bc");
 const SEED_M4_BYTES: &[u8] = include_bytes!("../pure/m4/m4.omni_bc");
 
 const SEED_M3_FNV: u64 = 0x0668919FB4378D88;
-const SEED_M2_FNV: u64 = 0x04A83A6E91820FB2;
+const SEED_M2_FNV: u64 = 0x51C0E67C68F1D13A;
 const SEED_M4_FNV: u64 = 0x00299F8C0BB3F88A;
 
 const SEED_M3_WORDS: usize = 59_474;
-const SEED_M2_WORDS: usize = 34_168;
+const SEED_M2_WORDS: usize = 35_529;
 const SEED_M4_WORDS: usize = 26_076;
 
 fn fnv1a_64(bytes: &[u8]) -> u64 {

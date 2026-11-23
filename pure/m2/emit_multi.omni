@@ -296,7 +296,12 @@ fn m2m_emit_entry_stub(arena: bytes, is_bytes: i64, entry_fn: i64, arg0: i64, ar
     w3 = m2m_fn_rel32(w3, entry_fn, pass);
     w3 = m2x_b4(w3, 72, 131, 196, 32);                      // 48 83 C4 20
     let w4: bytes = if_pos cb {
-        let t: bytes = m2x_b4(w3, 72, 141, 52, 3);          // 48 8D 34 03
+        // Bytes return ABI: rax = descriptor (base << 32) | len.
+        // Extract base (rcx) and len (rdx); write(1, rbx+base, len); exit(0).
+        let t: bytes = m2x_b3(w3, 72, 137, 193);            // 48 89 C1 mov rcx, rax
+        t = m2x_b4(t, 72, 193, 233, 32);                    // 48 C1 E9 20 shr rcx, 32
+        t = m2a_emit_u16(t, 49801);                         // 89 C2 mov edx, eax
+        t = m2x_b4(t, 72, 141, 52, 11);                     // 48 8D 34 0B lea rsi, [rbx+rcx]
         t = m2a_emit_u8(t, 191);                            // BF
         t = m2a_emit_u32(t, 1);
         t = m2a_emit_u8(t, 184);                            // B8
@@ -348,6 +353,23 @@ fn m2m_oob_check(arena: bytes, width: i64, pass: i64) -> bytes {
     return w;
 }
 
+// Emits multi-mode rbx-arena OOB bounds check for [rcx .. rcx + width) <= rdx (len).
+// Descriptor-model twin of m2m_oob_check (which bounds against r11).
+#[strict]
+fn m2m_oob_check_len(arena: bytes, width: i64, pass: i64) -> bytes {
+    let w: bytes = m2x_b3(arena, 72, 133, 201);             // 48 85 C9
+    w = m2a_emit_u16(w, 34831);                             // 0F 88 (0x880F)
+    w = m2m_trap_rel32(w, m2mg_t_oob(), pass);
+    w = m2x_b4(w, 72, 141, 65, width);                      // 48 8D 41 width
+    w = m2x_b3(w, 72, 57, 200);                             // 48 39 C8
+    w = m2a_emit_u16(w, 33295);                             // 0F 82 (0x820F)
+    w = m2m_trap_rel32(w, m2mg_t_oob(), pass);
+    w = m2x_b3(w, 72, 57, 208);                             // 48 39 D0 cmp rax, rdx
+    w = m2a_emit_u16(w, 34575);                             // 0F 87 (0x870F)
+    w = m2m_trap_rel32(w, m2mg_t_oob(), pass);
+    return w;
+}
+
 // Emits multi-mode append capacity guard (r11 + k <= 0x100000, else T_CAP).
 #[strict]
 fn m2m_cap_guard(arena: bytes, k: i64, pass: i64) -> bytes {
@@ -360,7 +382,10 @@ fn m2m_cap_guard(arena: bytes, k: i64, pass: i64) -> bytes {
     return w;
 }
 
-// Emits multi-mode MOV/ANEW/SLEN (typed SLEN: ARRAY param -> [rbx+0x120000], else r11).
+// Emits multi-mode MOV/ANEW/SLEN. Descriptor model (VM parity): a `bytes` SSA value
+// is `(base << 32) | len`; r11 is the bump cursor (arena top). ANEW allocates at the
+// top: dest = (r11 << 32) | 0, r11 unchanged. SLEN (ARRAY param -> [rbx+0x120000],
+// else) extracts the low 32 bits (len) of the descriptor.
 #[strict]
 fn m2m_emit_basic(arena: bytes, op: i64, d: i64, op0: i64) -> bytes {
     let is_mov: trit = (m2u_in(op, 32513, 32516) + m2u_eq(op, 32518) + m2u_eq(op, 32521) + m2u_in(op, 32599, 32601)) <=> 0;
@@ -373,7 +398,8 @@ fn m2m_emit_basic(arena: bytes, op: i64, d: i64, op0: i64) -> bytes {
         arena
     };
     let r2: bytes = if_pos is_anew {
-        let w: bytes = m2x_b3(r1, 69, 49, 219);
+        let w: bytes = m2x_b3(r1, 76, 137, 216);            // 4C 89 D8 mov rax, r11
+        w = m2x_b4(w, 72, 193, 224, 32);                    // 48 C1 E0 20 shl rax, 32
         m2m_store_rax(w, d)
     } else {
         r1
@@ -387,7 +413,8 @@ fn m2m_emit_basic(arena: bytes, op: i64, d: i64, op0: i64) -> bytes {
             let t: bytes = m2x_b3(r2, 72, 139, 131);        // 48 8B 83
             m2a_emit_u32(t, 1179648)                        // 00 00 12 00
         } else {
-            m2x_b3(r2, 76, 137, 216)                        // 4C 89 D8
+            let t: bytes = m2m_load_op(r2, op0, 0);         // rax = descriptor
+            m2a_emit_u16(t, 49289)                          // 89 C0 mov eax, eax (len)
         };
         m2m_store_rax(w, d)
     } else {
@@ -396,67 +423,152 @@ fn m2m_emit_basic(arena: bytes, op: i64, d: i64, op0: i64) -> bytes {
     return r3;
 }
 
-// Emits multi-mode IGET (3-op ISA-B ld_u8/16/32/64 from [rbx+rcx], or 2-op bounded input window).
+// Emits multi-mode IGET (3-op ISA-B ld_u8/16/32/64 from [rbx+rcx], 2-op heap byte
+// load for a constructed buffer, or 2-op stdin-window word load for a TY_ARRAY param).
 #[strict]
-fn m2m_emit_iget(arena: bytes, nops: i64, p1: i64, p2: i64, d: i64, pass: i64) -> bytes {
+fn m2m_emit_iget(arena: bytes, nops: i64, p0: i64, p1: i64, p2: i64, d: i64, pass: i64) -> bytes {
     let is_3op: trit = m2u_eq(nops, 3) <=> 0;
     let r: bytes = if_pos is_3op {
+        // 3-op IGET: (buf, mode, off) -> load width bytes at [rbx + base + off],
+        // bounds-checked against len (trap T_OOB). Descriptor model (VM parity).
         let mv: i64 = m2d_ival(p1);
         let width: i64 = 0 - mv;
-        let w: bytes = m2m_load_op(arena, p2, 1);
-        w = m2m_oob_check(w, width, pass);
+        let w: bytes = m2m_load_op(arena, p0, 0);           // rax = descriptor
+        w = m2x_b3(w, 72, 137, 198);                        // 48 89 C6 mov rsi, rax
+        w = m2x_b4(w, 72, 193, 238, 32);                    // 48 C1 EE 20 shr rsi, 32 (base)
+        w = m2a_emit_u16(w, 49801);                         // 89 C2 mov edx, eax (len)
+        w = m2m_load_op(w, p2, 1);                          // rcx = off
+        w = m2m_oob_check_len(w, width, pass);              // [rcx..rcx+width) <= len
+        w = m2x_b3(w, 72, 1, 206);                          // 48 01 CE add rsi, rcx (base+off)
         let c1: trit = m2u_eq(width, 1) <=> 0;
         let c2: trit = m2u_eq(width, 2) <=> 0;
         let c4: trit = m2u_eq(width, 4) <=> 0;
         let c8: trit = m2u_eq(width, 8) <=> 0;
-        let w1: bytes = if_pos c1 { m2x_b4(w, 15, 182, 4, 11) } else { w };
-        let w2: bytes = if_pos c2 { m2x_b4(w1, 15, 183, 4, 11) } else { w1 };
-        let w3: bytes = if_pos c4 { m2x_b3(w2, 139, 4, 11) } else { w2 };
-        let w4: bytes = if_pos c8 { m2x_b4(w3, 72, 139, 4, 11) } else { w3 };
+        let w1: bytes = if_pos c1 { m2x_b4(w, 15, 182, 4, 30) } else { w };
+        let w2: bytes = if_pos c2 { m2x_b4(w1, 15, 183, 4, 30) } else { w1 };
+        let w3: bytes = if_pos c4 { m2x_b3(w2, 139, 4, 30) } else { w2 };
+        let w4: bytes = if_pos c8 { m2x_b4(w3, 72, 139, 4, 30) } else { w3 };
         m2m_store_rax(w4, d)
     } else {
-        let w: bytes = m2m_load_op(arena, p1, 0);
-        w = m2x_b3(w, 72, 59, 131);                         // 48 3B 83
-        w = m2a_emit_u32(w, 1179648);                       // 00 00 12 00
-        w = m2a_emit_u16(w, 2675);                          // 73 0A (0x0A73)
-        w = m2x_b4(w, 15, 183, 132, 67);                    // 0F B7 84 43
-        w = m2a_emit_u32(w, 1048576);                       // 00 00 10 00
-        w = m2x_b4(w, 235, 2, 49, 192);                     // EB 02 31 C0
-        m2m_store_rax(w, d)
+        // 2-op IGET is (buf, idx) -> byte, lenient (0 on OOB) on the VM and in the
+        // Rust reference. A TY_ARRAY param reads the stdin window (token input);
+        // any other buffer is a constructed ISET-heap buffer, read as a byte from
+        // [rbx + base + idx] (0 if idx >= len) under the descriptor model.
+        // The old code read the stdin window for every buffer, so a constructed
+        // buffer always read 0.
+        let mask: i64 = ld_u64(arena, m2l_regs() + 96);
+        let is_par: i64 = m2u_eq(m2d_kind(p0), 2);
+        let bit: i64 = (mask >> m2d_uval(p0)) & 1;
+        let is_arr: trit = (is_par * bit) <=> 0;
+        let r2: bytes = if_pos is_arr {
+            let w: bytes = m2m_load_op(arena, p1, 0);
+            w = m2x_b3(w, 72, 59, 131);                         // 48 3B 83
+            w = m2a_emit_u32(w, 1179648);                       // 00 00 12 00
+            w = m2a_emit_u16(w, 2675);                          // 73 0A (0x0A73)
+            w = m2x_b4(w, 15, 183, 132, 67);                    // 0F B7 84 43
+            w = m2a_emit_u32(w, 1048576);                       // 00 00 10 00
+            w = m2x_b4(w, 235, 2, 49, 192);                     // EB 02 31 C0
+            m2m_store_rax(w, d)
+        } else {
+            // 2-op IGET is (buf, idx) -> byte, lenient (0 on OOB) on the VM.
+            // Descriptor model: base = desc >> 32, len = desc & 0xFFFFFFFF;
+            // read the byte at [rbx + base + idx] (0 if idx >= len). A TY_ARRAY
+            // param reads the stdin window (token input) as before.
+            let w: bytes = m2m_load_op(arena, p0, 0);           // rax = descriptor
+            w = m2x_b3(w, 72, 137, 193);                        // 48 89 C1 mov rcx, rax
+            w = m2x_b4(w, 72, 193, 233, 32);                    // 48 C1 E9 20 shr rcx, 32 (base)
+            w = m2a_emit_u16(w, 49801);                         // 89 C2 mov edx, eax (len)
+            w = m2m_load_op(w, p1, 0);                          // rax = idx
+            w = m2x_b3(w, 72, 57, 208);                         // 48 39 D0 cmp rax, rdx
+            w = m2a_emit_u16(w, 2419);                          // 73 09 jae oob
+            w = m2x_b3(w, 72, 1, 200);                          // 48 01 C8 add rax, rcx
+            w = m2x_b4(w, 15, 182, 4, 3);                       // 0F B6 04 03 movzx eax, byte [rbx+rax]
+            w = m2x_b4(w, 235, 2, 49, 192);                     // EB 02 31 C0 jmp done; xor eax, eax
+            m2m_store_rax(w, d)
+        };
+        r2
     };
     return r;
 }
 
-// Emits multi-mode 4-op ISET (-9 patch no-op on OOB, or -2/-4 ISA-B st_u16/st_u32).
+// Saves the descriptor base (rax >> 32) in rsi. Call after loading a descriptor into rax.
 #[strict]
-fn m2m_emit_iset_patch(arena: bytes, mv: i64, p2: i64, p3: i64, pass: i64) -> bytes {
+fn m2m_save_base_rsi(arena: bytes) -> bytes {
+    let w: bytes = m2x_b3(arena, 72, 137, 198);             // 48 89 C6 mov rsi, rax
+    m2x_b4(w, 72, 193, 238, 32)                             // 48 C1 EE 20 shr rsi, 32
+}
+
+// Builds the new buffer descriptor in rax after an append: rax = (rsi << 32) | (r11 - rsi),
+// where rsi = base and r11 = new top (at-top assumption: base + old_len == old r11).
+#[strict]
+fn m2m_desc_after_append(arena: bytes) -> bytes {
+    let w: bytes = m2x_b3(arena, 72, 137, 240);             // 48 89 F0 mov rax, rsi
+    w = m2x_b4(w, 72, 193, 224, 32);                        // 48 C1 E0 20 shl rax, 32
+    w = m2x_b3(w, 76, 137, 218);                            // 4C 89 DA mov rdx, r11
+    w = m2x_b3(w, 72, 41, 242);                             // 48 29 F2 sub rdx, rsi
+    m2x_b3(w, 72, 9, 208)                                   // 48 09 D0 or rax, rdx
+}
+
+// Emits multi-mode 4-op ISET (-9 patch no-op on OOB, or -2/-4 ISA-B st_u16/st_u32).
+// Descriptor model: the patch writes at [rbx + base + off] (bounds-checked against
+// len), the buffer descriptor is unchanged, so the dest is the original descriptor.
+#[strict]
+fn m2m_emit_iset_patch(arena: bytes, p0: i64, mv: i64, p2: i64, p3: i64, d: i64, pass: i64) -> bytes {
     let is_m9: trit = m2u_eq(mv, 0 - 9) <=> 0;
     let r: bytes = if_pos is_m9 {
-        let t: bytes = m2m_load_op(arena, p2, 1);
-        t = m2m_load_op(t, p3, 0);
-        t = m2x_b3(t, 72, 133, 201);                        // 48 85 C9
-        t = m2a_emit_u16(t, 3448);                          // 78 0D (0x0D78)
-        t = m2x_b4(t, 72, 141, 113, 8);                     // 48 8D 71 08
-        t = m2x_b3(t, 76, 57, 222);                         // 4C 39 DE
-        t = m2a_emit_u16(t, 1143);                          // 77 04 (0x0477)
-        m2x_b4(t, 72, 137, 4, 11)                           // 48 89 04 0B
+        let t: bytes = m2m_load_op(arena, p0, 0);           // rax = descriptor
+        t = m2x_b3(t, 72, 137, 199);                        // 48 89 C7 mov rdi, rax
+        t = m2x_b4(t, 72, 193, 239, 32);                    // 48 C1 EF 20 shr rdi, 32 (base)
+        t = m2a_emit_u16(t, 49801);                         // 89 C2 mov edx, eax (len)
+        t = m2m_load_op(t, p2, 1);                          // rcx = off
+        t = m2m_load_op(t, p3, 0);                          // rax = val
+        t = m2x_b3(t, 72, 1, 207);                          // 48 01 CF add rdi, rcx (base+off)
+        t = m2x_b3(t, 72, 133, 201);                        // 48 85 C9 test rcx, rcx
+        t = m2a_emit_u16(t, 3448);                          // 78 0D js +13 (skip store)
+        t = m2x_b4(t, 72, 141, 113, 8);                     // 48 8D 71 08 lea rsi, [rcx+8]
+        t = m2x_b3(t, 72, 57, 214);                         // 48 39 D6 cmp rsi, rdx
+        t = m2a_emit_u16(t, 1143);                          // 77 04 ja +4 (skip store)
+        t = m2x_b4(t, 72, 137, 4, 31);                      // 48 89 04 1F mov [rbx+rdi], rax
+        let u: bytes = m2m_load_op(t, p0, 0);               // rax = descriptor (unchanged)
+        m2m_store_rax(u, d)
     } else {
+        // -2/-4 ISA-B st_u16/st_u32: trap T_OOB unless 0 <= off and off+width <= len.
         let width: i64 = 0 - mv;
-        let t: bytes = m2m_load_op(arena, p3, 0);
-        t = m2x_b3(t, 72, 137, 194);                        // 48 89 C2
-        t = m2m_load_op(t, p2, 1);
-        t = m2m_oob_check(t, width, pass);
+        let t: bytes = m2m_load_op(arena, p0, 0);           // rax = descriptor
+        t = m2x_b3(t, 72, 137, 199);                        // 48 89 C7 mov rdi, rax
+        t = m2x_b4(t, 72, 193, 239, 32);                    // 48 C1 EF 20 shr rdi, 32 (base)
+        t = m2a_emit_u16(t, 49801);                         // 89 C2 mov edx, eax (len)
+        t = m2m_load_op(t, p3, 0);                          // rax = val
+        t = m2x_b3(t, 72, 137, 198);                        // 48 89 C6 mov rsi, rax (save val)
+        t = m2m_load_op(t, p2, 1);                          // rcx = off
+        t = m2x_b3(t, 72, 133, 201);                        // 48 85 C9 test rcx, rcx
+        t = m2a_emit_u16(t, 34831);                         // 0F 88 js T_OOB
+        t = m2m_trap_rel32(t, m2mg_t_oob(), pass);
+        t = m2x_b4(t, 72, 141, 65, width);                  // 48 8D 41 width lea rax, [rcx+width]
+        t = m2x_b3(t, 72, 57, 200);                         // 48 39 C8 cmp rax, rcx
+        t = m2a_emit_u16(t, 33295);                         // 0F 82 jb T_OOB
+        t = m2m_trap_rel32(t, m2mg_t_oob(), pass);
+        t = m2x_b3(t, 72, 57, 208);                         // 48 39 D0 cmp rax, rdx
+        t = m2a_emit_u16(t, 34575);                         // 0F 87 ja T_OOB
+        t = m2m_trap_rel32(t, m2mg_t_oob(), pass);
+        t = m2x_b3(t, 72, 1, 207);                          // 48 01 CF add rdi, rcx (base+off)
+        t = m2x_b3(t, 72, 137, 240);                        // 48 89 F0 mov rax, rsi (restore val)
         let c2: trit = m2u_eq(width, 2) <=> 0;
-        if_pos c2 {
-            m2x_b4(t, 102, 137, 20, 11)                     // 66 89 14 0B
+        let v: bytes = if_pos c2 {
+            m2x_b4(t, 102, 137, 4, 31)                      // 66 89 04 1F mov [rbx+rdi], ax
         } else {
-            m2x_b3(t, 137, 20, 11)                          // 89 14 0B
-        }
+            m2x_b3(t, 137, 4, 31)                           // 89 04 1F mov [rbx+rdi], eax
+        };
+        let u: bytes = m2m_load_op(v, p0, 0);               // rax = descriptor (unchanged)
+        m2m_store_rax(u, d)
     };
     return r;
 }
 
 // Emits multi-mode ISET (0x7F0F) into the rbx arena with cap/OOB guards.
+// Descriptor model (at-top assumption: the buffer being appended to is the most
+// recently created, so base + len == r11): appends write at [rbx+r11] and bump
+// r11 as before, but the dest is the new descriptor (base<<32)|(len+k), not r11.
 #[strict]
 fn m2m_emit_iset(arena: bytes, arr: array, n: i64, ops_start: i64, nops: i64, d: i64, pass: i64) -> bytes {
     let p0: i64 = m2d_operand(arr, n, ops_start);
@@ -476,43 +588,69 @@ fn m2m_emit_iset(arena: bytes, arr: array, n: i64, ops_start: i64, nops: i64, d:
     let cp: trit = is_patch <=> 0;
     let cb: trit = is_bytes <=> 0;
     let w1: bytes = if_pos c4 {
-        let t: bytes = m2m_cap_guard(arena, 4, pass);
-        t = m2m_load_op(t, p2, 0);
-        t = m2x_b4(t, 66, 137, 4, 27);                      // 42 89 04 1B
-        m2x_b4(t, 73, 131, 195, 4)                          // 49 83 C3 04
+        let t: bytes = m2m_load_op(arena, p0, 0);           // rax = descriptor
+        t = m2x_b3(t, 72, 137, 198);                        // 48 89 C6 mov rsi, rax
+        t = m2x_b4(t, 72, 193, 238, 32);                    // 48 C1 EE 20 shr rsi, 32 (base)
+        t = m2m_cap_guard(t, 4, pass);
+        t = m2m_load_op(t, p2, 0);                          // rax = val
+        t = m2x_b4(t, 66, 137, 4, 27);                      // 42 89 04 1B mov [rbx+r11], eax
+        t = m2x_b4(t, 73, 131, 195, 4);                     // 49 83 C3 04 add r11, 4
+        t = m2x_b3(t, 72, 137, 240);                        // 48 89 F0 mov rax, rsi
+        t = m2x_b4(t, 72, 193, 224, 32);                    // 48 C1 E0 20 shl rax, 32
+        t = m2x_b3(t, 76, 137, 218);                        // 4C 89 DA mov rdx, r11
+        t = m2x_b3(t, 72, 41, 242);                         // 48 29 F2 sub rdx, rsi
+        t = m2x_b3(t, 72, 9, 208);                          // 48 09 D0 or rax, rdx
+        m2m_store_rax(t, d)
     } else {
         arena
     };
     let w2: bytes = if_pos c8 {
-        let t: bytes = m2m_cap_guard(w1, 8, pass);
-        t = m2m_load_op(t, p2, 0);
-        t = m2x_b4(t, 74, 137, 4, 27);                      // 4A 89 04 1B
-        m2x_b4(t, 73, 131, 195, 8)                          // 49 83 C3 08
+        let t: bytes = m2m_load_op(w1, p0, 0);              // rax = descriptor
+        t = m2x_b3(t, 72, 137, 198);                        // 48 89 C6 mov rsi, rax
+        t = m2x_b4(t, 72, 193, 238, 32);                    // 48 C1 EE 20 shr rsi, 32 (base)
+        t = m2m_cap_guard(t, 8, pass);
+        t = m2m_load_op(t, p2, 0);                          // rax = val
+        t = m2x_b4(t, 74, 137, 4, 27);                      // 4A 89 04 1B mov [rbx+r11], rax
+        t = m2x_b4(t, 73, 131, 195, 8);                     // 49 83 C3 08 add r11, 8
+        t = m2x_b3(t, 72, 137, 240);                        // 48 89 F0 mov rax, rsi
+        t = m2x_b4(t, 72, 193, 224, 32);                    // 48 C1 E0 20 shl rax, 32
+        t = m2x_b3(t, 76, 137, 218);                        // 4C 89 DA mov rdx, r11
+        t = m2x_b3(t, 72, 41, 242);                         // 48 29 F2 sub rdx, rsi
+        t = m2x_b3(t, 72, 9, 208);                          // 48 09 D0 or rax, rdx
+        m2m_store_rax(t, d)
     } else {
         w1
     };
     let w3: bytes = if_pos cp {
-        m2m_emit_iset_patch(w2, mv, p2, p3, pass)
+        m2m_emit_iset_patch(w2, p0, mv, p2, p3, d, pass)
     } else {
         w2
     };
     let w4: bytes = if_pos cb {
-        let t: bytes = m2m_cap_guard(w3, nops - 1, pass);
+        let t: bytes = m2m_load_op(w3, p0, 0);              // rax = descriptor
+        t = m2x_b3(t, 72, 137, 198);                        // 48 89 C6 mov rsi, rax
+        t = m2x_b4(t, 72, 193, 238, 32);                    // 48 C1 EE 20 shr rsi, 32 (base)
+        t = m2m_cap_guard(t, nops - 1, pass);
         let cur: i64 = pos1;
         let k: i64 = 1;
         while nops - k <=> 0 {
             let pk: i64 = m2d_operand(arr, n, cur);
-            t = m2m_load_op(t, pk, 0);
-            t = m2x_b4(t, 66, 136, 4, 27);                  // 42 88 04 1B
-            t = m2x_b3(t, 73, 255, 195);                    // 49 FF C3
+            t = m2m_load_op(t, pk, 0);                      // rax = byte val
+            t = m2x_b4(t, 66, 136, 4, 27);                  // 42 88 04 1B mov [rbx+r11], al
+            t = m2x_b3(t, 73, 255, 195);                    // 49 FF C3 inc r11
             cur = m2d_next(pk);
             k = k + 1;
         }
-        t
+        t = m2x_b3(t, 72, 137, 240);                        // 48 89 F0 mov rax, rsi
+        t = m2x_b4(t, 72, 193, 224, 32);                    // 48 C1 E0 20 shl rax, 32
+        t = m2x_b3(t, 76, 137, 218);                        // 4C 89 DA mov rdx, r11
+        t = m2x_b3(t, 72, 41, 242);                         // 48 29 F2 sub rdx, rsi
+        t = m2x_b3(t, 72, 9, 208);                          // 48 09 D0 or rax, rdx
+        m2m_store_rax(t, d)
     } else {
         w3
     };
-    return m2m_store_r11_opt(w4, d);
+    return w4;
 }
 
 // Helpers for compact immediate ALU / shift / compare encodings.
@@ -823,12 +961,17 @@ fn m2m_emit_sel_ret(arena: bytes, op: i64, nops: i64, d: i64, op0: i64, op1: i64
                 t = m2x_b3(t, 76, 57, 222);                 // 4C 39 DE
                 t = m2a_emit_u16(t, 34575);                 // 0F 87
                 t = m2m_trap_rel32(t, m2mg_t_oob(), pass);
-                t = m2x_b3(t, 72, 137, 202);                // 48 89 CA
+                // Return the slice as a descriptor in rax: (off << 32) | len.
+                t = m2x_b4(t, 72, 193, 224, 32);            // 48 C1 E0 20 shl rax, 32
+                t = m2x_b3(t, 72, 9, 200);                  // 48 09 C8 or rax, rcx
+                t = m2x_b3(t, 72, 137, 202);                // 48 89 CA mov rdx, rcx (len)
                 m2a_emit_u16(t, 50121)                      // C9 C3 (0xC3C9)
             } else {
-                let t: bytes = m2a_emit_u16(r1, 49201);     // 31 C0
-                t = m2x_b3(t, 76, 137, 218);                // 4C 89 DA
-                m2a_emit_u16(t, 50121)                      // C9 C3
+                // 1-op bytes RET: return the descriptor itself in rax
+                // (rax = (base << 32) | len). The entry stub extracts base/len
+                // from it; CALL stores rax as the descriptor.
+                let t: bytes = m2m_load_op(r1, op0, 0);            // rax = descriptor
+                m2a_emit_u16(t, 50121)                             // C9 C3 leave; ret
             }
         } else {
             let t: bytes = m2m_load_op(r1, op0, 0);
@@ -933,7 +1076,7 @@ fn m2m_emit_one_ins(arena: bytes, arr: array, n: i64, cur: i64, pass: i64, is_by
     let c_alu: trit = (m2u_in(op, 32528, 32557) + m2u_eq(op, 32565) + m2u_eq(op, 32575)) <=> 0;
     let c_ctl: trit = m2u_in(op, 32576, 32586) <=> 0;
     let r1: bytes = if_pos c_basic { m2m_emit_basic(arena, op, d, p0) } else { arena };
-    let r2: bytes = if_pos c_iget { m2m_emit_iget(r1, nops, p1, p2, d, pass) } else { r1 };
+    let r2: bytes = if_pos c_iget { m2m_emit_iget(r1, nops, p0, p1, p2, d, pass) } else { r1 };
     let r3: bytes = if_pos c_iset { m2m_emit_iset(r2, arr, n, ops_start, nops, d, pass) } else { r2 };
     let r4: bytes = if_pos c_alu { m2m_emit_alu_group(r3, op, d, p0, p1, p2) } else { r3 };
     let r5: bytes = if_pos c_ctl { m2m_emit_ctl_group(r4, arr, n, ops_start, nops, op, d, p0, p1, p2, p3, pass, is_bytes) } else { r4 };
