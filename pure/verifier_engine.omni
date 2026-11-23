@@ -992,6 +992,10 @@ fn emit_fn_result(ws: bytes, fn_idx: i64) -> bytes {
     let passed: i64 = is_eq(nerr, 0);
     let cur: i64 = ws_get(w, 21);
     let fit_hdr: i64 = is_lt(cur + 3, 7168);
+    // Report-region word offset where a failed header write would land (overflow @word).
+    // Hoisted out of the `else` arm: the surface lowerer clobbers `w` (`CINT 0`) when that
+    // arm's call argument is an inline binary expression.
+    let ovf_word: i64 = 1024 + cur;
     let ch: trit = fit_hdr <=> 0;
     w = if_pos ch {
         let t: bytes = ws_set(w, 1024 + cur, fn_idx);
@@ -999,7 +1003,7 @@ fn emit_fn_result(ws: bytes, fn_idx: i64) -> bytes {
         t = ws_set(t, 1024 + cur + 2, nerr);
         ws_set(t, 21, cur + 3)
     } else {
-        set_overflow_err(w, 1024 + cur)
+        set_overflow_err(w, ovf_word)
     };
     let i: i64 = 0;
     while nerr - i <=> 0 {

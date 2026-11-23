@@ -33,8 +33,8 @@ pub const NATIVE_M3_ELF_BYTES: usize = 165_900;
 pub const NATIVE_M3_ELF_FNV: u64 = 0x54B2_48B6_9704_ED59;
 pub const NATIVE_M4_ELF_BYTES: usize = 81_763;
 pub const NATIVE_M4_ELF_FNV: u64 = 0xC935_88C4_A4D4_D962;
-pub const NATIVE_VERIFIER_ELF_BYTES: usize = 37_966;
-pub const NATIVE_VERIFIER_ELF_FNV: u64 = 0xD5A0_5B92_AF87_4468;
+pub const NATIVE_VERIFIER_ELF_BYTES: usize = 37_960;
+pub const NATIVE_VERIFIER_ELF_FNV: u64 = 0x0191_7D97_B6D3_5247;
 
 /// Audit Round 2 L5: Default & maximum fuel for `omni run --fuel N`, plus documented
 /// 65,536-word (128 KiB) native M2/M3/M4/verifier input-window threshold (larger inputs
