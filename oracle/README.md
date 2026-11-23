@@ -13,7 +13,7 @@ Measured against the pre-Seed-Shrink Rust baseline (**25 files, 48,590 lines** o
 ```bash
 bash scripts/zero_rust_rebuild.sh
 ```
-This verifies all 3 embedded seeds via `./omni-seed0`, runs the 181-byte zero-shim M5 `.omni_bc` validator/entry stub ELF64 (`0x87E30A9BB58BB3C4`), executes the native zero-Rust-binary `m2.elf -> m4.elf` compilation (`81,663 B`, `0x05304F996E83AD5B`), and checks `m2-fixed-point`, `m3-fixed-point`, `p5-sys`, `p7-measure`, and `p7-canary`.
+This verifies all 3 embedded seeds via `./omni-seed0`, runs the 237-byte zero-shim M5 `.omni_bc` validator/entry stub ELF64 (`0x45EE82AAE5008841`), executes the native zero-Rust-binary `m2.elf -> m4.elf` compilation (`81,827 B`, `0x1EA1507B0BBFDBAD`), and checks `m2-fixed-point`, `m3-fixed-point`, `p5-sys`, `p7-measure`, and `p7-canary`.
 
 ## Independent Verifier Checker (Phase C2)
 Run the zero-dependency Python 3 checker over the published verifier traces:

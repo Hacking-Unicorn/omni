@@ -999,7 +999,7 @@ fn emit_fn_result(ws: bytes, fn_idx: i64) -> bytes {
         t = ws_set(t, 1024 + cur + 2, nerr);
         ws_set(t, 21, cur + 3)
     } else {
-        set_overflow_err(w, fn_idx)
+        set_overflow_err(w, 1024 + cur)
     };
     let i: i64 = 0;
     while nerr - i <=> 0 {

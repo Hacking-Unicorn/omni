@@ -6378,6 +6378,34 @@ pub fn selftest_b2_pure_verifier() -> Result<usize, String> {
             }
         }
     }
+    // 7b. Audit Round-3 R3-2: the overflow `@word` is the report-region word offset where the failed
+    //     header write would have gone (1024 + cursor, inside 1024..8192), never a function index.
+    let overflow_word = |s: &[u16]| -> Result<i64, String> {
+        match pure_default_verify_u16(s, false) {
+            Ok(()) => Err(String::from("R3-2 overflow stream unexpectedly verified Ok")),
+            Err(msg) => {
+                if !msg.contains("PURE_VERIFY_REPORT_OVERFLOW") {
+                    return Err(format!("R3-2 expected PURE_VERIFY_REPORT_OVERFLOW, got: {}", msg));
+                }
+                msg.split("@word ")
+                    .nth(1)
+                    .and_then(|t| t.split(':').next())
+                    .and_then(|t| t.trim().parse::<i64>().ok())
+                    .ok_or_else(|| format!("R3-2 could not parse @word from: {}", msg))
+            }
+        }
+    };
+    for &n_good in &[2388usize, 2400usize] {
+        let w = overflow_word(&build_n_good_then_bad(n_good))?;
+        if !(1024..8192).contains(&w) || w == n_good as i64 || w == n_good as i64 + 1 {
+            return Err(format!(
+                "R3-2 {}-fn overflow @word {} is not a report-region word offset (want 1024..8192)",
+                n_good, w
+            ));
+        }
+    }
+    checks += 1;
+
     let s_2387 = build_n_good_then_bad(2387);
     match pure_default_verify_u16(&s_2387, false) {
         Ok(()) => return Err(String::from("M1 pure verifier failed open on 2,387 good + 1 bad fn")),
@@ -6799,8 +6827,8 @@ pub fn selftest_s1_2_call_target_arity_and_fuzz() -> Result<usize, String> {
 
 /// Seed-Shrink Phase B4 hard gate (`./omnic b4-pure-launcher`):
 ///   1. Pure-Omni M3 (0-word diff) + Pure-Omni M2 (0-byte diff) on `pure/m5/launcher.omni`.
-///   2. Emits standalone 181-byte zero-shim Linux x86-64 launcher ELF64 (`\x7fELF`, PT_LOAD, raw `0F 05` syscalls).
-///   3. On Linux x86-64: executes the 181-B launcher natively (zero Rust binary, zero libc) on valid
+///   2. Emits standalone 237-byte zero-shim Linux x86-64 launcher ELF64 (`\x7fELF`, PT_LOAD, raw `0F 05` syscalls).
+///   3. On Linux x86-64: executes the 237-B launcher natively (zero Rust binary, zero libc) on valid
 ///      `pure/m4/m4.omni_bc` (exit 0) AND corrupt `[0xFF, 0xFF]` (exit 1 fail-closed).
 ///   4. On Linux x86-64: runs the pure native M2 compiler ELF (`m2_native.elf`, zero Rust binary)
 ///      to rebuild `m2.omni_bc` (93,561 B) and `m4.omni_bc` (78,020 B) with 0-byte diff.
@@ -6821,7 +6849,7 @@ pub fn selftest_b4_pure_launcher() -> Result<(usize, usize, u64, bool), String> 
     }
     checks += 1;
 
-    // 2. Execute `pure/m5/launcher.omni` to emit the standalone 181-B zero-shim Linux x86-64 launcher ELF64.
+    // 2. Execute `pure/m5/launcher.omni` to emit the standalone 237-B zero-shim Linux x86-64 launcher ELF64.
     let l_mod = decode_omni_token_stream(&l_u16)?;
     let entry_fn = l_mod.functions.last().ok_or("B4 empty launcher module")?.fn_idx;
     let mut vm = OmniBinaryVm::with_budgets(50_000_000, 32 * 1024 * 1024);
@@ -6883,7 +6911,7 @@ pub fn selftest_b4_pure_launcher() -> Result<(usize, usize, u64, bool), String> 
         }
 
         // 4. Pure native M2 compiler ELF (emitted by Pure M2 itself, zero Rust binary) compiles
-        //    pure/m4/m4.omni_bc -> exact 81,663-B ELF64 (0x05304F996E83AD5B).
+        //    pure/m4/m4.omni_bc -> exact 81,827-B ELF64 (0x1EA1507B0BBFDBAD).
         let m2_raw = std::fs::read("pure/m2/m2.omni_bc").map_err(|e| format!("B4 read m2 seed: {}", e))?;
         let m2_u16 = decode_bytes_to_u16_stream(&m2_raw);
         let m2_elf = pure_default_compile_u16_to_elf(&m2_u16, 0, 0, 0)?;
@@ -7114,7 +7142,7 @@ pub fn selftest_s2_security() -> Result<usize, String> {
     }
     checks += 1;
 
-    // 7. Audit Round 2 N4: Native cache hardening (reject pre-created loose dir, mkdtemp unset-HOME fallback).
+    // 7. Audit Round 2 N4 + Round 3 L-C: Native cache hardening (reject pre-created loose dir, stable 0700 per-user unset-HOME fallback).
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -7130,9 +7158,31 @@ pub fn selftest_s2_security() -> Result<usize, String> {
         let loose_res = native_toolchain_cache_dir();
         let _ = std::fs::remove_dir_all(&loose_root);
 
+        // Audit Round-3 L-C: unset HOME/XDG -> one stable per-user `$TMPDIR/omni-native-cache-<euid>`
+        // (0700, owned by euid, reused across calls/processes), and a pre-created loose 0755
+        // fallback dir (e.g. squatted by another user) is rejected fail-closed. Run under a
+        // private TMPDIR so the gate never touches the real per-user fallback directory.
+        let prev_tmp = std::env::var_os("TMPDIR");
+        let fb_root = std::env::temp_dir().join(format!("omni_lc_fallback_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&fb_root);
+        std::fs::create_dir_all(&fb_root).map_err(|e| format!("L-C mkdir fallback root: {}", e))?;
+        let squat_root = std::env::temp_dir().join(format!("omni_lc_squat_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&squat_root);
+        let squat_dir = squat_root.join(format!("omni-native-cache-{}", current_euid()));
+        std::fs::create_dir_all(&squat_dir).map_err(|e| format!("L-C mkdir squat: {}", e))?;
+        std::fs::set_permissions(&squat_dir, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("L-C chmod squat: {}", e))?;
         std::env::remove_var("XDG_CACHE_HOME");
         std::env::remove_var("HOME");
+        std::env::set_var("TMPDIR", &fb_root);
         let fallback_res = native_toolchain_cache_dir();
+        let fallback_res2 = native_toolchain_cache_dir();
+        std::env::set_var("TMPDIR", &squat_root);
+        let squat_res = native_toolchain_cache_dir();
+        match prev_tmp {
+            Some(v) => std::env::set_var("TMPDIR", v),
+            None => std::env::remove_var("TMPDIR"),
+        }
 
         match prev_xdg {
             Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
@@ -7146,15 +7196,41 @@ pub fn selftest_s2_security() -> Result<usize, String> {
         if loose_res.is_ok() {
             return Err(String::from("N4 native_toolchain_cache_dir accepted pre-created 0755 loose dir"));
         }
-        let fb_dir = fallback_res.map_err(|e| format!("N4 unset-HOME fallback failed: {}", e))?;
-        let predictable = std::env::temp_dir().join(format!("omni-native-cache-{}", std::process::id()));
-        if fb_dir == predictable {
-            return Err(format!("N4 unset-HOME fallback used predictable PID path: {}", fb_dir.display()));
-        }
-        let fb_meta = std::fs::symlink_metadata(&fb_dir).map_err(|e| format!("N4 lstat fallback: {}", e))?;
-        if (fb_meta.mode() & 0o077) != 0 {
-            return Err(format!("N4 unset-HOME fallback dir has loose mode {:o}", fb_meta.mode()));
-        }
+        let lc_check = (|| -> Result<(), String> {
+            let fb_dir = fallback_res.map_err(|e| format!("L-C unset-HOME fallback failed: {}", e))?;
+            let fb_dir2 = fallback_res2.map_err(|e| format!("L-C unset-HOME fallback (2nd call) failed: {}", e))?;
+            let want = fb_root.join(format!("omni-native-cache-{}", current_euid()));
+            if fb_dir != want || fb_dir2 != want {
+                return Err(format!(
+                    "L-C unset-HOME fallback not the stable per-user dir: {} / {} (want {})",
+                    fb_dir.display(),
+                    fb_dir2.display(),
+                    want.display()
+                ));
+            }
+            let fb_meta = std::fs::symlink_metadata(&fb_dir).map_err(|e| format!("L-C lstat fallback: {}", e))?;
+            if !fb_meta.file_type().is_dir() || fb_meta.uid() != current_euid() || (fb_meta.mode() & 0o077) != 0 {
+                return Err(format!(
+                    "L-C unset-HOME fallback dir unsafe (uid={}, mode={:o})",
+                    fb_meta.uid(),
+                    fb_meta.mode() & 0o777
+                ));
+            }
+            let leaked = std::fs::read_dir(&fb_root)
+                .map_err(|e| format!("L-C read fallback root: {}", e))?
+                .count();
+            if leaked != 1 {
+                return Err(format!("L-C fallback root holds {} entries after 2 calls (want 1, no per-call leak)", leaked));
+            }
+            match squat_res {
+                Ok(d) => Err(format!("L-C accepted pre-created loose 0755 fallback dir {}", d.display())),
+                Err(msg) if msg.contains("CACHE_UNSAFE_DIR") => Ok(()),
+                Err(msg) => Err(format!("L-C squatted fallback expected CACHE_UNSAFE_DIR, got: {}", msg)),
+            }
+        })();
+        let _ = std::fs::remove_dir_all(&fb_root);
+        let _ = std::fs::remove_dir_all(&squat_root);
+        lc_check?;
         // Re-verify before spawn: wrong FNV pin must fail closed before exec.
         let fake_elf = PrivateTempElf::new(&[0x7F, b'E', b'L', b'F'], "n4_tamper")?;
         match spawn_verified_native_elf(&fake_elf.path, 4, 0xDEAD_BEEF_CAFE_BABE, &[]) {
@@ -7165,6 +7241,68 @@ pub fn selftest_s2_security() -> Result<usize, String> {
                 }
             }
         }
+    }
+    checks += 1;
+
+    // 7b. Audit Round-3 L-D: a native-cache failure on a CLI verify path prints
+    //     `[NATIVE-CACHE FAIL]` (never `[PURE-VERIFY FAIL]`), and a real verifier rejection
+    //     still prints `[PURE-VERIFY FAIL]` (never `[NATIVE-CACHE FAIL]`).
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let exe = std::env::current_exe().map_err(|e| format!("L-D current_exe: {}", e))?;
+        let ld_root = std::env::temp_dir().join(format!("omni_ld_label_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ld_root);
+        let ld_cache = ld_root.join("xdg").join("omni").join("native-v1");
+        std::fs::create_dir_all(&ld_cache).map_err(|e| format!("L-D mkdir: {}", e))?;
+        std::fs::set_permissions(&ld_cache, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("L-D chmod: {}", e))?;
+        let ld_check = (|| -> Result<(), String> {
+            let good_u16 = compile_omni_surface_file_to_u16("spec/acceptance/goldens/seed6_clamp.omni")?;
+            let good_bc = ld_root.join("good.omni_bc");
+            std::fs::write(&good_bc, encode_u16_stream_to_bytes(&good_u16))
+                .map_err(|e| format!("L-D write good bc: {}", e))?;
+            let bad_bc = ld_root.join("bad.omni_bc");
+            std::fs::write(&bad_bc, encode_u16_stream_to_bytes(&[0x1234u16, 0x7EE3, 0x7EEF]))
+                .map_err(|e| format!("L-D write bad bc: {}", e))?;
+            let cache_out = std::process::Command::new(&exe)
+                .arg("run-wasm")
+                .arg(&good_bc)
+                .env("XDG_CACHE_HOME", ld_root.join("xdg"))
+                .output()
+                .map_err(|e| format!("L-D spawn (loose cache): {}", e))?;
+            let cache_err = String::from_utf8_lossy(&cache_out.stderr).into_owned();
+            if cache_out.status.code() != Some(1)
+                || !cache_err.contains("[NATIVE-CACHE FAIL]")
+                || !cache_err.contains("CACHE_UNSAFE_DIR")
+                || cache_err.contains("[PURE-VERIFY FAIL]")
+            {
+                return Err(format!(
+                    "L-D loose cache dir must print [NATIVE-CACHE FAIL] (exit 1), got exit={:?} stderr={}",
+                    cache_out.status.code(),
+                    cache_err.trim()
+                ));
+            }
+            let verify_out = std::process::Command::new(&exe)
+                .arg("run-wasm")
+                .arg(&bad_bc)
+                .output()
+                .map_err(|e| format!("L-D spawn (bad stream): {}", e))?;
+            let verify_err = String::from_utf8_lossy(&verify_out.stderr).into_owned();
+            if verify_out.status.code() != Some(1)
+                || !verify_err.contains("[PURE-VERIFY FAIL]")
+                || verify_err.contains("[NATIVE-CACHE FAIL]")
+            {
+                return Err(format!(
+                    "L-D verifier rejection must print [PURE-VERIFY FAIL] (exit 1), got exit={:?} stderr={}",
+                    verify_out.status.code(),
+                    verify_err.trim()
+                ));
+            }
+            Ok(())
+        })();
+        let _ = std::fs::remove_dir_all(&ld_root);
+        ld_check?;
     }
     checks += 1;
 
@@ -7223,7 +7361,7 @@ pub fn parse_compile_elf_args(pos: &[&str]) -> (i64, i64, i64) {
 ///      and `oracle/README.md` accurately states that `zero_rust_rebuild.sh` invokes `./omni` ("no Rust toolchain on PATH").
 ///   3. §4.2: Line counts in `README.md` and `oracle/README.md` match live `wc -l` measurements on disk,
 ///      `seed0/omni_seed0.rs` header comments match code constants, and `pure/m5/launcher.omni` is documented
-///      honestly as a 181-byte `.omni_bc` `0x7EE0` header validator / entry stub.
+///      honestly as a 237-byte `.omni_bc` `0x7EE0` header validator / entry stub.
 pub fn selftest_s4_honesty() -> Result<usize, String> {
     let mut checks = 0usize;
 
@@ -7276,7 +7414,7 @@ pub fn selftest_s4_honesty() -> Result<usize, String> {
     }
     if !main_readme.contains("validator/entry stub") {
         return Err(String::from(
-            "S4.2 README.md must qualify M5 181-byte ELF as a .omni_bc header validator/entry stub",
+            "S4.2 README.md must qualify M5 237-byte ELF as a .omni_bc header validator/entry stub",
         ));
     }
     // Audit Round 2 L7: lock all 5 frozen hashes in README.md unconditionally.
@@ -7342,7 +7480,7 @@ pub fn selftest_s4_honesty() -> Result<usize, String> {
 ///      and `pure_default_run_u16` paths execute hash-pinned native ELFs (`m3.elf`, `m2.elf`, `m4.elf`) with:
 ///        - 0-word diff vs interpreted on `pure/verifier_engine.omni` & `pure/m3/include.omni` (< 1,000 ms)
 ///        - exact negative error span parity (`error[M3_CODE_...]`, line 3)
-///        - 0-byte diff vs interpreted on `pure/m4/m4.omni_bc` -> `81,663 B` (`0x05304F996E83AD5B`, < 500 ms)
+///        - 0-byte diff vs interpreted on `pure/m4/m4.omni_bc` -> `81,827 B` (`0x1EA1507B0BBFDBAD`, < 500 ms)
 ///        - exact `(ret, steps)` parity on `loop n=20000` -> `(200010000, 180010)` (< 1,000 ms) and
 ///          `error[OUT_OF_BOUNDS]` trap parity on OOB input.
 ///   3. All 5 frozen FNV-1a64 hashes remain intact.
@@ -7441,7 +7579,7 @@ pub fn selftest_s3_performance() -> Result<usize, String> {
     }
     checks += 1;
 
-    // 3. Default compile-elf on pure/m4/m4.omni_bc -> exact 81,663 B (0x05304F996E83AD5B) in < 500 ms.
+    // 3. Default compile-elf on pure/m4/m4.omni_bc -> exact 81,827 B (0x1EA1507B0BBFDBAD) in < 500 ms.
     let m4_raw = std::fs::read("pure/m4/m4.omni_bc")
         .map_err(|e| format!("S3 read m4.omni_bc: {}", e))?;
     let m4_u16 = decode_bytes_to_u16_stream(&m4_raw);

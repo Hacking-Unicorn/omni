@@ -11,6 +11,7 @@ These limits are intentional invariants (`HANDOFF.md` §2):
 - **Zero external crates.** `Cargo.lock` lists only the eight workspace packages.
 - **192 SSA registers and 16 labels (`0..=15`) per function** (enforced by both surface compiler and verifier); **64-deep call stack** (enforced by the VM and `m2-lint`).
 - **Eager argument evaluation.** No heap structs, hash maps, or GC in core `.omni`; data lives in flat linear byte arenas (compile-time offset constants and arena-backed sorted arrays with binary search are used).
+- **Pure verifier report limit: ~2,388 functions per module.** `pure/verifier_engine.omni` writes its per-function report into a fixed 7,168-word region at word 1024 of its 8,192-word workspace; a module with ~2,388+ functions (even a fully valid one) is rejected fail-closed with `error[PURE_VERIFY_REPORT_OVERFLOW] @word <offset>` (offset inside `1024..8192`). The M4 VM rejects modules that size anyway.
 - **No recursion in core `.omni` modules** (iterative state machines + explicit worklists, enforced by `m2-lint` and `m3-gate`).
 - **The 128-opcode table (`0x7F00..=0x7F7F`) is never renumbered.**
 - **5-backend differential parity** (`vm`, `wasm`, `x86`, `stage1`, `m4`) gated by `backend-diff --suite` (`242` graded: `204` pass, `38` xfail, `0` xpass, `0` fail), where any unexpected `FAIL` or `XPASS` fails the suite.
@@ -21,7 +22,7 @@ These limits are intentional invariants (`HANDOFF.md` §2):
 
 | Module | Lines | What it actually does |
 |---|---:|---|
-| `pure/verifier_engine.omni` | 1,300 | Full static token-stream verifier (capabilities, taint, linear/borrow state, SSA order, labels, opcodes, per-opcode minimum arity `2012`, `EMPTY_MODULE` `3007`, `CALL` target existence `2010` & arity `2011`). Active on the default Pure-Omni hot path via hash-pinned native `verifier.elf` (`37,636` B, `0xF3F0CC7177A2FA84`; `b2-pure-verifier`, 14 checks). |
+| `pure/verifier_engine.omni` | 1,300 | Full static token-stream verifier (capabilities, taint, linear/borrow state, SSA order, labels, opcodes, per-opcode minimum arity `2012`, `EMPTY_MODULE` `3007`, `CALL` target existence `2010` & arity `2011`, fail-closed `REPORT_OVERFLOW` `3008` at the report-region word offset). **Limit:** the report region is a fixed 7,168 words at word 1024 of the 8,192-word workspace, so a module with ~2,388 or more functions is rejected with `PURE_VERIFY_REPORT_OVERFLOW` even if every function is valid (the M4 VM rejects modules that size anyway, so nothing that previously worked is affected). Active on the default Pure-Omni hot path via hash-pinned native `verifier.elf` (`37,636` B, `0xF3F0CC7177A2FA84`; `b2-pure-verifier`, 14 checks). |
 | `pure/m2/decode.omni` + `pure/m2/util.omni` | 650 | Shared u16 token-stream decoder (`m2d_decode_at`, `m2d_decode_at_ws`) reading opcode metadata from `pure/isa/table.omni`. Differentially tested against Rust's `decode_omni_token_stream`. |
 | `pure/isa/table.omni` | 505 | Shared ISA rodata table (128 opcode rows + 81 frozen mnemonic ids `0..=80`), using strict-bounds `ld_u8`/`ld_u16`. Drift-locked against Rust (`13BA`). |
 | `pure/host_kv.omni` | 389 | Arena-backed sorted-array KV store (`0x1B0000..0x1EFFFF`, iterative binary search, 8192-key cap, miss = `-1`). Runs in lockstep against the Rust VM KV arms (`13AZ`). |

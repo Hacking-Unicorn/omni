@@ -5,7 +5,7 @@
 # ==============================================================================
 # Proves that with `rustc` and `cargo` completely absent from PATH, the
 # committed Pure-Omni seeds (`pure/m3/m3.omni_bc`, `pure/m2/m2.omni_bc`,
-# `pure/m4/m4.omni_bc`) verify bit-exact, pass the 181-B zero-shim M5 launcher
+# `pure/m4/m4.omni_bc`) verify bit-exact, pass the 237-B zero-shim M5 launcher
 # ELF64 and native zero-Rust-binary `m2.elf -> m4.elf` chain, and match every
 # published FNV-1a64 hash.
 # ==============================================================================
@@ -45,4 +45,4 @@ rm -f /tmp/c1_wd.omni_bc
 ./omni p7-measure
 ./omni p7-canary
 
-echo "[C1 ZERO-RUST RELEASE GATE PASS] All seeds, M5 181-B launcher, native M2->M4 chain, M2/M3 fixed points, and P7 gates passed with rustc/cargo off PATH."
+echo "[C1 ZERO-RUST RELEASE GATE PASS] All seeds, M5 237-B launcher, native M2->M4 chain, M2/M3 fixed points, and P7 gates passed with rustc/cargo off PATH."
