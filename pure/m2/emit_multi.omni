@@ -939,7 +939,10 @@ fn m2m_emit_sel_ret(arena: bytes, op: i64, nops: i64, d: i64, op0: i64, op1: i64
         if_pos cb {
             let c3: trit = m2u_eq(nops, 3) <=> 0;
             if_pos c3 {
-                let t: bytes = m2m_load_op(r1, op1, 0);
+                // 3-op bytes RET `RET buf, off, len`: slice of op0's buffer.
+                let t: bytes = m2m_load_op(r1, op0, 0);     // rax = buf descriptor
+                t = m2x_b3(t, 73, 137, 192);                // 49 89 C0 mov r8, rax
+                t = m2m_load_op(t, op1, 0);
                 t = m2m_load_op(t, op2, 1);
                 t = m2x_b3(t, 72, 133, 192);                // 48 85 C0
                 t = m2a_emit_u16(t, 34831);                 // 0F 88
@@ -951,10 +954,13 @@ fn m2m_emit_sel_ret(arena: bytes, op: i64, nops: i64, d: i64, op0: i64, op1: i64
                 t = m2x_b3(t, 72, 57, 198);                 // 48 39 C6
                 t = m2a_emit_u16(t, 33295);                 // 0F 82
                 t = m2m_trap_rel32(t, m2mg_t_oob(), pass);
-                t = m2x_b3(t, 76, 57, 222);                 // 4C 39 DE
+                t = m2x_b3(t, 68, 137, 194);                // 44 89 C2 mov edx, r8d (buf_len)
+                t = m2x_b3(t, 72, 57, 214);                 // 48 39 D6 cmp rsi, rdx
                 t = m2a_emit_u16(t, 34575);                 // 0F 87
                 t = m2m_trap_rel32(t, m2mg_t_oob(), pass);
-                // Return the slice as a descriptor in rax: (off << 32) | len.
+                t = m2x_b4(t, 73, 193, 232, 32);            // 49 C1 E8 20 shr r8, 32 (buf_base)
+                t = m2x_b3(t, 76, 1, 192);                  // 4C 01 C0 add rax, r8
+                // Return the slice as a descriptor in rax: ((base + off) << 32) | len.
                 t = m2x_b4(t, 72, 193, 224, 32);            // 48 C1 E0 20 shl rax, 32
                 t = m2x_b3(t, 72, 9, 200);                  // 48 09 C8 or rax, rcx
                 t = m2x_b3(t, 72, 137, 202);                // 48 89 CA mov rdx, rcx (len)

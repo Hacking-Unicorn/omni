@@ -19159,6 +19159,9 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
                 0x7F4A => {
                     if func.ret_ty_tok == TY_BYTES {
                         if ins.operands.len() == 3 {
+                            // 3-op bytes RET `RET buf, off, len`: slice of op0's buffer.
+                            emit_load_op(&mut code, &ins.operands[0], false); // rax = buf descriptor
+                            code.extend_from_slice(&[0x49, 0x89, 0xC0]); // mov r8, rax
                             emit_load_op(&mut code, &ins.operands[1], false); // rax = off
                             emit_load_op(&mut code, &ins.operands[2], true);  // rcx = len
                             code.extend_from_slice(&[0x48, 0x85, 0xC0, 0x0F, 0x88]); // js T_OOB
@@ -19171,10 +19174,13 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
                             code.extend_from_slice(&[0x48, 0x39, 0xC6, 0x0F, 0x82]); // cmp rsi, rax; jb T_OOB
                             trap_relocs.push((code.len(), 1));
                             code.extend_from_slice(&[0, 0, 0, 0]);
-                            code.extend_from_slice(&[0x4C, 0x39, 0xDE, 0x0F, 0x87]); // cmp rsi, r11; ja T_OOB
+                            code.extend_from_slice(&[0x44, 0x89, 0xC2]); // mov edx, r8d (buf_len)
+                            code.extend_from_slice(&[0x48, 0x39, 0xD6, 0x0F, 0x87]); // cmp rsi, rdx; ja T_OOB
                             trap_relocs.push((code.len(), 1));
                             code.extend_from_slice(&[0, 0, 0, 0]);
-                            // Return the slice as a descriptor in rax: (off << 32) | len.
+                            code.extend_from_slice(&[0x49, 0xC1, 0xE8, 0x20]); // shr r8, 32 (buf_base)
+                            code.extend_from_slice(&[0x4C, 0x01, 0xC0]); // add rax, r8
+                            // Return the slice as a descriptor in rax: ((base + off) << 32) | len.
                             code.extend_from_slice(&[0x48, 0xC1, 0xE0, 0x20]); // shl rax, 32
                             code.extend_from_slice(&[0x48, 0x09, 0xC8]); // or rax, rcx
                             code.extend_from_slice(&[0x48, 0x89, 0xCA, 0xC9, 0xC3]); // mov rdx, rcx; leave; ret
