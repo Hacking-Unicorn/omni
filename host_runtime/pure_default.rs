@@ -29,8 +29,8 @@ pub fn pure_default_reject_macros(src: &str) -> Result<(), String> {
 
 pub const NATIVE_M2_ELF_BYTES: usize = 119_581;
 pub const NATIVE_M2_ELF_FNV: u64 = 0x92F8_5264_4E07_8AA6;
-pub const NATIVE_M3_ELF_BYTES: usize = 182_878;
-pub const NATIVE_M3_ELF_FNV: u64 = 0x5E16_D51C_E103_B7FF;
+pub const NATIVE_M3_ELF_BYTES: usize = 183_434;
+pub const NATIVE_M3_ELF_FNV: u64 = 0x21E3_7ED9_A453_C048;
 pub const NATIVE_M4_ELF_BYTES: usize = 89_705;
 pub const NATIVE_M4_ELF_FNV: u64 = 0xAE3F_3DF0_69BE_D8B7;
 pub const NATIVE_VERIFIER_ELF_BYTES: usize = 37_992;
