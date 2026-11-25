@@ -1920,10 +1920,26 @@ pub fn selftest_m3_10_lower_diff() -> Result<usize, String> {
         ("neg_unresolved_label", include_str!("../spec/m3/fixtures/neg_unresolved_label.omni"), false),
         ("neg_unknown_fn", include_str!("../spec/m3/fixtures/neg_unknown_fn.omni"), false),
         ("neg_arity_mismatch", include_str!("../spec/m3/fixtures/neg_arity_mismatch.omni"), false),
+        (
+            "host_intrinsics_all",
+            "#[cap(NET, DB_R, DB_W, AUTH)]\nroute POST /ledger/:id (req: i64) {\n  let id: i64 = req.param(\"id\");\n  let ok: i64 = auth_verify(id);\n  let a: i64 = db_get(ok) + kv_get(\"acct\", \"42\") + db_query(\"SELECT 1\", ok);\n  let c: i64 = db_count() + kv_count(\"tbl\");\n  let p: i64 = kv_put(ok, a + c) + db_put(\"k1\", 7);\n  respond(201, p);\n}\n#[cap(NET)]\nfn main(x: i64) -> i64 { respond_html(x); }\n",
+            false,
+        ),
+        (
+            "pack5_tdot_arena_drop",
+            "#[cap(AI)]\nfn main(x: i64) -> i64 {\n  let a: bytes = pack5_bytes([+1t, -1t, 0t, +1t, -1t]);\n  let b: bytes = pack5([+1t, 0t, -1t, +1t, +1t]);\n  let c: bytes = tpack5([-1t, -1t, 0t, +1t, 0t]);\n  let ar: arena = arena(256);\n  let r: i64 = borrow_r(ar);\n  let t: trit = tlogic(x);\n  drop(r);\n  drop(ar);\n  return tdot(a, b) + pack5_tdot(b, c) + sel_trit(t, -1, 0, 1);\n}\n",
+            false,
+        ),
     ];
 
+    let kv_exp = resolve_omni_surface_includes(include_str!("../pure/programs/kv_ledger_service.omni"), None, None)?;
+    let p5_exp = resolve_omni_surface_includes(include_str!("../pure/programs/pack5_decision_controller.omni"), None, None)?;
+    let mut all_cases: Vec<(&str, &str, bool)> = cases.to_vec();
+    all_cases.push(("pure_kv_ledger_service", kv_exp.as_str(), false));
+    all_cases.push(("pure_pack5_decision_controller", p5_exp.as_str(), false));
+
     let mut checks = 0usize;
-    for &(name, src, strict_arg) in &cases {
+    for &(name, src, strict_arg) in &all_cases {
         let rust_res = with_lockstep_suspended(|| {
             if strict_arg { compile_omni_surface_strict_to_u16(src) } else { compile_omni_surface_to_u16(src) }
         });
@@ -7743,7 +7759,7 @@ pub fn selftest_s4_honesty() -> Result<usize, String> {
     );
     if strict_readme {
         for &(label, needle) in &[
-            ("M3 seed hash", "0xCBA538CD0E8100A8"),
+            ("M3 seed hash", "0xC42FBCB379EEF692"),
             ("M2 seed hash", "0x36ADC3CEAB97B1C9"),
             ("M4 seed hash", "0x0561704B3E50EFAC"),
             ("M4 ELF size", "90,402"),
@@ -7765,7 +7781,7 @@ pub fn selftest_s4_honesty() -> Result<usize, String> {
     // 3. §4.2: `seed0/omni_seed0.rs` header comment must match the active SEED_M2 / SEED_M4 pins.
     let seed0_src = std::fs::read_to_string("seed0/omni_seed0.rs")
         .map_err(|e| format!("S4 read seed0/omni_seed0.rs: {}", e))?;
-    if !seed0_src.contains("59,887 words, 0xCBA538CD0E8100A8")
+    if !seed0_src.contains("65,213 words, 0xC42FBCB379EEF692")
         || !seed0_src.contains("41,855 words, 0x36ADC3CEAB97B1C9")
         || !seed0_src.contains("28,062 words, 0x0561704B3E50EFAC")
     {

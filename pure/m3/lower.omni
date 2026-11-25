@@ -113,7 +113,27 @@ fn m3w_var_find(arena: bytes, src: array, off: i64, len: i64) -> i64 {
         let vw0: i64 = ld_u64(arena, base);
         let vh: i64 = ld_u64(arena, base + 8);
         let hm: i64 = m2u_eq(vh, h);
-        let hit: i64 = hm * m3s_eq_span(src, off, len, vw0 & m2u_mask32(), (vw0 >> 32) & 65535);
+        let vlen: i64 = (vw0 >> 32) & 65535;
+        let hit: i64 = hm * (m2u_eq(vlen, 0) | m3s_eq_span(src, off, len, vw0 & m2u_mask32(), vlen));
+        found = m2u_sel(hit, (vw0 >> 48) & 65535, found);
+        i = i - 1;
+        g = m2u_ge(i, 0) * m2u_eq(found, 0);
+    }
+    return found;
+}
+
+// Looks up variable by exact FNV-1a31 hash in `m3l_vtab()` (used for implicit `req` in 1-arg `req_param`).
+#[strict]
+fn m3w_var_find_hash(arena: bytes, h: i64) -> i64 {
+    let vcnt: i64 = ld_u64(arena, 272);
+    let i: i64 = vcnt - 1;
+    let found: i64 = 0;
+    let g: i64 = m2u_ge(i, 0);
+    while g <=> 0 {
+        let base: i64 = m3l_vtab() + (i << 4);
+        let vw0: i64 = ld_u64(arena, base);
+        let vh: i64 = ld_u64(arena, base + 8);
+        let hit: i64 = m2u_eq(vh, h);
         found = m2u_sel(hit, (vw0 >> 48) & 65535, found);
         i = i - 1;
         g = m2u_ge(i, 0) * m2u_eq(found, 0);
@@ -225,8 +245,9 @@ fn m3w_emit_br_trit(arena: bytes, cond_op: i64, ln: i64, lz: i64, lp: i64) -> by
 // Emits `dst = CSTR@UNTRUSTED @str:<bytes>` for a StrLit AST node.
 #[strict]
 fn m3w_emit_str(arena: bytes, src: array, nid: i64, treg: i64) -> bytes {
-    let w0: i64 = ld_u64(arena, m3l_ast() + (nid << 4));
-    let w1: i64 = ld_u64(arena, m3l_ast() + (nid << 4) + 8);
+    let ast: i64 = m3l_ast();
+    let w0: i64 = ld_u64(arena, ast + (nid << 4));
+    let w1: i64 = ld_u64(arena, ast + (nid << 4) + 8);
     let u: bytes = m3w_resolve_dst(arena, treg, (w0 >> 16) & 65535, (w0 >> 32) & 65535);
     let ok: trit = m2u_eq(ld_u64(u, 40), 0) <=> 0;
     let r: bytes = if_pos ok {
@@ -341,8 +362,9 @@ fn m3w_binop_tok(aop: i64) -> i64 {
 // Lowers a leaf expression (`Int`/`Trit`/`Var`) as operand (`as_op == 1`) or into `treg` (`as_op == 0`).
 #[strict]
 fn m3w_lower_leaf(arena: bytes, src: array, nid: i64, treg: i64, as_op: i64) -> bytes {
-    let w0: i64 = ld_u64(arena, m3l_ast() + (nid << 4));
-    let w1: i64 = ld_u64(arena, m3l_ast() + (nid << 4) + 8);
+    let ast: i64 = m3l_ast();
+    let w0: i64 = ld_u64(arena, ast + (nid << 4));
+    let w1: i64 = ld_u64(arena, ast + (nid << 4) + 8);
     let k: i64 = w0 & 255;
     let fl: i64 = (w0 >> 16) & 65535;
     let fc: i64 = (w0 >> 32) & 65535;
@@ -371,21 +393,188 @@ fn m3w_lower_leaf(arena: bytes, src: array, nid: i64, treg: i64, as_op: i64) -> 
     return r;
 }
 
+// Resolves lowercase callee hash for a Call AST node, honoring `dot_code` (1..4) from `ident.method(...)`.
+#[strict]
+fn m3w_call_hlow(arena: bytes, src: array, aw0: i64, aw1: i64) -> i64 {
+    let out: i64 = m3l_out();
+    let dc: i64 = (aw0 >> 8) & 255;
+    let nti: i64 = aw1 & 65535;
+    let nh: i64 = ld_u64(arena, out + (nti << 4));
+    let nv: i64 = ld_u64(arena, out + (nti << 4) + 8);
+    let raw_h: i64 = m3s_hash(src, nv, (nh >> 16) & 65535, 1);
+    let dh: i64 = m2u_eq(dc, 1) * 1872851941 + m2u_eq(dc, 2) * 706611728
+        + m2u_eq(dc, 3) * 925638096 + m2u_eq(dc, 4) * 344927282;
+    return m2u_sel(m2u_lt(0, dc), dh, raw_h);
+}
+
+// Classifies host intrinsics (0 = none, 1=req_param, 2=db/kv_get, 3=db_query,
+// 4=db/kv_count, 5=kv/db_put, 6=respond/respond_json, 7=respond_html, 8=auth_verify).
+#[strict]
+fn m3w_host_cls(hlow: i64) -> i64 {
+    return m2u_eq(hlow, 1872851941) * 1
+        + (m2u_eq(hlow, 925638096) + m2u_eq(hlow, 17383107)) * 2
+        + m2u_eq(hlow, 706611728) * 3
+        + (m2u_eq(hlow, 1384496843) + m2u_eq(hlow, 1516025256)) * 4
+        + (m2u_eq(hlow, 344927282) + m2u_eq(hlow, 1776526973)) * 5
+        + (m2u_eq(hlow, 160119590) + m2u_eq(hlow, 2015157561)) * 6
+        + m2u_eq(hlow, 1281037654) * 7
+        + m2u_eq(hlow, 1919428525) * 8;
+}
+
+// Lowers a StrLit argument to a host intrinsic: trimmed decimal i64 if numeric, else fnv1a_32_positive.
+#[strict]
+fn m3w_host_str_op(src: array, off: i64, len: i64) -> i64 {
+    let s: i64 = off;
+    let e: i64 = off + len;
+    let g1: i64 = m2u_lt(s, e);
+    while g1 <=> 0 {
+        let b: i64 = iget(src, s);
+        let ws: i64 = m2u_eq(b, 32) + m2u_in(b, 9, 13);
+        s = s + ws;
+        g1 = ws * m2u_lt(s, e);
+    }
+    let g2: i64 = m2u_lt(s, e);
+    while g2 <=> 0 {
+        let b: i64 = iget(src, e - 1);
+        let ws: i64 = m2u_eq(b, 32) + m2u_in(b, 9, 13);
+        e = e - ws;
+        g2 = ws * m2u_lt(s, e);
+    }
+    let b0: i64 = m2u_sel(m2u_lt(s, e), iget(src, s), 0);
+    let is_neg: i64 = m2u_lt(s, e) * m2u_eq(b0, 45);
+    let p: i64 = s + is_neg + m2u_lt(s, e) * m2u_eq(b0, 43);
+    let ok_num: i64 = m2u_lt(p, e);
+    let acc: i64 = 0;
+    let g3: i64 = ok_num;
+    while g3 <=> 0 {
+        let b: i64 = iget(src, p);
+        let dig: i64 = m2u_in(b, 48, 57);
+        ok_num = ok_num * dig;
+        acc = acc * 10 + (b - 48) * dig;
+        p = p + 1;
+        g3 = m2u_lt(p, e) * ok_num;
+    }
+    let h30: i64 = m3s_hash(src, off, len, 0) & 1073741823;
+    let val: i64 = m2u_sel(ok_num, m2u_sel(is_neg, 0 - acc, acc), m2u_sel(m2u_eq(h30, 0), 1, h30));
+    return (1 << 48) | (val & m2u_mask32());
+}
+
+// Emits host intrinsic `hcls` (1..8) with evaluated args at `arg_base`.
+#[strict]
+fn m3w_emit_host_intr(arena: bytes, hcls: i64, nargs: i64, treg: i64, arg_base: i64, fl: i64, fc: i64) -> bytes {
+    let c1: i64 = m2u_eq(hcls, 1); let c2: i64 = m2u_eq(hcls, 2);
+    let c3: i64 = m2u_eq(hcls, 3); let c4: i64 = m2u_eq(hcls, 4);
+    let c5: i64 = m2u_eq(hcls, 5); let c6: i64 = m2u_eq(hcls, 6);
+    let c7: i64 = m2u_eq(hcls, 7); let c8: i64 = m2u_eq(hcls, 8);
+    let is_resp: i64 = c6 + c7;
+    let n2: i64 = m2u_eq(nargs, 2);
+    let ok_n: i64 = (c1 + c2 + c3 + is_resp) * m2u_in(nargs, 1, 2) + c4 + c5 * n2 + c8 * m2u_eq(nargs, 1);
+    let req_v: i64 = m3w_var_find_hash(arena, 770990835);
+    let r: bytes = if_pos ok_n <=> 0 {
+        let u: bytes = m3w_resolve_dst(arena, treg, fl, fc);
+        let ok: trit = m2u_eq(ld_u64(u, 40), 0) <=> 0;
+        if_pos ok {
+            let dst: i64 = ld_u64(u, 288);
+            let op_tok: i64 = c1 * 32621 + c2 * 32612 + c3 * 32613 + c4 * 32616 + c5 * 32619 + c6 * 32622 + c7 * 32623 + c8 * 32624;
+            let a0: i64 = m2u_sel(m2u_lt(0, nargs), ld_u64(u, arg_base), 1 << 48);
+            let a1: i64 = m2u_sel(m2u_ge(nargs, 2), ld_u64(u, arg_base + 8), 1 << 48);
+            let r0: i64 = m2u_sel(n2, a0, m2u_sel(m2u_lt(0, req_v), req_v, a0));
+            let s0: i64 = m2u_sel(n2, a0, (1 << 48) | 200);
+            let op0: i64 = m2u_sel(c1, r0, m2u_sel(c2, m2u_sel(n2, a1, a0), m2u_sel(is_resp, s0, a0)));
+            let op1: i64 = m2u_sel(is_resp, m2u_sel(n2, a1, a0), a1);
+            let ty_tok: i64 = m2u_sel(c7, 32644, 32641);
+            let w: bytes = m3w_emit_dest2(u, dst, op_tok, ty_tok, op0, c1 + c3 + c5 + is_resp, op1);
+            iset_patch_i64(w, 288, dst)
+        } else { u }
+    } else {
+        m3a_set_err(arena, m3err_arity(), fl, fc)
+    };
+    return r;
+}
+
+// Emits `r_bytes = ANEW 0` + 24-byte-chunked `ISET` for a `TritVecLit` AST node (`kind == 8`).
+#[strict]
+fn m3w_emit_tritvec_pack5(arena: bytes, tv_nid: i64, r_bytes: i64) -> bytes {
+    let ast: i64 = m3l_ast();
+    let cur: i64 = ld_u64(arena, ast + (tv_nid << 4) + 8) & 65535;
+    let w: bytes = m3w_emit_dest2(arena, r_bytes, 32525, 32646, 1 << 48, 0, 0); // ANEW TY_BYTES 0
+    while cur <=> 0 {
+        w = m3w_emit_u16(w, r_bytes);
+        w = m3w_emit_u16(w, 32527); // ISET
+        w = m3w_emit_u16(w, 32646); // TY_BYTES
+        w = m3w_emit_u16(w, 32704); // TC_BASE
+        w = m3w_emit_u16(w, r_bytes);
+        let bi: i64 = 0;
+        let cg: i64 = m2u_lt(bi, 24) * m2u_lt(0, cur);
+        while cg <=> 0 {
+            let acc: i64 = 0;
+            let p3: i64 = 1;
+            let ti: i64 = 0;
+            while 5 - ti <=> 0 {
+                let has_c: i64 = m2u_lt(0, cur);
+                let ab: i64 = ast + ((cur * has_c) << 4);
+                let ew0: i64 = ld_u64(w, ab);
+                let ew1: i64 = ld_u64(w, ab + 8);
+                let tv: i64 = has_c * m2u_sel(m2u_eq(ew0 & 255, 2), m2u_sext16(ew1 & 65535), ew1);
+                acc = acc + (tv + 1) * p3;
+                p3 = p3 * 3;
+                cur = has_c * ((ew0 >> 48) & 65535);
+                ti = ti + 1;
+            }
+            w = m3w_emit_op(w, (1 << 48) | acc);
+            bi = bi + 1;
+            cg = m2u_lt(bi, 24) * m2u_lt(0, cur);
+        }
+        w = m3w_emit_u16(w, 32484); // TOK_INS_END
+        w = iset_patch_i64(w, 248, ld_u64(w, 248) + 1);
+    }
+    return w;
+}
+
+// Lowers a `TritVecLit` (`emit_unpack == 0`: `pack5_bytes([...])` -> BYTES, `emit_unpack == 1`: bare `[...]` -> TUNPACK5).
+#[strict]
+fn m3w_emit_tritvec(arena: bytes, tv_nid: i64, treg: i64, emit_unpack: i64) -> bytes {
+    let ab: i64 = m3l_ast() + (tv_nid << 4);
+    let tw0: i64 = ld_u64(arena, ab);
+    let nelems: i64 = (ld_u64(arena, ab + 8) >> 32) & 65535;
+    let fl: i64 = (tw0 >> 16) & 65535;
+    let fc: i64 = (tw0 >> 32) & 65535;
+    let u: bytes = m3w_resolve_dst(arena, m2u_sel(emit_unpack, 0, treg), fl, fc);
+    let r: bytes = if_pos m2u_eq(ld_u64(u, 40), 0) <=> 0 {
+        let r_bytes: i64 = ld_u64(u, 288);
+        let w: bytes = m3w_emit_tritvec_pack5(u, tv_nid, r_bytes);
+        if_pos emit_unpack <=> 0 {
+            let u2: bytes = m3w_resolve_dst(w, treg, fl, fc);
+            if_pos m2u_eq(ld_u64(u2, 40), 0) <=> 0 {
+                let dst: i64 = ld_u64(u2, 288);
+                let w2: bytes = m3w_emit_dest2(u2, dst, 32561, 32647, r_bytes, 1, (1 << 48) | nelems);
+                iset_patch_i64(w2, 288, dst)
+            } else { u2 }
+        } else {
+            iset_patch_i64(w, 288, r_bytes)
+        }
+    } else { u };
+    return r;
+}
+
 // Emits a completed Call node (args already evaluated into `m3l_wstack()` staging slots at `arg_base`).
-// Handles core intrinsics (`sel_trit`, `anew`, `slen`, `iget`, `iset*`, `ld_u*`, `st_u*`, `min`/`max`/`abs`, `ret_slice`) and user `CALL @fnN`.
+// Handles core intrinsics, host intrinsics, `ret_slice`, and user `CALL @fnN`.
 #[strict]
 fn m3w_emit_call_done(arena: bytes, src: array, nid: i64, treg: i64, arg_base: i64, is_ret_slice: i64) -> bytes {
-    let w0: i64 = ld_u64(arena, m3l_ast() + (nid << 4));
-    let w1: i64 = ld_u64(arena, m3l_ast() + (nid << 4) + 8);
+    let ast: i64 = m3l_ast();
+    let out: i64 = m3l_out();
+    let w0: i64 = ld_u64(arena, ast + (nid << 4));
+    let w1: i64 = ld_u64(arena, ast + (nid << 4) + 8);
     let fl: i64 = (w0 >> 16) & 65535;
     let fc: i64 = (w0 >> 32) & 65535;
     let nti: i64 = w1 & 65535;
     let nargs: i64 = (w1 >> 32) & 65535;
-    let nh: i64 = ld_u64(arena, m3l_out() + (nti << 4));
-    let nv: i64 = ld_u64(arena, m3l_out() + (nti << 4) + 8);
+    let nh: i64 = ld_u64(arena, out + (nti << 4));
+    let nv: i64 = ld_u64(arena, out + (nti << 4) + 8);
     let nlen: i64 = (nh >> 16) & 65535;
-    let hlow: i64 = m3s_hash(src, nv, nlen, 1);
+    let hlow: i64 = m3w_call_hlow(arena, src, w0, w1);
     let c_rs: trit = is_ret_slice <=> 0;
+    let c_dr: trit = m2u_eq(hlow, 698715532) <=> 0;
     let r: bytes = if_pos c_rs {
         let ok3: trit = m2u_eq(nargs, 3) <=> 0;
         if_pos ok3 {
@@ -394,13 +583,19 @@ fn m3w_emit_call_done(arena: bytes, src: array, nid: i64, treg: i64, arg_base: i
             u = m3w_emit_op(u, ld_u64(u, arg_base + 8));
             u = m3w_emit_op(u, ld_u64(u, arg_base + 16));
             u = m3w_emit_u16(u, 32484);
-            let ic: i64 = ld_u64(u, 248);
-            iset_patch_i64(u, 248, ic + 1)
+            iset_patch_i64(u, 248, ld_u64(u, 248) + 1)
         } else {
             m3a_set_err(arena, m3err_arity(), fl, fc)
         }
     } else {
-        m3w_emit_call_expr(arena, src, nv, nlen, hlow, nargs, treg, arg_base, fl, fc)
+        if_pos c_dr {
+            let u: bytes = m3w_emit_u16(arena, 32517); // DROP (0x7F05)
+            u = m3w_emit_op(u, ld_u64(u, arg_base));
+            u = m3w_emit_u16(u, 32484);
+            iset_patch_i64(u, 248, ld_u64(u, 248) + 1)
+        } else {
+            m3w_emit_call_expr(arena, src, nv, nlen, hlow, nargs, treg, arg_base, fl, fc)
+        }
     };
     return r;
 }
@@ -411,6 +606,7 @@ fn m3w_emit_call_expr(arena: bytes, src: array, nv: i64, nlen: i64, hlow: i64, n
     // Classify core intrinsics:
     // 1=anew(1), 2=slen(1), 3=abs/iabs(1), 4=min/imin(2), 5=max/imax(2), 6=iget(2), 7=sel_trit(4)
     // 8=tand(2), 9=tor(2), 10=txor(2), 11=tmaj(3), 12=egate/decision_hook/pack5_gate(1)
+    // 13=tdot/pack5_tdot(2), 14=pack5/tpack5(1), 15=tlogic(1), 16=arena(1), 17=borrow_r(1), 18=borrow_w(1)
     let is_ld: i64 = m2u_eq(hlow, 372681827) + m2u_eq(hlow, 1528998138) * 2 + m2u_eq(hlow, 1596454388) * 4 + m2u_eq(hlow, 1530130971) * 8;
     let is_st: i64 = m2u_eq(hlow, 683641129) * 2 + m2u_eq(hlow, 1018847735) * 4;
     let is_is: i64 = m2u_eq(hlow, 56909121) * 4 + m2u_eq(hlow, 2003554210) * 8;
@@ -420,16 +616,26 @@ fn m3w_emit_call_expr(arena: bytes, src: array, nv: i64, nlen: i64, hlow: i64, n
         + m2u_eq(hlow, 1234126167) * 4 + m2u_eq(hlow, 1470292761) * 5 + m2u_eq(hlow, 444340544) * 6 + m2u_eq(hlow, 153118099) * 7
         + m2u_eq(hlow, 354969780) * 8 + m2u_eq(hlow, 688971618) * 9 + m2u_eq(hlow, 644393288) * 10 + m2u_eq(hlow, 680826049) * 11
         + m2u_eq(hlow, 2057169916) * 3 + m2u_eq(hlow, 566644216) * 4 + m2u_eq(hlow, 937031762) * 5
-        + m2u_eq(hlow, 1078835159) * 12 + m2u_eq(hlow, 1103277427) * 12 + m2u_eq(hlow, 1247990215) * 12;
+        + (m2u_eq(hlow, 1078835159) + m2u_eq(hlow, 1103277427) + m2u_eq(hlow, 1247990215)) * 12
+        + (m2u_eq(hlow, 709872862) + m2u_eq(hlow, 1104639635)) * 13
+        + (m2u_eq(hlow, 822761039) + m2u_eq(hlow, 2139031121)) * 14
+        + m2u_eq(hlow, 1113971463) * 15 + m2u_eq(hlow, 1706796520) * 16
+        + m2u_eq(hlow, 1518184941) * 17 + m2u_eq(hlow, 1434296846) * 18;
+    let hcls: i64 = m3w_host_cls(hlow);
     let is_mem: trit = (is_ld + is_st + is_is + is_ip + is_ib) <=> 0;
     let is_core: trit = icls <=> 0;
+    let is_host: trit = hcls <=> 0;
     let r: bytes = if_pos is_mem {
         m3w_emit_mem_intr(arena, is_ld, is_st, is_is, is_ip, nargs, treg, arg_base, fl, fc)
     } else {
         if_pos is_core {
             m3w_emit_core_intr(arena, icls, nargs, treg, arg_base, fl, fc)
         } else {
-            m3w_emit_user_call(arena, src, nv, nlen, nargs, treg, arg_base, fl, fc)
+            if_pos is_host {
+                m3w_emit_host_intr(arena, hcls, nargs, treg, arg_base, fl, fc)
+            } else {
+                m3w_emit_user_call(arena, src, nv, nlen, nargs, treg, arg_base, fl, fc)
+            }
         }
     };
     return r;
@@ -466,10 +672,10 @@ fn m3w_emit_mem_intr(arena: bytes, is_ld: i64, is_st: i64, is_is: i64, is_ip: i6
     return r;
 }
 
-// Emits `anew`(1), `slen`(2), `abs`/`iabs`(3), `min`/`imin`(4), `max`/`imax`(5), `iget`(6), `sel_trit`(7), `tand`(8), `tor`(9), `txor`(10), `tmaj`(11), `egate`(12).
+// Emits core intrinsics 1..18.
 #[strict]
 fn m3w_emit_core_intr(arena: bytes, icls: i64, nargs: i64, treg: i64, arg_base: i64, fl: i64, fc: i64) -> bytes {
-    let want_n: i64 = m2u_sel(m2u_eq(icls, 12), 1, m2u_sel(m2u_in(icls, 1, 3), 1, m2u_sel(m2u_eq(icls, 7), 4, m2u_sel(m2u_eq(icls, 11), 3, 2))));
+    let want_n: i64 = m2u_sel(m2u_eq(icls, 12) + m2u_in(icls, 14, 18), 1, m2u_sel(m2u_in(icls, 1, 3), 1, m2u_sel(m2u_eq(icls, 7), 4, m2u_sel(m2u_eq(icls, 11), 3, 2))));
     let ok_n: trit = m2u_eq(nargs, want_n) <=> 0;
     let r: bytes = if_pos ok_n {
         let u: bytes = m3w_resolve_dst(arena, treg, fl, fc);
@@ -479,9 +685,12 @@ fn m3w_emit_core_intr(arena: bytes, icls: i64, nargs: i64, treg: i64, arg_base: 
             let op_tok: i64 = m2u_eq(icls, 1) * 32525 + m2u_eq(icls, 2) * 32592 + m2u_eq(icls, 3) * 32534
                 + m2u_eq(icls, 4) * 32535 + m2u_eq(icls, 5) * 32536 + m2u_eq(icls, 6) * 32526 + m2u_eq(icls, 7) * 32581
                 + m2u_eq(icls, 8) * 32553 + m2u_eq(icls, 9) * 32554 + m2u_eq(icls, 10) * 32555 + m2u_eq(icls, 11) * 32556
-                + m2u_eq(icls, 12) * 32565;
+                + m2u_eq(icls, 12) * 32565 + m2u_eq(icls, 13) * 32564 + m2u_eq(icls, 14) * 32560
+                + m2u_eq(icls, 15) * 32575 + m2u_eq(icls, 16) * 32513 + m2u_eq(icls, 17) * 32514 + m2u_eq(icls, 18) * 32515;
             let cur_rty: i64 = ld_u64(u, 296);
-            let ty_tok: i64 = m2u_sel(m2u_eq(icls, 1), 32646, m2u_sel(m2u_eq(icls, 7), cur_rty, m2u_sel(m2u_in(icls, 8, 12), 32643, 32641)));
+            let is_by: i64 = m2u_eq(icls, 1) + m2u_eq(icls, 14);
+            let is_tr: i64 = m2u_in(icls, 8, 12) + m2u_eq(icls, 15);
+            let ty_tok: i64 = m2u_sel(is_by, 32646, m2u_sel(m2u_eq(icls, 16), 32650, m2u_sel(m2u_eq(icls, 7), cur_rty, m2u_sel(is_tr, 32643, 32641))));
             let w: bytes = m3w_emit_u16(u, dst);
             w = m3w_emit_u16(w, op_tok);
             w = m3w_emit_u16(w, ty_tok);
@@ -542,29 +751,83 @@ fn m3w_emit_user_call(arena: bytes, src: array, nv: i64, nlen: i64, nargs: i64, 
     return r;
 }
 
-// Dispatches `StrLit`(3), `IfBranch`(9), `MatchTrit`(10) in expr enter (split to stay <= 10 labels).
+// Dispatches `StrLit`(3), `TritVecLit`(8), `IfBranch`(9), `MatchTrit`(10) in expr enter (split to stay <= 10 labels).
 #[strict]
 fn m3w_step_expr_enter_ext(arena: bytes, src: array, off: i64, nid: i64, treg: i64, fw1: i64, k: i64, aw0: i64, aw1: i64) -> bytes {
     let is_str: trit = m2u_eq(k, 3) <=> 0;
+    let is_tv: trit = m2u_eq(k, 8) <=> 0;
     let is_if: trit = m2u_eq(k, 9) <=> 0;
     let is_mt: trit = m2u_eq(k, 10) <=> 0;
     let r: bytes = if_pos is_str {
         let wsp: i64 = ld_u64(arena, 280);
-        m3w_emit_str(iset_patch_i64(arena, 280, wsp - 1), src, nid, treg)
-    } else {
-        if_pos is_if {
-            let shared_j: i64 = (fw1 >> 1) & 1;
-            let u: bytes = iset_patch_i64(arena, off, 7 | (0 << 16) | (nid << 32) | (treg << 48));
-            u = iset_patch_i64(u, off + 8, shared_j);
-            m3w_ws_push(u, 1, 0, aw1 & 65535, 0, 1)
+        let u: bytes = iset_patch_i64(arena, 280, wsp - 1);
+        let is_harg: trit = ((fw1 >> 2) & 1) <=> 0;
+        if_pos is_harg {
+            iset_patch_i64(u, 288, m3w_host_str_op(src, aw1 & m2u_mask32(), (aw1 >> 32) & 65535))
         } else {
-            if_pos is_mt {
-                let u: bytes = iset_patch_i64(arena, off, 8 | (0 << 16) | (nid << 32) | (treg << 48));
-                u = iset_patch_i64(u, off + 8, 0);
+            m3w_emit_str(u, src, nid, treg)
+        }
+    } else {
+        if_pos is_tv {
+            let wsp: i64 = ld_u64(arena, 280);
+            m3w_emit_tritvec(iset_patch_i64(arena, 280, wsp - 1), nid, treg, 1)
+        } else {
+            if_pos is_if {
+                let shared_j: i64 = (fw1 >> 1) & 1;
+                let u: bytes = iset_patch_i64(arena, off, 7 | (0 << 16) | (nid << 32) | (treg << 48));
+                u = iset_patch_i64(u, off + 8, shared_j);
                 m3w_ws_push(u, 1, 0, aw1 & 65535, 0, 1)
             } else {
-                m3a_set_err(arena, m3err_syntax(), (aw0 >> 16) & 65535, (aw0 >> 32) & 65535)
+                if_pos is_mt {
+                    let u: bytes = iset_patch_i64(arena, off, 8 | (0 << 16) | (nid << 32) | (treg << 48));
+                    u = iset_patch_i64(u, off + 8, 0);
+                    m3w_ws_push(u, 1, 0, aw1 & 65535, 0, 1)
+                } else {
+                    m3a_set_err(arena, m3err_syntax(), (aw0 >> 16) & 65535, (aw0 >> 32) & 65535)
+                }
             }
+        }
+    };
+    return r;
+}
+
+// Handles Call entry in `m3w_step_expr_enter` (`pack5_bytes` fast-path + host-arg flag propagation).
+#[strict]
+fn m3w_step_call_enter(arena: bytes, src: array, off: i64, nid: i64, treg: i64, aw0: i64, aw1: i64) -> bytes {
+    let ahead: i64 = (aw1 >> 16) & 65535;
+    let nargs: i64 = (aw1 >> 32) & 65535;
+    let fl: i64 = (aw0 >> 16) & 65535;
+    let fc: i64 = (aw0 >> 32) & 65535;
+    let hlow: i64 = m3w_call_hlow(arena, src, aw0, aw1);
+    let is_p5b: trit = m2u_eq(hlow, 1407924347) <=> 0;
+    let r: bytes = if_pos is_p5b {
+        let wsp: i64 = ld_u64(arena, 280);
+        let u: bytes = iset_patch_i64(arena, 280, wsp - 1);
+        let ok1: trit = m2u_eq(nargs, 1) <=> 0;
+        if_pos ok1 {
+            let ak: i64 = ld_u64(u, m3l_ast() + (ahead << 4)) & 255;
+            let ok_tv: trit = m2u_eq(ak, 8) <=> 0;
+            if_pos ok_tv {
+                m3w_emit_tritvec(u, ahead, treg, 0)
+            } else {
+                m3a_set_err(u, m3err_bad_type(), fl, fc)
+            }
+        } else {
+            m3a_set_err(u, m3err_arity(), fl, fc)
+        }
+    } else {
+        let is_h: i64 = m2u_lt(0, m3w_host_cls(hlow));
+        let has_a: trit = ahead <=> 0;
+        if_pos has_a {
+            let asp: i64 = ld_u64(arena, 320);
+            let u: bytes = iset_patch_i64(arena, 320, asp + nargs);
+            u = iset_patch_i64(u, off, 1 | (4 << 16) | (nid << 32) | (treg << 48));
+            u = iset_patch_i64(u, off + 8, ahead | (asp << 16) | (is_h << 48));
+            m3w_ws_push(u, 1, 0, ahead, 0, 1 | (is_h << 2))
+        } else {
+            let wsp: i64 = ld_u64(arena, 280);
+            let u: bytes = iset_patch_i64(arena, 280, wsp - 1);
+            m3w_emit_call_done(u, src, nid, treg, m3l_pool(), 0)
         }
     };
     return r;
@@ -572,11 +835,12 @@ fn m3w_step_expr_enter_ext(arena: bytes, src: array, off: i64, nid: i64, treg: i
 
 // Work-stack step for expression frames:
 //   fkind 1 = EVAL_EXPR (phase 0=enter, 1=UnOp post, 2=BinOp mid, 3=BinOp post, 4=Call arg loop)
-//   aux0 (`w1 & 1`) = as_op, `(w1 >> 1) & 1` = has_shared_join (phase 0)
+//   aux0 (`w1 & 1`) = as_op, `(w1 >> 1) & 1` = has_shared_join, `(w1 >> 2) & 1` = host_arg (phase 0)
 #[strict]
 fn m3w_step_expr_enter(arena: bytes, src: array, off: i64, nid: i64, treg: i64, fw1: i64) -> bytes {
-    let aw0: i64 = ld_u64(arena, m3l_ast() + (nid << 4));
-    let aw1: i64 = ld_u64(arena, m3l_ast() + (nid << 4) + 8);
+    let ab: i64 = m3l_ast() + (nid << 4);
+    let aw0: i64 = ld_u64(arena, ab);
+    let aw1: i64 = ld_u64(arena, ab + 8);
     let k: i64 = aw0 & 255;
     let is_leaf: trit = (m2u_eq(k, 1) + m2u_eq(k, 2) + m2u_eq(k, 4)) <=> 0;
     let is_un: trit = m2u_eq(k, 5) <=> 0;
@@ -596,20 +860,7 @@ fn m3w_step_expr_enter(arena: bytes, src: array, off: i64, nid: i64, treg: i64, 
                 m3w_ws_push(u, 1, 0, aw1 & 65535, 0, 1)
             } else {
                 if_pos is_call {
-                    let ahead: i64 = (aw1 >> 16) & 65535;
-                    let nargs: i64 = (aw1 >> 32) & 65535;
-                    let has_a: trit = ahead <=> 0;
-                    if_pos has_a {
-                        let asp: i64 = ld_u64(arena, 320);
-                        let u: bytes = iset_patch_i64(arena, 320, asp + nargs);
-                        u = iset_patch_i64(u, off, 1 | (4 << 16) | (nid << 32) | (treg << 48));
-                        u = iset_patch_i64(u, off + 8, ahead | (asp << 16));
-                        m3w_ws_push(u, 1, 0, ahead, 0, 1)
-                    } else {
-                        let wsp: i64 = ld_u64(arena, 280);
-                        let u: bytes = iset_patch_i64(arena, 280, wsp - 1);
-                        m3w_emit_call_done(u, src, nid, treg, m3l_pool(), 0)
-                    }
+                    m3w_step_call_enter(arena, src, off, nid, treg, aw0, aw1)
                 } else {
                     m3w_step_expr_enter_ext(arena, src, off, nid, treg, fw1, k, aw0, aw1)
                 }
@@ -622,8 +873,10 @@ fn m3w_step_expr_enter(arena: bytes, src: array, off: i64, nid: i64, treg: i64, 
 // Work-stack step for expression post-phases (phase 1=UnOp, 2=BinOp mid, 3=BinOp post, 4=Call args).
 #[strict]
 fn m3w_step_expr_post(arena: bytes, src: array, off: i64, phase: i64, nid: i64, treg: i64, w1: i64) -> bytes {
-    let aw0: i64 = ld_u64(arena, m3l_ast() + (nid << 4));
-    let aw1: i64 = ld_u64(arena, m3l_ast() + (nid << 4) + 8);
+    let ast: i64 = m3l_ast();
+    let ab: i64 = ast + (nid << 4);
+    let aw0: i64 = ld_u64(arena, ab);
+    let aw1: i64 = ld_u64(arena, ab + 8);
     let fl: i64 = (aw0 >> 16) & 65535;
     let fc: i64 = (aw0 >> 32) & 65535;
     let c1: trit = m2u_eq(phase, 1) <=> 0;
@@ -665,13 +918,14 @@ fn m3w_step_expr_post(arena: bytes, src: array, off: i64, phase: i64, nid: i64, 
                 let cur_a: i64 = w1 & 65535;
                 let asp: i64 = (w1 >> 16) & 65535;
                 let aidx: i64 = (w1 >> 32) & 65535;
+                let is_h: i64 = (w1 >> 48) & 1;
                 let abase: i64 = m3l_pool() + (asp << 3);
                 let u: bytes = iset_patch_i64(arena, abase + (aidx << 3), ld_u64(arena, 288));
-                let nxt_a: i64 = (ld_u64(u, m3l_ast() + (cur_a << 4)) >> 48) & 65535;
+                let nxt_a: i64 = (ld_u64(u, ast + (cur_a << 4)) >> 48) & 65535;
                 let has_n: trit = nxt_a <=> 0;
                 if_pos has_n {
-                    let u2: bytes = iset_patch_i64(u, off + 8, nxt_a | (asp << 16) | ((aidx + 1) << 32));
-                    m3w_ws_push(u2, 1, 0, nxt_a, 0, 1)
+                    let u2: bytes = iset_patch_i64(u, off + 8, nxt_a | (asp << 16) | ((aidx + 1) << 32) | (is_h << 48));
+                    m3w_ws_push(u2, 1, 0, nxt_a, 0, 1 | (is_h << 2))
                 } else {
                     let wsp: i64 = ld_u64(u, 280);
                     let u2: bytes = iset_patch_i64(u, 280, wsp - 1);
@@ -688,6 +942,7 @@ fn m3w_step_expr_post(arena: bytes, src: array, off: i64, phase: i64, nid: i64, 
 // Handles `Label`(20), `Goto`(21), `Let`(16), `Assign`(17), `While`(19), `DoWhile`(18), `Ret`(22), `ExprStmt`(23).
 #[strict]
 fn m3w_step_stmt_a(arena: bytes, src: array, nid: i64, k: i64, sw0: i64, sw1: i64) -> bytes {
+    let out: i64 = m3l_out();
     let sl: i64 = (sw0 >> 16) & 65535;
     let sc: i64 = (sw0 >> 32) & 65535;
     let c_let: trit = m2u_eq(k, 16) <=> 0;
@@ -700,8 +955,8 @@ fn m3w_step_stmt_a(arena: bytes, src: array, nid: i64, k: i64, sw0: i64, sw1: i6
     } else {
         if_pos c_asg {
             let nti: i64 = sw1 & 65535;
-            let nh: i64 = ld_u64(arena, m3l_out() + (nti << 4));
-            let nv: i64 = ld_u64(arena, m3l_out() + (nti << 4) + 8);
+            let nh: i64 = ld_u64(arena, out + (nti << 4));
+            let nv: i64 = ld_u64(arena, out + (nti << 4) + 8);
             let vtok: i64 = m3w_var_find(arena, src, nv, (nh >> 16) & 65535);
             let undef: trit = m2u_eq(vtok, 0) <=> 0;
             if_pos undef {
@@ -785,12 +1040,14 @@ fn m3w_step_stmt_b(arena: bytes, src: array, nid: i64, k: i64, sw0: i64, sw1: i6
 // Lowers `Ret(expr_id)` — detects 3-op `ret_slice(buf, off, len)` vs standard 1-op `RET op`.
 #[strict]
 fn m3w_step_ret(arena: bytes, src: array, eid: i64) -> bytes {
-    let ew0: i64 = ld_u64(arena, m3l_ast() + (eid << 4));
-    let ew1: i64 = ld_u64(arena, m3l_ast() + (eid << 4) + 8);
+    let ast: i64 = m3l_ast();
+    let out: i64 = m3l_out();
+    let ew0: i64 = ld_u64(arena, ast + (eid << 4));
+    let ew1: i64 = ld_u64(arena, ast + (eid << 4) + 8);
     let is_c: i64 = m2u_eq(ew0 & 255, 7);
     let nti: i64 = (ew1 & 65535) * is_c;
-    let nh: i64 = ld_u64(arena, m3l_out() + (nti << 4));
-    let nv: i64 = ld_u64(arena, m3l_out() + (nti << 4) + 8);
+    let nh: i64 = ld_u64(arena, out + (nti << 4));
+    let nv: i64 = ld_u64(arena, out + (nti << 4) + 8);
     let is_rs: trit = (is_c * m2u_eq(m3s_hash(src, nv * is_c, ((nh >> 16) & 65535) * is_c, 1), 124362893)) <=> 0;
     let r: bytes = if_pos is_rs {
         let ahead: i64 = (ew1 >> 16) & 65535;
@@ -814,20 +1071,22 @@ fn m3w_step_ret(arena: bytes, src: array, eid: i64) -> bytes {
 // Handles control post-frames: 3=ST_LET_POST, 4=DW_POST, 5=WH_POST, 6=RET_POST.
 #[strict]
 fn m3w_step_ctrl(arena: bytes, src: array, off: i64, fkind: i64, phase: i64, nid: i64, w1: i64) -> bytes {
+    let ast: i64 = m3l_ast();
+    let out: i64 = m3l_out();
     let wsp: i64 = ld_u64(arena, 280);
     let c3: trit = m2u_eq(fkind, 3) <=> 0;
     let c4: trit = m2u_eq(fkind, 4) <=> 0;
     let c5: trit = m2u_eq(fkind, 5) <=> 0;
     let r: bytes = if_pos c3 {
-        let nh: i64 = ld_u64(arena, m3l_out() + (w1 << 4));
-        let nv: i64 = ld_u64(arena, m3l_out() + (w1 << 4) + 8);
+        let nh: i64 = ld_u64(arena, out + (w1 << 4));
+        let nv: i64 = ld_u64(arena, out + (w1 << 4) + 8);
         let u: bytes = iset_patch_i64(arena, 280, wsp - 1);
         m3w_var_set(u, src, nv, (nh >> 16) & 65535, ld_u64(u, 288))
     } else {
         if_pos c4 {
             let is_p0: trit = m2u_eq(phase, 0) <=> 0;
             if_pos is_p0 {
-                let sw1: i64 = ld_u64(arena, m3l_ast() + (nid << 4) + 8);
+                let sw1: i64 = ld_u64(arena, ast + (nid << 4) + 8);
                 let u: bytes = iset_patch_i64(arena, off, 4 | (1 << 16) | (nid << 32));
                 m3w_ws_push(u, 1, 0, (sw1 >> 16) & 65535, 0, 1)
             } else {
@@ -838,7 +1097,7 @@ fn m3w_step_ctrl(arena: bytes, src: array, off: i64, fkind: i64, phase: i64, nid
             if_pos c5 {
                 let is_p0: trit = m2u_eq(phase, 0) <=> 0;
                 if_pos is_p0 {
-                    let sw1: i64 = ld_u64(arena, m3l_ast() + (nid << 4) + 8);
+                    let sw1: i64 = ld_u64(arena, ast + (nid << 4) + 8);
                     let u: bytes = m3w_emit_br(arena, 0, ld_u64(arena, 288), (w1 >> 16) & 15);
                     u = m3w_emit_lbl_jmp(u, 1, (w1 >> 32) & 15);
                     u = m3w_emit_lbl_jmp(u, 0, (w1 >> 16) & 15);
@@ -865,8 +1124,9 @@ fn m3w_step_ctrl(arena: bytes, src: array, off: i64, fkind: i64, phase: i64, nid
 // Handles `IF_CTRL` (`fkind == 7`): phase 0 (after cond), phase 1 (after else), phase 2 (after then).
 #[strict]
 fn m3w_step_if(arena: bytes, off: i64, phase: i64, nid: i64, treg: i64, w1: i64) -> bytes {
-    let aw0: i64 = ld_u64(arena, m3l_ast() + (nid << 4));
-    let aw1: i64 = ld_u64(arena, m3l_ast() + (nid << 4) + 8);
+    let ab: i64 = m3l_ast() + (nid << 4);
+    let aw0: i64 = ld_u64(arena, ab);
+    let aw1: i64 = ld_u64(arena, ab + 8);
     let fl: i64 = (aw0 >> 16) & 65535;
     let fc: i64 = (aw0 >> 32) & 65535;
     let c0: trit = m2u_eq(phase, 0) <=> 0;
@@ -932,8 +1192,9 @@ fn m3w_step_if(arena: bytes, off: i64, phase: i64, nid: i64, treg: i64, w1: i64)
 // Handles `MATCH_CTRL` (`fkind == 8`): phase 0 (after scrut), 1 (after neg), 2 (after zero), 3 (after pos).
 #[strict]
 fn m3w_step_match(arena: bytes, off: i64, phase: i64, nid: i64, treg: i64, w1: i64) -> bytes {
-    let aw0: i64 = ld_u64(arena, m3l_ast() + (nid << 4));
-    let aw1: i64 = ld_u64(arena, m3l_ast() + (nid << 4) + 8);
+    let ab: i64 = m3l_ast() + (nid << 4);
+    let aw0: i64 = ld_u64(arena, ab);
+    let aw1: i64 = ld_u64(arena, ab + 8);
     let fl: i64 = (aw0 >> 16) & 65535;
     let fc: i64 = (aw0 >> 32) & 65535;
     let c0: trit = m2u_eq(phase, 0) <=> 0;
@@ -1041,10 +1302,11 @@ fn m3w_run_lower(arena: bytes, src: array, root_stmt: i64) -> bytes {
 // When `treg > 0` and `next == 0`, lowers final `Expr`/`Ret` directly into `treg` (passing `has_shared_join = fw1`).
 #[strict]
 fn m3w_step_stmt_list(arena: bytes, src: array, off: i64, nid: i64, treg: i64, fw1: i64) -> bytes {
+    let ast: i64 = m3l_ast();
     let has_s: trit = nid <=> 0;
     let r: bytes = if_pos has_s {
-        let sw0: i64 = ld_u64(arena, m3l_ast() + (nid << 4));
-        let sw1: i64 = ld_u64(arena, m3l_ast() + (nid << 4) + 8);
+        let sw0: i64 = ld_u64(arena, ast + (nid << 4));
+        let sw1: i64 = ld_u64(arena, ast + (nid << 4) + 8);
         let nxt: i64 = (sw0 >> 48) & 65535;
         let u: bytes = iset_patch_i64(arena, off, 2 | (nxt << 32) | (treg << 48));
         let k: i64 = sw0 & 255;
@@ -1066,38 +1328,132 @@ fn m3w_step_stmt_list(arena: bytes, src: array, off: i64, nid: i64, treg: i64, f
     return r;
 }
 
-// Emits fn header params into the u16 stream AND populates `m3l_vtab()` with `PAR_BASE + p_idx`.
+// Feeds decimal ASCII digits of non-negative `v` into 32-bit FNV-1a state `h` (immediate `/ 10` only).
 #[strict]
-fn m3w_emit_fn_params(arena: bytes, src: array, ntok: i64, fn_tok: i64, nparams: i64, fstr: i64) -> bytes {
-    let w: bytes = iset_patch_i64(arena, 272, 0);
-    let ti: i64 = fn_tok + 3; // after `fn`, `name`, `(`
-    let pi: i64 = 0;
-    while nparams - pi <=> 0 {
-        let h0: i64 = ld_u64(w, m3l_out() + (ti << 4));
-        let v0: i64 = ld_u64(w, m3l_out() + (ti << 4) + 8);
-        let h2: i64 = ld_u64(w, m3l_out() + ((ti + 2) << 4));
-        let v2: i64 = ld_u64(w, m3l_out() + ((ti + 2) << 4) + 8);
-        let tlen: i64 = (h2 >> 16) & 65535;
-        let upfx: i64 = m3s_has_untrusted_pfx(src, v2, tlen);
-        let ty_tok: i64 = m3s_map_type(m3s_hash(src, v2 + upfx * 10, tlen - upfx * 10, 1), fstr);
-        let j: i64 = ti + 3;
-        let ha: i64 = ld_u64(w, m3l_out() + ((j * m2u_lt(j, ntok)) << 4));
-        let va: i64 = ld_u64(w, m3l_out() + ((j * m2u_lt(j, ntok)) << 4) + 8);
-        let is_at: i64 = m2u_lt(j, ntok) * m2u_eq(ha & 65535, 3);
-        let ah: i64 = m3s_hash(src, va * is_at, ((ha >> 16) & 65535) * is_at, 1);
-        let unt: i64 = m2u_sel(is_at, m2u_eq(ah, 1007564857), upfx);
-        let tc_tok: i64 = 32704 | (unt * 32); // TC_BASE | (unt ? TC_UNTRUSTED_BIT : 0)
-        w = m3w_var_set(w, src, v0, (h0 >> 16) & 65535, 32448 + pi); // PAR_BASE + pi
-        w = m3w_emit_u16(w, 32448 + pi);
-        w = m3w_emit_u16(w, ty_tok);
-        w = m3w_emit_u16(w, tc_tok);
-        let k: i64 = j + is_at;
-        let hc: i64 = ld_u64(w, m3l_out() + ((k * m2u_lt(k, ntok)) << 4));
-        let vc: i64 = ld_u64(w, m3l_out() + ((k * m2u_lt(k, ntok)) << 4) + 8);
-        ti = k + m2u_lt(k, ntok) * m2u_eq(hc & 65535, 5) * m2u_eq(vc, 44);
-        pi = pi + 1;
+fn m3w_fnv_uint(h: i64, v: i64) -> i64 {
+    let m32: i64 = m2u_mask32();
+    let rev: i64 = 0;
+    let nd: i64 = 0;
+    let x: i64 = v;
+    let g1: i64 = 1;
+    while g1 <=> 0 {
+        let q: i64 = x / 10;
+        let d: i64 = x - q * 10;
+        rev = (rev << 4) | (d & 15);
+        nd = nd + 1;
+        x = q;
+        g1 = m2u_lt(0, x);
     }
-    return w;
+    let out: i64 = h;
+    while nd <=> 0 {
+        let d: i64 = rev & 15;
+        out = ((out ^ (48 + d)) * 16777619) & m32;
+        rev = rev >> 4;
+        nd = nd - 1;
+    }
+    return out;
+}
+
+// Computes `fnv1a_32_positive` over route path tokens `p_start..p_end` (StrLit or unquoted path tokens).
+#[strict]
+fn m3w_route_path_hash(arena: bytes, src: array, p_start: i64, p_end: i64) -> i64 {
+    let out: i64 = m3l_out();
+    let h: i64 = (33052 << 16) | 40389; // 2166136261
+    let j: i64 = p_start;
+    while p_end - j <=> 0 {
+        let bj: i64 = out + (j << 4);
+        let hj: i64 = ld_u64(arena, bj);
+        let vj: i64 = ld_u64(arena, bj + 8);
+        let k: i64 = hj & 65535;
+        let is_span: trit = (m2u_eq(k, 2) + m2u_eq(k, 8)) <=> 0;
+        let is_ch: trit = (m2u_eq(k, 5) + m2u_eq(k, 6)) <=> 0;
+        let nh: i64 = if_pos is_span {
+            let sl: i64 = (hj >> 16) & 65535;
+            let i: i64 = 0;
+            let h1: i64 = h;
+            while sl - i <=> 0 {
+                h1 = ((h1 ^ iget(src, vj + i)) * 16777619) & 2147483647;
+                i = i + 1;
+            }
+            h1
+        } else {
+            if_pos is_ch {
+                ((h ^ (vj & 255)) * 16777619) & 2147483647
+            } else {
+                m3w_fnv_uint(h, vj)
+            }
+        };
+        h = nh;
+        j = j + 1;
+    }
+    let h30: i64 = h & 1073741823;
+    return m2u_sel(m2u_eq(h30, 0), 1, h30);
+}
+
+// Emits `%0 = ROUTE method_code path_hash` (`0x7F6C`) at the start of a `route` function body.
+#[strict]
+fn m3w_emit_route_prelude(arena: bytes, src: array, fn_tok: i64, p_end: i64) -> bytes {
+    let out: i64 = m3l_out();
+    let hm: i64 = ld_u64(arena, out + ((fn_tok + 1) << 4));
+    let vm: i64 = ld_u64(arena, out + ((fn_tok + 1) << 4) + 8);
+    let mh: i64 = m3s_hash(src, vm, (hm >> 16) & 65535, 1);
+    let mcode: i64 = m2u_eq(mh, 1410115415) * 1 + m2u_eq(mh, 166197831) * 2
+        + m2u_eq(mh, 1769118190) * 3 + m2u_eq(mh, 1740784714) * 4;
+    let phash: i64 = m3w_route_path_hash(arena, src, fn_tok + 2, p_end);
+    let u: bytes = m3w_alloc_reg(arena, (hm >> 32) & 65535, (hm >> 48) & 65535);
+    let ok: trit = m2u_eq(ld_u64(u, 40), 0) <=> 0;
+    let r: bytes = if_pos ok {
+        let dst: i64 = ld_u64(u, 288);
+        m3w_emit_dest2(u, dst, 32620, 32641, (1 << 48) | mcode, 1, (1 << 48) | phash)
+    } else { u };
+    return r;
+}
+
+// Emits fn/route header params into the u16 stream AND populates `m3l_vtab()` with `PAR_BASE + p_idx`.
+#[strict]
+fn m3w_emit_fn_params(arena: bytes, src: array, ntok: i64, param_ti: i64, nparams: i64, fstr: i64, synth_req: i64) -> bytes {
+    let w: bytes = iset_patch_i64(arena, 272, 0);
+    let out: i64 = m3l_out();
+    let r: bytes = if_pos synth_req <=> 0 {
+        let base: i64 = m3l_vtab();
+        let u: bytes = iset_patch_i64(w, base, 32448 << 48);
+        u = iset_patch_i64(u, base + 8, 770990835);
+        u = iset_patch_i64(u, 272, 1);
+        u = m3w_emit_u16(u, 32448);
+        u = m3w_emit_u16(u, 32641);
+        m3w_emit_u16(u, 32704)
+    } else {
+        let ti: i64 = param_ti;
+        let pi: i64 = 0;
+        let u: bytes = w;
+        while nparams - pi <=> 0 {
+            let b0: i64 = out + (ti << 4);
+            let h0: i64 = ld_u64(u, b0);
+            let v0: i64 = ld_u64(u, b0 + 8);
+            let h2: i64 = ld_u64(u, b0 + 32);
+            let v2: i64 = ld_u64(u, b0 + 40);
+            let tlen: i64 = (h2 >> 16) & 65535;
+            let upfx: i64 = m3s_has_untrusted_pfx(src, v2, tlen);
+            let ty_tok: i64 = m3s_map_type(m3s_hash(src, v2 + upfx * 10, tlen - upfx * 10, 1), fstr);
+            let j: i64 = ti + 3;
+            let bj: i64 = out + ((j * m2u_lt(j, ntok)) << 4);
+            let ha: i64 = ld_u64(u, bj);
+            let va: i64 = ld_u64(u, bj + 8);
+            let is_at: i64 = m2u_lt(j, ntok) * m2u_eq(ha & 65535, 3);
+            let ah: i64 = m3s_hash(src, va * is_at, ((ha >> 16) & 65535) * is_at, 1);
+            let unt: i64 = m2u_sel(is_at, m2u_eq(ah, 1007564857), upfx);
+            u = m3w_var_set(u, src, v0, (h0 >> 16) & 65535, 32448 + pi);
+            u = m3w_emit_u16(u, 32448 + pi);
+            u = m3w_emit_u16(u, ty_tok);
+            u = m3w_emit_u16(u, 32704 | (unt * 32));
+            let k: i64 = j + is_at;
+            let bk: i64 = out + ((k * m2u_lt(k, ntok)) << 4);
+            ti = k + m2u_lt(k, ntok) * m2u_eq(ld_u64(u, bk) & 65535, 5) * m2u_eq(ld_u64(u, bk + 8), 44);
+            pi = pi + 1;
+        }
+        u
+    };
+    return r;
 }
 
 // Checks that every `goto N` in `m3l_lbls()` has a matching `label N` in `lbl_def_mask`.
@@ -1123,6 +1479,7 @@ fn m3w_check_labels(arena: bytes) -> bytes {
 // Compiles one function `fi` (parse body -> emit header -> lower body -> backpatch ins_cnt -> check labels).
 #[strict]
 fn m3w_compile_one_fn(arena: bytes, src: array, ntok: i64, fi: i64) -> bytes {
+    let out: i64 = m3l_out();
     let base: i64 = m3l_fntab() + (fi << 5);
     let fw0: i64 = ld_u64(arena, base);
     let fw1: i64 = ld_u64(arena, base + 8);
@@ -1132,28 +1489,38 @@ fn m3w_compile_one_fn(arena: bytes, src: array, ntok: i64, fi: i64) -> bytes {
     let ret_ty: i64 = (fw0 >> 32) & 65535;
     let cap_mask: i64 = (fw0 >> 48) & 65535;
     let fstr: i64 = (fw1 >> 48) & 1;
+    let is_rt: i64 = (fw1 >> 49) & 1;
     let bstart: i64 = fw2 & m2u_mask32();
     let fn_tok: i64 = (fw2 >> 48) & 65535;
     let w: bytes = m3p_parse_fn_body(arena, src, ntok, bstart, fstr);
     let ok: trit = m2u_eq(ld_u64(w, 40), 0) <=> 0;
     let r: bytes = if_pos ok {
         let root: i64 = ld_u64(w, 200);
-        let u: bytes = iset_patch_i64(w, 248, 0);   // ins_cnt = 0
-        u = iset_patch_i64(u, 256, 0);              // next_reg = 0
-        u = iset_patch_i64(u, 264, 1);              // next_lbl = 1
-        u = iset_patch_i64(u, 296, ret_ty);         // cur_ret_ty
-        u = iset_patch_i64(u, 304, 0);              // lbl_def_mask = 0
-        u = iset_patch_i64(u, 312, 0);              // lbl_use_cnt = 0
-        u = iset_patch_i64(u, 320, 0);              // arg_sp = 0
-        u = m3w_emit_u16(u, 32483);                 // TOK_FN_DEF
+        let rt_t: trit = is_rt <=> 0;
+        let w_rp: bytes = if_pos rt_t { m3s_skip_route_path(iset_patch_i64(w, 96, fn_tok + 2), ntok) } else { w };
+        let p_end: i64 = m2u_sel(is_rt, ld_u64(w_rp, 96), fn_tok + 2);
+        let ok_p1: i64 = m2u_lt(p_end + 1, ntok);
+        let hp: i64 = ld_u64(w_rp, out + ((p_end * ok_p1) << 4));
+        let vp: i64 = ld_u64(w_rp, out + ((p_end * ok_p1) << 4) + 8);
+        let hp1: i64 = ld_u64(w_rp, out + (((p_end + 1) * ok_p1) << 4));
+        let synth_req: i64 = is_rt * (1 - ok_p1 * m2u_eq(hp & 65535, 5) * m2u_eq(vp, 40) * m2u_eq(hp1 & 65535, 8));
+        let u: bytes = iset_patch_i64(w_rp, 248, 0); // ins_cnt = 0
+        u = iset_patch_i64(u, 256, 0);               // next_reg = 0
+        u = iset_patch_i64(u, 264, 1);               // next_lbl = 1
+        u = iset_patch_i64(u, 296, ret_ty);          // cur_ret_ty
+        u = iset_patch_i64(u, 304, 0);               // lbl_def_mask = 0
+        u = iset_patch_i64(u, 312, 0);               // lbl_use_cnt = 0
+        u = iset_patch_i64(u, 320, 0);               // arg_sp = 0
+        u = m3w_emit_u16(u, 32483);                  // TOK_FN_DEF
         u = m3w_emit_u16(u, fid);
         u = m3w_emit_u16(u, nparams);
-        u = m3w_emit_fn_params(u, src, ntok, fn_tok, nparams, fstr);
+        u = m3w_emit_fn_params(u, src, ntok, p_end + 1, nparams, fstr, synth_req);
         u = m3w_emit_u16(u, ret_ty);
         u = m3w_emit_u16(u, cap_mask);
         let ic_word_off: i64 = ld_u64(u, 232) + (ld_u64(u, 240) << 1);
-        u = m3w_emit_u16(u, 0);                     // placeholder ins_cnt
-        u = m3w_run_lower(u, src, root);
+        u = m3w_emit_u16(u, 0);                      // placeholder ins_cnt
+        let u_rt: bytes = if_pos rt_t { m3w_emit_route_prelude(u, src, fn_tok, p_end) } else { u };
+        u = m3w_run_lower(u_rt, src, root);
         let ok2: trit = m2u_eq(ld_u64(u, 40), 0) <=> 0;
         if_pos ok2 {
             let ic: i64 = ld_u64(u, 248);
