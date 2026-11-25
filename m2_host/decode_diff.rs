@@ -2381,6 +2381,36 @@ pub fn selftest_m2_10_wasm_multi() -> Result<usize, String> {
         other => return Err(format!("M2-10 depth-70 expected call-depth BUDGET_EXCEEDED, got {:?}", other)),
     }
 
+    // Fix 2 regression: `compile_pure_u16_to_wasm` dispatches 2+ fn modules to multi-Wasm,
+    // selects the last function when `fn_idx == 0` is absent (matching `run`), and supports >4 entry params.
+    let fix2_src = "#[strict]\nfn helper_first(x: i64) -> i64 { return x * 100; }\n#[strict]\nfn entry_last(a: i64, b: i64, c: i64, d: i64, e: i64) -> i64 { return helper_first(d) + e + a * 0 + b * 0 + c * 0; }\n";
+    let fix2_stream = compile_omni_surface_strict_to_u16(fix2_src)?;
+    let fix2_wasm = compile_pure_u16_to_wasm(&fix2_stream)?;
+    let fix2_got = execute_wasm_module_i64(&fix2_wasm, &[1, 2, 3, 4, 5])?;
+    if fix2_got != 405 {
+        return Err(format!("M2-10 Fix 2 multi-fn dispatch / 5-arg last-entry returned {}, want 405", fix2_got));
+    }
+    checks += 1;
+
+    // x86-64 multi-AOT 4-param entry guard regression: >4 entry params must still reject on x86-64 multi-mode.
+    match compile_pure_u16_to_x86_64_elf_multi(&fix2_stream, 0, 0, 0) {
+        Err(e) if e.contains("MULTI_AOT_ENTRY_PARAMS") => checks += 1,
+        other => return Err(format!("M2-10 x86-64 multi-AOT 5-param entry expected MULTI_AOT_ENTRY_PARAMS, got {:?}", other)),
+    }
+
+    // Fix 3 positive & negative regressions: `#[mem_budget(8192)]` runs on the `"aot"` Wasm hot path
+    // without billing pre-allocated linear-memory pages, while still rejecting `arena(20000)`.
+    let fix3_ok_src = "#[strict]\n#[mem_budget(8192)]\nfn main(cur: i64, step: i64) -> i64 { let a: arena = arena(4096); drop(a); return cur + step; }\n";
+    match execute_omni_surface_aot_first(fix3_ok_src, vec![OmniValue::Int(5), OmniValue::Int(1)])? {
+        (OmniValue::Int(6), "aot") => checks += 1,
+        other => return Err(format!("M2-10 Fix 3 #[mem_budget(8192)] arena(4096) expected (Int(6), \"aot\"), got {:?}", other)),
+    }
+    let fix3_neg_src = "#[strict]\n#[mem_budget(8192)]\nfn main(cur: i64, step: i64) -> i64 { let a: arena = arena(20000); drop(a); return cur + step; }\n";
+    match execute_omni_surface_aot_first(fix3_neg_src, vec![OmniValue::Int(5), OmniValue::Int(1)]) {
+        Err(e) if e.contains("BUDGET_EXCEEDED") => checks += 1,
+        other => return Err(format!("M2-10 Fix 3 #[mem_budget(8192)] arena(20000) expected BUDGET_EXCEEDED, got {:?}", other)),
+    }
+
     Ok(checks)
 }
 

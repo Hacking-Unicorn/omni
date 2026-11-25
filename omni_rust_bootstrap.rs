@@ -18657,6 +18657,16 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
     let n_fns = module.functions.len();
     let entry_pos = module.functions.iter().position(|f| f.fn_idx == 0).unwrap_or(n_fns - 1);
     let entry_fn = &module.functions[entry_pos];
+    // Multi-mode x86-64 `_start` stub pushes only 4 register slots (`r15..r12`, 32 B)
+    // directly below the 1 MiB `rbx` stack arena; reject >4 entry params here so Wasm
+    // multi-AOT can accept up to 32 entry params without breaking x86-64 stack bounds.
+    if entry_fn.params.len() > 4 {
+        return Err(format!(
+            "error[MULTI_AOT_ENTRY_PARAMS]: x86-64 multi-AOT entry fn#{} has {} params (max 4)",
+            entry_fn.fn_idx,
+            entry_fn.params.len()
+        ));
+    }
     let entry_is_bytes = entry_fn.ret_ty_tok == TY_BYTES;
 
     let mut code: Vec<u8> = Vec::with_capacity(8192);

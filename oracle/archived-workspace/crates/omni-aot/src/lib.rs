@@ -872,6 +872,14 @@ pub fn compile_pure_u16_to_x86_64_elf_multi(
     let n_fns = module.functions.len();
     let entry_pos = module.functions.iter().position(|f| f.fn_idx == 0).unwrap_or(n_fns - 1);
     let entry_fn = &module.functions[entry_pos];
+    // Mirrors the live monolith: x86-64 multi-mode `_start` stub pushes only 4 args (`r15..r12`).
+    if entry_fn.params.len() > 4 {
+        return Err(format!(
+            "error[MULTI_AOT_ENTRY_PARAMS]: x86-64 multi-AOT entry fn#{} has {} params (max 4)",
+            entry_fn.fn_idx,
+            entry_fn.params.len()
+        ));
+    }
     let entry_is_bytes = entry_fn.ret_ty_tok == TY_BYTES;
 
     let mut code: Vec<u8> = Vec::with_capacity(8192);
@@ -2787,10 +2795,12 @@ pub fn execute_wasm_module_i64_with_budgets(
     let mut bpos = fn_code_starts[cur_fn];
     let total_locals = fn_total_locals[cur_fn];
 
+    // Fix 3 (mirrors the live monolith): exclude pre-allocated Wasm linear-memory
+    // capacity (2 or 32 pages) from `frame_bytes` so `#[mem_budget]` bounds user
+    // frame/locals + static `0x7F01` allocations rather than fixed runtime address space.
     let frame_bytes = wasm
         .len()
-        .saturating_add(total_locals.max(args.len()).saturating_mul(8))
-        .saturating_add(memory.len());
+        .saturating_add(total_locals.max(args.len()).saturating_mul(8));
     if frame_bytes > memory_budget_bytes {
         return Err(format!(
             "error[BUDGET_EXCEEDED]: Wasm AOT memory budget exceeded ({} > {} bytes)",
