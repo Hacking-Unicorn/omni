@@ -186,6 +186,26 @@ After Flywheel Round 2 (PR #16, `main@19a448d`), full re-measurement (`p7-measur
 
 ---
 
+## 7th Benchmark — `bench_m3_frontend` (`main@bfbfbdc` + Step 1)
+
+Expanded the fixed Phase 7 corpus from 6 to **7 benchmarks** by adding `bench_m3_frontend` (`args = [5, 2, -8]`, `ret = 1652`), which exercises the Pure-Omni M3 surface-language frontend path not covered by the 5 micro-benchmarks: `std/` includes (`std/math.omni`, `std/trit.omni`, `std/pack5.omni` via `pure/m3/include.omni`), `egate`, trit consensus/mux/quorum, `@PACK5` radix-3 packing & validation, `match_trit`, `if_pos`, and multi-function `CALL`, compiled through the default Pure-Omni M3 frontend (`pure/m3/m3.omni_bc`).
+
+Linux x86-64 (WSL2) baselines (`./omnic p7-measure` & `./omnic p7-canary`, 7 benchmarks × 5 runs, zero variance on deterministic fields):
+
+| ID | Benchmark | Compiler Path | `ret` | `bc_words` | `elf_bytes` (Compact) | `vm_steps` / `trace_ops` | `arena_bytes` | `hist (alu/mem/ctrl/cr)` | `fe_us` | `emit_us` | `vm_us` |
+|---:|---|---|---:|---:|---:|---:|---:|---|---:|---:|---:|
+| 0 | `bench_clamp` | Rust strict | `90` | `34` | `493 B` | `3` | `0 B` | `2/0/0/1` | `24` | `1` | `612` |
+| 1 | `bench_loop_sum` | Rust strict | `5050` | `75` | `558 B` | `809` | `0 B` | `404/0/404/1` | `30` | `8` | `46,369` |
+| 2 | `bench_branch_tree` | Rust strict | `70` | `69` | `552 B` | `6` | `0 B` | `2/0/3/1` | `100` | `12` | `2,042` |
+| 3 | `bench_multi_call` | Rust strict | `1209` | `73` | `567 B` | `10` | `0 B` | `5/0/0/5` | `46` | `6` | `2,092` |
+| 4 | `bench_arena_buf` | Rust strict | `120` | `143` | `756 B` | `271` | `128 B` | `101/33/136/1` | `54` | `7` | `16,421` |
+| 5 | `bench_verifier_engine` | Pure-Omni M3 | `11` | `15,718` | `38,630 B` | `82,071` | `65,562 B` | `2113/103/347/1533` | `13,018` | `337` | `4,660,936` |
+| 6 | **`bench_m3_frontend`** | **Pure-Omni M3 + `std/`** | **`1652`** | **`1,204`** | **`2,958 B`** | **`555`** | **`0 B`** | **`304/0/96/155`** | **`9,901`** | **`38`** | **`48,582`** |
+
+- **Canary proof (`./omnic p7-canary`, 7 benchmarks × 5 runs):** `PASS` (7 checks) — Canary A = `+1t (ADOPT, saved=14,761 B, attr=2 [M2_EMITTER])`; Canary B = `0t (HOLD, attr=0 [NONE])`; native Linux x86-64 execution verified across all 7 benchmarks; zero variance on all deterministic fields; all 5 frozen FNV-1a64 hashes and all committed seeds untouched.
+
+---
+
 ## Hard Rules (All of Phase 7)
 
 - The verifier, determinism, and capability model are never self-modified.
