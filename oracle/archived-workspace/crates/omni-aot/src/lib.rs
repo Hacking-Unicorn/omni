@@ -872,6 +872,14 @@ pub fn compile_pure_u16_to_x86_64_elf_multi(
     let n_fns = module.functions.len();
     let entry_pos = module.functions.iter().position(|f| f.fn_idx == 0).unwrap_or(n_fns - 1);
     let entry_fn = &module.functions[entry_pos];
+    // Mirrors the live monolith: x86-64 multi-mode `_start` stub pushes only 4 args (`r15..r12`).
+    if entry_fn.params.len() > 4 {
+        return Err(format!(
+            "error[MULTI_AOT_ENTRY_PARAMS]: x86-64 multi-AOT entry fn#{} has {} params (max 4)",
+            entry_fn.fn_idx,
+            entry_fn.params.len()
+        ));
+    }
     let entry_is_bytes = entry_fn.ret_ty_tok == TY_BYTES;
 
     let mut code: Vec<u8> = Vec::with_capacity(8192);
@@ -1688,6 +1696,13 @@ fn wasm_buf_in_bounds(b: &mut Vec<u8>, l: &WasmBufLocals, off_l: usize, width: i
 
 pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
     let module = decode_omni_token_stream(stream)?;
+    // Fix 2 (mirrors the live monolith): dispatch by function count. 0-1 functions
+    // keep the byte-locked single-function compiler; 2+ use the multi compiler.
+    // Without this, multi-function modules silently compile only the first
+    // function (std_clamp after include expansion) yet print PASS.
+    if module.functions.len() > 1 {
+        return compile_pure_u16_to_wasm_multi(stream);
+    }
     let func = module.functions.first().ok_or("No function in module")?;
     let rep = verify_binary_function(func);
     if !rep.passed {
@@ -1737,7 +1752,7 @@ pub fn compile_pure_u16_to_wasm_multi(stream: &[u16]) -> Result<Vec<u8>, String>
     for (idx, f) in module.functions.iter().enumerate() {
         fn_id_to_wasm_idx.insert(f.fn_idx, idx);
     }
-    let entry_wasm_idx = fn_id_to_wasm_idx.get(&0).copied().unwrap_or(0);
+    let entry_wasm_idx = fn_id_to_wasm_idx.get(&0).copied().unwrap_or(module.functions.len() - 1);
 
     let mut type_sec: Vec<u8> = Vec::new();
     type_sec.extend(encode_uleb128(module.functions.len()));
@@ -2780,10 +2795,12 @@ pub fn execute_wasm_module_i64_with_budgets(
     let mut bpos = fn_code_starts[cur_fn];
     let total_locals = fn_total_locals[cur_fn];
 
+    // Fix 3 (mirrors the live monolith): exclude pre-allocated Wasm linear-memory
+    // capacity (2 or 32 pages) from `frame_bytes` so `#[mem_budget]` bounds user
+    // frame/locals + static `0x7F01` allocations rather than fixed runtime address space.
     let frame_bytes = wasm
         .len()
-        .saturating_add(total_locals.max(args.len()).saturating_mul(8))
-        .saturating_add(memory.len());
+        .saturating_add(total_locals.max(args.len()).saturating_mul(8));
     if frame_bytes > memory_budget_bytes {
         return Err(format!(
             "error[BUDGET_EXCEEDED]: Wasm AOT memory budget exceeded ({} > {} bytes)",

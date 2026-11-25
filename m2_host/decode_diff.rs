@@ -2381,6 +2381,36 @@ pub fn selftest_m2_10_wasm_multi() -> Result<usize, String> {
         other => return Err(format!("M2-10 depth-70 expected call-depth BUDGET_EXCEEDED, got {:?}", other)),
     }
 
+    // Fix 2 regression: `compile_pure_u16_to_wasm` dispatches 2+ fn modules to multi-Wasm,
+    // selects the last function when `fn_idx == 0` is absent (matching `run`), and supports >4 entry params.
+    let fix2_src = "#[strict]\nfn helper_first(x: i64) -> i64 { return x * 100; }\n#[strict]\nfn entry_last(a: i64, b: i64, c: i64, d: i64, e: i64) -> i64 { return helper_first(d) + e + a * 0 + b * 0 + c * 0; }\n";
+    let fix2_stream = compile_omni_surface_strict_to_u16(fix2_src)?;
+    let fix2_wasm = compile_pure_u16_to_wasm(&fix2_stream)?;
+    let fix2_got = execute_wasm_module_i64(&fix2_wasm, &[1, 2, 3, 4, 5])?;
+    if fix2_got != 405 {
+        return Err(format!("M2-10 Fix 2 multi-fn dispatch / 5-arg last-entry returned {}, want 405", fix2_got));
+    }
+    checks += 1;
+
+    // x86-64 multi-AOT 4-param entry guard regression: >4 entry params must still reject on x86-64 multi-mode.
+    match compile_pure_u16_to_x86_64_elf_multi(&fix2_stream, 0, 0, 0) {
+        Err(e) if e.contains("MULTI_AOT_ENTRY_PARAMS") => checks += 1,
+        other => return Err(format!("M2-10 x86-64 multi-AOT 5-param entry expected MULTI_AOT_ENTRY_PARAMS, got {:?}", other)),
+    }
+
+    // Fix 3 positive & negative regressions: `#[mem_budget(8192)]` runs on the `"aot"` Wasm hot path
+    // without billing pre-allocated linear-memory pages, while still rejecting `arena(20000)`.
+    let fix3_ok_src = "#[strict]\n#[mem_budget(8192)]\nfn main(cur: i64, step: i64) -> i64 { let a: arena = arena(4096); drop(a); return cur + step; }\n";
+    match execute_omni_surface_aot_first(fix3_ok_src, vec![OmniValue::Int(5), OmniValue::Int(1)])? {
+        (OmniValue::Int(6), "aot") => checks += 1,
+        other => return Err(format!("M2-10 Fix 3 #[mem_budget(8192)] arena(4096) expected (Int(6), \"aot\"), got {:?}", other)),
+    }
+    let fix3_neg_src = "#[strict]\n#[mem_budget(8192)]\nfn main(cur: i64, step: i64) -> i64 { let a: arena = arena(20000); drop(a); return cur + step; }\n";
+    match execute_omni_surface_aot_first(fix3_neg_src, vec![OmniValue::Int(5), OmniValue::Int(1)]) {
+        Err(e) if e.contains("BUDGET_EXCEEDED") => checks += 1,
+        other => return Err(format!("M2-10 Fix 3 #[mem_budget(8192)] arena(20000) expected BUDGET_EXCEEDED, got {:?}", other)),
+    }
+
     Ok(checks)
 }
 
@@ -7467,6 +7497,8 @@ pub fn selftest_s4_honesty() -> Result<usize, String> {
         ));
     }
     let runtime_rust_lines = monolith_lines + m2_host_lines + pure_default_lines + p4_shim_lines;
+    let active_rust_lines =
+        seed0_lines + p4_shim_lines + dev_host_lines + monolith_lines + m2_host_lines + pure_default_lines;
     let oracle_readme = std::fs::read_to_string("oracle/README.md")
         .map_err(|e| format!("S4 read oracle/README.md: {}", e))?;
     let main_readme = std::fs::read_to_string("README.md")
@@ -7480,10 +7512,38 @@ pub fn selftest_s4_honesty() -> Result<usize, String> {
         || !oracle_readme.contains(&monolith_lines.to_string())
         || !oracle_readme.contains(&m2_host_lines.to_string())
         || !oracle_readme.contains(&pure_default_lines.to_string())
+        || !oracle_readme.contains(&active_rust_lines.to_string())
     {
         return Err(format!(
-            "S4.2 oracle/README.md line counts drifted from live wc -l (monolith={}, m2_host={}, pure_default={}, runtime_rust={})",
-            monolith_lines, m2_host_lines, pure_default_lines, runtime_rust_lines
+            "S4.2 oracle/README.md line counts drifted from live wc -l (monolith={}, m2_host={}, pure_default={}, runtime_rust={}, active_rust={})",
+            monolith_lines, m2_host_lines, pure_default_lines, runtime_rust_lines, active_rust_lines
+        ));
+    }
+    // S4.2 (extended): README.md prose counts must match live wc -l too. README.md
+    // writes counts comma-formatted (36,055), unlike oracle/README.md's plain table
+    // numbers, so format them the same way before comparing. This closes the blind
+    // spot that let README.md lines 5 and 144 drift to 36,028 / 26,328 / 36,202
+    // while the selftest still passed.
+    let fmt_comma = |n: usize| -> String {
+        let s = n.to_string();
+        let mut out = String::with_capacity(s.len() + s.len() / 3);
+        for (i, c) in s.chars().enumerate() {
+            if i > 0 && (s.len() - i) % 3 == 0 {
+                out.push(',');
+            }
+            out.push(c);
+        }
+        out
+    };
+    if !main_readme.contains(&fmt_comma(runtime_rust_lines))
+        || !main_readme.contains(&fmt_comma(monolith_lines))
+        || !main_readme.contains(&fmt_comma(m2_host_lines))
+        || !main_readme.contains(&fmt_comma(pure_default_lines))
+        || !main_readme.contains(&fmt_comma(active_rust_lines))
+    {
+        return Err(format!(
+            "S4.2 README.md line counts drifted from live wc -l (monolith={}, m2_host={}, pure_default={}, runtime_rust={}, active_rust={})",
+            monolith_lines, m2_host_lines, pure_default_lines, runtime_rust_lines, active_rust_lines
         ));
     }
     if !main_readme.contains("validator/entry stub") {

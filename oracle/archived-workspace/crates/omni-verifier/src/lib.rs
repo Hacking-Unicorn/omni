@@ -296,9 +296,12 @@ pub fn verify_module_for_multi_aot(module: &BinModule) -> Result<(), String> {
 
     let entry_pos = module.functions.iter().position(|f| f.fn_idx == 0).unwrap_or(n - 1);
     let entry_fn = &module.functions[entry_pos];
-    if entry_fn.params.len() > 4 {
+    // Entry cap is 32, matching the live monolith (raised from 4 by Fix 2: the
+    // Wasm executor handles N args, and a cap of 4 rejected 5-param entries
+    // such as arg_repro that the single compiler accepted).
+    if entry_fn.params.len() > 32 {
         return Err(format!(
-            "error[MULTI_AOT_ENTRY_PARAMS]: entry fn#{} has {} params (max 4)",
+            "error[MULTI_AOT_ENTRY_PARAMS]: entry fn#{} has {} params (max 32)",
             entry_fn.fn_idx,
             entry_fn.params.len()
         ));
