@@ -1,20 +1,77 @@
 // ==============================================================================
-// pure/m4/m4_standalone.omni  (Audit §3.1) — Standalone native M4 VM entry
+// pure/m4/m4_standalone.omni  (Audit §3.1 + Fix 1) — Standalone native M4 VM entry
 // ==============================================================================
-// 4-parameter standalone entry point for compiling `pure/m4/*` into a native
-// Linux x86-64 ELF64 binary (`m4.elf <prog.omni_bc> [a0] [a1] [a2]`).
-// Allocates the 512 KiB M4 arena in M2's 1 MiB rbx arena, executes `arr` with
-// fuel=500,000, and returns the 64-byte VM_STATE slice via ret_slice.
+// 32-parameter standalone entry point (`arr` + `a0..a30`) for compiling `pure/m4/*`
+// into a native Linux x86-64 ELF64 binary (`m4.elf <prog.omni_bc> [a0..a30]`).
+// Allocates the 512 KiB M4 arena in M2's 1 MiB rbx arena, stores all 31 CLI
+// arguments into `m4s_entry_args()`, executes `arr` with fuel=500,000, and returns
+// the 64-byte VM_STATE slice via ret_slice.
 // ==============================================================================
 
 #[strict]
-fn m4_standalone_entry(arr: array, a0: i64, a1: i64, a2: i64) -> bytes {
+fn m4sa_pack_lo16(
+    w_in: bytes,
+    a0: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64, a7: i64,
+    a8: i64, a9: i64, a10: i64, a11: i64, a12: i64, a13: i64, a14: i64, a15: i64
+) -> bytes {
+    let w: bytes = m4s_put_arg(w_in, 0, a0);
+    w = m4s_put_arg(w, 1, a1);
+    w = m4s_put_arg(w, 2, a2);
+    w = m4s_put_arg(w, 3, a3);
+    w = m4s_put_arg(w, 4, a4);
+    w = m4s_put_arg(w, 5, a5);
+    w = m4s_put_arg(w, 6, a6);
+    w = m4s_put_arg(w, 7, a7);
+    w = m4s_put_arg(w, 8, a8);
+    w = m4s_put_arg(w, 9, a9);
+    w = m4s_put_arg(w, 10, a10);
+    w = m4s_put_arg(w, 11, a11);
+    w = m4s_put_arg(w, 12, a12);
+    w = m4s_put_arg(w, 13, a13);
+    w = m4s_put_arg(w, 14, a14);
+    return m4s_put_arg(w, 15, a15);
+}
+
+#[strict]
+fn m4sa_pack_hi15(
+    w_in: bytes,
+    a16: i64, a17: i64, a18: i64, a19: i64, a20: i64, a21: i64, a22: i64, a23: i64,
+    a24: i64, a25: i64, a26: i64, a27: i64, a28: i64, a29: i64, a30: i64
+) -> bytes {
+    let w: bytes = m4s_put_arg(w_in, 16, a16);
+    w = m4s_put_arg(w, 17, a17);
+    w = m4s_put_arg(w, 18, a18);
+    w = m4s_put_arg(w, 19, a19);
+    w = m4s_put_arg(w, 20, a20);
+    w = m4s_put_arg(w, 21, a21);
+    w = m4s_put_arg(w, 22, a22);
+    w = m4s_put_arg(w, 23, a23);
+    w = m4s_put_arg(w, 24, a24);
+    w = m4s_put_arg(w, 25, a25);
+    w = m4s_put_arg(w, 26, a26);
+    w = m4s_put_arg(w, 27, a27);
+    w = m4s_put_arg(w, 28, a28);
+    w = m4s_put_arg(w, 29, a29);
+    return m4s_put_arg(w, 30, a30);
+}
+
+#[strict]
+fn m4_standalone_entry(
+    arr: array,
+    a0: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64, a7: i64,
+    a8: i64, a9: i64, a10: i64, a11: i64, a12: i64, a13: i64, a14: i64, a15: i64,
+    a16: i64, a17: i64, a18: i64, a19: i64, a20: i64, a21: i64, a22: i64, a23: i64,
+    a24: i64, a25: i64, a26: i64, a27: i64, a28: i64, a29: i64, a30: i64
+) -> bytes {
     let w: bytes = anew(0);
     let i: i64 = 0;
     while 65536 - i <=> 0 {
         w = iset_i64(w, 0);
         i = i + 1;
     }
-    let out: bytes = m4_vm_run_i64(w, arr, a0, a1, a2, 500000, 0);
+    w = iset_patch_i64(w, m4s_entry_argc(), 31);
+    w = m4sa_pack_lo16(w, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15);
+    w = m4sa_pack_hi15(w, a16, a17, a18, a19, a20, a21, a22, a23, a24, a25, a26, a27, a28, a29, a30);
+    let out: bytes = m4_vm_run_args(w, arr, 500000, 0);
     return ret_slice(out, m4a_state(), 64);
 }

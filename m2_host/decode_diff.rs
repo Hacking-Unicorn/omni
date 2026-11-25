@@ -2392,11 +2392,26 @@ pub fn selftest_m2_10_wasm_multi() -> Result<usize, String> {
     }
     checks += 1;
 
-    // x86-64 multi-AOT 4-param entry guard regression: >4 entry params must still reject on x86-64 multi-mode.
-    match compile_pure_u16_to_x86_64_elf_multi(&fix2_stream, 0, 0, 0) {
-        Err(e) if e.contains("MULTI_AOT_ENTRY_PARAMS") => checks += 1,
-        other => return Err(format!("M2-10 x86-64 multi-AOT 5-param entry expected MULTI_AOT_ENTRY_PARAMS, got {:?}", other)),
+    // Option A regression: x86-64 multi-AOT now supports up to 32 entry params (`_start` 256-B CLI block).
+    let fix2_elf = compile_pure_u16_to_x86_64_elf_multi(&fix2_stream, 0, 0, 0)?;
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        let tmp_f2 = PrivateTempElf::new(&fix2_elf, "fix1_x86_5arg")?;
+        let out_f2 = std::process::Command::new(&tmp_f2.path)
+            .args(["1", "2", "3", "4", "5"])
+            .output()
+            .map_err(|e| format!("M2-10 exec 5-arg multi ELF: {}", e))?;
+        drop(tmp_f2);
+        if !out_f2.status.success() || out_f2.stdout.len() != 8 {
+            return Err(format!("M2-10 5-arg multi ELF failed: {:?}", out_f2.status));
+        }
+        let got_x86 = i64::from_le_bytes(out_f2.stdout[..8].try_into().unwrap());
+        if got_x86 != 405 {
+            return Err(format!("M2-10 5-arg multi ELF returned {}, want 405", got_x86));
+        }
     }
+    let _ = &fix2_elf;
+    checks += 1;
 
     // Fix 3 positive & negative regressions: `#[mem_budget(8192)]` runs on the `"aot"` Wasm hot path
     // without billing pre-allocated linear-memory pages, while still rejecting `arena(20000)`.
@@ -6172,7 +6187,126 @@ pub fn selftest_a1_pure_default() -> Result<usize, String> {
     }
     checks += 1;
 
-    // 5. All 5 frozen FNV-1a64 hashes intact.
+    // 5. Fix 1 (Option A): Full N-arg (>3 params) parity across default native m4.elf + interpreted
+    //    Pure-M4 VM (`m4_vm_run_args`) + CLI `omnic run` validation (`error[CLI_ARG]`).
+    let arg_repro_src = "#[strict]\nfn main(a: i64, b: i64, c: i64, d: i64, e: i64) -> i64 {\n    return d * 100 + e;\n}\n";
+    let trit_pack5_src = "include \"std/math.omni\";\n#[strict]\nfn main(t0: i64, t1: i64, t2: i64, t3: i64, t4: i64) -> i64 {\n    let a0: i64 = std_clamp(t0, -1, 1) + 1;\n    let a1: i64 = std_clamp(t1, -1, 1) + 1;\n    let a2: i64 = std_clamp(t2, -1, 1) + 1;\n    let a3: i64 = std_clamp(t3, -1, 1) + 1;\n    let a4: i64 = std_clamp(t4, -1, 1) + 1;\n    return a0 * 81 + a1 * 27 + a2 * 9 + a3 * 3 + a4;\n}\n";
+    let running_stats4_src = "include \"std/math.omni\";\n#[strict]\nfn main(a: i64, b: i64, c: i64, d: i64) -> i64 {\n    let x0: i64 = std_clamp(a, -50, 49);\n    let x1: i64 = std_clamp(b, -50, 49);\n    let x2: i64 = std_clamp(c, -50, 49);\n    let x3: i64 = std_clamp(d, -50, 49);\n    let lo: i64 = imin(imin(x0, x1), imin(x2, x3));\n    let hi: i64 = imax(imax(x0, x1), imax(x2, x3));\n    let mean: i64 = (x0 + x1 + x2 + x3) / 4;\n    return (lo + 50) * 10000 + (hi + 50) * 100 + (mean + 50);\n}\n";
+    let sum10_src = "#[strict]\nfn main(a0: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64, a7: i64, a8: i64, a9: i64) -> i64 {\n    return a0 + a1 * 2 + a2 * 3 + a3 * 4 + a4 * 5 + a5 * 6 + a6 * 7 + a7 * 8 + a8 * 9 + a9 * 10;\n}\n";
+
+    let n_arg_cases: &[(&str, &str, &[(&[i64], i64)])] = &[
+        (
+            "arg_repro",
+            arg_repro_src,
+            &[(&[1, 2, 3, 4, 5], 405), (&[0, 0, 0, 7, 8], 708)],
+        ),
+        (
+            "trit_pack5",
+            trit_pack5_src,
+            &[
+                (&[-1, -1, -1, -1, -1], 0),
+                (&[0, 0, 0, 0, 0], 121),
+                (&[1, 1, 1, 1, 1], 242),
+                (&[1, 0, -1, 1, 0], 196),
+            ],
+        ),
+        (
+            "running_stats4",
+            running_stats4_src,
+            &[
+                (&[10, 20, 30, 40], 609_075),
+                (&[-10, 0, 10, 20], 407_055),
+                (&[0, 0, 0, 0], 505_050),
+            ],
+        ),
+        (
+            "sum10",
+            sum10_src,
+            &[(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 385)],
+        ),
+    ];
+    for &(label, raw_src, vectors) in n_arg_cases {
+        let exp = pure_default_expand_includes(raw_src, None, None)?;
+        let u16_s = pure_default_compile_surface_to_u16(&exp, true)?;
+        for &(args, want) in vectors {
+            let (got_def, _) = pure_default_run_u16_with_fuel(&u16_s, args, PURE_DEFAULT_FUEL, false)?;
+            let (got_int, _) = with_pure_default_interpreted(|| {
+                pure_default_run_u16_with_fuel(&u16_s, args, PURE_DEFAULT_FUEL, false)
+            })?;
+            if got_def != want || got_int != want {
+                return Err(format!(
+                    "A1 N-arg '{}' {:?} mismatch: default={} interpreted={} want={}",
+                    label, args, got_def, got_int, want
+                ));
+            }
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let is_test_harness = exe.parent().map_or(false, |d| {
+            d.ancestors().filter_map(|a| a.file_name()).any(|n| n == "deps" || n == "build")
+        });
+        if !is_test_harness {
+            let tmp_dir = std::env::temp_dir().join(format!("omni_a1_nargs_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("A1 N-arg mkdir: {}", e))?;
+            let cli_check = (|| -> Result<(), String> {
+                let repro_p = tmp_dir.join("arg_repro.omni");
+                std::fs::write(&repro_p, arg_repro_src).map_err(|e| format!("A1 write arg_repro: {}", e))?;
+                for &(use_interp, args, want_out) in &[
+                    (false, &["1", "2", "3", "4", "5"][..], "Int(405)"),
+                    (true, &["1", "2", "3", "4", "5"][..], "Int(405)"),
+                    (false, &["0", "0", "0", "7", "8"][..], "Int(708)"),
+                    (true, &["0", "0", "0", "7", "8"][..], "Int(708)"),
+                ] {
+                    let mut cmd = std::process::Command::new(&exe);
+                    cmd.arg("run");
+                    if use_interp {
+                        cmd.arg("--interpreted");
+                    }
+                    cmd.arg(&repro_p).args(args);
+                    let out = cmd.output().map_err(|e| format!("A1 spawn omnic run: {}", e))?;
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    if !out.status.success() || stdout.trim() != want_out {
+                        return Err(format!(
+                            "A1 CLI omnic run (interp={}) {:?} failed: status={:?} stdout='{}' stderr='{}'",
+                            use_interp,
+                            args,
+                            out.status.code(),
+                            stdout.trim(),
+                            String::from_utf8_lossy(&out.stderr).trim()
+                        ));
+                    }
+                }
+                for bad_args in [
+                    &["1", "2", "foo", "4", "5"][..],
+                    &["1", "2", "3"][..],
+                    &["1", "2", "3", "4", "5", "6"][..],
+                ] {
+                    let out = std::process::Command::new(&exe)
+                        .arg("run")
+                        .arg(&repro_p)
+                        .args(bad_args)
+                        .output()
+                        .map_err(|e| format!("A1 spawn bad CLI args: {}", e))?;
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    if out.status.success() || !stderr.contains("error[CLI_ARG]") {
+                        return Err(format!(
+                            "A1 CLI omnic run {:?} must fail with error[CLI_ARG], got status={:?} stderr='{}'",
+                            bad_args,
+                            out.status.code(),
+                            stderr.trim()
+                        ));
+                    }
+                }
+                Ok(())
+            })();
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            cli_check?;
+        }
+    }
+    checks += 1;
+
+    // 6. All 5 frozen FNV-1a64 hashes intact.
     selftest_m2_frozen_hashes()?;
     checks += 1;
 
@@ -6988,7 +7122,7 @@ pub fn selftest_b4_pure_launcher() -> Result<(usize, usize, u64, bool), String> 
         }
 
         // 4. Pure native M2 compiler ELF (emitted by Pure M2 itself, zero Rust binary) compiles
-        //    pure/m4/m4.omni_bc -> exact 89,789-B ELF64 (0x4CD6D6CCB4408577).
+        //    pure/m4/m4.omni_bc -> exact 90,402-B ELF64 (0xB43AFBB0DED59488).
         let m2_raw = std::fs::read("pure/m2/m2.omni_bc").map_err(|e| format!("B4 read m2 seed: {}", e))?;
         let m2_u16 = decode_bytes_to_u16_stream(&m2_raw);
         let m2_elf = pure_default_compile_u16_to_elf(&m2_u16, 0, 0, 0)?;
@@ -6998,7 +7132,7 @@ pub fn selftest_b4_pure_launcher() -> Result<(usize, usize, u64, bool), String> 
             .output()
             .map_err(|e| format!("B4 exec m2_native: {}", e))?;
         drop(tmp_m2);
-        if !out_m4.status.success() || out_m4.stdout.len() != 89_789 || fnv1a_64_hash(&out_m4.stdout) != 0x4CD6D6CCB4408577 {
+        if !out_m4.status.success() || out_m4.stdout.len() != 90_402 || fnv1a_64_hash(&out_m4.stdout) != 0xB43AFBB0DED59488 {
             return Err(format!(
                 "B4 pure native m2.elf -> m4.elf mismatch: status={:?} len={} hash=0x{:016X}",
                 out_m4.status,
@@ -7572,9 +7706,9 @@ pub fn selftest_s4_honesty() -> Result<usize, String> {
     if strict_readme {
         for &(label, needle) in &[
             ("M3 seed hash", "0xCBA538CD0E8100A8"),
-            ("M2 seed hash", "0x1DE7EDF361BB3626"),
-            ("M4 seed hash", "0x99567F6F5D0E8F32"),
-            ("M4 ELF size", "89,789"),
+            ("M2 seed hash", "0x36ADC3CEAB97B1C9"),
+            ("M4 seed hash", "0x0561704B3E50EFAC"),
+            ("M4 ELF size", "90,402"),
             ("archived workspace", "oracle/archived-workspace/Cargo.toml"),
         ] {
             if !main_readme.contains(needle) {
@@ -7594,8 +7728,8 @@ pub fn selftest_s4_honesty() -> Result<usize, String> {
     let seed0_src = std::fs::read_to_string("seed0/omni_seed0.rs")
         .map_err(|e| format!("S4 read seed0/omni_seed0.rs: {}", e))?;
     if !seed0_src.contains("59,887 words, 0xCBA538CD0E8100A8")
-        || !seed0_src.contains("41,289 words, 0x1DE7EDF361BB3626")
-        || !seed0_src.contains("27,819 words, 0x99567F6F5D0E8F32")
+        || !seed0_src.contains("41,855 words, 0x36ADC3CEAB97B1C9")
+        || !seed0_src.contains("28,062 words, 0x0561704B3E50EFAC")
     {
         return Err(String::from(
             "S4.2 seed0/omni_seed0.rs header comment drifted from SEED_M2/SEED_M4 constants",
@@ -7713,7 +7847,7 @@ pub fn selftest_s3_performance() -> Result<usize, String> {
     }
     checks += 1;
 
-    // 3. Default compile-elf on pure/m4/m4.omni_bc -> exact 89,789 B (0x4CD6D6CCB4408577) in < 500 ms.
+    // 3. Default compile-elf on pure/m4/m4.omni_bc -> exact 90,402 B (0xB43AFBB0DED59488) in < 500 ms.
     let m4_raw = std::fs::read("pure/m4/m4.omni_bc")
         .map_err(|e| format!("S3 read m4.omni_bc: {}", e))?;
     let m4_u16 = decode_bytes_to_u16_stream(&m4_raw);
@@ -7721,9 +7855,9 @@ pub fn selftest_s3_performance() -> Result<usize, String> {
     let m4_elf = pure_default_compile_u16_to_elf(&m4_u16, 0, 0, 0)?;
     let dt_m2_ms = t1.elapsed().as_millis();
     let h_m4_elf = fnv1a_64_hash(&m4_elf);
-    if m4_elf.len() != 89_789 || h_m4_elf != 0x4CD6_D6CC_B440_8577 {
+    if m4_elf.len() != 90_402 || h_m4_elf != 0xB43A_FBB0_DED5_9488 {
         return Err(format!(
-            "S3.3 default compile-elf m4.omni_bc mismatch: {} B (0x{:016X}) != 89789 B (0x4CD6D6CCB4408577)",
+            "S3.3 default compile-elf m4.omni_bc mismatch: {} B (0x{:016X}) != 90402 B (0xB43AFBB0DED59488)",
             m4_elf.len(),
             h_m4_elf
         ));

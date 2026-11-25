@@ -263,25 +263,41 @@ fn m2m_stub_read_input(arena: bytes, pass: i64) -> bytes {
     return w;
 }
 
-// Emits the bytes-entry defaults + 3 CLI parsers + input reader.
+// Emits the shared 81-byte CLI decimal argv parser loop (`k` in `r8`, `k < 32` and `k + 1 < argc`,
+// storing parsed signed i64 `argv[k + 1]` into `[rsp + r8*8]`).
 #[strict]
-fn m2m_stub_bytes_setup(arena: bytes, arg0: i64, arg1: i64, arg2: i64, pass: i64) -> bytes {
-    let w: bytes = m2x_b3(arena, 73, 199, 196);             // 49 C7 C4
-    w = m2a_emit_u32(w, 0);
-    w = m2a_emit_u16(w, 48457);                             // 49 BD
-    w = m2a_emit_u64(w, arg0);
-    w = m2a_emit_u16(w, 48713);                             // 49 BE
-    w = m2a_emit_u64(w, arg1);
-    w = m2a_emit_u16(w, 48969);                             // 49 BF
-    w = m2a_emit_u64(w, arg2);
-    w = m2x_cli_parser(w, 3, 32, 5);
-    w = m2x_cli_parser(w, 4, 40, 6);
-    w = m2x_cli_parser(w, 5, 48, 7);
-    w = m2m_stub_read_input(w, pass);
-    return w;
+fn m2m_stub_cli_loop(arena: bytes) -> bytes {
+    let w: bytes = m2x_b4(arena, 73, 131, 248, 32);          // 49 83 F8 20 cmp r8, 32
+    w = m2a_emit_u16(w, 19325);                              // 7D 4B jge +75 (done)
+    w = m2x_b4(w, 73, 141, 72, 1);                           // 49 8D 48 01 lea rcx, [r8+1]
+    w = m2x_b4(w, 72, 59, 77, 8);                            // 48 3B 4D 08 cmp rcx, [rbp+8]
+    w = m2a_emit_u16(w, 16765);                              // 7D 41 jge +65 (done)
+    w = m2x_b4(w, 72, 139, 116, 205);                        // 48 8B 74 CD 10 mov rsi, [rbp+rcx*8+16]
+    w = m2x_b3(w, 16, 49, 192);                              // (10) 31 C0 xor eax, eax
+    w = m2a_emit_u8(w, 191);                                 // BF mov edi, 1
+    w = m2a_emit_u32(w, 1);                                  // 01 00 00 00
+    w = m2x_b3(w, 15, 182, 14);                              // 0F B6 0E movzx ecx, byte [rsi]
+    w = m2x_b3(w, 128, 249, 45);                             // 80 F9 2D cmp cl, '-'
+    w = m2x_b4(w, 117, 10, 72, 199);                         // 75 0A jne +10; 48 C7 C7 -1
+    w = m2a_emit_u8(w, 199);                                 // C7
+    w = m2a_emit_u32(w, 0 - 1);                              // FF FF FF FF
+    w = m2x_b3(w, 72, 255, 198);                             // 48 FF C6 inc rsi
+    w = m2x_b3(w, 15, 182, 14);                              // 0F B6 0E movzx ecx, byte [rsi]
+    w = m2x_b4(w, 132, 201, 116, 15);                        // 84 C9 74 0F test cl, cl; jz +15
+    w = m2x_b3(w, 131, 233, 48);                             // 83 E9 30 sub ecx, '0'
+    w = m2x_b4(w, 72, 107, 192, 10);                         // 48 6B C0 0A imul rax, rax, 10
+    w = m2x_b3(w, 72, 1, 200);                               // 48 01 C8 add rax, rcx
+    w = m2x_b3(w, 72, 255, 198);                             // 48 FF C6 inc rsi
+    w = m2a_emit_u16(w, 60139);                              // EB EA jmp -22
+    w = m2x_b4(w, 72, 15, 175, 199);                         // 48 0F AF C7 imul rax, rdi
+    w = m2x_b4(w, 74, 137, 4, 196);                          // 4A 89 04 C4 mov [rsp+r8*8], rax
+    w = m2x_b3(w, 73, 255, 192);                             // 49 FF C0 inc r8
+    return m2a_emit_u16(w, 45035);                           // EB AF jmp -81
 }
 
 // Emits the multi-mode entry stub + 3 trap stubs (recording trap offsets in globals 6..8).
+// Allocates 32 entry-arg qwords (`sub rsp, 256`), zeros all 32 slots, writes defaults `arg0..arg2`,
+// and runs `m2m_stub_cli_loop` so entry functions support up to 32 parameters (`[rbp_fn+16+8*k]`).
 #[strict]
 fn m2m_emit_entry_stub(arena: bytes, is_bytes: i64, entry_fn: i64, arg0: i64, arg1: i64, arg2: i64, pass: i64) -> bytes {
     // push rbp; mov rbp, rsp; sub rsp, 0x120010 (1179664); mov rbx, rsp; mov qword [rbx+0x120000], 0
@@ -290,18 +306,50 @@ fn m2m_emit_entry_stub(arena: bytes, is_bytes: i64, entry_fn: i64, arg0: i64, ar
     w = m2x_b3(w, 72, 199, 131);                            // 48 C7 83
     w = m2a_emit_u32(w, 1179648);                           // 00 00 12 00
     w = m2a_emit_u32(w, 0);
+    // sub rsp, 256; mov rdi, rsp; mov ecx, 32; xor eax, eax; rep stosq
+    w = m2x_b3(w, 72, 129, 236);                            // 48 81 EC
+    w = m2a_emit_u32(w, 256);                               // 00 01 00 00
+    w = m2x_b4(w, 72, 137, 231, 185);                       // 48 89 E7 B9
+    w = m2a_emit_u32(w, 32);                                // 20 00 00 00
+    w = m2a_emit_u16(w, 49201);                             // 31 C0
+    w = m2x_b3(w, 243, 72, 171);                            // F3 48 AB
     let cb: trit = is_bytes <=> 0;
     let w2: bytes = if_pos cb {
-        m2m_stub_bytes_setup(w, arg0, arg1, arg2, pass)
+        let t: bytes = m2a_emit_u16(w, 47176);              // 48 B8
+        t = m2a_emit_u64(t, arg0);
+        t = m2x_b4(t, 72, 137, 68, 36);                     // 48 89 44 24 08 mov [rsp+8], rax
+        t = m2a_emit_u8(t, 8);
+        t = m2a_emit_u16(t, 47176);                         // 48 B8
+        t = m2a_emit_u64(t, arg1);
+        t = m2x_b4(t, 72, 137, 68, 36);                     // 48 89 44 24 10 mov [rsp+16], rax
+        t = m2a_emit_u8(t, 16);
+        t = m2a_emit_u16(t, 47176);                         // 48 B8
+        t = m2a_emit_u64(t, arg2);
+        t = m2x_b4(t, 72, 137, 68, 36);                     // 48 89 44 24 18 mov [rsp+24], rax
+        t = m2a_emit_u8(t, 24);
+        t = m2m_stub_read_input(t, pass);
+        t = m2a_emit_u16(t, 47169);                         // 41 B8 mov r8d, 1
+        m2a_emit_u32(t, 1)
     } else {
-        m2x_prologue_i64(w, arg0, arg1, arg2)
+        let t: bytes = m2a_emit_u16(w, 47176);              // 48 B8
+        t = m2a_emit_u64(t, arg0);
+        t = m2x_b4(t, 72, 137, 4, 36);                      // 48 89 04 24 mov [rsp], rax
+        t = m2a_emit_u16(t, 47176);                         // 48 B8
+        t = m2a_emit_u64(t, arg1);
+        t = m2x_b4(t, 72, 137, 68, 36);                     // 48 89 44 24 08 mov [rsp+8], rax
+        t = m2a_emit_u8(t, 8);
+        t = m2a_emit_u16(t, 47176);                         // 48 B8
+        t = m2a_emit_u64(t, arg2);
+        t = m2x_b4(t, 72, 137, 68, 36);                     // 48 89 44 24 10 mov [rsp+16], rax
+        t = m2a_emit_u8(t, 16);
+        m2x_b3(t, 69, 49, 192)                              // 45 31 C0 xor r8d, r8d
     };
-    // push r15..r12; xor r11d, r11d; call entry_fn; add rsp, 32
-    let w3: bytes = m2x_b4(w2, 65, 87, 65, 86);             // 41 57 41 56
-    w3 = m2x_b4(w3, 65, 85, 65, 84);                        // 41 55 41 54
+    let w3: bytes = m2m_stub_cli_loop(w2);
+    // xor r11d, r11d; call entry_fn; add rsp, 256
     w3 = m2x_b4(w3, 69, 49, 219, 232);                      // 45 31 DB E8
     w3 = m2m_fn_rel32(w3, entry_fn, pass);
-    w3 = m2x_b4(w3, 72, 131, 196, 32);                      // 48 83 C4 20
+    w3 = m2x_b3(w3, 72, 129, 196);                          // 48 81 C4
+    w3 = m2a_emit_u32(w3, 256);                             // 00 01 00 00
     let w4: bytes = if_pos cb {
         // Bytes return ABI: rax = descriptor (base << 32) | len.
         // Extract base (rcx) and len (rdx); write(1, rbx+base, len); exit(0).

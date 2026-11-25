@@ -51,8 +51,8 @@ mod wasm_aot_budget_parity_tests {
         let stream = compile_omni_surface_strict_to_u16(mf5_src).expect("compile mf5_src");
         let wasm = compile_pure_u16_to_wasm(&stream).expect("multi wasm dispatch");
         assert_eq!(execute_wasm_module_i64(&wasm, &[1, 2, 3, 4, 5]).unwrap(), 405);
-        let x86_err = compile_pure_u16_to_x86_64_elf_multi(&stream, 0, 0, 0)
-            .expect_err("x86-64 multi-AOT must reject >4 entry params");
-        assert!(x86_err.contains("MULTI_AOT_ENTRY_PARAMS"), "unexpected err: {x86_err}");
+        let x86_elf = compile_pure_u16_to_x86_64_elf_multi(&stream, 0, 0, 0)
+            .expect("x86-64 multi-AOT supports up to 32 entry params");
+        assert!(x86_elf.starts_with(b"\x7FELF"));
     }
 }
