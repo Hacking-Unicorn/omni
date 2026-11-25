@@ -29,8 +29,8 @@ pub fn pure_default_reject_macros(src: &str) -> Result<(), String> {
 
 pub const NATIVE_M2_ELF_BYTES: usize = 120_916;
 pub const NATIVE_M2_ELF_FNV: u64 = 0x70AA_C3C7_8C00_6370;
-pub const NATIVE_M3_ELF_BYTES: usize = 198_744;
-pub const NATIVE_M3_ELF_FNV: u64 = 0x1DA9_311B_8C0B_6257;
+pub const NATIVE_M3_ELF_BYTES: usize = 203_631;
+pub const NATIVE_M3_ELF_FNV: u64 = 0x34AB_0B4A_FFEB_CB00;
 pub const NATIVE_M4_ELF_BYTES: usize = 91_576;
 pub const NATIVE_M4_ELF_FNV: u64 = 0xFBA8_2723_37B1_BAC4;
 pub const NATIVE_VERIFIER_ELF_BYTES: usize = 37_907;
@@ -350,31 +350,118 @@ fn ensure_native_m2_elf() -> Result<&'static std::path::PathBuf, String> {
         .map_err(|e| e.clone())
 }
 
+/// Compiles each `.omni_bc` module independently through M2 (enforcing <= 65,536 words per module)
+/// and links the resulting ELF64 objects into one standalone Linux x86-64 ELF64 executable via the
+/// Pure-Omni linker `pure/link/elf_link.omni_bc` (zero Rust linking logic).
+pub fn pure_default_link_elf_modules(mod_bc_paths: &[&str]) -> Result<Vec<u8>, String> {
+    if mod_bc_paths.len() < 2 || mod_bc_paths.len() > 64 {
+        return Err(format!(
+            "error[LINK_ARITY]: link-elf requires 2..=64 modules, got {}",
+            mod_bc_paths.len()
+        ));
+    }
+    let mut mod_elfs: Vec<Vec<u8>> = Vec::with_capacity(mod_bc_paths.len());
+    for &bc_path in mod_bc_paths {
+        let raw = std::fs::read(bc_path)
+            .map_err(|e| format!("link-elf failed reading '{}': {}", bc_path, e))?;
+        if raw.len() % 2 != 0 {
+            return Err(format!("link-elf: '{}' has odd byte length", bc_path));
+        }
+        let nwords = raw.len() / 2;
+        if nwords > NATIVE_WINDOW_MAX_WORDS {
+            return Err(format!(
+                "error[MOD_OVER_CAP]: module '{}' is {} words (max {} words)",
+                bc_path, nwords, NATIVE_WINDOW_MAX_WORDS
+            ));
+        }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        let elf = if !pure_default_force_interpreted() {
+            let m2_elf = ensure_native_m2_elf()?;
+            let out = spawn_verified_native_elf(
+                m2_elf,
+                NATIVE_M2_ELF_BYTES,
+                NATIVE_M2_ELF_FNV,
+                &[
+                    std::ffi::OsStr::new(bc_path),
+                    std::ffi::OsStr::new("0"),
+                    std::ffi::OsStr::new("0"),
+                    std::ffi::OsStr::new("0"),
+                ],
+            )?;
+            if !out.status.success() {
+                return Err(format!(
+                    "m2.elf failed compiling module '{}' with status {:?}",
+                    bc_path,
+                    out.status.code()
+                ));
+            }
+            out.stdout
+        } else {
+            let u16s = decode_bytes_to_u16_stream(&raw);
+            pure_default_compile_u16_to_elf(&u16s, 0, 0, 0)?
+        };
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        let elf = {
+            let u16s = decode_bytes_to_u16_stream(&raw);
+            pure_default_compile_u16_to_elf(&u16s, 0, 0, 0)?
+        };
+        mod_elfs.push(elf);
+    }
+
+    // Pack `[u32 K, (u32 off, u32 len) x K, mod_0_bytes, ...]` for Pure-Omni `elf_link.omni_bc`.
+    let hdr_len = 4 + mod_elfs.len() * 8;
+    let total_in: usize = hdr_len + mod_elfs.iter().map(|e| e.len()).sum::<usize>();
+    let mut in_bytes: Vec<u8> = Vec::with_capacity(total_in);
+    in_bytes.extend_from_slice(&(mod_elfs.len() as u32).to_le_bytes());
+    let mut cur_off = hdr_len;
+    for e in &mod_elfs {
+        in_bytes.extend_from_slice(&(cur_off as u32).to_le_bytes());
+        in_bytes.extend_from_slice(&(e.len() as u32).to_le_bytes());
+        cur_off += e.len();
+    }
+    for e in &mod_elfs {
+        in_bytes.extend_from_slice(e);
+    }
+    let in_u16: Vec<u16> = in_bytes.iter().map(|&b| b as u16).collect();
+    let link_raw = std::fs::read("pure/link/elf_link.omni_bc")
+        .map_err(|e| format!("link-elf missing pure/link/elf_link.omni_bc: {}", e))?;
+    let link_u16 = decode_bytes_to_u16_stream(&link_raw);
+    let link_mod = decode_omni_token_stream(&link_u16)?;
+    let entry = m2_entry_of(&link_mod);
+    let arena_len = (4096 + total_in + 65_536).max(524_288);
+    let mut vm = OmniBinaryVm::with_budgets(400_000_000, 64 * 1024 * 1024);
+    let out = match vm.execute_function(
+        &link_mod,
+        entry,
+        vec![
+            OmniValue::Bytes(vec![0u8; arena_len]),
+            OmniValue::U16Array(in_u16),
+        ],
+    )? {
+        OmniValue::Bytes(b) => b,
+        other => return Err(format!("elf_link returned {:?}, expected Bytes", other)),
+    };
+    if out.len() == 16 && u16::from_le_bytes([out[0], out[1]]) == 0xFFFF {
+        let code = u16::from_le_bytes([out[2], out[3]]);
+        let aux = u16::from_le_bytes([out[4], out[5]]);
+        return Err(format!(
+            "error[ELF_LINK_{}]: Pure-Omni ELF linker rejected modules (aux={})",
+            code, aux
+        ));
+    }
+    Ok(out)
+}
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn ensure_native_m3_elf() -> Result<&'static std::path::PathBuf, String> {
     static M3_ELF: std::sync::OnceLock<Result<std::path::PathBuf, String>> = std::sync::OnceLock::new();
     M3_ELF
         .get_or_init(|| {
             ensure_cached_native_elf("m3", NATIVE_M3_ELF_BYTES, NATIVE_M3_ELF_FNV, || {
-                let m2_elf = ensure_native_m2_elf()?;
-                let out = spawn_verified_native_elf(
-                    m2_elf,
-                    NATIVE_M2_ELF_BYTES,
-                    NATIVE_M2_ELF_FNV,
-                    &[
-                        std::ffi::OsStr::new("pure/m3/m3_standalone.omni_bc"),
-                        std::ffi::OsStr::new("0"),
-                        std::ffi::OsStr::new("0"),
-                        std::ffi::OsStr::new("0"),
-                    ],
-                )?;
-                if !out.status.success() {
-                    return Err(format!(
-                        "m2.elf failed building m3.elf with status {:?}",
-                        out.status.code()
-                    ));
-                }
-                Ok(out.stdout)
+                pure_default_link_elf_modules(&[
+                    "pure/m3/m3_standalone.omni_bc",
+                    "pure/m3/mod_parse.omni_bc",
+                ])
             })
         })
         .as_ref()
@@ -459,6 +546,8 @@ pub fn pure_default_compile_surface_to_u16(src: &str, strict: bool) -> Result<Ve
     if !pure_default_force_interpreted()
         && src.len() <= 65_536
         && std::path::Path::new("pure/m3/m3_standalone.omni_bc").exists()
+        && std::path::Path::new("pure/m3/mod_parse.omni_bc").exists()
+        && std::path::Path::new("pure/link/elf_link.omni_bc").exists()
     {
         let m3_elf = ensure_native_m3_elf()?;
         let mut u16_bytes = Vec::with_capacity(src.len() * 2);
