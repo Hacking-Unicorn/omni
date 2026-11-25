@@ -1688,6 +1688,13 @@ fn wasm_buf_in_bounds(b: &mut Vec<u8>, l: &WasmBufLocals, off_l: usize, width: i
 
 pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
     let module = decode_omni_token_stream(stream)?;
+    // Fix 2 (mirrors the live monolith): dispatch by function count. 0-1 functions
+    // keep the byte-locked single-function compiler; 2+ use the multi compiler.
+    // Without this, multi-function modules silently compile only the first
+    // function (std_clamp after include expansion) yet print PASS.
+    if module.functions.len() > 1 {
+        return compile_pure_u16_to_wasm_multi(stream);
+    }
     let func = module.functions.first().ok_or("No function in module")?;
     let rep = verify_binary_function(func);
     if !rep.passed {
@@ -1737,7 +1744,7 @@ pub fn compile_pure_u16_to_wasm_multi(stream: &[u16]) -> Result<Vec<u8>, String>
     for (idx, f) in module.functions.iter().enumerate() {
         fn_id_to_wasm_idx.insert(f.fn_idx, idx);
     }
-    let entry_wasm_idx = fn_id_to_wasm_idx.get(&0).copied().unwrap_or(0);
+    let entry_wasm_idx = fn_id_to_wasm_idx.get(&0).copied().unwrap_or(module.functions.len() - 1);
 
     let mut type_sec: Vec<u8> = Vec::new();
     type_sec.extend(encode_uleb128(module.functions.len()));

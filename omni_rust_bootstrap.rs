@@ -1037,7 +1037,7 @@ pub fn verify_u16_stream(stream: &[u16]) -> Result<Vec<BinVerificationReport>, S
 /// (2) CALL argument count == callee `params.len()`;
 /// (3) call graph is acyclic (no direct or mutual recursion);
 /// (4) longest call chain from entry <= 64 frames (entry = frame 1);
-/// (5) entry = fn_idx 0 else last; entry `p_cnt <= 4`; every callee `p_cnt <= 32`;
+/// (5) entry = fn_idx 0 else last; entry `p_cnt <= 32`; every callee `p_cnt <= 32`;
 /// (6) function count in 1..=1024;
 /// (7) total M2 label-table slot budget <= 4096 (each key in `0x7EF0..=0x7EFF` or `< 4080`).
 pub fn verify_module_for_multi_aot(module: &BinModule) -> Result<(), String> {
@@ -1058,9 +1058,9 @@ pub fn verify_module_for_multi_aot(module: &BinModule) -> Result<(), String> {
 
     let entry_pos = module.functions.iter().position(|f| f.fn_idx == 0).unwrap_or(n - 1);
     let entry_fn = &module.functions[entry_pos];
-    if entry_fn.params.len() > 4 {
+    if entry_fn.params.len() > 32 {
         return Err(format!(
-            "error[MULTI_AOT_ENTRY_PARAMS]: entry fn#{} has {} params (max 4)",
+            "error[MULTI_AOT_ENTRY_PARAMS]: entry fn#{} has {} params (max 32)",
             entry_fn.fn_idx,
             entry_fn.params.len()
         ));
@@ -19570,8 +19570,24 @@ fn wasm_buf_in_bounds(b: &mut Vec<u8>, l: &WasmBufLocals, off_l: usize, width: i
     b.push(0x71);
 }
 
+/// Wasm entry dispatch. The single-function compiler is a trap for
+/// multi-function modules: compiling only `functions.first()` silently
+/// emits an included helper (e.g. `std_clamp`, a 75-byte module) for any
+/// module with an `include`, while printing PASS. But the single-function
+/// compiler is also the byte-locked single-mode output — replacing it for
+/// single-function modules would drift the M2 single-mode byte lock
+/// (e.g. `arena_lifecycle_golden` 65w -> 81w). So dispatch:
+///   * 0-1 functions: the original single-function compiler. For a
+///     single-function module `first()` IS the entry (only function), so
+///     this is correct and preserves the byte lock.
+///   * 2+ functions: the multi-function compiler, which selects the entry
+///     by the same rule as `run` (fn_idx 0, else last) and compiles every
+///     function.
 pub fn compile_pure_u16_to_wasm(stream: &[u16]) -> Result<Vec<u8>, String> {
     let module = decode_omni_token_stream(stream)?;
+    if module.functions.len() > 1 {
+        return compile_pure_u16_to_wasm_multi(stream);
+    }
     let func = module.functions.first().ok_or("No function in module")?;
     let rep = verify_binary_function(func);
     if !rep.passed {
@@ -19621,7 +19637,10 @@ pub fn compile_pure_u16_to_wasm_multi(stream: &[u16]) -> Result<Vec<u8>, String>
     for (idx, f) in module.functions.iter().enumerate() {
         fn_id_to_wasm_idx.insert(f.fn_idx, idx);
     }
-    let entry_wasm_idx = fn_id_to_wasm_idx.get(&0).copied().unwrap_or(0);
+    // Entry rule matches `run` (m4v_setup_entry): fn_idx 0 if present,
+    // otherwise the LAST function — never `.first()`, which silently
+    // selects an included helper (e.g. std_clamp) instead of main.
+    let entry_wasm_idx = fn_id_to_wasm_idx.get(&0).copied().unwrap_or(module.functions.len() - 1);
 
     let mut type_sec: Vec<u8> = Vec::new();
     type_sec.extend(encode_uleb128(module.functions.len()));
@@ -20688,10 +20707,17 @@ pub fn execute_wasm_module_i64_with_budgets(
     let mut bpos = fn_code_starts[cur_fn];
     let total_locals = fn_total_locals[cur_fn];
 
+    // The Wasm linear memory is a fixed-size pre-allocated address space
+    // (WASM_ISET_MEMORY_PAGES pages, 2 pages = 131,072 B for the single
+    // compiler, 32 pages for multi). Billing its full capacity against
+    // the user's #[mem_budget] makes any program with a budget fail, since
+    // the page minimum alone exceeds a typical budget (e.g. 8192). The
+    // program's actual data is bounded by the driver's static_alloc check
+    // (0x7F01 sums) and by locals/stack here, so exclude the linear
+    // memory capacity from the frame budget.
     let frame_bytes = wasm
         .len()
-        .saturating_add(total_locals.max(args.len()).saturating_mul(8))
-        .saturating_add(memory.len());
+        .saturating_add(total_locals.max(args.len()).saturating_mul(8));
     if frame_bytes > memory_budget_bytes {
         return Err(format!(
             "error[BUDGET_EXCEEDED]: Wasm AOT memory budget exceeded ({} > {} bytes)",
@@ -24470,12 +24496,13 @@ pub fn selftest_m2_08_multi_aot_precheck() -> Result<usize, String> {
     };
     expect_err("multi_reject_missing_fn", &m_missing, "MULTI_AOT_MISSING_FN")?;
 
-    // 7. multi_reject_entry_p5
-    let m_entry5 = BinModule {
-        functions: vec![mk_fn(0, 5, vec![ret0.clone()])],
+    // 7. multi_reject_entry_p33 (entry cap is 32, matching callees; 5-param
+    // entries such as arg_repro/trit_pack5 are accepted now)
+    let m_entry33 = BinModule {
+        functions: vec![mk_fn(0, 33, vec![ret0.clone()])],
         ..Default::default()
     };
-    expect_err("multi_reject_entry_p5", &m_entry5, "MULTI_AOT_ENTRY_PARAMS")?;
+    expect_err("multi_reject_entry_p33", &m_entry33, "MULTI_AOT_ENTRY_PARAMS")?;
 
     // 8. multi_ok_depth64: chain of 64 frames accepted by pre-check AND succeeds on VM
     let mut src64 = String::new();

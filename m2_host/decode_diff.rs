@@ -7467,6 +7467,8 @@ pub fn selftest_s4_honesty() -> Result<usize, String> {
         ));
     }
     let runtime_rust_lines = monolith_lines + m2_host_lines + pure_default_lines + p4_shim_lines;
+    let active_rust_lines =
+        seed0_lines + p4_shim_lines + dev_host_lines + monolith_lines + m2_host_lines + pure_default_lines;
     let oracle_readme = std::fs::read_to_string("oracle/README.md")
         .map_err(|e| format!("S4 read oracle/README.md: {}", e))?;
     let main_readme = std::fs::read_to_string("README.md")
@@ -7480,10 +7482,38 @@ pub fn selftest_s4_honesty() -> Result<usize, String> {
         || !oracle_readme.contains(&monolith_lines.to_string())
         || !oracle_readme.contains(&m2_host_lines.to_string())
         || !oracle_readme.contains(&pure_default_lines.to_string())
+        || !oracle_readme.contains(&active_rust_lines.to_string())
     {
         return Err(format!(
-            "S4.2 oracle/README.md line counts drifted from live wc -l (monolith={}, m2_host={}, pure_default={}, runtime_rust={})",
-            monolith_lines, m2_host_lines, pure_default_lines, runtime_rust_lines
+            "S4.2 oracle/README.md line counts drifted from live wc -l (monolith={}, m2_host={}, pure_default={}, runtime_rust={}, active_rust={})",
+            monolith_lines, m2_host_lines, pure_default_lines, runtime_rust_lines, active_rust_lines
+        ));
+    }
+    // S4.2 (extended): README.md prose counts must match live wc -l too. README.md
+    // writes counts comma-formatted (36,055), unlike oracle/README.md's plain table
+    // numbers, so format them the same way before comparing. This closes the blind
+    // spot that let README.md lines 5 and 144 drift to 36,028 / 26,328 / 36,202
+    // while the selftest still passed.
+    let fmt_comma = |n: usize| -> String {
+        let s = n.to_string();
+        let mut out = String::with_capacity(s.len() + s.len() / 3);
+        for (i, c) in s.chars().enumerate() {
+            if i > 0 && (s.len() - i) % 3 == 0 {
+                out.push(',');
+            }
+            out.push(c);
+        }
+        out
+    };
+    if !main_readme.contains(&fmt_comma(runtime_rust_lines))
+        || !main_readme.contains(&fmt_comma(monolith_lines))
+        || !main_readme.contains(&fmt_comma(m2_host_lines))
+        || !main_readme.contains(&fmt_comma(pure_default_lines))
+        || !main_readme.contains(&fmt_comma(active_rust_lines))
+    {
+        return Err(format!(
+            "S4.2 README.md line counts drifted from live wc -l (monolith={}, m2_host={}, pure_default={}, runtime_rust={}, active_rust={})",
+            monolith_lines, m2_host_lines, pure_default_lines, runtime_rust_lines, active_rust_lines
         ));
     }
     if !main_readme.contains("validator/entry stub") {
