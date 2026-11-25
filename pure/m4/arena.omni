@@ -49,6 +49,15 @@ fn m4s_ret_val() -> i64 { return 167968; }
 fn m4s_ret_tag() -> i64 { return 167976; }
 #[strict]
 fn m4s_steps() -> i64 { return 167980; }
+#[strict]
+fn m4s_entry_argc() -> i64 { return 168192; }
+#[strict]
+fn m4s_entry_args() -> i64 { return 168200; }
+
+#[strict]
+fn m4s_put_arg(w: bytes, idx: i64, val: i64) -> bytes {
+    return iset_patch_i64(w, m4s_entry_args() + idx * 8, val);
+}
 
 // Error codes: 0=OK, 1=DECODE, 2=OOB, 3=FUEL, 4=DEPTH, 5=UNSUPPORTED_OP, 6=BAD_CALL
 #[strict]

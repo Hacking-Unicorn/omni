@@ -509,7 +509,7 @@ fn m4v_step_one(w_in: bytes, arr: array, n: i64) -> bytes {
 }
 
 #[strict]
-fn m4v_setup_entry(w1: bytes, a0: i64, a1: i64, a2: i64) -> bytes {
+fn m4v_setup_entry_args(w1: bytes) -> bytes {
     let fn_cnt: i64 = ld_u32(w1, m4s_fn_cnt());
     let i: i64 = 0;
     let eslot_raw: i64 = 0 - 1;
@@ -525,20 +525,23 @@ fn m4v_setup_entry(w1: bytes, a0: i64, a1: i64, a2: i64) -> bytes {
     let ft: i64 = m4a_fn_tbl() + eslot * 16;
     let e_start: i64 = ld_u32(w1, ft + 8);
     let e_cnt: i64 = ld_u32(w1, ft + 12);
-    let w2: bytes = m4f_set_meta(w1, 0, eslot, e_start, 0, 255, e_start, e_cnt);
-    let w3: bytes = m4f_set_slot_val(w2, 0, 192, a0);
-    let w4: bytes = m4f_set_slot_tag(w3, 0, 192, 1);
-    let w5: bytes = m4f_set_slot_val(w4, 0, 193, a1);
-    let w6: bytes = m4f_set_slot_tag(w5, 0, 193, 1);
-    let w7: bytes = m4f_set_slot_val(w6, 0, 194, a2);
-    return m4f_set_slot_tag(w7, 0, 194, 1);
+    let raw_argc: i64 = ld_u64(w1, m4s_entry_argc());
+    let c0: i64 = m2u_sel(m2u_lt(raw_argc, 0), 0, raw_argc);
+    let argc: i64 = m2u_sel(m2u_lt(32, c0), 32, c0);
+    let w: bytes = m4f_set_meta(w1, 0, eslot, e_start, 0, 255, e_start, e_cnt);
+    let k: i64 = 0;
+    while m2u_lt(k, argc) <=> 0 {
+        let aval: i64 = ld_u64(w, m4s_entry_args() + k * 8);
+        w = m4f_set_slot_val(w, 0, 192 + k, aval);
+        w = m4f_set_slot_tag(w, 0, 192 + k, 1);
+        k = k + 1;
+    }
+    return w;
 }
 
-// Main Phase 4 VM entry point: executes raw `.omni_bc` u16 token stream `arr`
-// with up to 3 i64 arguments `(a0, a1, a2)`, `fuel` step limit, and `trace_mode` (0/1).
-// Returns updated arena `w` (read ret_val at m4s_ret_val(), err at m4s_err(), trace_cnt at m4s_trace_cnt()).
+// N-argument Phase 4 VM entry point (`0..=32` i64 args pre-populated at `m4s_entry_argc()`/`m4s_entry_args()`).
 #[strict]
-fn m4_vm_run_i64(w_in: bytes, arr: array, a0: i64, a1: i64, a2: i64, fuel: i64, trace_mode: i64) -> bytes {
+fn m4_vm_run_args(w_in: bytes, arr: array, fuel: i64, trace_mode: i64) -> bytes {
     let n: i64 = slen(arr);
     let w0: bytes = m4a_init(w_in, fuel, trace_mode);
     let scan: i64 = m2d_module_scan(arr);
@@ -548,7 +551,7 @@ fn m4_vm_run_i64(w_in: bytes, arr: array, a0: i64, a1: i64, a2: i64, fuel: i64, 
         let w1: bytes = m4v_load_fns(w0, arr, n);
         let fn_cnt: i64 = ld_u32(w1, m4s_fn_cnt());
         let err_init: i64 = ld_u32(w1, m4s_err());
-        let w: bytes = m4v_setup_entry(w1, a0, a1, a2);
+        let w: bytes = m4v_setup_entry_args(w1);
         let rem: i64 = ld_u64(w, m4s_fuel());
         let go: i64 = m2u_eq(err_init, 0) * m2u_lt(0, fn_cnt) * m2u_lt(0, rem);
         while go <=> 0 {
@@ -570,4 +573,14 @@ fn m4_vm_run_i64(w_in: bytes, arr: array, a0: i64, a1: i64, a2: i64, fuel: i64, 
         w_fin
     };
     return out;
+}
+
+// Legacy 3-argument Phase 4 VM wrapper (kept at `functions[len() - 2]` so `compile-elf`/`p4_shim` callers stay untouched).
+#[strict]
+fn m4_vm_run_i64(w_in: bytes, arr: array, a0: i64, a1: i64, a2: i64, fuel: i64, trace_mode: i64) -> bytes {
+    let w1: bytes = iset_patch_i64(w_in, m4s_entry_argc(), 3);
+    let w2: bytes = m4s_put_arg(w1, 0, a0);
+    let w3: bytes = m4s_put_arg(w2, 1, a1);
+    let w4: bytes = m4s_put_arg(w3, 2, a2);
+    return m4_vm_run_args(w4, arr, fuel, trace_mode);
 }

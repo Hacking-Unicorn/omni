@@ -6,8 +6,8 @@
 // zero Rust AOT. Its ONLY responsibilities are:
 //   1. Embed & verify exact FNV-1a64 hashes of the 3 committed Pure-Omni seeds:
 //      - `pure/m3/m3.omni_bc` (59,887 words, 0xCBA538CD0E8100A8)
-//      - `pure/m2/m2.omni_bc` (41,289 words, 0x1DE7EDF361BB3626)
-//      - `pure/m4/m4.omni_bc` (27,819 words, 0x99567F6F5D0E8F32)
+//      - `pure/m2/m2.omni_bc` (41,855 words, 0x36ADC3CEAB97B1C9)
+//      - `pure/m4/m4.omni_bc` (28,062 words, 0x0561704B3E50EFAC)
 //   2. Extract seeds to disk (`emit-seeds <out_dir>`).
 //   3. Provide the thin 3-op ELF/seed loader shim (`run-elf <path> [args...]`)
 //      and report mandatory Stage-0 Rust line count (`line-audit`).
@@ -20,12 +20,12 @@ const SEED_M2_BYTES: &[u8] = include_bytes!("../pure/m2/m2.omni_bc");
 const SEED_M4_BYTES: &[u8] = include_bytes!("../pure/m4/m4.omni_bc");
 
 const SEED_M3_FNV: u64 = 0xCBA538CD0E8100A8;
-const SEED_M2_FNV: u64 = 0x1DE7EDF361BB3626;
-const SEED_M4_FNV: u64 = 0x99567F6F5D0E8F32;
+const SEED_M2_FNV: u64 = 0x36ADC3CEAB97B1C9;
+const SEED_M4_FNV: u64 = 0x0561704B3E50EFAC;
 
 const SEED_M3_WORDS: usize = 59_887;
-const SEED_M2_WORDS: usize = 41_289;
-const SEED_M4_WORDS: usize = 27_819;
+const SEED_M2_WORDS: usize = 41_855;
+const SEED_M4_WORDS: usize = 28_062;
 
 fn fnv1a_64(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;

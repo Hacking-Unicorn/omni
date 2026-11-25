@@ -27,14 +27,14 @@ pub fn pure_default_reject_macros(src: &str) -> Result<(), String> {
 // + Audit §3.3: Per-process decoded seed module caches (`OnceLock`).
 // ==============================================================================
 
-pub const NATIVE_M2_ELF_BYTES: usize = 119_581;
-pub const NATIVE_M2_ELF_FNV: u64 = 0x92F8_5264_4E07_8AA6;
-pub const NATIVE_M3_ELF_BYTES: usize = 183_434;
-pub const NATIVE_M3_ELF_FNV: u64 = 0x21E3_7ED9_A453_C048;
-pub const NATIVE_M4_ELF_BYTES: usize = 89_705;
-pub const NATIVE_M4_ELF_FNV: u64 = 0xAE3F_3DF0_69BE_D8B7;
-pub const NATIVE_VERIFIER_ELF_BYTES: usize = 37_992;
-pub const NATIVE_VERIFIER_ELF_FNV: u64 = 0x1559_FEAF_0956_081E;
+pub const NATIVE_M2_ELF_BYTES: usize = 120_916;
+pub const NATIVE_M2_ELF_FNV: u64 = 0x70AA_C3C7_8C00_6370;
+pub const NATIVE_M3_ELF_BYTES: usize = 183_349;
+pub const NATIVE_M3_ELF_FNV: u64 = 0x5B02_2187_3659_4344;
+pub const NATIVE_M4_ELF_BYTES: usize = 91_576;
+pub const NATIVE_M4_ELF_FNV: u64 = 0xFBA8_2723_37B1_BAC4;
+pub const NATIVE_VERIFIER_ELF_BYTES: usize = 37_907;
+pub const NATIVE_VERIFIER_ELF_FNV: u64 = 0x2ECD_2CE3_DCB6_9346;
 
 /// Audit Round 2 L5: Default & maximum fuel for `omni run --fuel N`, plus documented
 /// 65,536-word (128 KiB) native M2/M3/M4/verifier input-window threshold (larger inputs
@@ -605,9 +605,7 @@ fn decode_m4_vm_state_64(st_bytes: &[u8]) -> Result<(i64, i64), String> {
 /// and not forced interpreted; otherwise executes `pure/m4/m4.omni_bc` with the requested `fuel`.
 pub fn pure_default_run_u16_with_fuel(
     u16_stream: &[u16],
-    a0: i64,
-    a1: i64,
-    a2: i64,
+    args: &[i64],
     fuel: i64,
     trace: bool,
 ) -> Result<(i64, i64), String> {
@@ -617,29 +615,34 @@ pub fn pure_default_run_u16_with_fuel(
             PURE_MAX_FUEL, fuel
         ));
     }
+    if args.len() > 32 {
+        return Err(format!(
+            "error[CLI_ARG]: at most 32 entry arguments are supported (got {})",
+            args.len()
+        ));
+    }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     if !pure_default_force_interpreted()
         && !trace
         && fuel == PURE_DEFAULT_FUEL
+        && args.len() <= 31
         && u16_stream.len() <= NATIVE_WINDOW_MAX_WORDS
         && std::path::Path::new("pure/m4/m4_standalone.omni_bc").exists()
     {
         let m4_elf = ensure_native_m4_elf()?;
         let bc_bytes = encode_u16_stream_to_bytes(u16_stream);
         let tmp = PrivateTempDataFile::create("m4_in", &bc_bytes)?;
-        let s0 = a0.to_string();
-        let s1 = a1.to_string();
-        let s2 = a2.to_string();
+        let arg_strs: Vec<String> = args.iter().map(|v| v.to_string()).collect();
+        let mut spawn_args: Vec<&std::ffi::OsStr> = Vec::with_capacity(1 + arg_strs.len());
+        spawn_args.push(tmp.path.as_os_str());
+        for s in &arg_strs {
+            spawn_args.push(std::ffi::OsStr::new(s));
+        }
         let out = spawn_verified_native_elf(
             m4_elf,
             NATIVE_M4_ELF_BYTES,
             NATIVE_M4_ELF_FNV,
-            &[
-                tmp.path.as_os_str(),
-                std::ffi::OsStr::new(&s0),
-                std::ffi::OsStr::new(&s1),
-                std::ffi::OsStr::new(&s2),
-            ],
+            &spawn_args,
         )?;
         if !out.status.success() {
             let code = out.status.code();
@@ -654,18 +657,24 @@ pub fn pure_default_run_u16_with_fuel(
         return decode_m4_vm_state_64(&out.stdout);
     }
     let m4_mod = cached_m4_seed_module()?;
-    let m4_run_fn = m4_mod.functions[m4_mod.functions.len() - 2].fn_idx;
+    // `m4_vm_run_args` sits at `len() - 3` (before `m4_vm_run_i64` at `-2` and `main` at `-1`).
+    let m4_run_args_fn = m4_mod.functions[m4_mod.functions.len() - 3].fn_idx;
     let vm_budget = ((fuel as u64).saturating_mul(2000)).max(500_000_000);
     let mut vm = OmniBinaryVm::with_budgets(vm_budget, 128 * 1024 * 1024);
+    let mut arena_in = vec![0u8; 524_288];
+    let argc_off = 168_192usize;
+    let args_off = 168_200usize;
+    arena_in[argc_off..argc_off + 8].copy_from_slice(&(args.len() as i64).to_le_bytes());
+    for (k, &val) in args.iter().enumerate() {
+        let off = args_off + k * 8;
+        arena_in[off..off + 8].copy_from_slice(&val.to_le_bytes());
+    }
     let arena = match vm.execute_function(
         m4_mod,
-        m4_run_fn,
+        m4_run_args_fn,
         vec![
-            OmniValue::Bytes(vec![0u8; 524_288]),
+            OmniValue::Bytes(arena_in),
             OmniValue::U16Array(u16_stream.to_vec()),
-            OmniValue::Int(a0),
-            OmniValue::Int(a1),
-            OmniValue::Int(a2),
             OmniValue::Int(fuel),
             OmniValue::Int(if trace { 1 } else { 0 }),
         ],
@@ -684,7 +693,7 @@ pub fn pure_default_run_u16(
     a2: i64,
     trace: bool,
 ) -> Result<(i64, i64), String> {
-    pure_default_run_u16_with_fuel(u16_stream, a0, a1, a2, PURE_DEFAULT_FUEL, trace)
+    pure_default_run_u16_with_fuel(u16_stream, &[a0, a1, a2], PURE_DEFAULT_FUEL, trace)
 }
 
 /// Seed-Shrink Phase A2 (O-5): Pure-Omni include expander driven by `pure/m3/include.omni`.

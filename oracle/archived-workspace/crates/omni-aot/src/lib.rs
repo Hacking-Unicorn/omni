@@ -872,14 +872,6 @@ pub fn compile_pure_u16_to_x86_64_elf_multi(
     let n_fns = module.functions.len();
     let entry_pos = module.functions.iter().position(|f| f.fn_idx == 0).unwrap_or(n_fns - 1);
     let entry_fn = &module.functions[entry_pos];
-    // Mirrors the live monolith: x86-64 multi-mode `_start` stub pushes only 4 args (`r15..r12`).
-    if entry_fn.params.len() > 4 {
-        return Err(format!(
-            "error[MULTI_AOT_ENTRY_PARAMS]: x86-64 multi-AOT entry fn#{} has {} params (max 4)",
-            entry_fn.fn_idx,
-            entry_fn.params.len()
-        ));
-    }
     let entry_is_bytes = entry_fn.ret_ty_tok == TY_BYTES;
 
     let mut code: Vec<u8> = Vec::with_capacity(8192);
@@ -889,18 +881,24 @@ pub fn compile_pure_u16_to_x86_64_elf_multi(
     code.extend_from_slice(&[0x55, 0x48, 0x89, 0xE5, 0x48, 0x81, 0xEC, 0x10, 0x00, 0x12, 0x00]);
     code.extend_from_slice(&[0x48, 0x89, 0xE3]);
     code.extend_from_slice(&[0x48, 0xC7, 0x83, 0x00, 0x00, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[
+        0x48, 0x81, 0xEC, 0x00, 0x01, 0x00, 0x00,
+        0x48, 0x89, 0xE7,
+        0xB9, 0x20, 0x00, 0x00, 0x00,
+        0x31, 0xC0,
+        0xF3, 0x48, 0xAB,
+    ]);
 
     if entry_is_bytes {
-        code.extend_from_slice(&[0x49, 0xC7, 0xC4, 0x00, 0x00, 0x00, 0x00]);
-        code.extend_from_slice(&[0x49, 0xBD]);
+        code.extend_from_slice(&[0x48, 0xB8]);
         code.extend_from_slice(&(arg0 as u64).to_le_bytes());
-        code.extend_from_slice(&[0x49, 0xBE]);
+        code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x08]);
+        code.extend_from_slice(&[0x48, 0xB8]);
         code.extend_from_slice(&(arg1 as u64).to_le_bytes());
-        code.extend_from_slice(&[0x49, 0xBF]);
+        code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x10]);
+        code.extend_from_slice(&[0x48, 0xB8]);
         code.extend_from_slice(&(arg2 as u64).to_le_bytes());
-        emit_cli_arg_parser(&mut code, 3, 0x20, 5);
-        emit_cli_arg_parser(&mut code, 4, 0x28, 6);
-        emit_cli_arg_parser(&mut code, 5, 0x30, 7);
+        code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x18]);
 
         code.extend_from_slice(&[0x48, 0x83, 0x7D, 0x08, 0x02, 0x7C]);
         let j_no_arg = code.len();
@@ -943,24 +941,52 @@ pub fn compile_pure_u16_to_x86_64_elf_multi(
         code[j_read_err] = (do_close_off - (j_read_err + 1)) as u8;
         code[j_open_err] = (after_read_off - (j_open_err + 1)) as u8;
         code[j_no_arg] = (after_read_off - (j_no_arg + 1)) as u8;
+        code.extend_from_slice(&[0x41, 0xB8, 0x01, 0x00, 0x00, 0x00]);
     } else {
-        code.extend_from_slice(&[0x49, 0xBC]);
+        code.extend_from_slice(&[0x48, 0xB8]);
         code.extend_from_slice(&(arg0 as u64).to_le_bytes());
-        code.extend_from_slice(&[0x49, 0xBD]);
+        code.extend_from_slice(&[0x48, 0x89, 0x04, 0x24]);
+        code.extend_from_slice(&[0x48, 0xB8]);
         code.extend_from_slice(&(arg1 as u64).to_le_bytes());
-        code.extend_from_slice(&[0x49, 0xBE]);
+        code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x08]);
+        code.extend_from_slice(&[0x48, 0xB8]);
         code.extend_from_slice(&(arg2 as u64).to_le_bytes());
-        code.extend_from_slice(&[0x49, 0xC7, 0xC7, 0x00, 0x00, 0x00, 0x00]);
-        emit_cli_arg_parser(&mut code, 2, 0x18, 4);
-        emit_cli_arg_parser(&mut code, 3, 0x20, 5);
-        emit_cli_arg_parser(&mut code, 4, 0x28, 6);
-        emit_cli_arg_parser(&mut code, 5, 0x30, 7);
+        code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x10]);
+        code.extend_from_slice(&[0x45, 0x31, 0xC0]);
     }
 
-    code.extend_from_slice(&[0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x45, 0x31, 0xDB, 0xE8]);
+    code.extend_from_slice(&[
+        0x49, 0x83, 0xF8, 0x20,
+        0x7D, 0x4B,
+        0x49, 0x8D, 0x48, 0x01,
+        0x48, 0x3B, 0x4D, 0x08,
+        0x7D, 0x41,
+        0x48, 0x8B, 0x74, 0xCD, 0x10,
+        0x31, 0xC0,
+        0xBF, 0x01, 0x00, 0x00, 0x00,
+        0x0F, 0xB6, 0x0E,
+        0x80, 0xF9, 0x2D,
+        0x75, 0x0A,
+        0x48, 0xC7, 0xC7, 0xFF, 0xFF, 0xFF, 0xFF,
+        0x48, 0xFF, 0xC6,
+        0x0F, 0xB6, 0x0E,
+        0x84, 0xC9,
+        0x74, 0x0F,
+        0x83, 0xE9, 0x30,
+        0x48, 0x6B, 0xC0, 0x0A,
+        0x48, 0x01, 0xC8,
+        0x48, 0xFF, 0xC6,
+        0xEB, 0xEA,
+        0x48, 0x0F, 0xAF, 0xC7,
+        0x4A, 0x89, 0x04, 0xC4,
+        0x49, 0xFF, 0xC0,
+        0xEB, 0xAF,
+    ]);
+
+    code.extend_from_slice(&[0x45, 0x31, 0xDB, 0xE8]);
     call_relocs.push((code.len(), entry_fn.fn_idx));
     code.extend_from_slice(&[0, 0, 0, 0]);
-    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x20]);
+    code.extend_from_slice(&[0x48, 0x81, 0xC4, 0x00, 0x01, 0x00, 0x00]);
 
     if entry_is_bytes {
         code.extend_from_slice(&[

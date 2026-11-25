@@ -18657,16 +18657,6 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
     let n_fns = module.functions.len();
     let entry_pos = module.functions.iter().position(|f| f.fn_idx == 0).unwrap_or(n_fns - 1);
     let entry_fn = &module.functions[entry_pos];
-    // Multi-mode x86-64 `_start` stub pushes only 4 register slots (`r15..r12`, 32 B)
-    // directly below the 1 MiB `rbx` stack arena; reject >4 entry params here so Wasm
-    // multi-AOT can accept up to 32 entry params without breaking x86-64 stack bounds.
-    if entry_fn.params.len() > 4 {
-        return Err(format!(
-            "error[MULTI_AOT_ENTRY_PARAMS]: x86-64 multi-AOT entry fn#{} has {} params (max 4)",
-            entry_fn.fn_idx,
-            entry_fn.params.len()
-        ));
-    }
     let entry_is_bytes = entry_fn.ret_ty_tok == TY_BYTES;
 
     let mut code: Vec<u8> = Vec::with_capacity(8192);
@@ -18680,18 +18670,25 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
     code.extend_from_slice(&[0x48, 0x89, 0xE3]);
     // mov qword [rbx+0x120000], 0 (nwords = 0)
     code.extend_from_slice(&[0x48, 0xC7, 0x83, 0x00, 0x00, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    // Allocate & zero 32 qword entry-arg stack slots (`sub rsp, 256; mov rdi, rsp; mov ecx, 32; xor eax, eax; rep stosq`)
+    code.extend_from_slice(&[
+        0x48, 0x81, 0xEC, 0x00, 0x01, 0x00, 0x00,
+        0x48, 0x89, 0xE7,
+        0xB9, 0x20, 0x00, 0x00, 0x00,
+        0x31, 0xC0,
+        0xF3, 0x48, 0xAB,
+    ]);
 
     if entry_is_bytes {
-        code.extend_from_slice(&[0x49, 0xC7, 0xC4, 0x00, 0x00, 0x00, 0x00]);
-        code.extend_from_slice(&[0x49, 0xBD]);
+        code.extend_from_slice(&[0x48, 0xB8]);
         code.extend_from_slice(&(arg0 as u64).to_le_bytes());
-        code.extend_from_slice(&[0x49, 0xBE]);
+        code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x08]);
+        code.extend_from_slice(&[0x48, 0xB8]);
         code.extend_from_slice(&(arg1 as u64).to_le_bytes());
-        code.extend_from_slice(&[0x49, 0xBF]);
+        code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x10]);
+        code.extend_from_slice(&[0x48, 0xB8]);
         code.extend_from_slice(&(arg2 as u64).to_le_bytes());
-        emit_cli_arg_parser(&mut code, 3, 0x20, 5);
-        emit_cli_arg_parser(&mut code, 4, 0x28, 6);
-        emit_cli_arg_parser(&mut code, 5, 0x30, 7);
+        code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x18]);
 
         // Read argv[1] into [rbx+0x100000..+0x20000]; reject odd length or >128 KiB via T_TRUNC.
         code.extend_from_slice(&[0x48, 0x83, 0x7D, 0x08, 0x02, 0x7C]);
@@ -18735,25 +18732,54 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
         code[j_read_err] = (do_close_off - (j_read_err + 1)) as u8;
         code[j_open_err] = (after_read_off - (j_open_err + 1)) as u8;
         code[j_no_arg] = (after_read_off - (j_no_arg + 1)) as u8;
+        code.extend_from_slice(&[0x41, 0xB8, 0x01, 0x00, 0x00, 0x00]); // mov r8d, 1
     } else {
-        code.extend_from_slice(&[0x49, 0xBC]);
+        code.extend_from_slice(&[0x48, 0xB8]);
         code.extend_from_slice(&(arg0 as u64).to_le_bytes());
-        code.extend_from_slice(&[0x49, 0xBD]);
+        code.extend_from_slice(&[0x48, 0x89, 0x04, 0x24]);
+        code.extend_from_slice(&[0x48, 0xB8]);
         code.extend_from_slice(&(arg1 as u64).to_le_bytes());
-        code.extend_from_slice(&[0x49, 0xBE]);
+        code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x08]);
+        code.extend_from_slice(&[0x48, 0xB8]);
         code.extend_from_slice(&(arg2 as u64).to_le_bytes());
-        code.extend_from_slice(&[0x49, 0xC7, 0xC7, 0x00, 0x00, 0x00, 0x00]);
-        emit_cli_arg_parser(&mut code, 2, 0x18, 4);
-        emit_cli_arg_parser(&mut code, 3, 0x20, 5);
-        emit_cli_arg_parser(&mut code, 4, 0x28, 6);
-        emit_cli_arg_parser(&mut code, 5, 0x30, 7);
+        code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x10]);
+        code.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d
     }
 
-    // Push r15..r12 so entry param k is at [rbp+16+8k], zero r11 (arena len), call entry.
-    code.extend_from_slice(&[0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x45, 0x31, 0xDB, 0xE8]);
+    // Shared 81-byte CLI decimal argv parser loop (`k` in `r8`, `k < 32` && `k+1 < argc` -> `[rsp+r8*8]`).
+    code.extend_from_slice(&[
+        0x49, 0x83, 0xF8, 0x20,                   // cmp r8, 32
+        0x7D, 0x4B,                               // jge +75 (done)
+        0x49, 0x8D, 0x48, 0x01,                   // lea rcx, [r8+1]
+        0x48, 0x3B, 0x4D, 0x08,                   // cmp rcx, [rbp+8]
+        0x7D, 0x41,                               // jge +65 (done)
+        0x48, 0x8B, 0x74, 0xCD, 0x10,             // mov rsi, [rbp+rcx*8+16]
+        0x31, 0xC0,                               // xor eax, eax
+        0xBF, 0x01, 0x00, 0x00, 0x00,             // mov edi, 1
+        0x0F, 0xB6, 0x0E,                         // movzx ecx, byte [rsi]
+        0x80, 0xF9, 0x2D,                         // cmp cl, '-'
+        0x75, 0x0A,                               // jne +10
+        0x48, 0xC7, 0xC7, 0xFF, 0xFF, 0xFF, 0xFF, // mov rdi, -1
+        0x48, 0xFF, 0xC6,                         // inc rsi
+        0x0F, 0xB6, 0x0E,                         // movzx ecx, byte [rsi]
+        0x84, 0xC9,                               // test cl, cl
+        0x74, 0x0F,                               // jz +15
+        0x83, 0xE9, 0x30,                         // sub ecx, '0'
+        0x48, 0x6B, 0xC0, 0x0A,                   // imul rax, rax, 10
+        0x48, 0x01, 0xC8,                         // add rax, rcx
+        0x48, 0xFF, 0xC6,                         // inc rsi
+        0xEB, 0xEA,                               // jmp -22
+        0x48, 0x0F, 0xAF, 0xC7,                   // imul rax, rdi
+        0x4A, 0x89, 0x04, 0xC4,                   // mov [rsp+r8*8], rax
+        0x49, 0xFF, 0xC0,                         // inc r8
+        0xEB, 0xAF,                               // jmp -81
+    ]);
+
+    // Zero r11 (arena bump cursor), call entry (`[rbp_callee+16+8k]`), clean up 256 B.
+    code.extend_from_slice(&[0x45, 0x31, 0xDB, 0xE8]);
     call_relocs.push((code.len(), entry_fn.fn_idx));
     code.extend_from_slice(&[0, 0, 0, 0]);
-    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x20]); // add rsp, 32
+    code.extend_from_slice(&[0x48, 0x81, 0xC4, 0x00, 0x01, 0x00, 0x00]); // add rsp, 256
 
     if entry_is_bytes {
         // Bytes return ABI: rax = descriptor (base << 32) | len.
@@ -24940,6 +24966,28 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
                 );
                 return 0;
             }
+            if args.get(1).map(|s| s.as_str()) == Some("--write-m4-seed") {
+                let m4_sa_u16 = match with_lockstep_suspended(|| {
+                    compile_omni_surface_strict_to_u16(M4_STANDALONE_OMNI_SRC)
+                }) {
+                    Ok(u) => u,
+                    Err(e) => {
+                        eprintln!("[M4 STANDALONE SEED FAIL] {}", e);
+                        return 1;
+                    }
+                };
+                let m4_sa_bytes = encode_u16_stream_to_bytes(&m4_sa_u16);
+                if let Err(e) = std::fs::write("pure/m4/m4_standalone.omni_bc", &m4_sa_bytes) {
+                    eprintln!("[M4 STANDALONE SEED FAIL] error[IO_ERROR]: write pure/m4/m4_standalone.omni_bc: {}", e);
+                    return 1;
+                }
+                println!(
+                    "[M4 STANDALONE SEED] Wrote {} words (FNV-1a64=0x{:016X}) to pure/m4/m4_standalone.omni_bc",
+                    m4_sa_u16.len(),
+                    fnv1a_64_hash(&m4_sa_bytes)
+                );
+                return 0;
+            }
             match selftest_s3_performance() {
                 Ok(n) => {
                     println!(
@@ -26115,17 +26163,45 @@ fn main() {
                         };
                         decode_bytes_to_u16_stream(&raw)
                     };
-                    let a0 = pos.get(1).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
-                    let a1 = pos.get(2).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
-                    let a2 = pos.get(3).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                    let mut cli_i64_args: Vec<i64> = Vec::with_capacity(pos.len().saturating_sub(1));
+                    for raw_arg in &pos[1..] {
+                        match raw_arg.parse::<i64>() {
+                            Ok(v) => cli_i64_args.push(v),
+                            Err(_) => {
+                                eprintln!(
+                                    "[PURE-RUN FAIL] error[CLI_ARG]: invalid integer CLI argument '{}'",
+                                    raw_arg
+                                );
+                                std::process::exit(1);
+                            }
+                        }
+                    }
                     if let Err(ve) = pure_default_verify_u16(&u16_stream, true) {
                         eprintln!("{}", cli_fail_label("PURE-VERIFY FAIL", &ve));
                         std::process::exit(1);
                     }
+                    if let Ok(decoded_mod) = decode_omni_token_stream(&u16_stream) {
+                        let entry_fn = decoded_mod
+                            .functions
+                            .iter()
+                            .find(|f| f.fn_idx == 0)
+                            .or_else(|| decoded_mod.functions.last());
+                        if let Some(ef) = entry_fn {
+                            let want_n = ef.params.len();
+                            if cli_i64_args.len() != want_n {
+                                eprintln!(
+                                    "[PURE-RUN FAIL] error[CLI_ARG]: entry function expects {} argument(s), got {}",
+                                    want_n,
+                                    cli_i64_args.len()
+                                );
+                                std::process::exit(1);
+                            }
+                        }
+                    }
                     let run_res = if use_interp {
-                        with_pure_default_interpreted(|| pure_default_run_u16_with_fuel(&u16_stream, a0, a1, a2, fuel, false))
+                        with_pure_default_interpreted(|| pure_default_run_u16_with_fuel(&u16_stream, &cli_i64_args, fuel, false))
                     } else {
-                        pure_default_run_u16_with_fuel(&u16_stream, a0, a1, a2, fuel, false)
+                        pure_default_run_u16_with_fuel(&u16_stream, &cli_i64_args, fuel, false)
                     };
                     match run_res {
                         Ok((ret, _steps)) => {
