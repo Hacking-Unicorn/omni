@@ -91,8 +91,9 @@ fn m3s_map_cap(h: i64) -> i64 {
 // Parses one cap identifier at token index `j`, updating `cur_cap_mask` or setting error.
 #[strict]
 fn m3s_cap_one(arena: bytes, src: array, j: i64) -> bytes {
-    let hj: i64 = ld_u64(arena, m3l_out() + (j << 4));
-    let vj: i64 = ld_u64(arena, m3l_out() + (j << 4) + 8);
+    let out: i64 = m3l_out();
+    let hj: i64 = ld_u64(arena, out + (j << 4));
+    let vj: i64 = ld_u64(arena, out + (j << 4) + 8);
     let cl: i64 = (hj >> 32) & 65535;
     let cc: i64 = (hj >> 48) & 65535;
     let is_id: trit = m2u_eq(hj & 65535, 8) <=> 0;
@@ -114,9 +115,10 @@ fn m3s_cap_one(arena: bytes, src: array, j: i64) -> bytes {
 // Parses `(CAP, ...)` list starting at `(` token index `ti`, OR-ing into `cur_cap_mask`.
 #[strict]
 fn m3s_attr_cap(arena: bytes, src: array, ntok: i64) -> bytes {
+    let out: i64 = m3l_out();
     let ti: i64 = ld_u64(arena, 96);
-    let h0: i64 = ld_u64(arena, m3l_out() + ((ti * m2u_lt(ti, ntok)) << 4));
-    let v0: i64 = ld_u64(arena, m3l_out() + ((ti * m2u_lt(ti, ntok)) << 4) + 8);
+    let h0: i64 = ld_u64(arena, out + ((ti * m2u_lt(ti, ntok)) << 4));
+    let v0: i64 = ld_u64(arena, out + ((ti * m2u_lt(ti, ntok)) << 4) + 8);
     let ok_lp: trit = (m2u_lt(ti, ntok) * m2u_eq(h0 & 65535, 5) * m2u_eq(v0, 40)) <=> 0;
     let r: bytes = if_pos ok_lp {
         let j: i64 = ti + 1;
@@ -124,22 +126,22 @@ fn m3s_attr_cap(arena: bytes, src: array, ntok: i64) -> bytes {
         let cg: i64 = 1;
         while cg <=> 0 {
             let okj: i64 = m2u_lt(j, ntok) * m2u_eq(ld_u64(u, 40), 0);
-            let hj: i64 = ld_u64(u, m3l_out() + ((j * okj) << 4));
-            let vj: i64 = ld_u64(u, m3l_out() + ((j * okj) << 4) + 8);
+            let hj: i64 = ld_u64(u, out + ((j * okj) << 4));
+            let vj: i64 = ld_u64(u, out + ((j * okj) << 4) + 8);
             let is_rp: i64 = okj * m2u_eq(hj & 65535, 5) * m2u_eq(vj, 41);
             let more: trit = (okj * (1 - is_rp)) <=> 0;
             let u2: bytes = if_pos more { m3s_cap_one(u, src, j) } else { u };
             u = u2;
             let adv: i64 = okj * (1 - is_rp) * m2u_eq(ld_u64(u, 40), 0);
             j = j + adv;
-            let hc: i64 = ld_u64(u, m3l_out() + ((j * m2u_lt(j, ntok)) << 4));
-            let vc: i64 = ld_u64(u, m3l_out() + ((j * m2u_lt(j, ntok)) << 4) + 8);
+            let hc: i64 = ld_u64(u, out + ((j * m2u_lt(j, ntok)) << 4));
+            let vc: i64 = ld_u64(u, out + ((j * m2u_lt(j, ntok)) << 4) + 8);
             j = j + adv * m2u_lt(j, ntok) * m2u_eq(hc & 65535, 5) * m2u_eq(vc, 44);
             cg = adv;
         }
         let ok_rp: i64 = m2u_lt(j, ntok) * m2u_eq(ld_u64(u, 40), 0);
-        let hrp: i64 = ld_u64(u, m3l_out() + ((j * ok_rp) << 4));
-        let vrp: i64 = ld_u64(u, m3l_out() + ((j * ok_rp) << 4) + 8);
+        let hrp: i64 = ld_u64(u, out + ((j * ok_rp) << 4));
+        let vrp: i64 = ld_u64(u, out + ((j * ok_rp) << 4) + 8);
         let got_rp: trit = (ok_rp * m2u_eq(hrp & 65535, 5) * m2u_eq(vrp, 41)) <=> 0;
         if_pos got_rp {
             iset_patch_i64(u, 96, j + 1)
@@ -156,14 +158,15 @@ fn m3s_attr_cap(arena: bytes, src: array, ntok: i64) -> bytes {
 // Consumes `@cap(...)`, `@pack5`, `@safe`, updating `cur_cap_mask` at global offset 136.
 #[strict]
 fn m3s_consume_at(arena: bytes, src: array, ntok: i64) -> bytes {
+    let out: i64 = m3l_out();
     let w: bytes = arena;
     let going: i64 = 1;
     while going <=> 0 {
         let ti: i64 = ld_u64(w, 96);
         let have: i64 = m2u_lt(ti, ntok) * m2u_eq(ld_u64(w, 40), 0);
-        let hdr: i64 = ld_u64(w, m3l_out() + ((ti * have) << 4));
+        let hdr: i64 = ld_u64(w, out + ((ti * have) << 4));
         let is_at: i64 = have * m2u_eq(hdr & 65535, 3);
-        let t_off: i64 = ld_u64(w, m3l_out() + ((ti * have) << 4) + 8);
+        let t_off: i64 = ld_u64(w, out + ((ti * have) << 4) + 8);
         let t_len: i64 = (hdr >> 16) & 65535;
         let h: i64 = m3s_hash(src, t_off * is_at, t_len * is_at, 1);
         let is_cap_f: i64 = is_at * m2u_eq(h, 41178555);
@@ -183,14 +186,15 @@ fn m3s_consume_at(arena: bytes, src: array, ntok: i64) -> bytes {
 // Parses `(INT)` for `fn_id` (mode=0) or `step_budget`/`mem_budget` (mode=1).
 #[strict]
 fn m3s_attr_int(arena: bytes, ntok: i64, mode: i64) -> bytes {
+    let out: i64 = m3l_out();
     let ti: i64 = ld_u64(arena, 96);
     let ok3: i64 = m2u_ge(ntok, ti + 3);
-    let h0: i64 = ld_u64(arena, m3l_out() + ((ti * ok3) << 4));
-    let v0: i64 = ld_u64(arena, m3l_out() + ((ti * ok3) << 4) + 8);
-    let h1: i64 = ld_u64(arena, m3l_out() + (((ti + 1) * ok3) << 4));
-    let v1: i64 = ld_u64(arena, m3l_out() + (((ti + 1) * ok3) << 4) + 8);
-    let h2: i64 = ld_u64(arena, m3l_out() + (((ti + 2) * ok3) << 4));
-    let v2: i64 = ld_u64(arena, m3l_out() + (((ti + 2) * ok3) << 4) + 8);
+    let h0: i64 = ld_u64(arena, out + ((ti * ok3) << 4));
+    let v0: i64 = ld_u64(arena, out + ((ti * ok3) << 4) + 8);
+    let h1: i64 = ld_u64(arena, out + (((ti + 1) * ok3) << 4));
+    let v1: i64 = ld_u64(arena, out + (((ti + 1) * ok3) << 4) + 8);
+    let h2: i64 = ld_u64(arena, out + (((ti + 2) * ok3) << 4));
+    let v2: i64 = ld_u64(arena, out + (((ti + 2) * ok3) << 4) + 8);
     let syn_ok: trit = (ok3 * m2u_eq(h0 & 65535, 5) * m2u_eq(v0, 40) * m2u_eq(h1 & 65535, 7) * m2u_eq(h2 & 65535, 5) * m2u_eq(v2, 41)) <=> 0;
     let r: bytes = if_pos syn_ok {
         let il: i64 = (h1 >> 32) & 65535;
@@ -238,20 +242,21 @@ fn m3s_attr_dispatch(arena: bytes, src: array, ntok: i64, ah: i64, al: i64, ac: 
 // Parses one `#[...]` attribute starting at `#`.
 #[strict]
 fn m3s_parse_hash_attr(arena: bytes, src: array, ntok: i64) -> bytes {
+    let out: i64 = m3l_out();
     let ti: i64 = ld_u64(arena, 96);
     let ok3: i64 = m2u_ge(ntok, ti + 3);
-    let h1: i64 = ld_u64(arena, m3l_out() + (((ti + 1) * ok3) << 4));
-    let v1: i64 = ld_u64(arena, m3l_out() + (((ti + 1) * ok3) << 4) + 8);
-    let h2: i64 = ld_u64(arena, m3l_out() + (((ti + 2) * ok3) << 4));
-    let v2: i64 = ld_u64(arena, m3l_out() + (((ti + 2) * ok3) << 4) + 8);
+    let h1: i64 = ld_u64(arena, out + (((ti + 1) * ok3) << 4));
+    let v1: i64 = ld_u64(arena, out + (((ti + 1) * ok3) << 4) + 8);
+    let h2: i64 = ld_u64(arena, out + (((ti + 2) * ok3) << 4));
+    let v2: i64 = ld_u64(arena, out + (((ti + 2) * ok3) << 4) + 8);
     let hdr_ok: trit = (ok3 * m2u_eq(h1 & 65535, 5) * m2u_eq(v1, 91) * m2u_eq(h2 & 65535, 8)) <=> 0;
     let r: bytes = if_pos hdr_ok {
         let ah: i64 = m3s_hash(src, v2, (h2 >> 16) & 65535, 0);
         let u5: bytes = m3s_attr_dispatch(iset_patch_i64(arena, 96, ti + 3), src, ntok, ah, (h2 >> 32) & 65535, (h2 >> 48) & 65535);
         let tj: i64 = ld_u64(u5, 96);
         let no_err: i64 = m2u_eq(ld_u64(u5, 40), 0);
-        let hrb: i64 = ld_u64(u5, m3l_out() + ((tj * m2u_lt(tj, ntok)) << 4));
-        let vrb: i64 = ld_u64(u5, m3l_out() + ((tj * m2u_lt(tj, ntok)) << 4) + 8);
+        let hrb: i64 = ld_u64(u5, out + ((tj * m2u_lt(tj, ntok)) << 4));
+        let vrb: i64 = ld_u64(u5, out + ((tj * m2u_lt(tj, ntok)) << 4) + 8);
         let ok_rb: trit = (no_err * m2u_lt(tj, ntok) * m2u_eq(hrb & 65535, 5) * m2u_eq(vrb, 93)) <=> 0;
         if_pos ok_rb {
             iset_patch_i64(u5, 96, tj + 1)
@@ -268,6 +273,7 @@ fn m3s_parse_hash_attr(arena: bytes, src: array, ntok: i64) -> bytes {
 // Validates param type + optional `@untrusted`/`@safe` tag (split to stay <= 8 labels).
 #[strict]
 fn m3s_check_param_ty(arena: bytes, src: array, ntok: i64, j: i64, v2: i64, t_len: i64, tl: i64, tc: i64) -> bytes {
+    let out: i64 = m3l_out();
     let strict: i64 = ld_u64(arena, 144);
     let has_upfx: i64 = m3s_has_untrusted_pfx(src, v2, t_len);
     let eff_off: i64 = v2 + has_upfx * 10;
@@ -279,8 +285,8 @@ fn m3s_check_param_ty(arena: bytes, src: array, ntok: i64, j: i64, v2: i64, t_le
         m3a_set_err(arena, ec, tl, tc)
     } else {
         let ok_at: i64 = m2u_lt(j, ntok);
-        let ha: i64 = ld_u64(arena, m3l_out() + ((j * ok_at) << 4));
-        let va: i64 = ld_u64(arena, m3l_out() + ((j * ok_at) << 4) + 8);
+        let ha: i64 = ld_u64(arena, out + ((j * ok_at) << 4));
+        let va: i64 = ld_u64(arena, out + ((j * ok_at) << 4) + 8);
         let is_at: trit = (ok_at * m2u_eq(ha & 65535, 3)) <=> 0;
         let u4: bytes = if_pos is_at {
             let ah: i64 = m3s_hash(src, va, (ha >> 16) & 65535, 1);
@@ -302,13 +308,14 @@ fn m3s_check_param_ty(arena: bytes, src: array, ntok: i64, j: i64, v2: i64, t_le
 // Parses one `param: ty [@untrusted|@safe]` entry at `ti`, advancing `ti` and incrementing `cur_nparams`.
 #[strict]
 fn m3s_parse_one_param(arena: bytes, src: array, ntok: i64) -> bytes {
+    let out: i64 = m3l_out();
     let ti: i64 = ld_u64(arena, 96);
     let ok3: i64 = m2u_ge(ntok, ti + 3);
-    let h0: i64 = ld_u64(arena, m3l_out() + ((ti * ok3) << 4));
-    let h1: i64 = ld_u64(arena, m3l_out() + (((ti + 1) * ok3) << 4));
-    let v1: i64 = ld_u64(arena, m3l_out() + (((ti + 1) * ok3) << 4) + 8);
-    let h2: i64 = ld_u64(arena, m3l_out() + (((ti + 2) * ok3) << 4));
-    let v2: i64 = ld_u64(arena, m3l_out() + (((ti + 2) * ok3) << 4) + 8);
+    let h0: i64 = ld_u64(arena, out + ((ti * ok3) << 4));
+    let h1: i64 = ld_u64(arena, out + (((ti + 1) * ok3) << 4));
+    let v1: i64 = ld_u64(arena, out + (((ti + 1) * ok3) << 4) + 8);
+    let h2: i64 = ld_u64(arena, out + (((ti + 2) * ok3) << 4));
+    let v2: i64 = ld_u64(arena, out + (((ti + 2) * ok3) << 4) + 8);
     let syn_ok: trit = (ok3 * m2u_eq(h0 & 65535, 8) * m2u_eq(h1 & 65535, 5) * m2u_eq(v1, 58) * m2u_eq(h2 & 65535, 8)) <=> 0;
     let r: bytes = if_pos syn_ok {
         m3s_check_param_ty(arena, src, ntok, ti + 3, v2, (h2 >> 16) & 65535, (h2 >> 32) & 65535, (h2 >> 48) & 65535)
@@ -321,9 +328,10 @@ fn m3s_parse_one_param(arena: bytes, src: array, ntok: i64) -> bytes {
 // Parses `( param_list )` starting at `(`.
 #[strict]
 fn m3s_parse_params(arena: bytes, src: array, ntok: i64) -> bytes {
+    let out: i64 = m3l_out();
     let ti: i64 = ld_u64(arena, 96);
-    let h0: i64 = ld_u64(arena, m3l_out() + ((ti * m2u_lt(ti, ntok)) << 4));
-    let v0: i64 = ld_u64(arena, m3l_out() + ((ti * m2u_lt(ti, ntok)) << 4) + 8);
+    let h0: i64 = ld_u64(arena, out + ((ti * m2u_lt(ti, ntok)) << 4));
+    let v0: i64 = ld_u64(arena, out + ((ti * m2u_lt(ti, ntok)) << 4) + 8);
     let ok_lp: trit = (m2u_lt(ti, ntok) * m2u_eq(h0 & 65535, 5) * m2u_eq(v0, 40)) <=> 0;
     let r: bytes = if_pos ok_lp {
         let u: bytes = iset_patch_i64(arena, 96, ti + 1);
@@ -332,24 +340,24 @@ fn m3s_parse_params(arena: bytes, src: array, ntok: i64) -> bytes {
         while cg <=> 0 {
             let j: i64 = ld_u64(u, 96);
             let okj: i64 = m2u_lt(j, ntok) * m2u_eq(ld_u64(u, 40), 0);
-            let hj: i64 = ld_u64(u, m3l_out() + ((j * okj) << 4));
-            let vj: i64 = ld_u64(u, m3l_out() + ((j * okj) << 4) + 8);
+            let hj: i64 = ld_u64(u, out + ((j * okj) << 4));
+            let vj: i64 = ld_u64(u, out + ((j * okj) << 4) + 8);
             let is_rp: i64 = okj * m2u_eq(hj & 65535, 5) * m2u_eq(vj, 41);
             let more: trit = (okj * (1 - is_rp)) <=> 0;
             let u2: bytes = if_pos more { m3s_parse_one_param(u, src, ntok) } else { u };
             u = u2;
             let k: i64 = ld_u64(u, 96);
             let adv: i64 = okj * (1 - is_rp) * m2u_eq(ld_u64(u, 40), 0);
-            let hc: i64 = ld_u64(u, m3l_out() + ((k * m2u_lt(k, ntok)) << 4));
-            let vc: i64 = ld_u64(u, m3l_out() + ((k * m2u_lt(k, ntok)) << 4) + 8);
+            let hc: i64 = ld_u64(u, out + ((k * m2u_lt(k, ntok)) << 4));
+            let vc: i64 = ld_u64(u, out + ((k * m2u_lt(k, ntok)) << 4) + 8);
             let is_cm: i64 = adv * m2u_lt(k, ntok) * m2u_eq(hc & 65535, 5) * m2u_eq(vc, 44);
             u = iset_patch_i64(u, 96, k + is_cm);
             cg = adv;
         }
         let j2: i64 = ld_u64(u, 96);
         let ok_rp: i64 = m2u_lt(j2, ntok) * m2u_eq(ld_u64(u, 40), 0);
-        let hrp: i64 = ld_u64(u, m3l_out() + ((j2 * ok_rp) << 4));
-        let vrp: i64 = ld_u64(u, m3l_out() + ((j2 * ok_rp) << 4) + 8);
+        let hrp: i64 = ld_u64(u, out + ((j2 * ok_rp) << 4));
+        let vrp: i64 = ld_u64(u, out + ((j2 * ok_rp) << 4) + 8);
         let got_rp: trit = (ok_rp * m2u_eq(hrp & 65535, 5) * m2u_eq(vrp, 41)) <=> 0;
         if_pos got_rp {
             iset_patch_i64(u, 96, j2 + 1)
@@ -366,17 +374,18 @@ fn m3s_parse_params(arena: bytes, src: array, ntok: i64) -> bytes {
 // Brace-skips `{ ... }` starting at `ti`, storing body_end_tok in global slot 23 (offset 184).
 #[strict]
 fn m3s_skip_braces(arena: bytes, ntok: i64) -> bytes {
+    let out: i64 = m3l_out();
     let ti: i64 = ld_u64(arena, 96);
-    let h0: i64 = ld_u64(arena, m3l_out() + ((ti * m2u_lt(ti, ntok)) << 4));
-    let v0: i64 = ld_u64(arena, m3l_out() + ((ti * m2u_lt(ti, ntok)) << 4) + 8);
+    let h0: i64 = ld_u64(arena, out + ((ti * m2u_lt(ti, ntok)) << 4));
+    let v0: i64 = ld_u64(arena, out + ((ti * m2u_lt(ti, ntok)) << 4) + 8);
     let ok_lb: trit = (m2u_lt(ti, ntok) * m2u_eq(h0 & 65535, 5) * m2u_eq(v0, 123)) <=> 0;
     let r: bytes = if_pos ok_lb {
         let j: i64 = ti + 1;
         let depth: i64 = 1;
         let g: i64 = m2u_lt(j, ntok) * m2u_lt(0, depth);
         while g <=> 0 {
-            let hj: i64 = ld_u64(arena, m3l_out() + (j << 4));
-            let vj: i64 = ld_u64(arena, m3l_out() + (j << 4) + 8);
+            let hj: i64 = ld_u64(arena, out + (j << 4));
+            let vj: i64 = ld_u64(arena, out + (j << 4) + 8);
             let is_s: i64 = m2u_eq(hj & 65535, 5);
             depth = depth + is_s * m2u_eq(vj, 123) - is_s * m2u_eq(vj, 125);
             j = j + 1;
@@ -398,21 +407,22 @@ fn m3s_skip_braces(arena: bytes, ntok: i64) -> bytes {
 // Parses `include`/`mod` `"path"` `[;]`.
 #[strict]
 fn m3s_parse_include(arena: bytes, ntok: i64, is_mod: i64) -> bytes {
+    let out: i64 = m3l_out();
     let ti: i64 = ld_u64(arena, 96);
     let strict: i64 = ld_u64(arena, 32);
-    let h0: i64 = ld_u64(arena, m3l_out() + (ti << 4));
+    let h0: i64 = ld_u64(arena, out + (ti << 4));
     let bad_mod: trit = (strict * is_mod) <=> 0;
     let r: bytes = if_pos bad_mod {
         m3a_set_err(arena, m3err_ambiguous(), (h0 >> 32) & 65535, (h0 >> 48) & 65535)
     } else {
         let j: i64 = ti + 1;
         let ok_s: i64 = m2u_lt(j, ntok);
-        let h1: i64 = ld_u64(arena, m3l_out() + ((j * ok_s) << 4));
+        let h1: i64 = ld_u64(arena, out + ((j * ok_s) << 4));
         let is_str: trit = (ok_s * m2u_eq(h1 & 65535, 2)) <=> 0;
         if_pos is_str {
             let k: i64 = j + 1;
-            let hc: i64 = ld_u64(arena, m3l_out() + ((k * m2u_lt(k, ntok)) << 4));
-            let vc: i64 = ld_u64(arena, m3l_out() + ((k * m2u_lt(k, ntok)) << 4) + 8);
+            let hc: i64 = ld_u64(arena, out + ((k * m2u_lt(k, ntok)) << 4));
+            let vc: i64 = ld_u64(arena, out + ((k * m2u_lt(k, ntok)) << 4) + 8);
             let is_sc: i64 = m2u_lt(k, ntok) * m2u_eq(hc & 65535, 5) * m2u_eq(vc, 59);
             let u: bytes = iset_patch_i64(arena, 96, k + is_sc);
             let ic: i64 = ld_u64(u, 112);
@@ -427,12 +437,13 @@ fn m3s_parse_include(arena: bytes, ntok: i64, is_mod: i64) -> bytes {
 // Skips `= expr;` macro body starting at `j` (token index of `=`).
 #[strict]
 fn m3s_skip_macro_eq(arena: bytes, ntok: i64, j: i64) -> bytes {
+    let out: i64 = m3l_out();
     let k: i64 = j + 1;
     let dp: i64 = 0;
     let kg: i64 = m2u_lt(k, ntok);
     while kg <=> 0 {
-        let hk: i64 = ld_u64(arena, m3l_out() + (k << 4));
-        let vk: i64 = ld_u64(arena, m3l_out() + (k << 4) + 8);
+        let hk: i64 = ld_u64(arena, out + (k << 4));
+        let vk: i64 = ld_u64(arena, out + (k << 4) + 8);
         let is_s: i64 = m2u_eq(hk & 65535, 5);
         dp = dp + is_s * (m2u_eq(vk, 40) + m2u_eq(vk, 123)) - is_s * (m2u_eq(vk, 41) + m2u_eq(vk, 125));
         let is_sc: i64 = m2u_eq(dp, 0) * is_s * m2u_eq(vk, 59);
@@ -447,25 +458,26 @@ fn m3s_skip_macro_eq(arena: bytes, ntok: i64, j: i64) -> bytes {
 // Skims `macro name(...) = expr [;]` or `macro name(...) { expr } [;]`.
 #[strict]
 fn m3s_parse_macro(arena: bytes, ntok: i64) -> bytes {
+    let out: i64 = m3l_out();
     let ti: i64 = ld_u64(arena, 96);
     let ok3: i64 = m2u_ge(ntok, ti + 3);
-    let h1: i64 = ld_u64(arena, m3l_out() + (((ti + 1) * ok3) << 4));
-    let h2: i64 = ld_u64(arena, m3l_out() + (((ti + 2) * ok3) << 4));
-    let v2: i64 = ld_u64(arena, m3l_out() + (((ti + 2) * ok3) << 4) + 8);
+    let h1: i64 = ld_u64(arena, out + (((ti + 1) * ok3) << 4));
+    let h2: i64 = ld_u64(arena, out + (((ti + 2) * ok3) << 4));
+    let v2: i64 = ld_u64(arena, out + (((ti + 2) * ok3) << 4) + 8);
     let hdr_ok: trit = (ok3 * m2u_eq(h1 & 65535, 8) * m2u_eq(h2 & 65535, 5) * m2u_eq(v2, 40)) <=> 0;
     let r: bytes = if_pos hdr_ok {
         let j: i64 = ti + 3;
         let g: i64 = m2u_lt(j, ntok);
         while g <=> 0 {
-            let hj: i64 = ld_u64(arena, m3l_out() + (j << 4));
-            let vj: i64 = ld_u64(arena, m3l_out() + (j << 4) + 8);
+            let hj: i64 = ld_u64(arena, out + (j << 4));
+            let vj: i64 = ld_u64(arena, out + (j << 4) + 8);
             let is_rp: i64 = m2u_eq(hj & 65535, 5) * m2u_eq(vj, 41);
             j = j + 1;
             g = m2u_lt(j, ntok) * (1 - is_rp);
         }
         let ok_b: i64 = m2u_lt(j, ntok);
-        let hb: i64 = ld_u64(arena, m3l_out() + ((j * ok_b) << 4));
-        let vb: i64 = ld_u64(arena, m3l_out() + ((j * ok_b) << 4) + 8);
+        let hb: i64 = ld_u64(arena, out + ((j * ok_b) << 4));
+        let vb: i64 = ld_u64(arena, out + ((j * ok_b) << 4) + 8);
         let is_eq: trit = (ok_b * m2u_eq(hb & 65535, 5) * m2u_eq(vb, 61)) <=> 0;
         let is_lb: trit = (ok_b * m2u_eq(hb & 65535, 5) * m2u_eq(vb, 123)) <=> 0;
         let u1: bytes = if_pos is_eq {
@@ -474,8 +486,8 @@ fn m3s_parse_macro(arena: bytes, ntok: i64) -> bytes {
             if_pos is_lb {
                 let u: bytes = m3s_skip_braces(iset_patch_i64(arena, 96, j), ntok);
                 let k: i64 = ld_u64(u, 96);
-                let hc: i64 = ld_u64(u, m3l_out() + ((k * m2u_lt(k, ntok)) << 4));
-                let vc: i64 = ld_u64(u, m3l_out() + ((k * m2u_lt(k, ntok)) << 4) + 8);
+                let hc: i64 = ld_u64(u, out + ((k * m2u_lt(k, ntok)) << 4));
+                let vc: i64 = ld_u64(u, out + ((k * m2u_lt(k, ntok)) << 4) + 8);
                 let is_sc: i64 = m2u_lt(k, ntok) * m2u_eq(hc & 65535, 5) * m2u_eq(vc, 59);
                 u = iset_patch_i64(u, 96, k + is_sc);
                 let mc: i64 = ld_u64(u, 120);
@@ -523,18 +535,19 @@ fn m3s_emit_fn_rec(arena: bytes, name_off: i64, name_len: i64, is_route: i64, bo
 // Parses `-> ret_ty` (when `required == 1` or `->` present) and validates `ret_ty`.
 #[strict]
 fn m3s_parse_ret_ty(arena: bytes, src: array, ntok: i64, required: i64, def_line: i64, def_col: i64) -> bytes {
+    let out: i64 = m3l_out();
     let ti: i64 = ld_u64(arena, 96);
     let strict: i64 = ld_u64(arena, 144);
     let ok1: i64 = m2u_lt(ti, ntok);
-    let h0: i64 = ld_u64(arena, m3l_out() + ((ti * ok1) << 4));
-    let v0: i64 = ld_u64(arena, m3l_out() + ((ti * ok1) << 4) + 8);
+    let h0: i64 = ld_u64(arena, out + ((ti * ok1) << 4));
+    let v0: i64 = ld_u64(arena, out + ((ti * ok1) << 4) + 8);
     let is_arr: i64 = ok1 * m2u_eq(h0 & 65535, 5) * m2u_eq(v0, 45 | (62 << 8));
     let has_arr: trit = is_arr <=> 0;
     let r: bytes = if_pos has_arr {
         let j: i64 = ti + 1;
         let ok2: i64 = m2u_lt(j, ntok);
-        let h1: i64 = ld_u64(arena, m3l_out() + ((j * ok2) << 4));
-        let v1: i64 = ld_u64(arena, m3l_out() + ((j * ok2) << 4) + 8);
+        let h1: i64 = ld_u64(arena, out + ((j * ok2) << 4));
+        let v1: i64 = ld_u64(arena, out + ((j * ok2) << 4) + 8);
         let is_id: trit = (ok2 * m2u_eq(h1 & 65535, 8)) <=> 0;
         if_pos is_id {
             let rl: i64 = (h1 >> 32) & 65535;
@@ -586,11 +599,12 @@ fn m3s_fn_tail(arena: bytes, src: array, ntok: i64, req_ret: i64, name_off: i64,
 // Parses `fn name(params) [@at] -> ret_ty [@at] { ... }`.
 #[strict]
 fn m3s_parse_fn(arena: bytes, src: array, ntok: i64) -> bytes {
+    let out: i64 = m3l_out();
     let ti: i64 = ld_u64(arena, 96);
     let ok2: i64 = m2u_ge(ntok, ti + 2);
-    let h0: i64 = ld_u64(arena, m3l_out() + ((ti * ok2) << 4));
-    let h1: i64 = ld_u64(arena, m3l_out() + (((ti + 1) * ok2) << 4));
-    let v1: i64 = ld_u64(arena, m3l_out() + (((ti + 1) * ok2) << 4) + 8);
+    let h0: i64 = ld_u64(arena, out + ((ti * ok2) << 4));
+    let h1: i64 = ld_u64(arena, out + (((ti + 1) * ok2) << 4));
+    let v1: i64 = ld_u64(arena, out + (((ti + 1) * ok2) << 4) + 8);
     let is_id: trit = (ok2 * m2u_eq(h1 & 65535, 8)) <=> 0;
     let r: bytes = if_pos is_id {
         let u: bytes = iset_patch_i64(arena, 224, ti);
@@ -605,9 +619,10 @@ fn m3s_parse_fn(arena: bytes, src: array, ntok: i64) -> bytes {
 // Skips route path tokens (string literal or `/`, `-`, `*`, `:`, `.`, ident, int).
 #[strict]
 fn m3s_skip_route_path(arena: bytes, ntok: i64) -> bytes {
+    let out: i64 = m3l_out();
     let ti: i64 = ld_u64(arena, 96);
     let ok0: i64 = m2u_lt(ti, ntok);
-    let h0: i64 = ld_u64(arena, m3l_out() + ((ti * ok0) << 4));
+    let h0: i64 = ld_u64(arena, out + ((ti * ok0) << 4));
     let is_str: trit = (ok0 * m2u_eq(h0 & 65535, 2)) <=> 0;
     let r: bytes = if_pos is_str {
         iset_patch_i64(arena, 96, ti + 1)
@@ -615,8 +630,8 @@ fn m3s_skip_route_path(arena: bytes, ntok: i64) -> bytes {
         let j: i64 = ti;
         let g: i64 = m2u_lt(j, ntok);
         while g <=> 0 {
-            let hj: i64 = ld_u64(arena, m3l_out() + (j << 4));
-            let vj: i64 = ld_u64(arena, m3l_out() + (j << 4) + 8);
+            let hj: i64 = ld_u64(arena, out + (j << 4));
+            let vj: i64 = ld_u64(arena, out + (j << 4) + 8);
             let k: i64 = hj & 65535;
             let p_op: i64 = m2u_eq(k, 6) * (m2u_eq(vj, 47) + m2u_eq(vj, 45) + m2u_eq(vj, 42));
             let p_sy: i64 = m2u_eq(k, 5) * (m2u_eq(vj, 58) + m2u_eq(vj, 46));
@@ -638,18 +653,20 @@ fn m3s_skip_route_path(arena: bytes, ntok: i64) -> bytes {
 // Parses `route METHOD path [(params)] [@at] [-> ret_ty] [@at] { ... }`.
 #[strict]
 fn m3s_parse_route(arena: bytes, src: array, ntok: i64) -> bytes {
+    let out: i64 = m3l_out();
     let ti: i64 = ld_u64(arena, 96);
     let ok2: i64 = m2u_ge(ntok, ti + 2);
-    let h0: i64 = ld_u64(arena, m3l_out() + ((ti * ok2) << 4));
-    let h1: i64 = ld_u64(arena, m3l_out() + (((ti + 1) * ok2) << 4));
-    let v1: i64 = ld_u64(arena, m3l_out() + (((ti + 1) * ok2) << 4) + 8);
+    let h0: i64 = ld_u64(arena, out + ((ti * ok2) << 4));
+    let h1: i64 = ld_u64(arena, out + (((ti + 1) * ok2) << 4));
+    let v1: i64 = ld_u64(arena, out + (((ti + 1) * ok2) << 4) + 8);
     let is_id: trit = (ok2 * m2u_eq(h1 & 65535, 8)) <=> 0;
     let r: bytes = if_pos is_id {
-        let u: bytes = m3s_skip_route_path(iset_patch_i64(arena, 96, ti + 2), ntok);
+        let u0: bytes = iset_patch_i64(arena, 224, ti);
+        let u: bytes = m3s_skip_route_path(iset_patch_i64(u0, 96, ti + 2), ntok);
         let j: i64 = ld_u64(u, 96);
         let okp: i64 = m2u_lt(j, ntok) * m2u_eq(ld_u64(u, 40), 0);
-        let hp: i64 = ld_u64(u, m3l_out() + ((j * okp) << 4));
-        let vp: i64 = ld_u64(u, m3l_out() + ((j * okp) << 4) + 8);
+        let hp: i64 = ld_u64(u, out + ((j * okp) << 4));
+        let vp: i64 = ld_u64(u, out + ((j * okp) << 4) + 8);
         let has_p: trit = (okp * m2u_eq(hp & 65535, 5) * m2u_eq(vp, 40)) <=> 0;
         let u2: bytes = if_pos has_p { m3s_parse_params(u, src, ntok) } else { iset_patch_i64(u, 152, 0) };
         let np: i64 = ld_u64(u2, 152);
@@ -686,11 +703,12 @@ fn m3s_parse_attrs_loop(arena: bytes, src: array, ntok: i64) -> bytes {
 // Consumes leading `#[...]` and `@...` attributes before a `fn` or `route`, then parses it.
 #[strict]
 fn m3s_parse_item_fn(arena: bytes, src: array, ntok: i64) -> bytes {
+    let out: i64 = m3l_out();
     let u: bytes = m3s_parse_attrs_loop(arena, src, ntok);
     let tj: i64 = ld_u64(u, 96);
     let ok2: i64 = m2u_lt(tj, ntok) * m2u_eq(ld_u64(u, 40), 0);
-    let hj: i64 = ld_u64(u, m3l_out() + ((tj * ok2) << 4));
-    let vj: i64 = ld_u64(u, m3l_out() + ((tj * ok2) << 4) + 8);
+    let hj: i64 = ld_u64(u, out + ((tj * ok2) << 4));
+    let vj: i64 = ld_u64(u, out + ((tj * ok2) << 4) + 8);
     let is_id: i64 = ok2 * m2u_eq(hj & 65535, 8);
     let kh: i64 = m3s_hash(src, vj * is_id, ((hj >> 16) & 65535) * is_id, 0);
     let is_rt: trit = (is_id * m2u_eq(kh, 840613662)) <=> 0;
@@ -705,9 +723,10 @@ fn m3s_parse_item_fn(arena: bytes, src: array, ntok: i64) -> bytes {
 // Dispatches one top-level item: `include`, `mod`, `macro`, or `[attrs] fn/route`.
 #[strict]
 fn m3s_parse_top(arena: bytes, src: array, ntok: i64) -> bytes {
+    let out: i64 = m3l_out();
     let ti: i64 = ld_u64(arena, 96);
-    let h: i64 = ld_u64(arena, m3l_out() + (ti << 4));
-    let v: i64 = ld_u64(arena, m3l_out() + (ti << 4) + 8);
+    let h: i64 = ld_u64(arena, out + (ti << 4));
+    let v: i64 = ld_u64(arena, out + (ti << 4) + 8);
     let is_id: i64 = m2u_eq(h & 65535, 8);
     let kh: i64 = m3s_hash(src, v * is_id, ((h >> 16) & 65535) * is_id, 0);
     let is_inc: trit = (is_id * m2u_eq(kh, 1968798311)) <=> 0;
