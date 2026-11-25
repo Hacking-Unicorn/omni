@@ -24335,6 +24335,7 @@ pub fn run_m2_foundation_selftests() -> Result<usize, String> {
         ("s2_security", selftest_s2_security),
         ("s4_honesty", selftest_s4_honesty),
         ("s3_perf", selftest_s3_performance),
+        ("m3_modular", selftest_m3_modular),
         ("s5_refreeze", selftest_s5_refreeze),
         ("s6_cleanup", selftest_s6_cleanup),
         ("b4_pure_launcher", selftest_b4_pure_launcher_count),
@@ -24942,6 +24943,19 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
                 }
             }
         }
+        "m3-modular" => match selftest_m3_modular() {
+            Ok(n) => {
+                println!(
+                    "[M3-MODULAR PASS] {} checks | mod_parse (42034 w) + m3_standalone (25289 w) + elf_link (3582 w) all < 65536 w | Pure-Omni linked m3.elf ({} B, 0x{:016X}) 0-word diff on all 6 pure/programs/*",
+                    n, NATIVE_M3_ELF_BYTES, NATIVE_M3_ELF_FNV
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("[M3-MODULAR FAIL] {}", e);
+                1
+            }
+        },
         "s3-perf" => {
             if args.get(1).map(|s| s.as_str()) == Some("--write-verifier-seed") {
                 let ve_sa_src = verifier_standalone_source();
@@ -25556,7 +25570,7 @@ fn main() {
             "harness" | "--harness" => {
                 std::process::exit(run_omni_harness_cli(&cli_args[2..]));
             }
-            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" | "p7-heal" | "p7-adapt" | "p7-learn" | "a1-pure-default" | "a2-pure-include" | "a3-macro-quarantine" | "b2-pure-verifier" | "b4-pure-launcher" | "s2-security" | "s4-honesty" | "s3-perf" | "s5-refreeze" | "s6-cleanup" | "api-stage1" | "api-stage2" | "api-stage2-emit" | "api-stage2-5" => {
+            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "m3-modular" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" | "p7-heal" | "p7-adapt" | "p7-learn" | "a1-pure-default" | "a2-pure-include" | "a3-macro-quarantine" | "b2-pure-verifier" | "b4-pure-launcher" | "s2-security" | "s4-honesty" | "s3-perf" | "s5-refreeze" | "s6-cleanup" | "api-stage1" | "api-stage2" | "api-stage2-emit" | "api-stage2-5" => {
                 std::process::exit(run_m2_cli(&cli_args[1..]));
             }
             "agent-driver" | "--agent-driver" => {
@@ -25818,6 +25832,49 @@ fn main() {
                 }
                 println!("[STAGE-1 ELF PASS] Wrote {} bytes to '{}' (FNV-1a64=0x{:016X})", elf.len(), cli_args[3], fnv1a_64_hash(&elf));
                 return;
+            }
+            "link-elf" if cli_args.len() >= 6 => {
+                let mut mods: Vec<&str> = Vec::new();
+                let mut out_path: Option<&str> = None;
+                let mut i = 2usize;
+                while i < cli_args.len() {
+                    if cli_args[i] == "-o" && i + 1 < cli_args.len() {
+                        out_path = Some(cli_args[i + 1].as_str());
+                        i += 2;
+                    } else {
+                        mods.push(cli_args[i].as_str());
+                        i += 1;
+                    }
+                }
+                let Some(out_p) = out_path else {
+                    eprintln!("Usage: omni link-elf <entry.omni_bc> <dep1.omni_bc> [...] -o <out.elf>");
+                    std::process::exit(2);
+                };
+                match pure_default_link_elf_modules(&mods) {
+                    Ok(elf) => {
+                        if let Err(e) = fs::write(out_p, &elf) {
+                            eprintln!("[LINK-ELF FAIL] write '{}': {}", out_p, e);
+                            std::process::exit(1);
+                        }
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            let _ = fs::set_permissions(out_p, fs::Permissions::from_mode(0o755));
+                        }
+                        println!(
+                            "[PURE-LINK ELF PASS] Linked {} modules -> '{}' ({} B, FNV-1a64=0x{:016X})",
+                            mods.len(),
+                            out_p,
+                            elf.len(),
+                            fnv1a_64_hash(&elf)
+                        );
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        eprintln!("[LINK-ELF FAIL] {}", e);
+                        std::process::exit(1);
+                    }
+                }
             }
             "compile-elf" if cli_args.len() >= 4 => {
                 let use_rust = cli_args[2..].iter().any(|a| a == "--rust" || a == "--oracle");

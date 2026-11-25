@@ -1,0 +1,262 @@
+// ==============================================================================
+// pure/link/elf_link.omni  (Step 2b) — Pure-Omni Multi-Module ELF64 Linker
+// ==============================================================================
+// Iterative, zero recursion, zero ANEW, every fn <= 12 labels / <= 120 SSA.
+// Links K >= 2 independently M2-compiled x86-64 ELF64 module objects into one
+// standalone Linux x86-64 ELF64 executable:
+//   - Input `in_buf: array` (1 byte per u16 element):
+//       u32 LE @ 0          : num_mods (2..=64)
+//       u32 LE @ 4 + m*8    : mod_off[m] (byte offset in in_buf)
+//       u32 LE @ 8 + m*8    : mod_len[m] (byte length of module m ELF64)
+//       raw bytes of mod_0 (entry module), mod_1, ..., mod_{K-1}
+//   - Arena layout (`arena: bytes`, >= 4096 + total_out_bytes):
+//       0..255      : state (0=err, 8=out_len, 16=n_exports, 24=n_patched)
+//       256..2303   : exp_table[0..255] (target_off + 1, 0 = unset)
+//       4096..      : linked ELF64 output buffer
+//   - Error codes (returned as 16-B 0xFFFF sentinel on error):
+//       1=BAD_HEADER, 2=DUP_EXPORT, 3=UNRESOLVED_IMPORT, 4=OUT_OVERFLOW, 5=BAD_EXPORT_CALL
+// ==============================================================================
+
+include "pure/m2/util.omni";
+
+#[strict]
+fn el_out_base() -> i64 { return 4096; }
+
+// Reads little-endian u32 from `in_buf` (1 byte per element) at byte offset `off`.
+#[strict]
+fn el_in_u32(in_buf: array, off: i64) -> i64 {
+    let b0: i64 = iget(in_buf, off) & 255;
+    let b1: i64 = iget(in_buf, off + 1) & 255;
+    let b2: i64 = iget(in_buf, off + 2) & 255;
+    let b3: i64 = iget(in_buf, off + 3) & 255;
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+// Writes one byte `val & 255` into `arena` at `off` (using `st_u16` preserving adjacent byte).
+#[strict]
+fn el_st_u8(arena: bytes, off: i64, val: i64) -> bytes {
+    let nxt: i64 = ld_u8(arena, off + 1);
+    return st_u16(arena, off, (val & 255) | (nxt << 8));
+}
+
+// Sets error code `ec` in `arena[0]` if not already set.
+#[strict]
+fn el_set_err(arena: bytes, ec: i64, aux: i64) -> bytes {
+    let cur: i64 = ld_u64(arena, 0);
+    let r: bytes = if_pos m2u_eq(cur, 0) <=> 0 {
+        let u: bytes = iset_patch_i64(arena, 0, ec);
+        iset_patch_i64(u, 32, aux)
+    } else { arena };
+    return r;
+}
+
+// Copies `len` bytes from `in_buf[src_off..]` into `arena[dst_off..]`.
+#[strict]
+fn el_copy_bytes(arena: bytes, in_buf: array, dst_off: i64, src_off: i64, len: i64) -> bytes {
+    let w: bytes = arena;
+    let i: i64 = 0;
+    let pairs: i64 = len >> 1;
+    while pairs - i <=> 0 {
+        let lo: i64 = iget(in_buf, src_off + (i << 1)) & 255;
+        let hi: i64 = iget(in_buf, src_off + (i << 1) + 1) & 255;
+        w = st_u16(w, dst_off + (i << 1), lo | (hi << 8));
+        i = i + 1;
+    }
+    let has_odd: trit = (len & 1) <=> 0;
+    let r: bytes = if_pos has_odd {
+        el_st_u8(w, dst_off + len - 1, iget(in_buf, src_off + len - 1))
+    } else { w };
+    return r;
+}
+
+// Concatenates module 0 (full ELF64) and modules 1..K-1 (code bytes 176..len) into `out_buf`.
+#[strict]
+fn el_concat_mods(arena: bytes, in_buf: array, n_in: i64, k: i64) -> bytes {
+    let ob: i64 = el_out_base();
+    let cap: i64 = slen(arena) - ob - 16;
+    let w: bytes = iset_patch_i64(arena, 8, 0);
+    let m: i64 = 0;
+    let going: i64 = m2u_lt(m, k) * m2u_eq(ld_u64(w, 0), 0);
+    while going <=> 0 {
+        let moff: i64 = el_in_u32(in_buf, 4 + (m << 3));
+        let mlen: i64 = el_in_u32(in_buf, 8 + (m << 3));
+        let ok_b: i64 = m2u_ge(mlen, 176) * m2u_ge(n_in, moff + mlen);
+        let magic: i64 = m2u_sel(ok_b, el_in_u32(in_buf, moff), 0);
+        let ok_hdr: trit = (ok_b * m2u_eq(magic, 1179403647)) <=> 0;
+        let w1: bytes = if_pos ok_hdr {
+            let skip: i64 = m2u_sel(m2u_eq(m, 0), 0, 176);
+            let clen: i64 = mlen - skip;
+            let cur: i64 = ld_u64(w, 8);
+            let ok_cap: trit = m2u_ge(cap, cur + clen) <=> 0;
+            if_pos ok_cap {
+                let u: bytes = el_copy_bytes(w, in_buf, ob + cur, moff + skip, clen);
+                iset_patch_i64(u, 8, cur + clen)
+            } else {
+                el_set_err(w, 4, cur + clen)
+            }
+        } else {
+            el_set_err(w, 1, m)
+        };
+        w = w1;
+        m = m + 1;
+        going = m2u_lt(m, k) * m2u_eq(ld_u64(w, 0), 0);
+    }
+    return w;
+}
+
+// Finds the first `E8 <rel32> 48 83 C4` within `start..limit` in `out_buf` and returns
+// its resolved target offset `pos + 5 + sext32(rel32)`, or `-1` if not found.
+#[strict]
+fn el_find_export_target(arena: bytes, start: i64, limit: i64) -> i64 {
+    let ob: i64 = el_out_base();
+    let p: i64 = start;
+    let res: i64 = 0 - 1;
+    let g: i64 = m2u_lt(p + 8, limit);
+    while g <=> 0 {
+        let b0: i64 = ld_u8(arena, ob + p);
+        let b5: i64 = ld_u8(arena, ob + p + 5);
+        let b6: i64 = ld_u8(arena, ob + p + 6);
+        let b7: i64 = ld_u8(arena, ob + p + 7);
+        let hit: i64 = m2u_eq(b0, 232) * m2u_eq(b5, 72) * m2u_eq(b6, 131) * m2u_eq(b7, 196);
+        let rel: i64 = m2u_sext32(ld_u32(arena, ob + p + 1));
+        res = m2u_sel(hit, p + 5 + rel, res);
+        p = p + 1;
+        g = m2u_lt(p + 8, limit) * m2u_lt(res, 0);
+    }
+    return res;
+}
+
+// Pass 1: Scans `out_buf[176..out_len]` for `MOEX..MOEY` export tables and populates `exp_table[0..255]`.
+#[strict]
+fn el_scan_exports(arena: bytes, out_len: i64) -> bytes {
+    let ob: i64 = el_out_base();
+    let w: bytes = arena;
+    let p: i64 = 176;
+    let in_tbl: i64 = 0;
+    let g: i64 = m2u_lt(p + 5, out_len) * m2u_eq(ld_u64(w, 0), 0);
+    while g <=> 0 {
+        let b0: i64 = ld_u8(w, ob + p);
+        let imm: i64 = ld_u32(w, ob + p + 1);
+        let is_mov: i64 = m2u_eq(b0, 184); // 0xB8 mov eax, imm32
+        let is_start: i64 = is_mov * m2u_eq(imm, 1297040728); // "MOEX"
+        let is_end: i64 = is_mov * m2u_eq(imm, 1297040729);   // "MOEY"
+        let is_slot: i64 = in_tbl * (1 - is_end) * is_mov * m2u_eq(imm >> 8, 5066565); // 0x4D4F45
+        in_tbl = m2u_sel(is_start, 1, m2u_sel(is_end, 0, in_tbl));
+        let w1: bytes = if_pos is_slot <=> 0 {
+            let slot: i64 = imm & 255;
+            let lim: i64 = m2u_sel(m2u_lt(p + 80, out_len), p + 80, out_len);
+            let tgt: i64 = el_find_export_target(w, p + 5, lim);
+            let ok_t: trit = m2u_ge(tgt, 176) <=> 0;
+            if_pos ok_t {
+                let eoff: i64 = 256 + (slot << 3);
+                let prev: i64 = ld_u64(w, eoff);
+                if_pos m2u_eq(prev, 0) <=> 0 {
+                    let u: bytes = iset_patch_i64(w, eoff, tgt + 1);
+                    iset_patch_i64(u, 16, ld_u64(u, 16) + 1)
+                } else {
+                    el_set_err(w, 2, slot)
+                }
+            } else {
+                el_set_err(w, 5, slot)
+            }
+        } else { w };
+        w = w1;
+        p = p + 1;
+        g = m2u_lt(p + 5, out_len) * m2u_eq(ld_u64(w, 0), 0);
+    }
+    return w;
+}
+
+// Pass 2: Scans `out_buf[176..out_len]` for `55 48 89 E5 48 83 EC ?? B8 <slot> 49 4F 4D`
+// import stubs and patches their entry to `E9 <rel32>` tail-jump to `exp_table[slot]`.
+#[strict]
+fn el_patch_imports(arena: bytes, out_len: i64) -> bytes {
+    let ob: i64 = el_out_base();
+    let w: bytes = arena;
+    let p: i64 = 176;
+    let g: i64 = m2u_lt(p + 13, out_len) * m2u_eq(ld_u64(w, 0), 0);
+    while g <=> 0 {
+        let w0: i64 = ld_u32(w, ob + p);
+        let w1: i64 = ld_u32(w, ob + p + 4);
+        let b8: i64 = ld_u8(w, ob + p + 8);
+        let imm: i64 = ld_u32(w, ob + p + 9);
+        // 55 48 89 E5 = 0xE5894855 (3850979413), 48 83 EC ?? = low 24 bits 0xEC8348 (15500104)
+        let m_pro: i64 = m2u_eq(w0 & 65535, 18517) * m2u_eq((w0 >> 16) & 65535, 58761);
+        let m_sub: i64 = m2u_eq(w1 & 16777215, 15500104);
+        let m_moi: i64 = m2u_eq(b8, 184) * m2u_eq(imm >> 8, 5066569); // 0x4D4F49 ("MOI")
+        let hit: trit = (m_pro * m_sub * m_moi) <=> 0;
+        let w1b: bytes = if_pos hit {
+            let slot: i64 = imm & 255;
+            let ent: i64 = ld_u64(w, 256 + (slot << 3));
+            if_pos ent <=> 0 {
+                let tgt: i64 = ent - 1;
+                let rel: i64 = tgt - (p + 5);
+                let u: bytes = el_st_u8(w, ob + p, 233); // 0xE9 jmp rel32
+                u = st_u32(u, ob + p + 1, rel & m2u_mask32());
+                iset_patch_i64(u, 24, ld_u64(u, 24) + 1)
+            } else {
+                el_set_err(w, 3, slot)
+            }
+        } else { w };
+        w = w1b;
+        p = p + 1;
+        g = m2u_lt(p + 13, out_len) * m2u_eq(ld_u64(w, 0), 0);
+    }
+    return w;
+}
+
+// Clears state slots and the 256-entry export table in `arena`.
+#[strict]
+fn el_init_arena(arena: bytes) -> bytes {
+    let w: bytes = iset_patch_i64(arena, 0, 0);
+    w = iset_patch_i64(w, 16, 0);
+    w = iset_patch_i64(w, 24, 0);
+    let i: i64 = 0;
+    while 256 - i <=> 0 {
+        w = iset_patch_i64(w, 256 + (i << 3), 0);
+        i = i + 1;
+    }
+    return w;
+}
+
+// Top-level Pure-Omni ELF64 linker: links `in_buf` modules into `arena` and returns the ELF64 bytes
+// (or 16-byte `0xFFFF` error sentinel on failure).
+#[strict]
+fn elf_link_modules(arena: bytes, in_buf: array) -> bytes {
+    let n_in: i64 = slen(in_buf);
+    let w: bytes = el_init_arena(arena);
+    let ok_in: trit = m2u_ge(n_in, 20) <=> 0;
+    let w1: bytes = if_pos ok_in {
+        let k: i64 = el_in_u32(in_buf, 0);
+        let ok_k: trit = (m2u_in(k, 2, 64) * m2u_ge(n_in, 4 + (k << 3))) <=> 0;
+        if_pos ok_k {
+            let u: bytes = el_concat_mods(w, in_buf, n_in, k);
+            let out_len: i64 = ld_u64(u, 8);
+            let ok1: trit = m2u_eq(ld_u64(u, 0), 0) <=> 0;
+            let u2: bytes = if_pos ok1 { el_scan_exports(u, out_len) } else { u };
+            let ok2: trit = m2u_eq(ld_u64(u2, 0), 0) <=> 0;
+            let u3: bytes = if_pos ok2 { el_patch_imports(u2, out_len) } else { u2 };
+            let ok3: trit = m2u_eq(ld_u64(u3, 0), 0) <=> 0;
+            if_pos ok3 {
+                // Patch ELF64 PT_LOAD p_filesz (offset 96) and p_memsz (offset 104)
+                let ob: i64 = el_out_base();
+                let u4: bytes = iset_patch_i64(u3, ob + 96, out_len);
+                iset_patch_i64(u4, ob + 104, out_len)
+            } else { u3 }
+        } else {
+            el_set_err(w, 1, k)
+        }
+    } else {
+        el_set_err(w, 1, n_in)
+    };
+    let err: i64 = ld_u64(w1, 0);
+    let ob: i64 = el_out_base();
+    let w2: bytes = if_pos err <=> 0 {
+        let aux: i64 = ld_u64(w1, 32);
+        let hdr: i64 = 65535 | ((err & 65535) << 16) | ((aux & 65535) << 32);
+        let u: bytes = iset_patch_i64(w1, ob, hdr);
+        iset_patch_i64(u, ob + 8, 0)
+    } else { w1 };
+    let rlen: i64 = m2u_sel(m2u_lt(0, err), 16, ld_u64(w2, 8));
+    return ret_slice(w2, ob, rlen);
+}

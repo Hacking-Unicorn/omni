@@ -1,13 +1,71 @@
 // ==============================================================================
-// pure/m3/m3_standalone.omni  (Audit §3.1) — Standalone native M3 compiler entry
+// pure/m3/m3_standalone.omni  (Step 2b) — Modular M3 Lowering & Link Entry
 // ==============================================================================
-// 4-parameter standalone entry point for compiling `pure/m3/*` into a native
-// Linux x86-64 ELF64 binary (`m3.elf <src_u16_file> [strict_0_or_1]`).
-// Allocates the 768 KiB M3 arena in M2's 1 MiB rbx arena, runs `m3_compile_all_into`,
-// and returns the exact `.omni_bc` byte stream (or 16-B error sentinel) via ret_slice.
+// Independently compiled M3 entry/lowering module (~24,950 words, >40,500 words
+// below M2's 65,536-word window cap). Imports the 9 parser functions from
+// `pure/m3/mod_parse.omni` via `0x4D4F4900 | slot` ("MOI") tail-jump stubs,
+// linked with `mod_parse.elf` by Pure-Omni `pure/link/elf_link.omni` into `m3.elf`.
 // ==============================================================================
 
-include "pure/m3/lower.omni";
+include "pure/m2/util.omni";
+include "pure/m3/arena.omni";
+
+// Cross-module import stubs (slot 0..8, patched to `E9 rel32` by `pure/link/elf_link.omni`).
+#[strict]
+fn m3_lex_into(arena: bytes, src: array, strict_arg: i64) -> bytes {
+    let tag: i64 = 1297041664; // 0x4D4F4900 | 0
+    return arena;
+}
+
+#[strict]
+fn m3s_parse_top(arena: bytes, src: array, ntok: i64) -> bytes {
+    let tag: i64 = 1297041665; // 0x4D4F4900 | 1
+    return arena;
+}
+
+#[strict]
+fn m3s_finalize_sigs(arena: bytes, src: array) -> bytes {
+    let tag: i64 = 1297041666; // 0x4D4F4900 | 2
+    return arena;
+}
+
+#[strict]
+fn m3s_hash(src: array, off: i64, len: i64, low: i64) -> i64 {
+    let tag: i64 = 1297041667; // 0x4D4F4900 | 3
+    return tag;
+}
+
+#[strict]
+fn m3s_eq_span(src: array, o1: i64, l1: i64, o2: i64, l2: i64) -> i64 {
+    let tag: i64 = 1297041668; // 0x4D4F4900 | 4
+    return tag;
+}
+
+#[strict]
+fn m3s_has_untrusted_pfx(src: array, off: i64, len: i64) -> i64 {
+    let tag: i64 = 1297041669; // 0x4D4F4900 | 5
+    return tag;
+}
+
+#[strict]
+fn m3s_map_type(h: i64, strict: i64) -> i64 {
+    let tag: i64 = 1297041670; // 0x4D4F4900 | 6
+    return tag;
+}
+
+#[strict]
+fn m3s_skip_route_path(arena: bytes, ntok: i64) -> bytes {
+    let tag: i64 = 1297041671; // 0x4D4F4900 | 7
+    return arena;
+}
+
+#[strict]
+fn m3p_parse_fn_body(arena: bytes, src: array, ntok: i64, bstart: i64, fstr: i64) -> bytes {
+    let tag: i64 = 1297041672; // 0x4D4F4900 | 8
+    return arena;
+}
+
+include "pure/m3/inc/lower_body.omni";
 
 #[strict]
 fn m3_standalone_entry(src: array, strict_arg: i64, a1: i64, a2: i64) -> bytes {

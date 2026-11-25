@@ -1,0 +1,39 @@
+// ==============================================================================
+// pure/m3/mod_parse.omni  (Step 2b) — M3 Parser Module (Pass L + S + E + P)
+// ==============================================================================
+// Independently compiled M3 frontend unit (~41,850 words, >23,600 words below
+// M2's 65,536-word window cap). Exports the 9 cross-module functions consumed
+// by `pure/m3/m3_standalone.omni` via a Pure-Omni `MOEX..MOEY` export table,
+// linked into `m3.elf` by `pure/link/elf_link.omni`.
+// ==============================================================================
+
+include "pure/m3/stmt.omni";
+
+// Export table anchor (scanned by `pure/link/elf_link.omni`, never called at runtime).
+// Each slot `k` (`0..8`) emits `B8 <k> 45 4F 4D` (`0x4D4F4500 | k`) immediately
+// before a normal M2 `CALL` (`E8 rel32 48 83 C4 imm8`) to exported function `k`.
+#[strict]
+fn m3_mod_exports(arena: bytes, src: array, x: i64) -> bytes {
+    let m0: i64 = 1297040728; // 0x4D4F4558 ("MOEX")
+    let s0: i64 = 1297040640; // slot 0: m3_lex_into
+    let w: bytes = m3_lex_into(arena, src, x);
+    let s1: i64 = 1297040641; // slot 1: m3s_parse_top
+    w = m3s_parse_top(w, src, x);
+    let s2: i64 = 1297040642; // slot 2: m3s_finalize_sigs
+    w = m3s_finalize_sigs(w, src);
+    let s3: i64 = 1297040643; // slot 3: m3s_hash
+    let r3: i64 = m3s_hash(src, x, x, x);
+    let s4: i64 = 1297040644; // slot 4: m3s_eq_span
+    let r4: i64 = m3s_eq_span(src, x, x, x, x);
+    let s5: i64 = 1297040645; // slot 5: m3s_has_untrusted_pfx
+    let r5: i64 = m3s_has_untrusted_pfx(src, x, x);
+    let s6: i64 = 1297040646; // slot 6: m3s_map_type
+    let r6: i64 = m3s_map_type(x, x);
+    let s7: i64 = 1297040647; // slot 7: m3s_skip_route_path
+    w = m3s_skip_route_path(w, x);
+    let s8: i64 = 1297040648; // slot 8: m3p_parse_fn_body
+    w = m3p_parse_fn_body(w, src, x, x, x);
+    let m1: i64 = 1297040729; // 0x4D4F4559 ("MOEY")
+    let keep: i64 = m0 + s0 + s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8 + m1 + r3 + r4 + r5 + r6;
+    return iset_patch_i64(w, 0, keep);
+}

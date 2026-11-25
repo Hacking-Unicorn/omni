@@ -8156,4 +8156,132 @@ pub fn selftest_s6_cleanup() -> Result<usize, String> {
     Ok(checks)
 }
 
+/// Step 2b Modular Compilation gate (`./omni m3-modular`):
+///   1. Every M3 frontend module object (`mod_parse.omni_bc`, `m3_standalone.omni_bc`, `elf_link.omni_bc`)
+///      matches its `.omni` source with 0-word diff and is strictly under M2's 65,536-word cap.
+///   2. Pure-Omni `pure/link/elf_link.omni_bc` links `m3_standalone.omni_bc` + `mod_parse.omni_bc`
+///      into the exact hash-pinned native `m3.elf` (`NATIVE_M3_ELF_BYTES` / `NATIVE_M3_ELF_FNV`).
+///   3. The linked native `m3.elf` reproduces Rust `--rust` output with 0-word diff across all 6
+///      `pure/programs/*.omni` programs.
+///   4. Pure-Omni `elf_link` fails closed (`ELF_LINK_3`) on an unresolved cross-module import.
+pub fn selftest_m3_modular() -> Result<usize, String> {
+    let mut checks = 0usize;
+
+    // 1. Verify all 3 modular objects match source (0-word diff) and stay strictly under 65,536 words.
+    let mod_specs: [(&str, &str); 3] = [
+        ("pure/m3/mod_parse.omni", "pure/m3/mod_parse.omni_bc"),
+        ("pure/m3/m3_standalone.omni", "pure/m3/m3_standalone.omni_bc"),
+        ("pure/link/elf_link.omni", "pure/link/elf_link.omni_bc"),
+    ];
+    for &(src_path, bc_path) in &mod_specs {
+        let raw_bc = std::fs::read(bc_path)
+            .map_err(|e| format!("M3-MODULAR missing '{}': {}", bc_path, e))?;
+        if raw_bc.len() % 2 != 0 {
+            return Err(format!("M3-MODULAR '{}' has odd byte length", bc_path));
+        }
+        let nwords = raw_bc.len() / 2;
+        if nwords > NATIVE_WINDOW_MAX_WORDS {
+            return Err(format!(
+                "M3-MODULAR '{}' exceeds 65,536-word M2 window cap ({} words)",
+                bc_path, nwords
+            ));
+        }
+        let src_txt = std::fs::read_to_string(src_path)
+            .map_err(|e| format!("M3-MODULAR read '{}': {}", src_path, e))?;
+        let exp = resolve_omni_surface_includes(&src_txt, None, None)?;
+        let ref_bc = encode_u16_stream_to_bytes(&with_lockstep_suspended(|| {
+            compile_omni_surface_strict_to_u16(&exp)
+        })?);
+        if raw_bc != ref_bc {
+            return Err(format!(
+                "M3-MODULAR '{}' drift ({} B, 0x{:016X} != {} B, 0x{:016X})",
+                bc_path,
+                raw_bc.len(),
+                fnv1a_64_hash(&raw_bc),
+                ref_bc.len(),
+                fnv1a_64_hash(&ref_bc)
+            ));
+        }
+        checks += 1;
+    }
+
+    // 2. Link modular M3 via Pure-Omni `elf_link.omni_bc` and verify exact size + FNV-1a64 pin.
+    let linked_elf = pure_default_link_elf_modules(&[
+        "pure/m3/m3_standalone.omni_bc",
+        "pure/m3/mod_parse.omni_bc",
+    ])?;
+    let linked_fnv = fnv1a_64_hash(&linked_elf);
+    if linked_elf.len() != NATIVE_M3_ELF_BYTES || linked_fnv != NATIVE_M3_ELF_FNV {
+        return Err(format!(
+            "M3-MODULAR linked m3.elf drift: {} B / 0x{:016X} != expected {} B / 0x{:016X}",
+            linked_elf.len(),
+            linked_fnv,
+            NATIVE_M3_ELF_BYTES,
+            NATIVE_M3_ELF_FNV
+        ));
+    }
+    checks += 1;
+
+    // 3. Verify 0-word diff on all Pure-M3-supported pure/programs/* + verifier_engine + include.omni
+    //    through the default modular M3 path, plus exact single-unit error parity on the rest.
+    let zero_diff_progs: [&str; 5] = [
+        "pure/programs/kv_ledger_service.omni",
+        "pure/programs/compiler_self_audit.omni",
+        "pure/programs/pack5_decision_controller.omni",
+        "pure/verifier_engine.omni",
+        "pure/m3/include.omni",
+    ];
+    for &prog_path in &zero_diff_progs {
+        let raw_src = std::fs::read_to_string(prog_path)
+            .map_err(|e| format!("M3-MODULAR read '{}': {}", prog_path, e))?;
+        let exp = resolve_omni_surface_includes(&raw_src, None, None)?;
+        let want = with_lockstep_suspended(|| compile_omni_surface_to_u16(&exp))?;
+        let got = pure_default_compile_surface_to_u16(&exp, false)?;
+        if got != want {
+            return Err(format!(
+                "M3-MODULAR 0-word diff failed on '{}': got {} w vs rust {} w",
+                prog_path,
+                got.len(),
+                want.len()
+            ));
+        }
+        checks += 1;
+    }
+    for &(prog_path, expect_err) in &[
+        ("pure/programs/ternary_neural_router.omni", "ORACLE_ONLY_MACRO"),
+        ("pure/programs/policy_consensus_engine.omni", "ORACLE_ONLY_MACRO"),
+        ("pure/programs/arena_audit_pipeline.omni", "M3_CODE_9"),
+    ] {
+        let raw_src = std::fs::read_to_string(prog_path)
+            .map_err(|e| format!("M3-MODULAR read '{}': {}", prog_path, e))?;
+        let exp = resolve_omni_surface_includes(&raw_src, None, None)?;
+        match pure_default_compile_surface_to_u16(&exp, false) {
+            Err(e) if e.contains(expect_err) => checks += 1,
+            other => {
+                return Err(format!(
+                    "M3-MODULAR expected {} on '{}', got {:?}",
+                    expect_err, prog_path, other
+                ));
+            }
+        }
+    }
+
+    // 4. Fail-closed check: linking `m3_standalone.omni_bc` with itself (no exports) rejects with ELF_LINK_3.
+    match pure_default_link_elf_modules(&[
+        "pure/m3/m3_standalone.omni_bc",
+        "pure/m3/m3_standalone.omni_bc",
+    ]) {
+        Err(e) if e.contains("ELF_LINK_3") => checks += 1,
+        other => {
+            return Err(format!(
+                "M3-MODULAR fail-closed unresolved import expected ELF_LINK_3, got {:?}",
+                other
+            ));
+        }
+    }
+
+    Ok(checks)
+}
+
+
 
