@@ -3201,12 +3201,20 @@ pub const P7_BENCHMARK_CORPUS: &[(&str, &str, [i64; 3], i64)] = &[
     ),
 ];
 
-pub const P7_CORPUS_LEN: usize = 6;
+pub const P7_CORPUS_LEN: usize = 7;
 
 const P7_VERIFIER_ENGINE_HARNESS_SRC: &str = "\n#[strict]\nfn p7_ve_push_u16(buf: bytes, w: i64) -> bytes {\n    let b1: bytes = iset(buf, w & 255);\n    return iset(b1, (w >> 8) & 255);\n}\n\n#[strict]\nfn main(a0: i64, a1: i64, a2: i64) -> i64 {\n    let w: bytes = anew(0);\n    w = p7_ve_push_u16(w, 32480);\n    w = p7_ve_push_u16(w, 32483);\n    w = p7_ve_push_u16(w, 0);\n    w = p7_ve_push_u16(w, 0);\n    w = p7_ve_push_u16(w, 32641);\n    w = p7_ve_push_u16(w, 0);\n    w = p7_ve_push_u16(w, 1);\n    w = p7_ve_push_u16(w, 32586);\n    w = p7_ve_push_u16(w, 32486);\n    w = p7_ve_push_u16(w, (a0 >> 16) & 65535);\n    w = p7_ve_push_u16(w, a0 & 65535);\n    w = p7_ve_push_u16(w, 32484);\n    w = p7_ve_push_u16(w, 32495);\n    let rep: bytes = omni_verify_module(w);\n    let status: i64 = load_i64le(rep, 0);\n    let nfns: i64 = load_i64le(rep, 16);\n    let fn0_pass: i64 = load_i64le(rep, 32);\n    return status * 100 + nfns * 10 + fn0_pass;\n}\n";
 
-/// Returns the full 6-benchmark Phase 7 corpus: the 5 fixed micro-benchmarks plus
-/// `bench_verifier_engine` (`pure/verifier_engine.omni` + minimal 1-fn harness),
+/// 7th Phase 7 benchmark (`bench_m3_frontend`): exercises the Pure-Omni M3 surface-language
+/// frontend path not covered by the 5 micro-benchmarks — `std/` includes (`std/math.omni`,
+/// `std/trit.omni`, `std/pack5.omni`), `egate`, trit consensus/mux/quorum, `@PACK5` radix-3
+/// packing & validation, `match_trit`, `if_pos`, and multi-function `CALL` — compiled end-to-end
+/// through Pure-Omni O-5 include expansion (`pure/m3/include.omni`) and `pure/m3/m3.omni_bc`.
+const P7_M3_FRONTEND_BENCH_SRC: &str = "include \"std/math.omni\";\ninclude \"std/trit.omni\";\ninclude \"std/pack5.omni\";\n\n#[strict]\nfn p7_m3_pack5_trits(t0: trit, t1: trit, t2: trit, t3: trit, t4: trit) -> i64 {\n    let d0: i64 = std_trit_mux(t0, 0, 1, 2);\n    let d1: i64 = std_trit_mux(t1, 0, 1, 2);\n    let d2: i64 = std_trit_mux(t2, 0, 1, 2);\n    let d3: i64 = std_trit_mux(t3, 0, 1, 2);\n    let d4: i64 = std_trit_mux(t4, 0, 1, 2);\n    return d0 * 81 + d1 * 27 + d2 * 9 + d3 * 3 + d4;\n}\n\n#[strict]\n#[cap(AI)]\nfn p7_m3_score_window(x: i64, y: i64, z: i64) -> i64 {\n    let cx: i64 = std_clamp(x, -100, 100);\n    let cy: i64 = std_clamp(y, -100, 100);\n    let cz: i64 = std_clamp(z, -100, 100);\n    let gx: trit = egate(cx - 10);\n    let gy: trit = egate(cy);\n    let gz: trit = egate(cz + 5);\n    let q3: trit = std_consensus3(gx, gy, gz);\n    let q5: trit = std_trit_quorum5(gx, gy, gz, q3, std_signum(cx + cy));\n    let pbyte: i64 = p7_m3_pack5_trits(gx, gy, gz, q3, q5);\n    let valid: trit = std_pack5_is_valid_byte(pbyte);\n    let nbytes: i64 = std_pack5_bytes_needed(12);\n    let tscore: i64 = std_trit_score(gx, gy, gz, nbytes);\n    let dscore: i64 = std_pack5_dot10_score(pbyte, 2, 200);\n    let cgate: trit = std_pack5_cosine_gate(dscore, 150);\n    let bonus: i64 = match_trit cgate {\n        neg => -10,\n        zero => 0,\n        pos => 25\n    };\n    let ok_val: i64 = if_pos valid { pbyte + tscore + dscore + bonus } else { -1 };\n    return ok_val;\n}\n\n#[strict]\nfn main(a: i64, b: i64, c: i64) -> i64 {\n    let acc: i64 = 0;\n    let i: i64 = 0;\n    while i < 4 {\n        let step_v: i64 = p7_m3_score_window(a + i * 5, b - i * 3, c + i * 2);\n        let mad_v: i64 = std_mad_clamped(i, 7, 3, 0, 50);\n        acc = acc + step_v + mad_v;\n        i = i + 1;\n    }\n    return acc + std_sum_range(5);\n}\n";
+
+/// Returns the full 7-benchmark Phase 7 corpus: the 5 fixed micro-benchmarks plus
+/// `bench_verifier_engine` (`pure/verifier_engine.omni` + minimal 1-fn harness) and
+/// `bench_m3_frontend` (`std/` includes + `egate` + trit + `@PACK5` surface path),
 /// where `use_pure_m3 = true` compiles through the default Pure-Omni M3 frontend.
 pub fn p7_benchmark_corpus_all() -> Vec<(&'static str, String, [i64; 3], i64, bool)> {
     let mut out: Vec<(&'static str, String, [i64; 3], i64, bool)> = P7_BENCHMARK_CORPUS
@@ -3217,6 +3225,7 @@ pub fn p7_benchmark_corpus_all() -> Vec<(&'static str, String, [i64; 3], i64, bo
     ve_src.push_str(OMNI_VERIFIER_ENGINE_SURFACE);
     ve_src.push_str(P7_VERIFIER_ENGINE_HARNESS_SRC);
     out.push(("bench_verifier_engine", ve_src, [42, 0, 0], 11, true));
+    out.push(("bench_m3_frontend", String::from(P7_M3_FRONTEND_BENCH_SRC), [5, 2, -8], 1652, true));
     out
 }
 
@@ -3324,7 +3333,12 @@ pub fn p7_measure_program_with_opts(
 ) -> Result<(P7BenchMetrics, Vec<u8>, i64), String> {
     let t_fe = std::time::Instant::now();
     let bc = if use_pure_m3 {
-        pure_default_compile_surface_to_u16(src, true)?
+        if src.contains("include \"") {
+            let expanded = pure_default_expand_includes(src, None, None)?;
+            pure_default_compile_surface_to_u16(&expanded, true)?
+        } else {
+            pure_default_compile_surface_to_u16(src, true)?
+        }
     } else {
         with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(src))?
     };
@@ -3575,12 +3589,27 @@ pub fn selftest_p7_0_measure() -> Result<(usize, Vec<P7BenchMetrics>, u8), Strin
     }
     checks += 1;
 
-    // Check 5: Execute all 6 fixed benchmarks end-to-end (M3 compile, M2 ELF64, M4 VM + P4-5 trace ring).
+    // Check 5: Execute all 7 fixed benchmarks end-to-end (M3 compile, M2 ELF64, M4 VM + P4-5 trace ring)
+    // and assert pinned deterministic metrics on `bench_m3_frontend` (index 6).
     let corpus = p7_benchmark_corpus_all();
     let mut baseline: Vec<P7BenchMetrics> = Vec::with_capacity(corpus.len());
     for (bname, bsrc, bargs, want, use_pure_m3) in &corpus {
         let m = p7_measure_program(&m4_mod, m4_run_fn, &judge_mod, judge_trace_fn, bname, bsrc, *bargs, *want, *use_pure_m3)?;
         baseline.push(m);
+    }
+    let m3fe = &baseline[6];
+    if m3fe.bc_words != 1204
+        || m3fe.elf_bytes != 2958
+        || m3fe.vm_steps != 555
+        || m3fe.trace_ops != 555
+        || m3fe.arena_bytes != 0
+        || (m3fe.hist_alu, m3fe.hist_mem, m3fe.hist_ctrl, m3fe.hist_call_ret) != (304, 0, 96, 155)
+    {
+        return Err(format!(
+            "P7-0 bench_m3_frontend pinned metrics drifted: bc={}w elf={}B steps={} trace={} arena={}B hist={}/{}/{}/{}",
+            m3fe.bc_words, m3fe.elf_bytes, m3fe.vm_steps, m3fe.trace_ops, m3fe.arena_bytes,
+            m3fe.hist_alu, m3fe.hist_mem, m3fe.hist_ctrl, m3fe.hist_call_ret
+        ));
     }
     // Also verify corrupted (non-monotonic) trace ring is rejected by Pure-Omni p7_verify_trace_ring.
     let mut bad_arena = vec![0u8; 524_288];
@@ -3817,13 +3846,14 @@ pub fn selftest_p7_0a_canary() -> Result<(usize, i64, i64, i64, bool), String> {
     }
     checks += 1;
 
-    let agg6 = |vm: &mut OmniBinaryVm, v: &[i64; P7_CORPUS_LEN]| -> Result<i64, String> {
+    let agg7 = |vm: &mut OmniBinaryVm, v: &[i64; P7_CORPUS_LEN]| -> Result<i64, String> {
         let s5 = call_judge(vm, 3, v[0], v[1], v[2], v[3], v[4])?;
-        call_judge(vm, 3, s5, v[5], 0, 0, 0)
+        call_judge(vm, 3, s5, v[5], v[6], 0, 0)
     };
 
-    // Check 2: Collect 5 repeated baseline runs across the 6-benchmark corpus (5 micro + verifier_engine)
-    // and verify zero variance on deterministic metrics + architectural opcode histogram signatures.
+    // Check 2: Collect 5 repeated baseline runs across the 7-benchmark corpus
+    // (5 micro + bench_verifier_engine + bench_m3_frontend) and verify zero variance
+    // on deterministic metrics + architectural opcode histogram signatures.
     let corpus = p7_benchmark_corpus_all();
     let mut base_runs: Vec<[P7BenchMetrics; 5]> = Vec::with_capacity(P7_CORPUS_LEN);
     let mut zero_loads_per_bench = [0i64; P7_CORPUS_LEN];
@@ -3853,11 +3883,12 @@ pub fn selftest_p7_0a_canary() -> Result<(usize, i64, i64, i64, bool), String> {
         }
         base_runs.push(arr.try_into().unwrap());
     }
-    // Verify architectural histogram signatures on the 6-benchmark corpus:
+    // Verify architectural histogram signatures on the 7-benchmark corpus:
     //   bench_loop_sum (1) & bench_branch_tree (2) exercise control flow;
     //   bench_multi_call (3) exercises CALL/RET;
     //   bench_arena_buf (4) exercises Memory/Arena ops;
-    //   bench_verifier_engine (5) exercises all 4 classes (ALU + MEM + CTRL + CALL/RET).
+    //   bench_verifier_engine (5) exercises all 4 classes (ALU + MEM + CTRL + CALL/RET);
+    //   bench_m3_frontend (6) exercises std/ includes + trit/egate/@PACK5 + ALU/CTRL/CALL-RET.
     if base_runs[1][0].hist_ctrl <= 0
         || base_runs[2][0].hist_ctrl <= 0
         || base_runs[3][0].hist_call_ret < 2
@@ -3866,9 +3897,12 @@ pub fn selftest_p7_0a_canary() -> Result<(usize, i64, i64, i64, bool), String> {
         || base_runs[5][0].hist_mem <= 0
         || base_runs[5][0].hist_ctrl <= 0
         || base_runs[5][0].hist_call_ret <= 0
+        || base_runs[6][0].hist_alu <= 0
+        || base_runs[6][0].hist_ctrl <= 0
+        || base_runs[6][0].hist_call_ret < 10
     {
         return Err(format!(
-            "P7-0a histogram signature mismatch: loop.ctrl={} branch.ctrl={} call.cr={} arena.mem={} ve={}/{}/{}/{}",
+            "P7-0a histogram signature mismatch: loop.ctrl={} branch.ctrl={} call.cr={} arena.mem={} ve={}/{}/{}/{} m3fe={}/{}/{}/{}",
             base_runs[1][0].hist_ctrl,
             base_runs[2][0].hist_ctrl,
             base_runs[3][0].hist_call_ret,
@@ -3876,7 +3910,11 @@ pub fn selftest_p7_0a_canary() -> Result<(usize, i64, i64, i64, bool), String> {
             base_runs[5][0].hist_alu,
             base_runs[5][0].hist_mem,
             base_runs[5][0].hist_ctrl,
-            base_runs[5][0].hist_call_ret
+            base_runs[5][0].hist_call_ret,
+            base_runs[6][0].hist_alu,
+            base_runs[6][0].hist_mem,
+            base_runs[6][0].hist_ctrl,
+            base_runs[6][0].hist_call_ret
         ));
     }
     checks += 1;
@@ -3948,16 +3986,16 @@ pub fn selftest_p7_0a_canary() -> Result<(usize, i64, i64, i64, bool), String> {
         canary_m4[bi] = call_judge(&mut vm, 3, v_steps, v_arena, 0, 0, 0)?;
         canary_bench_v[bi] = call_judge(&mut vm, 3, canary_m3[bi], canary_m2[bi], canary_m4[bi], 0, 0)?;
     }
-    let suite_m3 = agg6(&mut vm, &canary_m3)?;
-    let suite_m2 = agg6(&mut vm, &canary_m2)?;
-    let suite_m4 = agg6(&mut vm, &canary_m4)?;
-    let canary_suite = agg6(&mut vm, &canary_bench_v)?;
+    let suite_m3 = agg7(&mut vm, &canary_m3)?;
+    let suite_m2 = agg7(&mut vm, &canary_m2)?;
+    let suite_m4 = agg7(&mut vm, &canary_m4)?;
+    let canary_suite = agg7(&mut vm, &canary_bench_v)?;
     let canary_adopt = call_judge(&mut vm, 4, 1, canary_suite, 0, 0, 0)?;
     let canary_attr = call_attr(&mut vm, suite_m3, suite_m2, suite_m4)?;
-    if total_saved_bytes <= 0 || canary_bench_v[5] != 1 || canary_suite != 1 || canary_adopt != 1 || canary_attr != 2 {
+    if total_saved_bytes <= 0 || canary_bench_v[5] != 1 || canary_bench_v[6] != 1 || canary_suite != 1 || canary_adopt != 1 || canary_attr != 2 {
         return Err(format!(
-            "P7-0a canary A gate failed: saved={}B ve={} suite={} adopt={} attr={} (m3={},m2={},m4={})",
-            total_saved_bytes, canary_bench_v[5], canary_suite, canary_adopt, canary_attr, suite_m3, suite_m2, suite_m4
+            "P7-0a canary A gate failed: saved={}B ve={} m3fe={} suite={} adopt={} attr={} (m3={},m2={},m4={})",
+            total_saved_bytes, canary_bench_v[5], canary_bench_v[6], canary_suite, canary_adopt, canary_attr, suite_m3, suite_m2, suite_m4
         ));
     }
     checks += 1;
@@ -4000,16 +4038,16 @@ pub fn selftest_p7_0a_canary() -> Result<(usize, i64, i64, i64, bool), String> {
         neut_m4[bi] = call_judge(&mut vm, 3, v_steps, v_arena, 0, 0, 0)?;
         neut_bench_v[bi] = call_judge(&mut vm, 3, neut_m3[bi], neut_m2[bi], neut_m4[bi], 0, 0)?;
     }
-    let nm3 = agg6(&mut vm, &neut_m3)?;
-    let nm2 = agg6(&mut vm, &neut_m2)?;
-    let nm4 = agg6(&mut vm, &neut_m4)?;
-    let neutral_suite = agg6(&mut vm, &neut_bench_v)?;
+    let nm3 = agg7(&mut vm, &neut_m3)?;
+    let nm2 = agg7(&mut vm, &neut_m2)?;
+    let nm4 = agg7(&mut vm, &neut_m4)?;
+    let neutral_suite = agg7(&mut vm, &neut_bench_v)?;
     let neutral_adopt = call_judge(&mut vm, 4, 1, neutral_suite, 0, 0, 0)?;
     let neutral_attr = call_attr(&mut vm, nm3, nm2, nm4)?;
-    if neut_bench_v[5] != 0 || neutral_suite != 0 || neutral_adopt != 0 || neutral_attr != 0 {
+    if neut_bench_v[5] != 0 || neut_bench_v[6] != 0 || neutral_suite != 0 || neutral_adopt != 0 || neutral_attr != 0 {
         return Err(format!(
-            "P7-0a canary B (neutral) gate failed: ve={} suite={} adopt={} attr={}",
-            neut_bench_v[5], neutral_suite, neutral_adopt, neutral_attr
+            "P7-0a canary B (neutral) gate failed: ve={} m3fe={} suite={} adopt={} attr={}",
+            neut_bench_v[5], neut_bench_v[6], neutral_suite, neutral_adopt, neutral_attr
         ));
     }
     checks += 1;
@@ -4066,16 +4104,16 @@ pub fn selftest_p7_0a_canary() -> Result<(usize, i64, i64, i64, bool), String> {
         prod_m4[bi] = call_judge(&mut vm, 3, vs, va, 0, 0, 0)?;
         prod_v[bi] = call_judge(&mut vm, 3, prod_m3[bi], prod_m2[bi], prod_m4[bi], 0, 0)?;
     }
-    let pm3 = agg6(&mut vm, &prod_m3)?;
-    let pm2 = agg6(&mut vm, &prod_m2)?;
-    let pm4 = agg6(&mut vm, &prod_m4)?;
-    let prod_suite = agg6(&mut vm, &prod_v)?;
+    let pm3 = agg7(&mut vm, &prod_m3)?;
+    let pm2 = agg7(&mut vm, &prod_m2)?;
+    let pm4 = agg7(&mut vm, &prod_m4)?;
+    let prod_suite = agg7(&mut vm, &prod_v)?;
     let prod_adopt = call_judge(&mut vm, 4, 1, prod_suite, 0, 0, 0)?;
     let prod_attr = call_attr(&mut vm, pm3, pm2, pm4)?;
-    if prod_saved_bytes <= total_saved_bytes || prod_v[5] != 1 || prod_suite != 1 || prod_adopt != 1 || prod_attr != 2 {
+    if prod_saved_bytes <= total_saved_bytes || prod_v[5] != 1 || prod_v[6] != 1 || prod_suite != 1 || prod_adopt != 1 || prod_attr != 2 {
         return Err(format!(
-            "P7 M2-Compact gate failed: saved={}B ve={} suite={} adopt={} attr={}",
-            prod_saved_bytes, prod_v[5], prod_suite, prod_adopt, prod_attr
+            "P7 M2-Compact gate failed: saved={}B ve={} m3fe={} suite={} adopt={} attr={}",
+            prod_saved_bytes, prod_v[5], prod_v[6], prod_suite, prod_adopt, prod_attr
         ));
     }
     checks += 1;

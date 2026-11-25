@@ -24720,7 +24720,7 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
                     );
                 }
                 println!(
-                    "[P7-MEASURE PASS] {} checks (6 fixed benchmarks + P4-5 trace ring + pure/m7/judge.omni ternary +1t/0t/-1t + @PACK5 byte={} + frozen hashes intact)",
+                    "[P7-MEASURE PASS] {} checks (7 fixed benchmarks + P4-5 trace ring + pure/m7/judge.omni ternary +1t/0t/-1t + @PACK5 byte={} + frozen hashes intact)",
                     n, packed_better
                 );
                 0
