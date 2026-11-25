@@ -775,7 +775,9 @@ fn m3s_finalize_sigs(arena: bytes, src: array) -> bytes {
                     let bj: i64 = m3l_fntab() + (j << 5);
                     let w1j: i64 = ld_u64(u, bj + 8);
                     let is_rt_j: i64 = (w1j >> 49) & 1;
-                    let dup: trit = ((1 - is_rt_j) * m3s_eq_span(src, oi, li, w1j & m32, (w1j >> 32) & 65535)) <=> 0;
+                    let lj: i64 = (w1j >> 32) & 65535;
+                    let can_dup: i64 = (1 - is_rt_j) * m2u_eq(li, lj);
+                    let dup: trit = (can_dup * m3s_eq_span(src, oi, li * can_dup, (w1j & m32) * can_dup, lj * can_dup)) <=> 0;
                     let u2: bytes = if_pos dup { m3a_set_err(u, m3err_syntax(), (w3 >> 32) & 65535, (w3 >> 48) & 65535) } else { u };
                     u = u2;
                     j = j + 1;

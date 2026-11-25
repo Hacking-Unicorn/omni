@@ -100,7 +100,9 @@ fn m3w_var_find(arena: bytes, src: array, off: i64, len: i64) -> i64 {
         let vh: i64 = ld_u64(arena, base + 8);
         let hm: i64 = m2u_eq(vh, h);
         let vlen: i64 = (vw0 >> 32) & 65535;
-        let hit: i64 = hm * (m2u_eq(vlen, 0) | m3s_eq_span(src, off, len, vw0 & m2u_mask32(), vlen));
+        let hit: i64 = if_pos hm <=> 0 {
+            if_pos m2u_eq(vlen, 0) <=> 0 { 1 } else { m3s_eq_span(src, off, len, vw0 & m2u_mask32(), vlen) }
+        } else { 0 };
         found = m2u_sel(hit, (vw0 >> 48) & 65535, found);
         i = i - 1;
         g = m2u_ge(i, 0) * m2u_eq(found, 0);
@@ -151,7 +153,10 @@ fn m3w_fn_find(arena: bytes, src: array, off: i64, len: i64) -> i64 {
         let base: i64 = m3l_fntab() + (i << 5);
         let w0: i64 = ld_u64(arena, base);
         let w1: i64 = ld_u64(arena, base + 8);
-        let hit: i64 = m3s_eq_span(src, off, len, w1 & m2u_mask32(), (w1 >> 32) & 65535);
+        let flen: i64 = (w1 >> 32) & 65535;
+        let hit: i64 = if_pos m2u_eq(len, flen) <=> 0 {
+            m3s_eq_span(src, off, len, w1 & m2u_mask32(), flen)
+        } else { 0 };
         let fid: i64 = w0 & 65535;
         let np: i64 = (w0 >> 16) & 65535;
         let rty: i64 = (w0 >> 32) & 65535;
@@ -598,26 +603,24 @@ fn m3w_emit_call_expr(arena: bytes, src: array, nv: i64, nlen: i64, hlow: i64, n
     let is_is: i64 = m2u_eq(hlow, 56909121) * 4 + m2u_eq(hlow, 2003554210) * 8;
     let is_ip: i64 = m2u_eq(hlow, 1657868527) + m2u_eq(hlow, 615397820);
     let is_ib: i64 = m2u_eq(hlow, 476966828);
-    let icls: i64 = m2u_eq(hlow, 1069549258) * 1 + m2u_eq(hlow, 1991071177) * 2 + m2u_eq(hlow, 709362235) * 3
-        + m2u_eq(hlow, 1234126167) * 4 + m2u_eq(hlow, 1470292761) * 5 + m2u_eq(hlow, 444340544) * 6 + m2u_eq(hlow, 153118099) * 7
-        + m2u_eq(hlow, 354969780) * 8 + m2u_eq(hlow, 688971618) * 9 + m2u_eq(hlow, 644393288) * 10 + m2u_eq(hlow, 680826049) * 11
-        + m2u_eq(hlow, 2057169916) * 3 + m2u_eq(hlow, 566644216) * 4 + m2u_eq(hlow, 937031762) * 5
-        + (m2u_eq(hlow, 1078835159) + m2u_eq(hlow, 1103277427) + m2u_eq(hlow, 1247990215)) * 12
-        + (m2u_eq(hlow, 709872862) + m2u_eq(hlow, 1104639635)) * 13
-        + (m2u_eq(hlow, 822761039) + m2u_eq(hlow, 2139031121)) * 14
-        + m2u_eq(hlow, 1113971463) * 15 + m2u_eq(hlow, 1706796520) * 16
-        + m2u_eq(hlow, 1518184941) * 17 + m2u_eq(hlow, 1434296846) * 18;
-    let hcls: i64 = m3w_host_cls(hlow);
     let is_mem: trit = (is_ld + is_st + is_is + is_ip + is_ib) <=> 0;
-    let is_core: trit = icls <=> 0;
-    let is_host: trit = hcls <=> 0;
     let r: bytes = if_pos is_mem {
         m3w_emit_mem_intr(arena, is_ld, is_st, is_is, is_ip, nargs, treg, arg_base, fl, fc)
     } else {
-        if_pos is_core {
+        let icls: i64 = m2u_eq(hlow, 1069549258) * 1 + m2u_eq(hlow, 1991071177) * 2 + m2u_eq(hlow, 709362235) * 3
+            + m2u_eq(hlow, 1234126167) * 4 + m2u_eq(hlow, 1470292761) * 5 + m2u_eq(hlow, 444340544) * 6 + m2u_eq(hlow, 153118099) * 7
+            + m2u_eq(hlow, 354969780) * 8 + m2u_eq(hlow, 688971618) * 9 + m2u_eq(hlow, 644393288) * 10 + m2u_eq(hlow, 680826049) * 11
+            + m2u_eq(hlow, 2057169916) * 3 + m2u_eq(hlow, 566644216) * 4 + m2u_eq(hlow, 937031762) * 5
+            + (m2u_eq(hlow, 1078835159) + m2u_eq(hlow, 1103277427) + m2u_eq(hlow, 1247990215)) * 12
+            + (m2u_eq(hlow, 709872862) + m2u_eq(hlow, 1104639635)) * 13
+            + (m2u_eq(hlow, 822761039) + m2u_eq(hlow, 2139031121)) * 14
+            + m2u_eq(hlow, 1113971463) * 15 + m2u_eq(hlow, 1706796520) * 16
+            + m2u_eq(hlow, 1518184941) * 17 + m2u_eq(hlow, 1434296846) * 18;
+        if_pos icls <=> 0 {
             m3w_emit_core_intr(arena, icls, nargs, treg, arg_base, fl, fc)
         } else {
-            if_pos is_host {
+            let hcls: i64 = m3w_host_cls(hlow);
+            if_pos hcls <=> 0 {
                 m3w_emit_host_intr(arena, hcls, nargs, treg, arg_base, fl, fc)
             } else {
                 m3w_emit_user_call(arena, src, nv, nlen, nargs, treg, arg_base, fl, fc)

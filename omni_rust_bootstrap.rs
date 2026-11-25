@@ -24946,7 +24946,7 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
         "m3-modular" => match selftest_m3_modular() {
             Ok(n) => {
                 println!(
-                    "[M3-MODULAR PASS] {} checks | mod_parse (42034 w) + m3_standalone (25289 w) + elf_link (3582 w) all < 65536 w | Pure-Omni linked m3.elf ({} B, 0x{:016X}) 0-word diff on all 6 pure/programs/*",
+                    "[M3-MODULAR PASS] {} checks | mod_parse (42265 w) + m3_standalone (25515 w) + elf_link (3582 w) all < 65536 w | Pure-Omni linked m3.elf ({} B, 0x{:016X}) 0-word diff on all 6 pure/programs/*",
                     n, NATIVE_M3_ELF_BYTES, NATIVE_M3_ELF_FNV
                 );
                 0

@@ -206,6 +206,36 @@ Linux x86-64 (WSL2) baselines (`./omnic p7-measure` & `./omnic p7-canary`, 7 ben
 
 ---
 
+## Flywheel Round 3 — M3 Frontend Hot-Path Pass (`main@017d0c8` + Step 3)
+
+**Target subsystem:** Pure-Omni M3 frontend (`pure/m3/lex.omni`, `pure/m3/skim.omni`, `pure/m3/inc/lower_body.omni`, `pure/m3/m3_standalone.omni`), built modularly via Step 2b (`mod_parse.omni_bc` + `m3_standalone.omni_bc` linked by Pure-Omni `pure/link/elf_link.omni_bc` into `m3.elf`).
+
+**Proposed changes (0-word diff on all compiled output):**
+1. **Guarded span equality (`pure/m3/inc/lower_body.omni`, `pure/m3/skim.omni`):** Guard cross-module `m3s_eq_span` calls behind `if_pos hm <=> 0` in `m3w_var_find` (eliminating eager evaluation on 99.9% hash misses), behind length equality in `m3w_fn_find`, and short-circuit `m3s_eq_span` on length mismatch in `m3s_finalize_sigs`.
+2. **Lexer hot-path tightening (`pure/m3/lex.omni`):** Skip `m3l_has_strict_attr` when `strict_arg == 1` and exit early on first `#[strict]` match; fast-path spaces/comments in `m3l_skip_ws`; fast-path identifiers in `m3l_lex_one` (split non-ident dispatch to `m3l_lex_non_id` to stay `<= 12` labels); gate `m3l_check_legacy_trit` on `len ∈ {8, 9} && src[start] == 'T'` in `m3l_lex_ident`.
+3. **Call-dispatch short-circuit (`pure/m3/inc/lower_body.omni`):** In `m3w_emit_call_expr`, evaluate `is_mem` before `icls` and `m3w_host_cls` so common memory/core intrinsics skip 12–40 unused hash comparisons.
+4. **Dynamic 8× unrolled arena init (`pure/m3/m3_standalone.omni`):** Size the M3 arena dynamically (`min(98304, 20480 + slen(src) * 3)` qwords) and unroll `iset_i64(w, 0)` 8× per iteration.
+
+**Measured Linux x86-64 (WSL2) Before vs. After (5 warm runs, `pure/m7/judge.omni` 3% noise band):**
+
+| Benchmark / Probe | Before (median) | After (median) | Delta | `p7_judge_5runs` Verdict |
+|---|---:|---:|---:|---|
+| `bench_verifier_engine` (`p7-measure` `fe_us`) | `11,361 us` | `8,124 us` | **−28.5% (1.40× faster)** | **`+1t` (5/5 `+1t`, ADOPT)** |
+| `bench_m3_frontend` (`p7-measure` `fe_us`) | `9,961 us` | `8,756 us` | **−12.1% (1.14× faster)** | **`+1t` (5/5 `+1t`, ADOPT)** |
+| Direct `m3.elf` `pure/verifier_engine.omni` (52 KB, 9 runs) | `9,829 us` | `6,687 us` | **−32.0% (1.47× faster)** | **`+1t`** |
+| Direct `m3.elf` `pure/m3/include.omni` (8 KB, 9 runs) | `2,207 us` | `1,589 us` | **−28.0% (1.39× faster)** | **`+1t`** |
+| Direct `m3.elf` 40-B minimal fn (9 runs) | `736 us` | `433 us` | **−41.2% (1.70× faster)** | **`+1t`** |
+| 5 micro-benchmarks (`bench_clamp`..`bench_arena_buf`) | unchanged | unchanged | `0%` | **`0t` (HOLD, 0 regressions)** |
+
+- **Verdict:** **`+1t` (ADOPT, attr = `1 [M3_FRONTEND]`)** — measurable improvement on both Pure-Omni M3 benchmarks, zero `-1t` regressions, 0-word diff on all compiled streams (`m3-fixed-point`, `m3-lower`, `m3-modular`, `s3-perf`), `m2-lint` 0 findings, `p7-measure` (10 checks) + `p7-canary` (7 checks) pass.
+- **Updated M3 pins (M2, M4, verifier, and all 5 frozen hashes unchanged):**
+  - `pure/m3/m3.omni_bc`: `65,541` words (`131,082 B`, `0xE12D02135BCEB128`, `0`-word self-compile fixed point)
+  - `pure/m3/mod_parse.omni_bc`: `42,265` words (`84,530 B`, `23,271 w` / `35.5%` headroom below 65,536)
+  - `pure/m3/m3_standalone.omni_bc`: `25,515` words (`51,030 B`, `40,021 w` / `61.1%` headroom below 65,536)
+  - `m3.elf`: `205,025 B` (`0x177809347B74102D`, linked by Pure-Omni `pure/link/elf_link.omni_bc` `3,582 w`)
+
+---
+
 ## Hard Rules (All of Phase 7)
 
 - The verifier, determinism, and capability model are never self-modified.
