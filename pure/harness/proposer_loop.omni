@@ -238,7 +238,8 @@ fn pl_print_pass(arena: bytes) -> i64 {
     return 0 + nw * 0;
 }
 
-// Evaluates ternary judge verdict (`+1` ADOPT, `0` HOLD, `-1` REJECT) from `(sem_ok, base_w, cand_w, base_elf, cand_elf)`.
+// Evaluates ternary verdict (`+1` ADOPT, `0` HOLD, `-1` REJECT) for the SYNTHETIC SELF-TEST ONLY.
+// Live `propose-run` cycles invoke the real `pure/m7/judge.omni` evaluator via `proposer_live.elf` -> `judge_cli.elf`.
 #[strict]
 fn pl_judge_verdict(sem_ok: i64, base_w: i64, cand_w: i64, base_elf: i64, cand_elf: i64) -> i64 {
     let better: i64 = m2u_lt(cand_w, base_w) * m2u_ge(base_elf, cand_elf);
@@ -246,38 +247,92 @@ fn pl_judge_verdict(sem_ok: i64, base_w: i64, cand_w: i64, base_elf: i64, cand_e
     return m2u_sel(1 - sem_ok, 0 - 1, m2u_sel(better, 1, m2u_sel(m2u_lt(0, worse), 0 - 1, 0)));
 }
 
+// Builds `<dir_of_argv0>/proposer_live.elf\0`.
+#[strict]
+fn pl_live_tool(arena: bytes) -> bytes {
+    let a0_off: i64 = su_arg_off(arena, 0);
+    let a0_len: i64 = su_arg_len(arena, 0);
+    let slash: i64 = 0 - 1;
+    let i: i64 = 0;
+    while a0_len - i <=> 0 {
+        slash = m2u_sel(m2u_eq(ld_u8(arena, a0_off + i), 47), i, slash);
+        i = i + 1;
+    }
+    let b: bytes = anew(0);
+    let k: i64 = 0;
+    let pfx: i64 = m2u_sel(m2u_ge(slash, 0), slash + 1, 0);
+    while pfx - k <=> 0 { b = iset(b, ld_u8(arena, a0_off + k)); k = k + 1; }
+    let u: bytes = iset(b, 112, 114, 111, 112, 111, 115, 101, 114, 95, 108, 105, 118, 101, 46, 101, 108);
+    return iset(u, 102, 0);
+}
+
 #[strict]
 #[cap(SYS)]
-fn main() -> i64 {
-    let w: bytes = su_load_cmdline(su_alloc_arena());
-    // Stage 0: immutable TCB deny-list + frozen-5 guard (pre-check)
+fn pl_run_selftest(w0: bytes) -> i64 {
+    let w: bytes = w0;
     let g0_pre: i64 = pl_stage0_guard(w);
-    // Compile baseline (`x*3+0 + (y+7)*1`) -> base.bc, run native with (10, 5, 0) -> expect 42
     w = pl_emit_baseline_src(w);
     let base_bc: bytes = pl_tmp(98);
     let n_base: i64 = pl_compile_verify(w, su_band_a(), ld_u64(w, 0), base_bc);
     let r_base: i64 = pl_run_native(w, base_bc, 10, 5, 0);
     let elf_base: i64 = ld_u64(w, 160);
-    // Negative A: broken semantics (`y+8` -> 43 != 42) MUST REJECT (-1t)
     w = pl_emit_broken_src(w);
     let brk_bc: bytes = pl_tmp(107);
     let n_brk: i64 = pl_compile_verify(w, su_band_a(), ld_u64(w, 0), brk_bc);
     let r_brk: i64 = pl_run_native(w, brk_bc, 10, 5, 0);
     let v_brk: i64 = pl_judge_verdict(m2u_eq(r_brk, 42), n_base >> 1, n_brk >> 1, elf_base, ld_u64(w, 160));
-    // Neutral: identical baseline MUST HOLD (0t)
     let v_neut: i64 = pl_judge_verdict(m2u_eq(r_base, 42), n_base >> 1, n_base >> 1, elf_base, elf_base);
-    // Positive: Tier-1 peephole identity elimination (`+0`, `*1` removed) MUST ADOPT (+1t)
     let opt_bc: bytes = pl_tmp(112);
     let saved_w: i64 = pl_peephole_elim(w, base_bc, opt_bc);
     let r_opt: i64 = pl_run_native(w, opt_bc, 10, 5, 0);
     let elf_opt: i64 = ld_u64(w, 160);
     let v_opt: i64 = pl_judge_verdict(m2u_eq(r_opt, 42), n_base >> 1, (n_base >> 1) - saved_w, elf_base, elf_opt);
-    // Stage 4: audit_decompile.elf on opt_bc must succeed (rc==0)
     let rc_dc: i64 = su_spawn_capture(pl_tool(w, 3), opt_bc, pl_tmp(100), 420);
-    // Stage 0 post-check: immutable TCB deny-list + frozen-5 untouched!
     let g0_post: i64 = pl_stage0_guard(w);
     let ok: i64 = g0_pre * g0_post * m2u_eq(r_base, 42) * m2u_eq(r_brk, 43) * m2u_eq(v_brk, 0 - 1)
         * m2u_eq(v_neut, 0) * m2u_lt(0, saved_w) * m2u_eq(r_opt, 42) * m2u_eq(v_opt, 1) * m2u_eq(rc_dc, 0);
-    let rc: i64 = if_pos ok <=> 0 { pl_print_pass(w) } else { 1 };
+    return if_pos ok <=> 0 { pl_print_pass(w) } else { 1 };
+}
+
+#[strict]
+#[cap(SYS)]
+fn pl_print_usage(arena: bytes) -> i64 {
+    let u: bytes = iset_patch_i64(arena, 0, 0);
+    u = su_out4(su_out4(su_out4(su_out4(u, 117, 115, 97, 103), 101, 58, 32, 112), 114, 111, 112, 111), 115, 101, 114, 95);
+    u = su_out4(su_out4(su_out4(su_out4(u, 108, 111, 111, 112), 32, 91, 112, 114), 111, 112, 111, 115), 101, 45, 114, 117);
+    u = su_out4(su_out4(su_out4(su_out4(u, 110, 32, 45, 45), 116, 97, 114, 103), 101, 116, 32, 60), 102, 62, 32, 45);
+    u = su_out4(su_out4(su_out4(su_out4(u, 45, 99, 97, 110), 100, 105, 100, 97), 116, 101, 32, 60), 102, 62, 93, 10);
+    let nw: i64 = sys_write(1, u, su_band_a(), ld_u64(u, 0));
+    return 2 + nw * 0;
+}
+
+#[strict]
+#[cap(SYS)]
+fn main() -> i64 {
+    let w: bytes = su_load_cmdline(su_alloc_arena());
+    let argc: i64 = su_argc(w);
+    let rc: i64 = if_pos m2u_lt(argc, 2) <=> 0 {
+        pl_run_selftest(w)
+    } else {
+        let a1_off: i64 = su_arg_off(w, 1);
+        let a1_len: i64 = su_arg_len(w, 1);
+        let is_req: i64 = m2u_ge(a1_len, 10) * m2u_eq(ld_u8(w, a1_off), 47);
+        let is_pr: i64 = m2u_eq(a1_len, 11) * m2u_eq(ld_u8(w, a1_off), 112) * m2u_eq(ld_u8(w, a1_off + 7), 45);
+        if_pos is_req <=> 0 {
+            sys_spawn(pl_live_tool(w), su_make_cstr(w, a1_off, a1_len))
+        } else { if_pos is_pr <=> 0 {
+            let u: bytes = iset_patch_i64(w, 0, 0);
+            let i: i64 = 1;
+            while argc - i <=> 0 {
+                u = su_out_u8(su_out_copy(u, su_arg_off(u, i), su_arg_len(u, i)), 10);
+                i = i + 1;
+            }
+            let req_p: bytes = pl_tmp(114);
+            let nw: i64 = su_write_file_from(u, req_p, su_band_a(), ld_u64(u, 0), 420);
+            if_pos m2u_ge(nw, 1) <=> 0 { sys_spawn(pl_live_tool(u), req_p) } else { 2 }
+        } else {
+            pl_print_usage(w)
+        } }
+    };
     return sys_exit(rc);
 }

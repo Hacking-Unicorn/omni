@@ -1,0 +1,423 @@
+// ==============================================================================
+// pure/harness/proposer_live.omni (Step 11 Part C) — Real Live `propose-run` Engine
+// ==============================================================================
+// Executes Stages 0-4 against a real candidate patch on the Pure-Omni stack:
+//   Stage 0 : Full post-Step-9 TCB deny-list digest snapshot (10 files) +
+//             deny-list & single-subsystem allowlist enforcement on `--target`.
+//   Stage 1 : Compile & verify baseline & candidate via `omnic_pure.elf` (`p7-measure`).
+//   Stage 2 : Live canary ruler check via `p7_gates.elf p7-canary`.
+//   Stage 3 : 5-run sequential 0-variance deterministic measurement (`bc_words`,
+//             `elf_bytes`); timing marked EXTERNAL until Step 11b native clock.
+//   Stage 4 : Real `judge_cli.elf` (`pure/m7/judge.omni` + `learn.omni` + `heal.omni`)
+//             + `audit_diff.elf` + TCB post-digest check + `flywheel/auto` Git commit
+//             on `+1t` ADOPT only (skipped on `--dry-run`, `0t`, `-1t`).
+//
+// Usage (via `proposer_loop.elf` / `omnic_pure.elf propose-run`):
+//   propose-run --target <path> --candidate <path> [--dry-run] [--repo <dir>]
+// ==============================================================================
+
+include "../m2/util.omni";
+include "../driver/sys_util.omni";
+
+// tid: 0=omnic_pure.elf, 1=p7_gates.elf, 2=judge_cli.elf, 3=audit_diff.elf
+#[strict]
+fn plv_tool(arena: bytes, tid: i64) -> bytes {
+    let a0_off: i64 = su_arg_off(arena, 0);
+    let a0_len: i64 = su_arg_len(arena, 0);
+    let slash: i64 = 0 - 1;
+    let i: i64 = 0;
+    while a0_len - i <=> 0 {
+        slash = m2u_sel(m2u_eq(ld_u8(arena, a0_off + i), 47), i, slash);
+        i = i + 1;
+    }
+    let b: bytes = anew(0);
+    let k: i64 = 0;
+    let pfx: i64 = m2u_sel(m2u_ge(slash, 0), slash + 1, 0);
+    while pfx - k <=> 0 { b = iset(b, ld_u8(arena, a0_off + k)); k = k + 1; }
+    let r: bytes = if_pos m2u_eq(tid, 0) <=> 0 {
+        iset(b, 111, 109, 110, 105, 99, 95, 112, 117, 114, 101, 46, 101, 108, 102, 0)
+    } else { if_pos m2u_eq(tid, 1) <=> 0 {
+        iset(b, 112, 55, 95, 103, 97, 116, 101, 115, 46, 101, 108, 102, 0)
+    } else { if_pos m2u_eq(tid, 2) <=> 0 {
+        iset(b, 106, 117, 100, 103, 101, 95, 99, 108, 105, 46, 101, 108, 102, 0)
+    } else {
+        iset(b, 97, 117, 100, 105, 116, 95, 100, 105, 102, 102, 46, 101, 108, 102, 0)
+    } } };
+    return r;
+}
+
+#[strict]
+fn plv_tmp(tag: i64) -> bytes {
+    let p: bytes = anew(0);
+    p = iset(p, 47, 116, 109, 112, 47, 111, 109, 110, 105, 95, 112, 108, 118, 95);
+    return iset(p, tag, 0);
+}
+
+#[strict]
+#[cap(SYS)]
+fn plv_hash_file(w: bytes, p: bytes) -> i64 {
+    let nb: i64 = su_read_file_into(w, p, su_band_b(), 250000);
+    return m2u_sel(m2u_ge(nb, 1), su_fnv1a64(w, su_band_b(), nb), 0);
+}
+
+// Stage 0: computes combined FNV-1a64 digest of all 10 post-Step-9 TCB deny-list files.
+// Returns 0 if any TCB file is missing/unreadable; otherwise non-zero combined digest.
+#[strict]
+#[cap(SYS)]
+fn plv_tcb_digest_a(w: bytes) -> i64 {
+    let p1: bytes = anew(0);
+    p1 = iset(p1, 98, 111, 111, 116, 115, 116, 114, 97, 112, 47, 109, 50, 46, 101, 108, 102);
+    let h1: i64 = plv_hash_file(w, iset(p1, 0));
+    let p2: bytes = anew(0);
+    p2 = iset(p2, 98, 111, 111, 116, 115, 116, 114, 97, 112, 47, 109, 51, 46, 101, 108, 102);
+    let h2: i64 = plv_hash_file(w, iset(p2, 0));
+    let p3: bytes = anew(0);
+    p3 = iset(p3, 98, 111, 111, 116, 115, 116, 114, 97, 112, 47, 77, 65, 78, 73, 70, 69);
+    let h3: i64 = plv_hash_file(w, iset(p3, 83, 84, 46, 109, 100, 0));
+    let p4: bytes = anew(0);
+    p4 = iset(p4, 112, 117, 114, 101, 47, 118, 101, 114, 105, 102, 105, 101, 114, 95, 101, 110);
+    let h4: i64 = plv_hash_file(w, iset(p4, 103, 105, 110, 101, 46, 111, 109, 110, 105, 0));
+    let p5: bytes = anew(0);
+    p5 = iset(p5, 112, 117, 114, 101, 47, 105, 115, 97, 47, 116, 97, 98, 108, 101, 46, 111);
+    let h5: i64 = plv_hash_file(w, iset(p5, 109, 110, 105, 0));
+    let ok: i64 = (1 - m2u_eq(h1, 0)) * (1 - m2u_eq(h2, 0)) * (1 - m2u_eq(h3, 0)) * (1 - m2u_eq(h4, 0)) * (1 - m2u_eq(h5, 0));
+    return m2u_sel(ok, h1 ^ (h2 * 3) ^ (h3 * 5) ^ (h4 * 7) ^ (h5 * 11), 0);
+}
+
+#[strict]
+#[cap(SYS)]
+fn plv_tcb_digest_b(w: bytes) -> i64 {
+    let p6: bytes = anew(0);
+    p6 = iset(p6, 112, 117, 114, 101, 47, 109, 55, 47, 106, 117, 100, 103, 101, 46, 111, 109);
+    let h6: i64 = plv_hash_file(w, iset(p6, 110, 105, 0));
+    let p7: bytes = anew(0);
+    p7 = iset(p7, 112, 117, 114, 101, 47, 109, 55, 47, 104, 101, 97, 108, 46, 111, 109, 110);
+    let h7: i64 = plv_hash_file(w, iset(p7, 105, 0));
+    let p8: bytes = anew(0);
+    p8 = iset(p8, 115, 99, 114, 105, 112, 116, 115, 47, 122, 101, 114, 111, 95, 114, 117, 115);
+    let h8: i64 = plv_hash_file(w, iset(p8, 116, 95, 114, 101, 98, 117, 105, 108, 100, 46, 115, 104, 0));
+    let p9: bytes = anew(0);
+    p9 = iset(p9, 46, 103, 105, 116, 104, 117, 98, 47, 119, 111, 114, 107, 102, 108, 111, 119);
+    let h9: i64 = plv_hash_file(w, iset(p9, 115, 47, 99, 105, 46, 121, 109, 108, 0));
+    let p10: bytes = anew(0);
+    p10 = iset(p10, 115, 112, 101, 99, 47, 104, 97, 114, 110, 101, 115, 115, 45, 97, 99, 99);
+    let h10: i64 = plv_hash_file(w, iset(p10, 111, 117, 110, 116, 105, 110, 103, 46, 109, 100, 0));
+    let ok: i64 = (1 - m2u_eq(h6, 0)) * (1 - m2u_eq(h7, 0)) * (1 - m2u_eq(h8, 0)) * (1 - m2u_eq(h9, 0)) * (1 - m2u_eq(h10, 0));
+    return m2u_sel(ok, h6 ^ (h7 * 13) ^ (h8 * 17) ^ (h9 * 19) ^ (h10 * 23), 0);
+}
+
+#[strict]
+#[cap(SYS)]
+fn plv_tcb_digest(w: bytes) -> i64 {
+    let a: i64 = plv_tcb_digest_a(w);
+    let b: i64 = plv_tcb_digest_b(w);
+    return m2u_sel((1 - m2u_eq(a, 0)) * (1 - m2u_eq(b, 0)), a ^ (b * 29), 0);
+}
+
+// Returns 1 if `w[off..off+len]` starts with 4 ASCII bytes `(c0,c1,c2,c3)`.
+#[strict]
+fn plv_starts4(w: bytes, off: i64, len: i64, c0: i64, c1: i64, c2: i64, c3: i64) -> i64 {
+    let ok: i64 = m2u_ge(len, 4);
+    let o: i64 = m2u_sel(ok, off, 0);
+    return ok * m2u_eq(ld_u8(w, o), c0) * m2u_eq(ld_u8(w, o + 1), c1) * m2u_eq(ld_u8(w, o + 2), c2) * m2u_eq(ld_u8(w, o + 3), c3);
+}
+
+// Stage 0 path guard: returns 1 if `target` at `w[off..off+len]` is ALLOWED (outside TCB deny-list & single-subsystem).
+#[strict]
+fn plv_target_allowed(w: bytes, off: i64, len: i64) -> i64 {
+    // Reject empty, comma (multi-target), "bootstrap/", ".github/", "scripts/", "spec/"
+    let has_comma: i64 = 0;
+    let i: i64 = 0;
+    while len - i <=> 0 {
+        has_comma = has_comma | m2u_eq(ld_u8(w, off + i), 44);
+        i = i + 1;
+    }
+    let d_boot: i64 = plv_starts4(w, off, len, 98, 111, 111, 116);
+    let d_gh: i64 = plv_starts4(w, off, len, 46, 103, 105, 116);
+    let d_scr: i64 = plv_starts4(w, off, len, 115, 99, 114, 105);
+    let d_spec: i64 = plv_starts4(w, off, len, 115, 112, 101, 99);
+    // Reject "pure/verifier*", "pure/isa/", "pure/m7/judge*", "pure/m7/heal*"
+    let is_pure: i64 = plv_starts4(w, off, len, 112, 117, 114, 101) * m2u_ge(len, 10) * m2u_eq(ld_u8(w, off + 4), 47);
+    let s5: i64 = m2u_sel(is_pure, off + 5, 0);
+    let d_ver: i64 = is_pure * m2u_eq(ld_u8(w, s5), 118) * m2u_eq(ld_u8(w, s5 + 1), 101);
+    let d_isa: i64 = is_pure * m2u_eq(ld_u8(w, s5), 105) * m2u_eq(ld_u8(w, s5 + 1), 115);
+    let d_m7: i64 = is_pure * m2u_eq(ld_u8(w, s5), 109) * m2u_eq(ld_u8(w, s5 + 1), 55);
+    let d_m7_jh: i64 = d_m7 * m2u_ge(len, 12) * (m2u_eq(ld_u8(w, s5 + 3), 106) + m2u_eq(ld_u8(w, s5 + 3), 104));
+    let denied: i64 = has_comma + d_boot + d_gh + d_scr + d_spec + d_ver + d_isa + d_m7_jh;
+    return m2u_ge(len, 1) * m2u_eq(denied, 0);
+}
+
+#[strict]
+fn plv_out_cstr(w: bytes, s: bytes) -> bytes {
+    let u: bytes = w;
+    let n: i64 = slen(s) - 1;
+    let i: i64 = 0;
+    while n - i <=> 0 { u = su_out_u8(u, ld_u8(s, i)); i = i + 1; }
+    return u;
+}
+
+// Runs `omnic_pure.elf compile` + `compile-elf` via `/bin/sh` 5 sequential times, checking 0-variance.
+// Writes `bc_words` -> `w[160]`, `elf_bytes` -> `w[168]`, `ok` -> `w[176]`, and leaves final `.omni_bc` at `out_bc_tag`.
+#[strict]
+#[cap(SYS)]
+fn plv_measure_5(w: bytes, src_cstr: bytes, out_bc_tag: i64) -> bytes {
+    let sh_p: bytes = plv_tmp(115);
+    let bc_p: bytes = plv_tmp(out_bc_tag);
+    let elf_p: bytes = plv_tmp(101);
+    let omnic: bytes = plv_tool(w, 0);
+    let u: bytes = plv_out_cstr(iset_patch_i64(w, 0, 0), omnic);
+    u = plv_out_cstr(su_out4(su_out4(su_out4(u, 32, 99, 111, 109), 112, 105, 108, 101), 32, 34, 0, 0), src_cstr);
+    u = su_out4(su_out4(su_out4(su_out4(u, 34, 32, 47, 116), 109, 112, 47, 111), 109, 110, 105, 95), 112, 108, 118, 95);
+    u = plv_out_cstr(su_out4(su_out4(u, out_bc_tag, 32, 38, 38), 32, 0, 0, 0), omnic);
+    u = su_out4(su_out4(su_out4(u, 32, 99, 111, 109), 112, 105, 108, 101), 45, 101, 108, 102);
+    u = su_out4(su_out4(su_out4(su_out4(u, 32, 47, 116, 109), 112, 47, 111, 109), 110, 105, 95, 112), 108, 118, 95, out_bc_tag);
+    u = su_out4(su_out4(su_out4(su_out4(u, 32, 47, 116, 109), 112, 47, 111, 109), 110, 105, 95, 112), 108, 118, 95, 101);
+    u = su_out_u8(u, 10);
+    let nw: i64 = su_write_file_from(u, sh_p, su_band_a(), ld_u64(u, 0), 493);
+    let sh_bin: bytes = anew(0);
+    sh_bin = iset(sh_bin, 47, 98, 105, 110, 47, 115, 104, 0);
+    let ok: i64 = m2u_ge(nw, 1);
+    let w0: i64 = 0;
+    let e0: i64 = 0;
+    let r: i64 = 0;
+    while 5 - r <=> 0 {
+        let rc: i64 = if_pos ok <=> 0 { su_spawn_capture(sh_bin, sh_p, plv_tmp(111), 420) } else { 1 };
+        let nb_bc: i64 = if_pos m2u_eq(rc, 0) <=> 0 { su_read_file_into(u, bc_p, su_band_b(), 250000) } else { 0 - 1 };
+        let nb_elf: i64 = if_pos m2u_ge(nb_bc, 4) <=> 0 { su_read_file_into(u, elf_p, su_band_b(), 250000) } else { 0 - 1 };
+        let bw: i64 = nb_bc >> 1;
+        ok = ok * m2u_eq(rc, 0) * m2u_ge(bw, 2) * m2u_ge(nb_elf, 120);
+        w0 = m2u_sel(m2u_eq(r, 0), bw, w0);
+        e0 = m2u_sel(m2u_eq(r, 0), nb_elf, e0);
+        ok = ok * m2u_eq(bw, w0) * m2u_eq(nb_elf, e0);
+        r = r + 1;
+    }
+    return iset_patch_i64(iset_patch_i64(iset_patch_i64(u, 160, w0), 168, e0), 176, ok);
+}
+
+// Writes a POSIX `/bin/sh` script to commit candidate -> target on `flywheel/auto` (never `main`) inside `repo_cstr`.
+#[strict]
+#[cap(SYS)]
+fn plv_git_adopt_commit(w: bytes, repo_cstr: bytes, tgt_cstr: bytes, cand_cstr: bytes) -> i64 {
+    let sh_p: bytes = plv_tmp(103);
+    let u: bytes = iset_patch_i64(w, 0, 0);
+    // "set -e\nORIG=$(git -C \"" + repo + "\" rev-parse --abbrev-ref HEAD)\n"
+    u = su_out4(su_out4(su_out4(su_out4(u, 115, 101, 116, 32), 45, 101, 10, 79), 82, 73, 71, 61), 36, 40, 103, 105);
+    u = plv_out_cstr(su_out4(su_out4(u, 116, 32, 45, 67), 32, 34, 0, 0), repo_cstr);
+    u = su_out4(su_out4(su_out4(su_out4(u, 34, 32, 114, 101), 118, 45, 112, 97), 114, 115, 101, 32), 45, 45, 97, 98);
+    u = su_out4(su_out4(su_out4(su_out4(u, 98, 114, 101, 118), 45, 114, 101, 102), 32, 72, 69, 65), 68, 41, 10, 103);
+    // "git -C \"<repo>\" checkout -B flywheel/auto\ncp \"<cand>\" \"<repo>/<tgt>\"\n"
+    u = plv_out_cstr(su_out4(su_out4(u, 105, 116, 32, 45), 67, 32, 34, 0), repo_cstr);
+    u = su_out4(su_out4(su_out4(su_out4(u, 34, 32, 99, 104), 101, 99, 107, 111), 117, 116, 32, 45), 66, 32, 102, 108);
+    u = su_out4(su_out4(su_out4(su_out4(u, 121, 119, 104, 101), 101, 108, 47, 97), 117, 116, 111, 10), 99, 112, 32, 34);
+    u = plv_out_cstr(u, cand_cstr);
+    u = plv_out_cstr(su_out4(u, 34, 32, 34, 0), repo_cstr);
+    u = plv_out_cstr(su_out_u8(u, 47), tgt_cstr);
+    // "\"\ngit -C \"<repo>\" add \"<tgt>\"\ngit -C \"<repo>\" commit -m \"flywheel(auto): ADOPT\"\ngit -C \"<repo>\" checkout \"$ORIG\"\n"
+    u = plv_out_cstr(su_out4(su_out4(su_out4(u, 34, 10, 103, 105), 116, 32, 45, 67), 32, 34, 0, 0), repo_cstr);
+    u = plv_out_cstr(su_out4(su_out4(u, 34, 32, 97, 100), 100, 32, 34, 0), tgt_cstr);
+    u = plv_out_cstr(su_out4(su_out4(su_out4(u, 34, 10, 103, 105), 116, 32, 45, 67), 32, 34, 0, 0), repo_cstr);
+    u = su_out4(su_out4(su_out4(su_out4(u, 34, 32, 99, 111), 109, 109, 105, 116), 32, 45, 109, 32), 34, 102, 108, 121);
+    u = su_out4(su_out4(su_out4(su_out4(u, 119, 104, 101, 101), 108, 40, 97, 117), 116, 111, 41, 58), 32, 65, 68, 79);
+    u = plv_out_cstr(su_out4(su_out4(su_out4(u, 80, 84, 34, 10), 103, 105, 116, 32), 45, 67, 32, 34), repo_cstr);
+    u = su_out4(su_out4(su_out4(su_out4(u, 34, 32, 99, 104), 101, 99, 107, 111), 117, 116, 32, 34), 36, 79, 82, 73);
+    u = su_out4(u, 71, 34, 10, 0);
+    let nw: i64 = su_write_file_from(u, sh_p, su_band_a(), ld_u64(u, 0), 493);
+    let sh_bin: bytes = anew(0);
+    sh_bin = iset(sh_bin, 47, 98, 105, 110, 47, 115, 104, 0);
+    return if_pos m2u_ge(nw, 1) <=> 0 { su_spawn_capture(sh_bin, sh_p, plv_tmp(104), 420) } else { 1 };
+}
+
+// Writes usage line to stdout and returns 2.
+#[strict]
+#[cap(SYS)]
+fn plv_usage(w: bytes) -> i64 {
+    let u: bytes = iset_patch_i64(w, 0, 0);
+    // "usage: omnic propose-run --target <file> --candidate <file> [--dry-run] [--repo <dir>]\n"
+    u = su_out4(su_out4(su_out4(su_out4(u, 117, 115, 97, 103), 101, 58, 32, 111), 109, 110, 105, 99), 32, 112, 114, 111);
+    u = su_out4(su_out4(su_out4(su_out4(u, 112, 111, 115, 101), 45, 114, 117, 110), 32, 45, 45, 116), 97, 114, 103, 101);
+    u = su_out4(su_out4(su_out4(su_out4(u, 116, 32, 60, 102), 105, 108, 101, 62), 32, 45, 45, 99), 97, 110, 100, 105);
+    u = su_out4(su_out4(su_out4(su_out4(u, 100, 97, 116, 101), 32, 60, 102, 105), 108, 101, 62, 32), 91, 45, 45, 100);
+    u = su_out4(su_out4(su_out4(su_out4(u, 114, 121, 45, 114), 117, 110, 93, 32), 91, 45, 45, 114), 101, 112, 111, 32);
+    u = su_out4(su_out4(u, 60, 100, 105, 114), 62, 93, 10, 0);
+    let nw: i64 = sys_write(1, u, su_band_a(), ld_u64(u, 0));
+    return 2 + nw * 0;
+}
+
+// Helper: processes one request line `[lo..lo+ll)` with current `expect` in `u[192]`.
+#[strict]
+fn plv_parse_line(u0: bytes, lo: i64, ll: i64, idx: i64) -> bytes {
+    let expect: i64 = ld_u64(u0, 192);
+    let is_first_pr: i64 = m2u_eq(idx, 0) * m2u_eq(ll, 11) * plv_starts4(u0, lo, ll, 112, 114, 111, 112);
+    let is_dry: i64 = m2u_eq(ll, 9) * plv_starts4(u0, lo, ll, 45, 45, 100, 114);
+    let is_tgt: i64 = m2u_eq(ll, 8) * plv_starts4(u0, lo, ll, 45, 45, 116, 97);
+    let is_cnd: i64 = m2u_eq(ll, 11) * plv_starts4(u0, lo, ll, 45, 45, 99, 97);
+    let is_rep: i64 = m2u_eq(ll, 6) * plv_starts4(u0, lo, ll, 45, 45, 114, 101);
+    let u: bytes = u0;
+    let e1: i64 = m2u_eq(expect, 1);
+    let e2: i64 = m2u_eq(expect, 2);
+    let e3: i64 = m2u_eq(expect, 3);
+    u = iset_patch_i64(u, 112, m2u_sel(e1, lo, ld_u64(u, 112)));
+    u = iset_patch_i64(u, 120, m2u_sel(e1, ll, ld_u64(u, 120)));
+    u = iset_patch_i64(u, 128, m2u_sel(e2, lo, ld_u64(u, 128)));
+    u = iset_patch_i64(u, 136, m2u_sel(e2, ll, ld_u64(u, 136)));
+    u = iset_patch_i64(u, 144, m2u_sel(e3, lo, ld_u64(u, 144)));
+    u = iset_patch_i64(u, 152, m2u_sel(e3, ll, ld_u64(u, 152)));
+    let no_exp: i64 = m2u_eq(expect, 0);
+    u = iset_patch_i64(u, 104, m2u_sel(no_exp * is_dry, 1, ld_u64(u, 104)));
+    let next_exp: i64 = m2u_sel(no_exp, is_tgt + is_cnd * 2 + is_rep * 3, 0);
+    let known: i64 = is_first_pr + is_dry + is_tgt + is_cnd + is_rep;
+    let bad: i64 = no_exp * m2u_eq(known, 0) * m2u_ge(ll, 1);
+    u = iset_patch_i64(u, 184, m2u_sel(bad, 0, ld_u64(u, 184)));
+    return iset_patch_i64(u, 192, next_exp);
+}
+
+// Parses newline-delimited request file in `w[1024..2048]`.
+// Stores: `w[104]=dry_run`, `w[112]=tgt_off`, `w[120]=tgt_len`, `w[128]=cand_off`, `w[136]=cand_len`,
+//         `w[144]=repo_off`, `w[152]=repo_len`, `w[184]=parse_ok`.
+#[strict]
+fn plv_parse_req(w: bytes, nb: i64) -> bytes {
+    let u: bytes = iset_patch_i64(iset_patch_i64(iset_patch_i64(w, 104, 0), 120, 0), 136, 0);
+    u = iset_patch_i64(iset_patch_i64(iset_patch_i64(u, 152, 0), 184, 1), 192, 0);
+    let pos: i64 = 0;
+    let idx: i64 = 0;
+    while nb - pos <=> 0 {
+        let ls: i64 = pos;
+        let g: i64 = m2u_lt(pos, nb) * (1 - m2u_eq(ld_u8(u, 1024 + pos), 10));
+        while g <=> 0 { pos = pos + 1; g = m2u_lt(pos, nb) * (1 - m2u_eq(ld_u8(u, 1024 + pos), 10)); }
+        let ll: i64 = pos - ls;
+        pos = pos + m2u_lt(pos, nb);
+        u = plv_parse_line(u, 1024 + ls, ll, idx);
+        idx = idx + 1;
+    }
+    let ok: i64 = ld_u64(u, 184) * m2u_eq(ld_u64(u, 192), 0) * m2u_ge(ld_u64(u, 120), 1) * m2u_ge(ld_u64(u, 136), 1);
+    return iset_patch_i64(u, 184, ok);
+}
+
+// Stage 4: invokes real `judge_cli.elf`, runs `flywheel/auto` Git commit on `+1t` ADOPT (non-dry-run), prints live report.
+#[strict]
+#[cap(SYS)]
+fn plv_stage4_judge(mc: bytes, gates_ok: i64, bw: i64, be: i64, cw: i64, ce: i64, err_code: i64) -> i64 {
+    let dry_run: i64 = ld_u64(mc, 104);
+    let tgt_c: bytes = su_make_cstr(mc, ld_u64(mc, 112), ld_u64(mc, 120));
+    let cand_c: bytes = su_make_cstr(mc, ld_u64(mc, 128), ld_u64(mc, 136));
+    let r_off: i64 = ld_u64(mc, 144);
+    let r_len: i64 = ld_u64(mc, 152);
+    let jr: bytes = iset_patch_i64(mc, 0, 0);
+    jr = su_out_u8(su_out_i64(jr, gates_ok), 10);
+    jr = su_out_u8(su_out_i64(jr, bw), 10);
+    jr = su_out_u8(su_out_i64(jr, cw), 10);
+    jr = su_out_u8(su_out_i64(jr, be), 10);
+    jr = su_out_u8(su_out_i64(jr, ce), 10);
+    jr = su_out_u8(su_out_i64(jr, err_code), 10);
+    jr = su_out_u8(su_out_i64(jr, 0), 10);
+    jr = su_out4(su_out4(su_out4(su_out4(jr, 47, 116, 109, 112), 47, 111, 109, 110), 105, 95, 112, 108), 118, 95, 108, 101);
+    jr = su_out4(su_out4(jr, 97, 114, 110, 46), 98, 105, 110, 10);
+    jr = su_out4(su_out4(su_out4(su_out4(jr, 47, 116, 109, 112), 47, 111, 109, 110), 105, 95, 112, 108), 118, 95, 104, 101);
+    jr = su_out4(su_out4(jr, 97, 108, 46, 98), 105, 110, 10, 0);
+    let jreq_p: bytes = plv_tmp(106);
+    let jout_p: bytes = plv_tmp(107);
+    let nwj: i64 = su_write_file_from(jr, jreq_p, su_band_a(), ld_u64(jr, 0), 420);
+    let rcj: i64 = if_pos m2u_ge(nwj, 1) <=> 0 { su_spawn_capture(plv_tool(jr, 2), jreq_p, jout_p, 420) } else { 1 };
+    let nj: i64 = if_pos m2u_eq(rcj, 0) <=> 0 { su_read_file_into(jr, jout_p, su_band_b(), 256) } else { 0 };
+    let is_adopt: i64 = m2u_ge(nj, 10) * m2u_eq(ld_u8(jr, su_band_b() + 8), 43);
+    let is_hold: i64 = m2u_ge(nj, 10) * m2u_eq(ld_u8(jr, su_band_b() + 8), 48);
+    let git_rc: i64 = if_pos is_adopt * (1 - dry_run) <=> 0 {
+        let repo_c: bytes = if_pos m2u_ge(r_len, 1) <=> 0 {
+            su_make_cstr(jr, r_off, r_len)
+        } else {
+            let dot: bytes = anew(0);
+            iset(dot, 46, 0)
+        };
+        plv_git_adopt_commit(jr, repo_c, tgt_c, cand_c)
+    } else { 0 };
+    let out: bytes = iset_patch_i64(jr, 0, 0);
+    out = su_out4(su_out4(su_out4(su_out4(out, 91, 80, 82, 79), 80, 79, 83, 69), 45, 82, 85, 78), 32, 76, 73, 86);
+    out = su_out4(su_out4(su_out4(su_out4(out, 69, 93, 32, 115), 116, 97, 103, 101), 48, 61, 79, 75), 32, 115, 116, 97);
+    out = su_out4(su_out4(su_out4(su_out4(out, 103, 101, 50, 61), 99, 97, 110, 97), 114, 121, 58, 79), 75, 32, 115, 116);
+    out = su_out4(su_out4(su_out4(su_out4(out, 97, 103, 101, 51), 61, 53, 114, 47), 48, 118, 32, 98), 97, 115, 101, 61);
+    out = su_out_i64(su_out_u8(su_out_i64(out, bw), 47), be);
+    out = su_out4(su_out4(out, 32, 99, 97, 110), 100, 61, 0, 0);
+    out = su_out_i64(su_out_u8(su_out_i64(out, cw), 47), ce);
+    out = su_out4(su_out4(out, 32, 100, 114, 121), 61, 0, 0, 0);
+    out = su_out_u8(su_out_i64(out, dry_run), 10);
+    out = su_out_copy(out, su_band_b(), nj);
+    let nwo: i64 = sys_write(1, out, su_band_a(), ld_u64(out, 0));
+    return m2u_sel(m2u_eq(git_rc, 0) * (is_adopt + is_hold), 0, 1) + nwo * 0;
+}
+
+// Builds `<repo>/<tgt>\0` when `r_len >= 1`, else `<tgt>\0`.
+#[strict]
+fn plv_resolve_tgt(u: bytes, r_off: i64, r_len: i64, t_off: i64, t_len: i64) -> bytes {
+    let b: bytes = anew(0);
+    let i: i64 = 0;
+    while r_len - i <=> 0 { b = iset(b, ld_u8(u, r_off + i)); i = i + 1; }
+    b = if_pos m2u_ge(r_len, 1) <=> 0 { iset(b, 47) } else { b };
+    let j: i64 = 0;
+    while t_len - j <=> 0 { b = iset(b, ld_u8(u, t_off + j)); j = j + 1; }
+    return iset(b, 0);
+}
+
+// Executes live Stages 0..4 once args are parsed in `u`.
+#[strict]
+#[cap(SYS)]
+fn plv_run_cycle(u: bytes) -> i64 {
+    let t_off: i64 = ld_u64(u, 112);
+    let t_len: i64 = ld_u64(u, 120);
+    let c_off: i64 = ld_u64(u, 128);
+    let c_len: i64 = ld_u64(u, 136);
+    let r_off: i64 = ld_u64(u, 144);
+    let r_len: i64 = ld_u64(u, 152);
+    let tcb_pre: i64 = plv_tcb_digest(u);
+    let allowed: i64 = plv_target_allowed(u, t_off, t_len);
+    let rc: i64 = if_pos m2u_eq(allowed, 0) + m2u_eq(tcb_pre, 0) <=> 0 {
+        let m: bytes = iset_patch_i64(u, 0, 0);
+        m = su_out4(su_out4(su_out4(su_out4(m, 91, 80, 82, 79), 80, 79, 83, 69), 45, 82, 85, 78), 32, 83, 84, 65);
+        m = su_out4(su_out4(su_out4(su_out4(m, 71, 69, 32, 48), 32, 82, 69, 74), 69, 67, 84, 93), 32, 45, 49, 116);
+        m = su_out4(su_out4(su_out4(su_out4(m, 32, 84, 67, 66), 95, 68, 69, 78), 89, 95, 76, 73), 83, 84, 10, 0);
+        let nw: i64 = sys_write(1, m, su_band_a(), ld_u64(m, 0));
+        1 + nw * 0
+    } else {
+        let can_arg: bytes = anew(0);
+        can_arg = iset(can_arg, 112, 55, 45, 99, 97, 110, 97, 114, 121, 0);
+        let rc_can: i64 = su_spawn_capture(plv_tool(u, 1), can_arg, plv_tmp(99), 420);
+        if_pos m2u_eq(rc_can, 0) <=> 0 {
+            let tgt_src: bytes = plv_resolve_tgt(u, r_off, r_len, t_off, t_len);
+            let cand_c: bytes = su_make_cstr(u, c_off, c_len);
+            let mb: bytes = plv_measure_5(u, tgt_src, 65);
+            let bw: i64 = ld_u64(mb, 160);
+            let be: i64 = ld_u64(mb, 168);
+            let ok_b: i64 = ld_u64(mb, 176);
+            let mc: bytes = plv_measure_5(mb, cand_c, 66);
+            let cw: i64 = ld_u64(mc, 160);
+            let ce: i64 = ld_u64(mc, 168);
+            let ok_c: i64 = ld_u64(mc, 176);
+            let tcb_post: i64 = plv_tcb_digest(mc);
+            let gates_ok: i64 = ok_b * ok_c * m2u_eq(tcb_pre, tcb_post);
+            let err_code: i64 = m2u_sel(m2u_eq(tcb_pre, tcb_post), m2u_sel(ok_b * ok_c, 0, 2), 10);
+            plv_stage4_judge(mc, gates_ok, bw, be, cw, ce, err_code)
+        } else {
+            1
+        }
+    };
+    return rc;
+}
+
+#[strict]
+#[cap(SYS)]
+fn main() -> i64 {
+    let w: bytes = su_load_cmdline(su_alloc_arena());
+    let argc: i64 = su_argc(w);
+    let rc: i64 = if_pos m2u_lt(argc, 2) <=> 0 {
+        plv_usage(w)
+    } else {
+        let req_p: bytes = su_make_cstr(w, su_arg_off(w, 1), su_arg_len(w, 1));
+        let nb: i64 = su_read_file_into(w, req_p, 1024, 1023);
+        if_pos m2u_lt(nb, 1) <=> 0 {
+            plv_usage(w)
+        } else {
+            let u: bytes = plv_parse_req(w, nb);
+            if_pos ld_u64(u, 184) <=> 0 { plv_run_cycle(u) } else { plv_usage(u) }
+        }
+    };
+    return sys_exit(rc);
+}

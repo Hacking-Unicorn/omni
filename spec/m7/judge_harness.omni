@@ -1,5 +1,5 @@
 // Phase 7 (P7-0) harness for `pure/m7/judge.omni`.
-// Exposes mode-dispatched entry points for differential testing across Rust VM & Pure-Omni M4 VM.
+// Exposes mode-dispatched entry points for standalone compilation & testing.
 //   mode 0: p7_cmp_band(a, b, c) -> i64 (-1, 0, +1)
 //   mode 1: p7_vote3(a, b, c) -> i64
 //   mode 2: p7_vote5(a, b, c, d, e) -> i64
@@ -7,6 +7,8 @@
 //   mode 4: p7_adopt_rule(gates_ok=a, suite_verdict=b) -> i64
 //   mode 5: p7_pack5_byte(a, b, c, d, e) -> i64 (0..=242)
 //   mode 6: p7_unpack5_trit(packed=a, idx=b) -> i64 (-1, 0, +1)
+
+include "../../pure/m7/judge.omni";
 
 #[strict]
 fn p7_dispatch_lo(mode: i64, a: i64, b: i64, c: i64, d: i64, e: i64) -> i64 {
