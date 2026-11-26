@@ -10097,62 +10097,6 @@ pub fn run_omni_acceptance_diff(candidate_cmd: Option<&str>) -> Result<usize, St
         ("stdlib_macro_pipeline_golden", "include \"std/prelude.omni\";\nmacro weighted_diff(lhs, rhs, scale) = (lhs - rhs) * scale;\n#[strict]\n#[cap(AI)]\nfn main(x: i64, lo: i64, hi: i64) -> i64 {\n    let c: i64 = std_clamp(x, lo, hi);\n    let d: i64 = weighted_diff(c, lo, 3);\n    let g: trit = egate(d - 50);\n    let bonus: i64 = std_trit_mux(g, -10, 0, 10);\n    return d + bonus;\n}", None, &["45", "10", "40"], "100", "vm"),
     ];
 
-    for &(gid, gsrc, locked_toks, arg_strs, want_res, want_backend) in positive_suite {
-        let direct_u16 = compile_omni_surface_to_u16(gsrc)
-            .map_err(|e| format!("Acceptance golden '{}' failed direct compile: {}", gid, e))?;
-        let via_asm_u16 = assemble_omni_text_to_u16(&compile_omni_surface_to_asm(gsrc)?)
-            .map_err(|e| format!("Acceptance golden '{}' failed asm roundtrip: {}", gid, e))?;
-        if direct_u16 != via_asm_u16 {
-            return Err(format!("Acceptance golden '{}' direct vs asm Vec<u16> divergence", gid));
-        }
-        if let Some(lock_n) = locked_toks {
-            if direct_u16.len() != lock_n {
-                return Err(format!(
-                    "Acceptance golden '{}' token count {} != locked {}",
-                    gid,
-                    direct_u16.len(),
-                    lock_n
-                ));
-            }
-        }
-        let vm_args: Vec<OmniValue> = arg_strs.iter().map(|s| parse_cli_omni_value(s)).collect();
-        let h_json = run_omni_harness_json(gsrc, vm_args.clone(), gsrc.contains("#[strict]"), true);
-        let pure_u16 = compile_omni_surface_via_pure_omni_frontend(gsrc, gsrc.contains("#[strict]"))
-            .map_err(|e| format!("Acceptance golden '{}' failed Pure-Omni frontend compile: {}", gid, e))?;
-        verify_module_via_phase7_pure_omni_kernel(&pure_u16)
-            .map_err(|e| format!("Acceptance golden '{}' failed Pure-Omni verifier kernel: {}", gid, e))?;
-        let pure_json = run_pure_omni_driver_json(gsrc, vm_args, gsrc.contains("#[strict]"), true);
-        if pure_u16 != direct_u16 || pure_json != h_json {
-            return Err(format!(
-                "Acceptance golden '{}' Pure-Omni vs Rust divergence: pure_json={}, rust_json={}",
-                gid, pure_json, h_json
-            ));
-        }
-        let want_res_tag = format!("\"result\":\"{}\"", want_res);
-        let want_back_tag = format!("\"backend\":\"{}\"", want_backend);
-        if !h_json.starts_with("{\"ok\":true") || !h_json.contains(&want_res_tag) || !h_json.contains(&want_back_tag) {
-            return Err(format!(
-                "Acceptance golden '{}' harness mismatch: got {}, expected {} & {}",
-                gid, h_json, want_res_tag, want_back_tag
-            ));
-        }
-        if let Some(cmd) = candidate_cmd {
-            let out = std::process::Command::new(cmd)
-                .arg(gsrc)
-                .args(arg_strs)
-                .output()
-                .map_err(|e| format!("Failed to invoke candidate_cmd '{}': {}", cmd, e))?;
-            let cand_json = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if cand_json != h_json {
-                return Err(format!(
-                    "Acceptance diff mismatch on '{}': rust={} vs candidate={}",
-                    gid, h_json, cand_json
-                ));
-            }
-        }
-        verified_cases += 1;
-    }
-
     let negative_suite: &[(&str, &str, bool, &str, usize, usize)] = &[
         ("neg_taint_on_ret", "fn main(x: i64 @untrusted) -> i64 {\n    let safe_a = 1;\n    return x;\n}", false, "TAINT_ON_RET", 3, 5),
         ("neg_taint_sink", "#[cap(AI)]\nfn main(x: i64 @untrusted) -> trit {\n    let g = egate(x);\n    return g;\n}", false, "TAINT_SINK", 3, 13),
@@ -10171,18 +10115,133 @@ pub fn run_omni_acceptance_diff(candidate_cmd: Option<&str>) -> Result<usize, St
         ("neg_syntax_error", "fn main(x: i64) -> i64 {\n    let r = ;\n    return r;\n}", false, "SYNTAX_ERROR", 2, 13),
     ];
 
-    for &(nid, nsrc, strict_flag, want_code, want_l, want_c) in negative_suite {
-        let h_json = run_omni_harness_json(nsrc, vec![OmniValue::Int(1000)], strict_flag, true);
-        let pure_json = run_pure_omni_driver_json(nsrc, vec![OmniValue::Int(1000)], strict_flag, true);
-        let want_tag = format!("\"code\":\"{}\",\"line\":{},\"col\":{}", want_code, want_l, want_c);
-        if !h_json.starts_with("{\"ok\":false") || !h_json.contains(&want_tag) || pure_json != h_json {
-            return Err(format!(
-                "Acceptance negative golden '{}' mismatch: got {}, pure={}, expected {}",
-                nid, h_json, pure_json, want_tag
-            ));
-        }
-        verified_cases += 1;
+    enum AcceptanceCase {
+        Pos {
+            gid: &'static str,
+            gsrc: &'static str,
+            locked_toks: Option<usize>,
+            arg_strs: &'static [&'static str],
+            want_res: &'static str,
+            want_backend: &'static str,
+        },
+        Neg {
+            nid: &'static str,
+            nsrc: &'static str,
+            strict_flag: bool,
+            want_code: &'static str,
+            want_l: usize,
+            want_c: usize,
+        },
     }
+
+    let mut all_cases: Vec<AcceptanceCase> =
+        Vec::with_capacity(positive_suite.len() + negative_suite.len());
+    for &(gid, gsrc, locked_toks, arg_strs, want_res, want_backend) in positive_suite {
+        all_cases.push(AcceptanceCase::Pos {
+            gid,
+            gsrc,
+            locked_toks,
+            arg_strs,
+            want_res,
+            want_backend,
+        });
+    }
+    for &(nid, nsrc, strict_flag, want_code, want_l, want_c) in negative_suite {
+        all_cases.push(AcceptanceCase::Neg {
+            nid,
+            nsrc,
+            strict_flag,
+            want_code,
+            want_l,
+            want_c,
+        });
+    }
+
+    let cand_owned: Option<String> = candidate_cmd.map(String::from);
+    let results = run_selftest_items_in_lanes(all_cases, move |case| match case {
+        AcceptanceCase::Pos {
+            gid,
+            gsrc,
+            locked_toks,
+            arg_strs,
+            want_res,
+            want_backend,
+        } => {
+            let direct_u16 = compile_omni_surface_to_u16(gsrc)
+                .map_err(|e| format!("Acceptance golden '{}' failed direct compile: {}", gid, e))?;
+            let via_asm_u16 = assemble_omni_text_to_u16(&compile_omni_surface_to_asm(gsrc)?)
+                .map_err(|e| format!("Acceptance golden '{}' failed asm roundtrip: {}", gid, e))?;
+            if direct_u16 != via_asm_u16 {
+                return Err(format!("Acceptance golden '{}' direct vs asm Vec<u16> divergence", gid));
+            }
+            if let Some(lock_n) = locked_toks {
+                if direct_u16.len() != lock_n {
+                    return Err(format!(
+                        "Acceptance golden '{}' token count {} != locked {}",
+                        gid,
+                        direct_u16.len(),
+                        lock_n
+                    ));
+                }
+            }
+            let vm_args: Vec<OmniValue> = arg_strs.iter().map(|s| parse_cli_omni_value(s)).collect();
+            let h_json = run_omni_harness_json(gsrc, vm_args.clone(), gsrc.contains("#[strict]"), true);
+            let pure_u16 = compile_omni_surface_via_pure_omni_frontend(gsrc, gsrc.contains("#[strict]"))
+                .map_err(|e| format!("Acceptance golden '{}' failed Pure-Omni frontend compile: {}", gid, e))?;
+            verify_module_via_phase7_pure_omni_kernel(&pure_u16)
+                .map_err(|e| format!("Acceptance golden '{}' failed Pure-Omni verifier kernel: {}", gid, e))?;
+            let pure_json = run_pure_omni_driver_json(gsrc, vm_args, gsrc.contains("#[strict]"), true);
+            if pure_u16 != direct_u16 || pure_json != h_json {
+                return Err(format!(
+                    "Acceptance golden '{}' Pure-Omni vs Rust divergence: pure_json={}, rust_json={}",
+                    gid, pure_json, h_json
+                ));
+            }
+            let want_res_tag = format!("\"result\":\"{}\"", want_res);
+            let want_back_tag = format!("\"backend\":\"{}\"", want_backend);
+            if !h_json.starts_with("{\"ok\":true") || !h_json.contains(&want_res_tag) || !h_json.contains(&want_back_tag) {
+                return Err(format!(
+                    "Acceptance golden '{}' harness mismatch: got {}, expected {} & {}",
+                    gid, h_json, want_res_tag, want_back_tag
+                ));
+            }
+            if let Some(ref cmd) = cand_owned {
+                let out = std::process::Command::new(cmd)
+                    .arg(gsrc)
+                    .args(arg_strs)
+                    .output()
+                    .map_err(|e| format!("Failed to invoke candidate_cmd '{}': {}", cmd, e))?;
+                let cand_json = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if cand_json != h_json {
+                    return Err(format!(
+                        "Acceptance diff mismatch on '{}': rust={} vs candidate={}",
+                        gid, h_json, cand_json
+                    ));
+                }
+            }
+            Ok(1usize)
+        }
+        AcceptanceCase::Neg {
+            nid,
+            nsrc,
+            strict_flag,
+            want_code,
+            want_l,
+            want_c,
+        } => {
+            let h_json = run_omni_harness_json(nsrc, vec![OmniValue::Int(1000)], strict_flag, true);
+            let pure_json = run_pure_omni_driver_json(nsrc, vec![OmniValue::Int(1000)], strict_flag, true);
+            let want_tag = format!("\"code\":\"{}\",\"line\":{},\"col\":{}", want_code, want_l, want_c);
+            if !h_json.starts_with("{\"ok\":false") || !h_json.contains(&want_tag) || pure_json != h_json {
+                return Err(format!(
+                    "Acceptance negative golden '{}' mismatch: got {}, pure={}, expected {}",
+                    nid, h_json, pure_json, want_tag
+                ));
+            }
+            Ok(1usize)
+        }
+    })?;
+    verified_cases += results.into_iter().sum::<usize>();
 
     Ok(verified_cases)
 }
@@ -11573,59 +11632,79 @@ pub fn run_pure_omni_acceptance_diff() -> Result<usize, String> {
     let acc_cases = run_omni_acceptance_diff(None)?;
     total_verified += acc_cases;
 
-    let (g1_u16, g2_u16, g1_elf, g2_elf) = run_phase_d_pure_omni_selfhost_bootstrap()?;
-    if g1_u16 != g2_u16 || g1_elf != g2_elf {
-        return Err(String::from("pure-omni-diff: Generation-1 != Generation-2 self-host fixed point"));
+    enum PureDiffItem {
+        PhaseDBootstrap,
+        AgentRepair,
+        RealProgram(&'static str),
     }
-    total_verified += 1;
 
-    // Verify agent-driver repair loop paired with Pure-Omni driver produces identical repaired output
-    let broken_src = "fn main(a: i64, b: i64) -> trit {\n    let g: trit = egate(a - b);\n    return g;\n}";
-    let rep = run_omni_agent_repair_loop(
-        broken_src,
-        vec![OmniValue::Int(30), OmniValue::Int(10)],
-        true,
-        4,
-        OMNI_HARNESS_CONTRACT_VERSION,
-    )?;
-    let pure_repaired_json = run_pure_omni_driver_json(
-        &rep.final_source,
-        vec![OmniValue::Int(30), OmniValue::Int(10)],
-        true,
-        true,
-    );
-    if !rep.ok || pure_repaired_json != rep.final_json {
-        return Err(format!(
-            "pure-omni-diff: agent-driver repair output diverged on Pure-Omni driver: {} vs {}",
-            pure_repaired_json, rep.final_json
-        ));
-    }
-    total_verified += 1;
-
-    // Verify all 6 Phase S1..S3 real Pure-Omni programs (`pure/programs/*.omni`) under differential lock
-    let real_programs = [
-        "pure/programs/ternary_neural_router.omni",
-        "pure/programs/arena_audit_pipeline.omni",
-        "pure/programs/policy_consensus_engine.omni",
-        "pure/programs/kv_ledger_service.omni",
-        "pure/programs/compiler_self_audit.omni",
-        "pure/programs/pack5_decision_controller.omni",
+    let tail_items = vec![
+        PureDiffItem::PhaseDBootstrap,
+        PureDiffItem::AgentRepair,
+        PureDiffItem::RealProgram("pure/programs/ternary_neural_router.omni"),
+        PureDiffItem::RealProgram("pure/programs/arena_audit_pipeline.omni"),
+        PureDiffItem::RealProgram("pure/programs/policy_consensus_engine.omni"),
+        PureDiffItem::RealProgram("pure/programs/kv_ledger_service.omni"),
+        PureDiffItem::RealProgram("pure/programs/compiler_self_audit.omni"),
+        PureDiffItem::RealProgram("pure/programs/pack5_decision_controller.omni"),
     ];
-    for p_path in &real_programs {
-        let src = lookup_omni_stdlib_module(p_path)
-            .ok_or_else(|| format!("pure-omni-diff: missing built-in real program '{}'", p_path))?;
-        let (pure_u16, pure_sm) = compile_omni_surface_via_pure_omni_frontend_with_sourcemap(src, true)?;
-        let (rust_u16, rust_sm) = compile_omni_surface_to_u16_with_sourcemap(src, true)?;
-        verify_module_via_phase7_pure_omni_kernel(&pure_u16)?;
-        if pure_u16 != rust_u16 || pure_sm.offset_to_span != rust_sm.offset_to_span || pure_u16.len() < 150 {
-            return Err(format!(
-                "pure-omni-diff: real program '{}' Vec<u16> or sourcemap diverged (len={})",
-                p_path,
-                pure_u16.len()
-            ));
+
+    let tail_counts = run_selftest_items_in_lanes(tail_items, |item| match item {
+        PureDiffItem::PhaseDBootstrap => {
+            let (g1_u16, g2_u16, g1_elf, g2_elf) = run_phase_d_pure_omni_selfhost_bootstrap()?;
+            if g1_u16 != g2_u16 || g1_elf != g2_elf {
+                return Err(String::from(
+                    "pure-omni-diff: Generation-1 != Generation-2 self-host fixed point",
+                ));
+            }
+            Ok(1usize)
         }
-        total_verified += 1;
-    }
+        PureDiffItem::AgentRepair => {
+            let broken_src =
+                "fn main(a: i64, b: i64) -> trit {\n    let g: trit = egate(a - b);\n    return g;\n}";
+            let rep = run_omni_agent_repair_loop(
+                broken_src,
+                vec![OmniValue::Int(30), OmniValue::Int(10)],
+                true,
+                4,
+                OMNI_HARNESS_CONTRACT_VERSION,
+            )?;
+            let pure_repaired_json = run_pure_omni_driver_json(
+                &rep.final_source,
+                vec![OmniValue::Int(30), OmniValue::Int(10)],
+                true,
+                true,
+            );
+            if !rep.ok || pure_repaired_json != rep.final_json {
+                return Err(format!(
+                    "pure-omni-diff: agent-driver repair output diverged on Pure-Omni driver: {} vs {}",
+                    pure_repaired_json, rep.final_json
+                ));
+            }
+            Ok(1usize)
+        }
+        PureDiffItem::RealProgram(p_path) => {
+            let src = lookup_omni_stdlib_module(p_path).ok_or_else(|| {
+                format!("pure-omni-diff: missing built-in real program '{}'", p_path)
+            })?;
+            let (pure_u16, pure_sm) =
+                compile_omni_surface_via_pure_omni_frontend_with_sourcemap(src, true)?;
+            let (rust_u16, rust_sm) = compile_omni_surface_to_u16_with_sourcemap(src, true)?;
+            verify_module_via_phase7_pure_omni_kernel(&pure_u16)?;
+            if pure_u16 != rust_u16
+                || pure_sm.offset_to_span != rust_sm.offset_to_span
+                || pure_u16.len() < 150
+            {
+                return Err(format!(
+                    "pure-omni-diff: real program '{}' Vec<u16> or sourcemap diverged (len={})",
+                    p_path,
+                    pure_u16.len()
+                ));
+            }
+            Ok(1usize)
+        }
+    })?;
+    total_verified += tail_counts.into_iter().sum::<usize>();
 
     Ok(total_verified)
 }
@@ -13969,15 +14048,17 @@ pub fn run_verifier_engine_diff_selftests() -> Result<usize, String> {
         cases.push((format!("fuzz_mut_ok_add_{i}"), s));
     }
 
-    let mut matched = 0usize;
-    for (name, stream) in &cases {
-        compare_rust_and_omni_verifier(name, stream)?;
-        matched += 1;
-    }
-    if matched != cases.len() {
+    // Warm up the OnceLock-cached verifier engine module once before fanning out.
+    let _ = omni_verifier_engine_module()?;
+    let n_cases = cases.len();
+    let results = run_selftest_items_in_lanes(cases, |(name, stream)| {
+        compare_rust_and_omni_verifier(&name, &stream)?;
+        Ok(1usize)
+    })?;
+    let matched: usize = results.into_iter().sum();
+    if matched != n_cases {
         return Err(format!(
-            "verifier-diff internal count mismatch: {matched} != {}",
-            cases.len()
+            "verifier-diff internal count mismatch: {matched} != {n_cases}"
         ));
     }
     Ok(matched)
@@ -24132,6 +24213,10 @@ pub fn selftest_m2_shape_census() -> Result<usize, String> {
     Ok(1)
 }
 
+thread_local! {
+    static IN_SELFTEST_LANE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Returns the adaptive parallel lane count for the monolith selftest runner:
 ///   - `OMNI_SELFTEST_LANES=N` overrides explicitly (clamped >= 1).
 ///   - Default leaves 1 core free for OS responsiveness: `max(1, available_parallelism - 1)`.
@@ -24147,17 +24232,22 @@ pub fn omni_selftest_lane_count() -> usize {
     cores.saturating_sub(1).max(1)
 }
 
-type SelftestLaneTask = (&'static str, fn() -> Result<usize, String>);
+pub type SelftestLaneTask = (&'static str, fn() -> Result<usize, String>);
 
 /// Executes independent selftest tasks across adaptive parallel lanes using a fixed static
 /// round-robin partition and aggregates results in fixed check order (0..tasks.len()),
 /// guaranteeing byte-identical output and identical check counts on any lane count.
-fn run_selftest_tasks_in_lanes(tasks: &[SelftestLaneTask]) -> Result<usize, String> {
+pub fn run_selftest_tasks_in_lanes(tasks: &[SelftestLaneTask]) -> Result<usize, String> {
     let n_tasks = tasks.len();
     if n_tasks == 0 {
         return Ok(0);
     }
-    let lanes = omni_selftest_lane_count().min(n_tasks);
+    let in_lane = IN_SELFTEST_LANE.with(|c| c.get());
+    let lanes = if in_lane {
+        1
+    } else {
+        omni_selftest_lane_count().min(n_tasks)
+    };
     if lanes <= 1 {
         let mut total = 0usize;
         for &(_name, f) in tasks {
@@ -24177,6 +24267,7 @@ fn run_selftest_tasks_in_lanes(tasks: &[SelftestLaneTask]) -> Result<usize, Stri
         match std::thread::Builder::new()
             .stack_size(16 * 1024 * 1024)
             .spawn(move || {
+                IN_SELFTEST_LANE.with(|c| c.set(true));
                 let mut out = Vec::with_capacity(q_worker.len());
                 for (idx, (_name, f)) in q_worker {
                     out.push((idx, f()));
@@ -24210,6 +24301,92 @@ fn run_selftest_tasks_in_lanes(tasks: &[SelftestLaneTask]) -> Result<usize, Stri
         total += res?;
     }
     Ok(total)
+}
+
+/// Executes independent corpus items across adaptive parallel lanes using a fixed static
+/// round-robin partition and returns results in fixed corpus order (`0..items.len()`).
+pub fn run_selftest_items_in_lanes<T, R, F>(items: Vec<T>, f: F) -> Result<Vec<R>, String>
+where
+    T: Send + 'static,
+    R: Send + 'static,
+    F: Fn(T) -> Result<R, String> + Send + Sync + 'static,
+{
+    let n_items = items.len();
+    if n_items == 0 {
+        return Ok(Vec::new());
+    }
+    let in_lane = IN_SELFTEST_LANE.with(|c| c.get());
+    let lanes = if in_lane {
+        1
+    } else {
+        omni_selftest_lane_count().min(n_items)
+    };
+    if lanes <= 1 {
+        let mut out = Vec::with_capacity(n_items);
+        for item in items {
+            out.push(f(item)?);
+        }
+        return Ok(out);
+    }
+    let mut queues: Vec<Vec<(usize, T)>> = (0..lanes).map(|_| Vec::new()).collect();
+    for (idx, item) in items.into_iter().enumerate() {
+        queues[idx % lanes].push((idx, item));
+    }
+    let f = std::sync::Arc::new(f);
+    let mut handles: Vec<std::thread::JoinHandle<Vec<(usize, Result<R, String>)>>> =
+        Vec::with_capacity(lanes);
+    let mut fallback: Vec<(usize, Result<R, String>)> = Vec::new();
+    for queue in queues {
+        let f_worker = std::sync::Arc::clone(&f);
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(queue)));
+        let slot_worker = std::sync::Arc::clone(&slot);
+        match std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                IN_SELFTEST_LANE.with(|c| c.set(true));
+                let q = slot_worker
+                    .lock()
+                    .expect("lane queue lock")
+                    .take()
+                    .unwrap_or_default();
+                let mut out = Vec::with_capacity(q.len());
+                for (idx, item) in q {
+                    out.push((idx, f_worker(item)));
+                }
+                out
+            }) {
+            Ok(h) => handles.push(h),
+            Err(_) => {
+                // Graceful fallback if threads are unavailable on this host.
+                let q = slot
+                    .lock()
+                    .expect("lane queue lock")
+                    .take()
+                    .unwrap_or_default();
+                for (idx, item) in q {
+                    fallback.push((idx, f(item)));
+                }
+            }
+        }
+    }
+    let mut ordered: Vec<Option<Result<R, String>>> = (0..n_items).map(|_| None).collect();
+    for (idx, res) in fallback {
+        ordered[idx] = Some(res);
+    }
+    for h in handles {
+        let lane_out = h
+            .join()
+            .map_err(|_| String::from("Selftest worker lane panicked"))?;
+        for (idx, res) in lane_out {
+            ordered[idx] = Some(res);
+        }
+    }
+    let mut out = Vec::with_capacity(n_items);
+    for (idx, slot) in ordered.into_iter().enumerate() {
+        let res = slot.ok_or_else(|| format!("Selftest item #{} missing result", idx))?;
+        out.push(res?);
+    }
+    Ok(out)
 }
 
 fn run_verifier_engine_diff_checked() -> Result<usize, String> {

@@ -111,62 +111,6 @@ pub fn run_omni_acceptance_diff(candidate_cmd: Option<&str>) -> Result<usize, St
         ("stdlib_macro_pipeline_golden", "include \"std/prelude.omni\";\nmacro weighted_diff(lhs, rhs, scale) = (lhs - rhs) * scale;\n#[strict]\n#[cap(AI)]\nfn main(x: i64, lo: i64, hi: i64) -> i64 {\n    let c: i64 = std_clamp(x, lo, hi);\n    let d: i64 = weighted_diff(c, lo, 3);\n    let g: trit = egate(d - 50);\n    let bonus: i64 = std_trit_mux(g, -10, 0, 10);\n    return d + bonus;\n}", None, &["45", "10", "40"], "100", "vm"),
     ];
 
-    for &(gid, gsrc, locked_toks, arg_strs, want_res, want_backend) in positive_suite {
-        let direct_u16 = compile_omni_surface_to_u16(gsrc)
-            .map_err(|e| format!("Acceptance golden '{}' failed direct compile: {}", gid, e))?;
-        let via_asm_u16 = assemble_omni_text_to_u16(&compile_omni_surface_to_asm(gsrc)?)
-            .map_err(|e| format!("Acceptance golden '{}' failed asm roundtrip: {}", gid, e))?;
-        if direct_u16 != via_asm_u16 {
-            return Err(format!("Acceptance golden '{}' direct vs asm Vec<u16> divergence", gid));
-        }
-        if let Some(lock_n) = locked_toks {
-            if direct_u16.len() != lock_n {
-                return Err(format!(
-                    "Acceptance golden '{}' token count {} != locked {}",
-                    gid,
-                    direct_u16.len(),
-                    lock_n
-                ));
-            }
-        }
-        let vm_args: Vec<OmniValue> = arg_strs.iter().map(|s| parse_cli_omni_value(s)).collect();
-        let h_json = run_omni_harness_json(gsrc, vm_args.clone(), gsrc.contains("#[strict]"), true);
-        let pure_u16 = compile_omni_surface_via_pure_omni_frontend(gsrc, gsrc.contains("#[strict]"))
-            .map_err(|e| format!("Acceptance golden '{}' failed Pure-Omni frontend compile: {}", gid, e))?;
-        verify_module_via_phase7_pure_omni_kernel(&pure_u16)
-            .map_err(|e| format!("Acceptance golden '{}' failed Pure-Omni verifier kernel: {}", gid, e))?;
-        let pure_json = run_pure_omni_driver_json(gsrc, vm_args, gsrc.contains("#[strict]"), true);
-        if pure_u16 != direct_u16 || pure_json != h_json {
-            return Err(format!(
-                "Acceptance golden '{}' Pure-Omni vs Rust divergence: pure_json={}, rust_json={}",
-                gid, pure_json, h_json
-            ));
-        }
-        let want_res_tag = format!("\"result\":\"{}\"", want_res);
-        let want_back_tag = format!("\"backend\":\"{}\"", want_backend);
-        if !h_json.starts_with("{\"ok\":true") || !h_json.contains(&want_res_tag) || !h_json.contains(&want_back_tag) {
-            return Err(format!(
-                "Acceptance golden '{}' harness mismatch: got {}, expected {} & {}",
-                gid, h_json, want_res_tag, want_back_tag
-            ));
-        }
-        if let Some(cmd) = candidate_cmd {
-            let out = std::process::Command::new(cmd)
-                .arg(gsrc)
-                .args(arg_strs)
-                .output()
-                .map_err(|e| format!("Failed to invoke candidate_cmd '{}': {}", cmd, e))?;
-            let cand_json = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if cand_json != h_json {
-                return Err(format!(
-                    "Acceptance diff mismatch on '{}': rust={} vs candidate={}",
-                    gid, h_json, cand_json
-                ));
-            }
-        }
-        verified_cases += 1;
-    }
-
     let negative_suite: &[(&str, &str, bool, &str, usize, usize)] = &[
         ("neg_taint_on_ret", "fn main(x: i64 @untrusted) -> i64 {\n    let safe_a = 1;\n    return x;\n}", false, "TAINT_ON_RET", 3, 5),
         ("neg_taint_sink", "#[cap(AI)]\nfn main(x: i64 @untrusted) -> trit {\n    let g = egate(x);\n    return g;\n}", false, "TAINT_SINK", 3, 13),
@@ -185,18 +129,133 @@ pub fn run_omni_acceptance_diff(candidate_cmd: Option<&str>) -> Result<usize, St
         ("neg_syntax_error", "fn main(x: i64) -> i64 {\n    let r = ;\n    return r;\n}", false, "SYNTAX_ERROR", 2, 13),
     ];
 
-    for &(nid, nsrc, strict_flag, want_code, want_l, want_c) in negative_suite {
-        let h_json = run_omni_harness_json(nsrc, vec![OmniValue::Int(1000)], strict_flag, true);
-        let pure_json = run_pure_omni_driver_json(nsrc, vec![OmniValue::Int(1000)], strict_flag, true);
-        let want_tag = format!("\"code\":\"{}\",\"line\":{},\"col\":{}", want_code, want_l, want_c);
-        if !h_json.starts_with("{\"ok\":false") || !h_json.contains(&want_tag) || pure_json != h_json {
-            return Err(format!(
-                "Acceptance negative golden '{}' mismatch: got {}, pure={}, expected {}",
-                nid, h_json, pure_json, want_tag
-            ));
-        }
-        verified_cases += 1;
+    enum AcceptanceCase {
+        Pos {
+            gid: &'static str,
+            gsrc: &'static str,
+            locked_toks: Option<usize>,
+            arg_strs: &'static [&'static str],
+            want_res: &'static str,
+            want_backend: &'static str,
+        },
+        Neg {
+            nid: &'static str,
+            nsrc: &'static str,
+            strict_flag: bool,
+            want_code: &'static str,
+            want_l: usize,
+            want_c: usize,
+        },
     }
+
+    let mut all_cases: Vec<AcceptanceCase> =
+        Vec::with_capacity(positive_suite.len() + negative_suite.len());
+    for &(gid, gsrc, locked_toks, arg_strs, want_res, want_backend) in positive_suite {
+        all_cases.push(AcceptanceCase::Pos {
+            gid,
+            gsrc,
+            locked_toks,
+            arg_strs,
+            want_res,
+            want_backend,
+        });
+    }
+    for &(nid, nsrc, strict_flag, want_code, want_l, want_c) in negative_suite {
+        all_cases.push(AcceptanceCase::Neg {
+            nid,
+            nsrc,
+            strict_flag,
+            want_code,
+            want_l,
+            want_c,
+        });
+    }
+
+    let cand_owned: Option<String> = candidate_cmd.map(String::from);
+    let results = crate::lanes::run_selftest_items_in_lanes(all_cases, move |case| match case {
+        AcceptanceCase::Pos {
+            gid,
+            gsrc,
+            locked_toks,
+            arg_strs,
+            want_res,
+            want_backend,
+        } => {
+            let direct_u16 = compile_omni_surface_to_u16(gsrc)
+                .map_err(|e| format!("Acceptance golden '{}' failed direct compile: {}", gid, e))?;
+            let via_asm_u16 = assemble_omni_text_to_u16(&compile_omni_surface_to_asm(gsrc)?)
+                .map_err(|e| format!("Acceptance golden '{}' failed asm roundtrip: {}", gid, e))?;
+            if direct_u16 != via_asm_u16 {
+                return Err(format!("Acceptance golden '{}' direct vs asm Vec<u16> divergence", gid));
+            }
+            if let Some(lock_n) = locked_toks {
+                if direct_u16.len() != lock_n {
+                    return Err(format!(
+                        "Acceptance golden '{}' token count {} != locked {}",
+                        gid,
+                        direct_u16.len(),
+                        lock_n
+                    ));
+                }
+            }
+            let vm_args: Vec<OmniValue> = arg_strs.iter().map(|s| parse_cli_omni_value(s)).collect();
+            let h_json = run_omni_harness_json(gsrc, vm_args.clone(), gsrc.contains("#[strict]"), true);
+            let pure_u16 = compile_omni_surface_via_pure_omni_frontend(gsrc, gsrc.contains("#[strict]"))
+                .map_err(|e| format!("Acceptance golden '{}' failed Pure-Omni frontend compile: {}", gid, e))?;
+            verify_module_via_phase7_pure_omni_kernel(&pure_u16)
+                .map_err(|e| format!("Acceptance golden '{}' failed Pure-Omni verifier kernel: {}", gid, e))?;
+            let pure_json = run_pure_omni_driver_json(gsrc, vm_args, gsrc.contains("#[strict]"), true);
+            if pure_u16 != direct_u16 || pure_json != h_json {
+                return Err(format!(
+                    "Acceptance golden '{}' Pure-Omni vs Rust divergence: pure_json={}, rust_json={}",
+                    gid, pure_json, h_json
+                ));
+            }
+            let want_res_tag = format!("\"result\":\"{}\"", want_res);
+            let want_back_tag = format!("\"backend\":\"{}\"", want_backend);
+            if !h_json.starts_with("{\"ok\":true") || !h_json.contains(&want_res_tag) || !h_json.contains(&want_back_tag) {
+                return Err(format!(
+                    "Acceptance golden '{}' harness mismatch: got {}, expected {} & {}",
+                    gid, h_json, want_res_tag, want_back_tag
+                ));
+            }
+            if let Some(ref cmd) = cand_owned {
+                let out = std::process::Command::new(cmd)
+                    .arg(gsrc)
+                    .args(arg_strs)
+                    .output()
+                    .map_err(|e| format!("Failed to invoke candidate_cmd '{}': {}", cmd, e))?;
+                let cand_json = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if cand_json != h_json {
+                    return Err(format!(
+                        "Acceptance diff mismatch on '{}': rust={} vs candidate={}",
+                        gid, h_json, cand_json
+                    ));
+                }
+            }
+            Ok(1usize)
+        }
+        AcceptanceCase::Neg {
+            nid,
+            nsrc,
+            strict_flag,
+            want_code,
+            want_l,
+            want_c,
+        } => {
+            let h_json = run_omni_harness_json(nsrc, vec![OmniValue::Int(1000)], strict_flag, true);
+            let pure_json = run_pure_omni_driver_json(nsrc, vec![OmniValue::Int(1000)], strict_flag, true);
+            let want_tag = format!("\"code\":\"{}\",\"line\":{},\"col\":{}", want_code, want_l, want_c);
+            if !h_json.starts_with("{\"ok\":false") || !h_json.contains(&want_tag) || pure_json != h_json {
+                return Err(format!(
+                    "Acceptance negative golden '{}' mismatch: got {}, pure={}, expected {}",
+                    nid, h_json, pure_json, want_tag
+                ));
+            }
+            Ok(1usize)
+        }
+    })?;
+    verified_cases += results.into_iter().sum::<usize>();
 
     Ok(verified_cases)
 }

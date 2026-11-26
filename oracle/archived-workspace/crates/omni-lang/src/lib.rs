@@ -6,6 +6,7 @@
 //! each Rust unit with a Pure-Omni twin.
 
 pub mod compiler;
+pub mod lanes;
 pub mod ternary;
 pub mod verifier;
 pub mod host;
@@ -17,6 +18,7 @@ pub mod pure_omni;
 pub mod isa_table;
 
 pub use compiler::*;
+pub use lanes::*;
 pub use ternary::*;
 pub use verifier::*;
 pub use host::*;

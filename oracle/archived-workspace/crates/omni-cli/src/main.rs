@@ -157,160 +157,16 @@ fn assert_golden_monolith_vs_workspace(
 }
 
 pub fn run_workspace_selftest() -> Result<usize, String> {
-    let mut checks = 0usize;
-    let tc_safe = pack_tc(false, CAP_ID_PURE);
-    let tc_untr = pack_tc(true, CAP_ID_PURE);
-
-    // 1. Pack5 round-trip + sentinel check (Monolith vs Workspace)
-    let trits: Vec<i8> = (0..64).map(|i| ((i * 5 + 1) % 3) as i8 - 1).collect();
-    let m_packed = monolith::pack5_encode(&trits);
-    let w_packed = pack5_encode(&trits);
-    let unpacked = pack5_decode(&w_packed, trits.len()).map_err(|e| e.to_string())?;
-    if m_packed != w_packed || unpacked != trits || pack5_decode(&[SENTINEL_SPECIAL_TOKEN], 5).is_ok() {
-        return Err("Workspace pack5 differential check failed".into());
-    }
-    checks += 2;
-
-    // 2. Complete Verifier Clone Differential (Item 3: valid and invalid functions fed to BOTH verifiers)
-    let bad_taint = pack_fn_module(
-        &[(0x0000, vec![(TY_STR, tc_safe)])],
-        0,
-        &[(0x7EC0, TY_STR, tc_untr)],
-        TY_STRUCT,
-        cap_bit(CAP_ID_DB_W),
-        &[
-            vec![0x7E00, 0x7F63, TY_STRUCT, pack_tc(false, CAP_ID_DB_W), TOK_SYM_SCHEMA, 0x0000, TOK_FIELD_KV, 0x0000, 0x7EC0, TOK_INS_END],
-            vec![0x7F4A, 0x7E00, TOK_INS_END],
-        ],
-    );
-    assert_verifier_clone_eq(&bad_taint, false, "bad_taint")?;
-
-    let bad_cap = pack_fn_module(
-        &[(0x0000, vec![(TY_STR, tc_safe)])],
-        0,
-        &[(0x7EC0, TY_STR, tc_safe)],
-        TY_STRUCT,
-        0x0000,
-        &[
-            vec![0x7E00, 0x7F63, TY_STRUCT, pack_tc(false, CAP_ID_DB_W), TOK_SYM_SCHEMA, 0x0000, TOK_FIELD_KV, 0x0000, 0x7EC0, TOK_INS_END],
-            vec![0x7F4A, 0x7E00, TOK_INS_END],
-        ],
-    );
-    assert_verifier_clone_eq(&bad_cap, false, "bad_cap")?;
-
-    let bad_leak = pack_fn_module(
-        &[],
-        0,
-        &[(0x7EC0, TY_I64, tc_safe)],
-        TY_I64,
-        0x0000,
-        &[
-            vec![0x7E00, 0x7F01, TY_ARENA, tc_safe, TOK_IMM_I32, 0x0100, 0x0000, TOK_INS_END],
-            vec![0x7F4A, 0x7EC0, TOK_INS_END],
-        ],
-    );
-    assert_verifier_clone_eq(&bad_leak, false, "bad_leak")?;
-
-    let bad_ssa = pack_fn_module(
-        &[],
-        0,
-        &[(0x7EC0, TY_I64, tc_safe)],
-        TY_I64,
-        0x0000,
-        &[
-            vec![0x7E05, 0x7F06, TY_I64, tc_safe, 0x7EC0, TOK_INS_END],
-            vec![0x7F4A, 0x7E05, TOK_INS_END],
-        ],
-    );
-    assert_verifier_clone_eq(&bad_ssa, false, "bad_ssa")?;
-
-    let bad_op = pack_fn_module(
-        &[],
-        0,
-        &[(0x7EC0, TY_I64, tc_safe)],
-        TY_I64,
-        0x0000,
-        &[
-            vec![0x7E00, 0x7F99, TY_I64, tc_safe, 0x7EC0, TOK_INS_END],
-            vec![0x7F4A, 0x7E00, TOK_INS_END],
-        ],
-    );
-    assert_verifier_clone_eq(&bad_op, false, "bad_op")?;
-
-    let bad_lbl = assemble_omni_text_to_u16("PARAM $0 I64 SAFE\nRET_TY I64\nJMP 12\nRET $0\n")?;
-    assert_verifier_clone_eq(&bad_lbl, false, "bad_unresolved_label")?;
-
-    // Active reader borrow drop violation (dropping %0 while %1 borrows %0)
-    let bad_borrow_drop = pack_fn_module(
-        &[],
-        0,
-        &[(0x7EC0, TY_I64, tc_safe)],
-        TY_I64,
-        0x0000,
-        &[
-            vec![0x7E00, 0x7F01, TY_ARENA, tc_safe, TOK_IMM_I32, 0x0100, 0x0000, TOK_INS_END],
-            vec![0x7E01, 0x7F02, TY_ARENA, tc_safe, 0x7E00, TOK_INS_END],
-            vec![0x7F05, 0x7E00, TOK_INS_END],
-            vec![0x7F4A, 0x7EC0, TOK_INS_END],
-        ],
-    );
-    assert_verifier_clone_eq(&bad_borrow_drop, false, "bad_borrow_drop")?;
-    checks += 7;
-
-    // 3. Fuel & memory budget differential (Monolith VM vs Workspace VM)
-    let inf_u16 = assemble_omni_text_to_u16("PARAM $0 I64 SAFE\nRET_TY I64\nLABEL 1\nJMP 1\nRET $0\n")?;
-    let m_inf = monolith::decode_omni_token_stream(&inf_u16)?;
-    let w_inf = decode_omni_token_stream(&inf_u16)?;
-    let mut m_step_vm = monolith::OmniBinaryVm::with_budgets(64, 1024);
-    let mut w_step_vm = OmniBinaryVm::with_budgets(64, 1024);
-    if m_step_vm.execute_function(&m_inf, 0, vec![monolith::OmniValue::Int(1)]).is_ok()
-        || w_step_vm.execute_function(&w_inf, 0, vec![OmniValue::Int(1)]).is_ok()
-    {
-        return Err("VM failed to enforce step_limit=64".into());
-    }
-
-    let arena_64mb = pack_fn_module(
-        &[],
-        0,
-        &[(0x7EC0, TY_I64, tc_safe)],
-        TY_I64,
-        0x0000,
-        &[
-            vec![0x7E00, 0x7F01, TY_ARENA, tc_safe, TOK_IMM_I32, 0x0400, 0x0000, TOK_INS_END],
-            vec![0x7F05, 0x7E00, TOK_INS_END],
-            vec![0x7F4A, 0x7EC0, TOK_INS_END],
-        ],
-    );
-    assert_verifier_clone_eq(&arena_64mb, true, "arena_64mb")?;
-    let m_mod_64mb = monolith::decode_omni_token_stream(&arena_64mb)?;
-    let w_mod_64mb = decode_omni_token_stream(&arena_64mb)?;
-    if monolith::OmniBinaryVm::new().execute_function(&m_mod_64mb, 0, vec![monolith::OmniValue::Int(77)])?
-        != monolith::OmniValue::Int(77)
-        || OmniBinaryVm::new().execute_function(&w_mod_64mb, 0, vec![OmniValue::Int(77)])? != OmniValue::Int(77)
-    {
-        return Err("Default 256 MiB VM failed 64 MiB ARENA execution".into());
-    }
-    if monolith::OmniBinaryVm::with_budgets(1000, 1024)
-        .execute_function(&m_mod_64mb, 0, vec![monolith::OmniValue::Int(77)])
-        .is_ok()
-        || OmniBinaryVm::with_budgets(1000, 1024)
-            .execute_function(&w_mod_64mb, 0, vec![OmniValue::Int(77)])
-            .is_ok()
-    {
-        return Err("VM failed to reject 64 MiB ARENA under 1024-byte budget".into());
-    }
-    checks += 3;
-
-    // 4. Full Golden Set Differential across Monolith & Workspace (Items 2, 4, 5)
     let stage1_u16 = build_step7_stage1_compiler_stream();
     let m_stage1_u16 = monolith::build_step7_stage1_compiler_stream();
     if stage1_u16 != m_stage1_u16 {
         return Err("Stage-1 compiler stream mismatch between monolith and workspace".into());
     }
     assert_verifier_clone_eq(&stage1_u16, true, "stage1_self_compiler")?;
-    let stage1_mod = decode_omni_token_stream(&stage1_u16)?;
+    let stage1_mod = std::sync::Arc::new(decode_omni_token_stream(&stage1_u16)?);
+    let stage1_u16_arc = std::sync::Arc::new(stage1_u16);
 
-    let goldens: &[(&str, &[i64], i64, &str)] = &[
+    const GOLDENS: &[(&str, &[i64], i64, &str)] = &[
         ("PARAM $0 I64 SAFE\nRET_TY I64\n%0 = IABS $0\nRET %0\n", &[-42], 42, "IABS_-42"),
         ("PARAM $0 I64 SAFE\nRET_TY I64\n%0 = IABS $0\nRET %0\n", &[17], 17, "IABS_17"),
         ("PARAM $0 I64 SAFE\nRET_TY I64\n%0 = IABS $0\nRET %0\n", &[0], 0, "IABS_0"),
@@ -344,32 +200,7 @@ pub fn run_workspace_selftest() -> Result<usize, String> {
         ("PARAM $0 I64 SAFE\nPARAM $1 I64 SAFE\nPARAM $2 I64 SAFE\nRET_TY I64\n%0 = IMUL $0 4\n%1 = ISUB %0 $1\n%2 = SHL $2 1\n%3 = IADD %1 %2\n%4 = IDIV %3 3\n%5 = TCMP %4 35\n%6 = TNOT %5\n%7 = SEL_TRIT %6 25 50 75\n%8 = IADD %4 %7\nRET %8\n", &[30, 15, 9], 66, "CUSTOM_NON_SEED_ALU"),
     ];
 
-    for &(asm, inputs, expected, label) in goldens {
-        assert_golden_monolith_vs_workspace(asm, inputs, expected, &stage1_mod, label)?;
-        checks += 1;
-    }
-
-    // 5. All 64 Corpus Samples Differential (Monolith Verifier + VM vs Workspace Verifier + VM)
-    for idx in 0..64usize {
-        let (_, stream, m_args, m_expected) = monolith::build_transpiled_seed_stream(idx);
-        assert_verifier_clone_eq(&stream, true, &format!("corpus_{}", idx))?;
-        let m_mod = monolith::decode_omni_token_stream(&stream)?;
-        let w_mod = decode_omni_token_stream(&stream)?;
-        let w_args: Vec<OmniValue> = m_args.iter().map(to_ws_val).collect();
-        let w_expected = to_ws_val(&m_expected);
-
-        let mut m_vm = monolith::OmniBinaryVm::new();
-        let mut w_vm = OmniBinaryVm::new();
-        let m_actual = m_vm.execute_function(&m_mod, m_mod.functions[0].fn_idx, m_args)?;
-        let w_actual = w_vm.execute_function(&w_mod, w_mod.functions[0].fn_idx, w_args)?;
-        if to_ws_val(&m_actual) != w_actual || w_actual != w_expected {
-            return Err(format!("Corpus #{} differential mismatch: {:?} vs {:?}", idx, m_actual, w_actual));
-        }
-        checks += 1;
-    }
-
-    // 6. Surface Language (`omni-lang`) Differential (Monolith vs Workspace vs Assembler Vec<u16> Identity)
-    let surface_goldens: &[(&str, &str, Vec<u16>)] = &[
+    let surface_goldens = std::sync::Arc::new(vec![
         (
             "seed0_risk",
             "fn seed0_risk(base: i64, delta: i64) -> trit { let scaled = base * 2; let score = scaled + delta; let cmp = score <=> 50; let pos = +1t; let res = tand(cmp, pos); return res; }",
@@ -445,82 +276,10 @@ pub fn run_workspace_selftest() -> Result<usize, String> {
             "fn byte_buf_golden(x: i64) -> i64 { let buf = anew(0); buf = iset(buf, 10, 20, 30); buf = iset_i32(buf, 100); buf = iset_i64(buf, 200); let len = slen(buf); let cmp = x <=> 5; let sel = cmov(cmp, 100, 200, 300); let total = len + sel; return total; }",
             assemble_omni_text_to_u16("PARAM $0 I64 SAFE\nRET_TY I64\n%0 = ANEW 0\n%0 = ISET %0 10 20 30\n%0 = ISET %0 -4 100\n%0 = ISET %0 -8 200\n%1 = SLEN %0\n%2 = TCMP $0 5\n%3 = CMOV %2 100 200 300\n%4 = IADD %1 %3\nRET %4\n")?,
         ),
-    ];
+    ]);
 
-    for &(g_name, surf_src, ref expected_u16) in surface_goldens {
-        let m_asm = monolith::compile_omni_surface_to_asm(surf_src)?;
-        let w_asm = compile_omni_surface_to_asm(surf_src)?;
-        if m_asm != w_asm {
-            return Err(format!("Surface ASM mismatch on '{}': monolith != omni-lang", g_name));
-        }
-        let m_u16 = monolith::compile_omni_surface_to_u16(surf_src)?;
-        let w_u16 = compile_omni_surface_to_u16(surf_src)?;
-        if m_u16 != w_u16 || &w_u16 != expected_u16 {
-            return Err(format!("Surface Vec<u16> mismatch on '{}'", g_name));
-        }
-        assert_verifier_clone_eq(&w_u16, true, g_name)?;
-        checks += 1;
-    }
-
-    // 6b. Line & column error diagnostics differential (undefined vars, bad types, bad control flow)
-    let bad_surface_cases: &[(&str, &str, &str)] = &[
-        ("undefined_var", "fn bad(x: i64) -> i64 {\n    let r = missing_y + 1;\n    return r;\n}", "line 2, col 13: Undefined variable 'missing_y'"),
-        ("unknown_intrinsic", "fn bad(x: i64) -> i64 {\n    let r = foo_bar(x);\n    return r;\n}", "line 2, col 13: Unknown surface intrinsic or function 'foo_bar'"),
-        ("unknown_type", "fn bad(x: float128) -> i64 {\n    return x;\n}", "line 1, col 11: Unknown surface type 'float128'"),
-        ("mutate_param", "fn bad(x: i64) -> i64 {\n    x = x + 1;\n    return x;\n}", "line 2, col 5: Cannot reassign immutable function parameter 'x'"),
-        ("bad_control_flow_unresolved_goto", "fn bad(x: i64) -> i64 {\n    goto 9;\n    return x;\n}", "line 2, col 10: Unresolved branch target label 9"),
-        ("bad_control_flow_missing_match_arm", "fn bad(x: trit) -> i64 {\n    let r = match_trit x { neg => 1, zero => 2 };\n    return r;\n}", "line 2, col 13: match_trit missing 'pos' arm"),
-    ];
-    for &(c_name, bad_src, expected_loc) in bad_surface_cases {
-        let m_err = match monolith::compile_omni_surface_to_u16(bad_src) {
-            Err(e) => e,
-            Ok(_) => return Err(format!("Monolith surface compiler failed to reject '{}'", c_name)),
-        };
-        let w_err = match compile_omni_surface_to_u16(bad_src) {
-            Err(e) => e,
-            Ok(_) => return Err(format!("Workspace surface compiler failed to reject '{}'", c_name)),
-        };
-        if m_err != w_err || !w_err.contains(expected_loc) {
-            return Err(format!(
-                "Surface diagnostic mismatch on '{}': expected '{}', got m='{}' w='{}'",
-                c_name, expected_loc, m_err, w_err
-            ));
-        }
-        checks += 1;
-    }
-
-    // 6c. Surface-level taint & capability rejection differential
-    let surf_untr_ret = "fn bad_untr_ret(x: i64 @untrusted) -> i64 { return x; }";
-    let u16_untr_ret = compile_omni_surface_to_u16(surf_untr_ret)?;
-    assert_verifier_clone_eq(&u16_untr_ret, false, "surf_untr_ret")?;
-
-    let surf_untr_sink = "#[cap(AI)] fn bad_untr_sink(x: i64 @untrusted) -> trit { let g = egate(x); return g; }";
-    let u16_untr_sink = compile_omni_surface_to_u16(surf_untr_sink)?;
-    assert_verifier_clone_eq(&u16_untr_sink, false, "surf_untr_sink")?;
-
-    let surf_missing_cap = "fn bad_missing_cap(x: i64) -> trit { let g = egate(x); return g; }";
-    let u16_missing_cap = compile_omni_surface_to_u16(surf_missing_cap)?;
-    assert_verifier_clone_eq(&u16_missing_cap, false, "surf_missing_cap")?;
-
-    let surf_good_san = "#[cap(AI)] fn good_san(s: str @untrusted) -> str { let clean = san_prm(s); return clean; }";
-    let u16_good_san = compile_omni_surface_to_u16(surf_good_san)?;
-    assert_verifier_clone_eq(&u16_good_san, true, "surf_good_san")?;
-    checks += 4;
-
-    // 6d. Decision hook golden (`egate` / `0x7F35`)
-    let surf_decision_hook = "#[cap(AI)] fn decision_hook_golden(a: i64, b: i64) -> trit { let delta = a - b; let gate = egate(delta); return gate; }";
-    let u16_decision = compile_omni_surface_to_u16(surf_decision_hook)?;
-    assert_verifier_clone_eq(&u16_decision, true, "decision_hook_golden")?;
-    if execute_omni_surface_program(surf_decision_hook, vec![OmniValue::Int(30), OmniValue::Int(10)])? != OmniValue::Trit(1)
-        || execute_omni_surface_program(surf_decision_hook, vec![OmniValue::Int(5), OmniValue::Int(20)])? != OmniValue::Trit(-1)
-        || execute_omni_surface_program(surf_decision_hook, vec![OmniValue::Int(12), OmniValue::Int(12)])? != OmniValue::Trit(0)
-    {
-        return Err("Decision hook golden execution mismatch".into());
-    }
-    checks += 1;
-
-    // 6e. Pack5 lowering for trit values golden (10 trits -> 2 @PACK5 bytes vs 80 i64 bytes)
-    let surf_pack5 = "
+    const SURF_DECISION_HOOK: &str = "#[cap(AI)] fn decision_hook_golden(a: i64, b: i64) -> trit { let delta = a - b; let gate = egate(delta); return gate; }";
+    const SURF_PACK5: &str = "
         #[cap(AI)]
         fn pack5_trit_vec_golden() -> i64 {
             let v = [+1t, -1t, 0t, +1t, +1t, -1t, 0t, -1t, +1t, +1t];
@@ -534,102 +293,7 @@ pub fn run_workspace_selftest() -> Result<usize, String> {
             return res;
         }
     ";
-    let u16_pack5 = compile_omni_surface_to_u16(surf_pack5)?;
-    assert_verifier_clone_eq(&u16_pack5, true, "pack5_trit_vec_golden")?;
-    if execute_omni_surface_program(surf_pack5, vec![])? != OmniValue::Int(2455) {
-        return Err("Pack5 trit vector golden execution mismatch".into());
-    }
-    checks += 1;
-
-    // 6f. Multi-function `.omni` program golden (`CALL_I64` / `0x7F48`)
-    let surf_multi_fn = "
-        fn weighted_term(x: i64, w: i64) -> i64 {
-            let p = x * w;
-            let s = p + 5;
-            return s;
-        }
-
-        fn main(a: i64, b: i64) -> i64 {
-            let left = weighted_term(a, 3);
-            let right = weighted_term(b, 2);
-            let total = left + right;
-            return total;
-        }
-    ";
-    if execute_omni_surface_program(surf_multi_fn, vec![OmniValue::Int(10), OmniValue::Int(20)])? != OmniValue::Int(80) {
-        return Err("Multi-function surface program execution mismatch".into());
-    }
-    checks += 1;
-
-    // 6g. Module/file `include` linker + circular include detection
-    let mut vfs = BTreeMap::new();
-    vfs.insert(
-        String::from("trit_helper.omni"),
-        String::from("fn score_to_trit(v: i64, thresh: i64) -> trit { let c = v <=> thresh; return c; }"),
-    );
-    let main_with_inc = "
-        include \"trit_helper.omni\";
-        fn main(x: i64) -> i64 {
-            let t = score_to_trit(x, 50);
-            let out = sel_trit(t, 10, 20, 30);
-            return out;
-        }
-    ";
-    let expanded = resolve_omni_surface_includes(main_with_inc, None, Some(&vfs))?;
-    if execute_omni_surface_program(&expanded, vec![OmniValue::Int(75)])? != OmniValue::Int(30) {
-        return Err("Module include execution mismatch".into());
-    }
-    let mut bad_vfs = BTreeMap::new();
-    bad_vfs.insert(String::from("loop.omni"), String::from("include \"loop.omni\"; fn f(x: i64) -> i64 { return x; }"));
-    if resolve_omni_surface_includes("include \"loop.omni\"; fn main(x: i64) -> i64 { return x; }", None, Some(&bad_vfs)).is_ok() {
-        return Err("Module include failed to reject circular include".into());
-    }
-    checks += 2;
-
-    // 6h. Phase 4: Pre-conditioned `while` loop + `<=` / `+=` + Surface-to-ELF / Stage-1 / Wasm AOT Differential
-    let while_surf = "
-        fn while_sum_even_golden(limit: i64) -> i64 {
-            let acc = 0;
-            let i = 2;
-            while i <= limit {
-                acc += i;
-                i += 2;
-            }
-            return acc;
-        }
-    ";
-    let m_while_u16 = monolith::compile_omni_surface_to_u16(while_surf)?;
-    let w_while_u16 = compile_omni_surface_to_u16(while_surf)?;
-    if m_while_u16 != w_while_u16 {
-        return Err("Surface while_sum_even_golden u16 mismatch between monolith and workspace".into());
-    }
-    assert_verifier_clone_eq(&w_while_u16, true, "while_sum_even_golden")?;
-    let m_while_elf = monolith::compile_omni_surface_to_x86_64_elf(while_surf, 10, 0, 0)?;
-    let w_while_elf = compile_omni_surface_to_x86_64_elf(while_surf, 10, 0, 0)?;
-    let m_while_wasm = monolith::compile_omni_surface_to_wasm(while_surf)?;
-    let w_while_wasm = compile_omni_surface_to_wasm(while_surf)?;
-    let w_while_wasm_val = execute_omni_surface_wasm_i64(while_surf, &[10])?;
-    let mut s1_vm = OmniBinaryVm::new();
-    let s1_while_elf = match s1_vm.execute_function(
-        &stage1_mod,
-        0,
-        vec![OmniValue::U16Array(w_while_u16), OmniValue::Int(10), OmniValue::Int(0), OmniValue::Int(0)],
-    )? {
-        OmniValue::Bytes(b) => b,
-        _ => return Err("Stage-1 did not return Bytes on while_sum_even_golden".into()),
-    };
-    if m_while_elf != w_while_elf
-        || w_while_elf != s1_while_elf
-        || m_while_wasm != w_while_wasm
-        || w_while_wasm_val != 30
-        || execute_omni_surface_program(while_surf, vec![OmniValue::Int(10)])? != OmniValue::Int(30)
-    {
-        return Err("Surface while_sum_even_golden AOT/Stage-1/Wasm differential mismatch".into());
-    }
-    checks += 2;
-
-    // 6i. Phase 4: Surface Linear Memory Arena & Borrow Checker Differential
-    let arena_ok_surf = "
+    const ARENA_OK_SURF: &str = "
         fn arena_lifecycle_golden(x: i64) -> i64 {
             let a = arena(4096);
             let r = borrow_r(a);
@@ -639,330 +303,810 @@ pub fn run_workspace_selftest() -> Result<usize, String> {
             return res;
         }
     ";
-    let arena_ok_u16 = compile_omni_surface_to_u16(arena_ok_surf)?;
-    assert_verifier_clone_eq(&arena_ok_u16, true, "arena_lifecycle_golden")?;
-    if execute_omni_surface_program(arena_ok_surf, vec![OmniValue::Int(8)])? != OmniValue::Int(50) {
-        return Err("Surface arena_lifecycle_golden execution mismatch".into());
+
+    enum WsTask {
+        Pack5,
+        VerifierClone,
+        FuelMemBudget,
+        Golden(usize),
+        Corpus(usize),
+        SurfaceGolden(usize),
+        BadSurface,
+        SurfaceTaintCap,
+        DecisionHook,
+        Pack5TritVec,
+        MultiFn,
+        ModuleInclude,
+        WhileAot,
+        ArenaBorrow,
+        StrPipeline,
+        BareExpr,
+        Pack5DirectAot,
+        AotFirstAndStage1,
+        Budgets,
+        ZeroIrDirect,
+        DeepAudit,
+        M3aLock,
+        M3bGate,
+        M3FeRows,
+        HarnessAndAgentDiff,
+        Phase7KernelEq,
+        PhaseAFrontendEq,
+        PhaseBDriverEq,
+        PhaseCHostEq,
+        PhaseDBootstrapEq,
+        CoreSuiteEq,
+        #[cfg(all(unix, target_arch = "x86_64"))]
+        Stage1FixedPoint,
+        M2Guards,
     }
 
-    let arena_leak_u16 = compile_omni_surface_to_u16("fn bad_surface_arena_leak(x: i64) -> i64 { let a = arena(4096); return x; }")?;
-    assert_verifier_clone_eq(&arena_leak_u16, false, "bad_surface_arena_leak")?;
-
-    let borrow_conflict_u16 = compile_omni_surface_to_u16(
-        "fn bad_surface_borrow_conflict(x: i64) -> i64 { let a = arena(4096); let r = borrow_r(a); drop(a); drop(r); return x; }",
-    )?;
-    assert_verifier_clone_eq(&borrow_conflict_u16, false, "bad_surface_borrow_conflict")?;
-    checks += 3;
-
-    // 6j. Phase 4: Surface String Literals (`@ENG` Taint), Sanitizers, `scat`, `s2i`/`i2s`, and `fnv1a` Differential
-    let bad_str_u16 = compile_omni_surface_to_u16("fn bad_unsanitized_str_lit() -> str { let s = \"raw <script> span\"; return s; }")?;
-    assert_verifier_clone_eq(&bad_str_u16, false, "bad_unsanitized_str_lit")?;
-
-    let good_str_pipeline = "
-        #[cap(AI)]
-        fn str_pipeline_golden(n: i64) -> i64 {
-            let raw = \"120\";
-            let clean = san_prm(raw);
-            let parsed = s2i(clean);
-            let num_s = i2s(n);
-            let joined = scat(clean, num_s);
-            let len = slen(joined);
-            let h = fnv1a(clean);
-            let cmp = h <=> 0;
-            let bonus = sel_trit(cmp, 5, 0, 5);
-            return parsed + len + bonus;
-        }
-    ";
-    let good_str_u16 = compile_omni_surface_to_u16(good_str_pipeline)?;
-    assert_verifier_clone_eq(&good_str_u16, true, "str_pipeline_golden")?;
-    if execute_omni_surface_program(good_str_pipeline, vec![OmniValue::Int(45)])? != OmniValue::Int(130) {
-        return Err("Surface str_pipeline_golden execution mismatch".into());
+    let mut tasks: Vec<WsTask> = Vec::with_capacity(140);
+    tasks.push(WsTask::Pack5);
+    tasks.push(WsTask::VerifierClone);
+    tasks.push(WsTask::FuelMemBudget);
+    for i in 0..GOLDENS.len() {
+        tasks.push(WsTask::Golden(i));
     }
-    checks += 2;
+    for i in 0..64usize {
+        tasks.push(WsTask::Corpus(i));
+    }
+    for i in 0..surface_goldens.len() {
+        tasks.push(WsTask::SurfaceGolden(i));
+    }
+    tasks.push(WsTask::BadSurface);
+    tasks.push(WsTask::SurfaceTaintCap);
+    tasks.push(WsTask::DecisionHook);
+    tasks.push(WsTask::Pack5TritVec);
+    tasks.push(WsTask::MultiFn);
+    tasks.push(WsTask::ModuleInclude);
+    tasks.push(WsTask::WhileAot);
+    tasks.push(WsTask::ArenaBorrow);
+    tasks.push(WsTask::StrPipeline);
+    tasks.push(WsTask::BareExpr);
+    tasks.push(WsTask::Pack5DirectAot);
+    tasks.push(WsTask::AotFirstAndStage1);
+    tasks.push(WsTask::Budgets);
+    tasks.push(WsTask::ZeroIrDirect);
+    tasks.push(WsTask::DeepAudit);
+    tasks.push(WsTask::M3aLock);
+    tasks.push(WsTask::M3bGate);
+    tasks.push(WsTask::M3FeRows);
+    tasks.push(WsTask::HarnessAndAgentDiff);
+    tasks.push(WsTask::Phase7KernelEq);
+    tasks.push(WsTask::PhaseAFrontendEq);
+    tasks.push(WsTask::PhaseBDriverEq);
+    tasks.push(WsTask::PhaseCHostEq);
+    tasks.push(WsTask::PhaseDBootstrapEq);
+    tasks.push(WsTask::CoreSuiteEq);
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    tasks.push(WsTask::Stage1FixedPoint);
+    tasks.push(WsTask::M2Guards);
 
-    // 6k. Phase 4: Bare-Expression `eval` / `repl` Wrapper Differential
-    if execute_omni_surface_program("egate(30 - 10)", vec![])? != OmniValue::Trit(1)
-        || execute_omni_surface_program("10 <= 10", vec![])? != OmniValue::Trit(1)
-        || execute_omni_surface_program("san_dom(\"<b>ok</b>\")", vec![])?
-            != OmniValue::Str(String::from("&lt;b&gt;ok&lt;/b&gt;"))
-    {
-        return Err("Bare-expression wrap_omni_surface_snippet execution mismatch".into());
-    }
-    checks += 1;
+    let stage1_mod_for_lanes = std::sync::Arc::clone(&stage1_mod);
+    let stage1_u16_for_lanes = std::sync::Arc::clone(&stage1_u16_arc);
+    let surface_goldens_for_lanes = std::sync::Arc::clone(&surface_goldens);
 
-    // 6l. Phase 5: Direct @PACK5 Trit Operations & Pack5/EGATE AOT (x86-64 ELF64 + 64-bit Wasm) Differential
-    let p5_a = pack5_encode(&[1, -1, 0, 1, 1, -1, 0, -1, 1, 1]);
-    let p5_b = pack5_encode(&[1, 1, 0, -1, 1, -1, 0, 1, 1, -1]);
-    let direct_dot = pack5_tdot_direct(&p5_a, &p5_b, 10).map_err(|e| e.to_string())?;
-    let m_direct_dot = monolith::pack5_tdot_direct(&p5_a, &p5_b, 10).map_err(|e| e.to_string())?;
-    let direct_sum = pack5_sum_direct(&p5_a, 10).map_err(|e| e.to_string())?;
-    let m_direct_sum = monolith::pack5_sum_direct(&p5_a, 10).map_err(|e| e.to_string())?;
-    if direct_dot != m_direct_dot || direct_dot != 0 || direct_sum != m_direct_sum || direct_sum != 2 {
-        return Err("Direct @PACK5 tdot/sum mismatch between monolith and workspace".into());
-    }
-    let m_p5_elf = monolith::compile_omni_surface_to_x86_64_elf(surf_pack5, 0, 0, 0)?;
-    let w_p5_elf = compile_omni_surface_to_x86_64_elf(surf_pack5, 0, 0, 0)?;
-    let m_p5_wasm_val = monolith::execute_omni_surface_wasm_i64(surf_pack5, &[])?;
-    let w_p5_wasm_val = execute_omni_surface_wasm_i64(surf_pack5, &[])?;
-    let w_dec_wasm_val = execute_omni_surface_wasm_i64(surf_decision_hook, &[30, 10])?;
-    if m_p5_elf != w_p5_elf || m_p5_wasm_val != 2455 || w_p5_wasm_val != 2455 || w_dec_wasm_val != 1 {
-        return Err("Phase 5 @PACK5 / EGATE AOT (ELF64 + Wasm) differential mismatch".into());
-    }
-    let surf_pack5_direct = "
-        #[cap(AI)]
-        fn pack5_direct_golden() -> i64 {
-            let p = pack5_bytes([+1t, -1t, 0t, +1t, +1t, -1t, 0t, -1t, +1t, +1t]);
-            let dot = pack5_tdot(p, p);
-            let gate = pack5_gate(p);
-            let len = pack5_len(p);
-            return len * 100 + dot * 10 + gate;
-        }
-    ";
-    if execute_omni_surface_wasm_i64(surf_pack5_direct, &[])? != 281
-        || execute_omni_surface_program(surf_pack5_direct, vec![])? != OmniValue::Int(281)
-    {
-        return Err("Phase 5 pack5_bytes direct AOT execution mismatch".into());
-    }
-    checks += 3;
-
-    // 6m. Phase 5: AOT-First Hot-Path Dispatcher & Stage-1 Surface-to-ELF Differential
-    let (aot_v1, backend1) = execute_omni_surface_aot_first(surf_pack5, vec![])?;
-    let (aot_v2, backend2) = execute_omni_surface_aot_first(surf_decision_hook, vec![OmniValue::Int(5), OmniValue::Int(20)])?;
-    let (aot_v3, backend3) = execute_omni_surface_aot_first(arena_ok_surf, vec![OmniValue::Int(8)])?;
-    if backend1 != "aot" || aot_v1 != OmniValue::Int(2455)
-        || backend2 != "aot" || aot_v2 != OmniValue::Trit(-1)
-        || backend3 != "aot" || aot_v3 != OmniValue::Int(50)
-    {
-        return Err("execute_omni_surface_aot_first failed to dispatch hot numeric/@PACK5/arena paths to AOT".into());
-    }
-    let s1_seed0_elf = compile_omni_surface_via_stage1_to_elf(surface_goldens[0].1, 30, 15, 0)?;
-    let aot_seed0_elf = compile_omni_surface_to_x86_64_elf(surface_goldens[0].1, 30, 15, 0)?;
-    if s1_seed0_elf != aot_seed0_elf {
-        return Err("compile_omni_surface_via_stage1_to_elf mismatch against direct x86-64 AOT".into());
-    }
-    checks += 2;
-
-    // 6n. Phase 5: Explicit Step & Memory Budgets (`#[step_budget(N)]`, `#[mem_budget(N)]`) across AOT & VM
-    let inf_surface = "
-        #[step_budget(150)]
-        fn runaway_loop(x: i64) -> i64 {
-            let acc = x;
-            while +1t {
-                acc += 1;
+    // Wave A: execute all independent workspace checks across adaptive parallel lanes
+    // (fixed round-robin partition, fixed-order aggregation).
+    let counts = monolith::run_selftest_items_in_lanes(tasks, move |task| {
+        let tc_safe = pack_tc(false, CAP_ID_PURE);
+        let tc_untr = pack_tc(true, CAP_ID_PURE);
+        match task {
+            WsTask::Pack5 => {
+                // 1. Pack5 round-trip + sentinel check (Monolith vs Workspace)
+                let trits: Vec<i8> = (0..64).map(|i| ((i * 5 + 1) % 3) as i8 - 1).collect();
+                let m_packed = monolith::pack5_encode(&trits);
+                let w_packed = pack5_encode(&trits);
+                let unpacked = pack5_decode(&w_packed, trits.len()).map_err(|e| e.to_string())?;
+                if m_packed != w_packed
+                    || unpacked != trits
+                    || pack5_decode(&[SENTINEL_SPECIAL_TOKEN], 5).is_ok()
+                {
+                    return Err("Workspace pack5 differential check failed".into());
+                }
+                Ok(2)
             }
-            return acc;
-        }
-    ";
-    if execute_omni_surface_program(inf_surface, vec![OmniValue::Int(1)]).is_ok()
-        || execute_omni_surface_program_with_budgets(inf_surface, vec![OmniValue::Int(1)], Some(150), None).is_ok()
-        || monolith::execute_omni_surface_program(inf_surface, vec![monolith::OmniValue::Int(1)]).is_ok()
-    {
-        return Err("Step budget failed to halt runaway surface loop in AOT/VM".into());
-    }
-    let mem_blowup_surface = "
-        #[mem_budget(512)]
-        fn runaway_alloc(x: i64) -> i64 {
-            let a = arena(4096);
-            drop(a);
-            return x;
-        }
-    ";
-    if execute_omni_surface_program(mem_blowup_surface, vec![OmniValue::Int(1)]).is_ok()
-        || execute_omni_surface_program_with_budgets(mem_blowup_surface, vec![OmniValue::Int(1)], None, Some(512)).is_ok()
-        || monolith::execute_omni_surface_program(mem_blowup_surface, vec![monolith::OmniValue::Int(1)]).is_ok()
-    {
-        return Err("Memory budget failed to reject oversized arena in AOT/VM".into());
-    }
-    let vm_buf_blowup_surface = "
-        #[mem_budget(256)]
-        fn runaway_buf() -> i64 {
-            let b = anew(0);
-            let i = 0;
-            while i < 100 {
-                b = iset_i64(b, i);
-                i += 1;
+            WsTask::VerifierClone => {
+                // 2. Complete Verifier Clone Differential (Item 3: valid and invalid functions fed to BOTH verifiers)
+                let bad_taint = pack_fn_module(
+                    &[(0x0000, vec![(TY_STR, tc_safe)])],
+                    0,
+                    &[(0x7EC0, TY_STR, tc_untr)],
+                    TY_STRUCT,
+                    cap_bit(CAP_ID_DB_W),
+                    &[
+                        vec![0x7E00, 0x7F63, TY_STRUCT, pack_tc(false, CAP_ID_DB_W), TOK_SYM_SCHEMA, 0x0000, TOK_FIELD_KV, 0x0000, 0x7EC0, TOK_INS_END],
+                        vec![0x7F4A, 0x7E00, TOK_INS_END],
+                    ],
+                );
+                assert_verifier_clone_eq(&bad_taint, false, "bad_taint")?;
+
+                let bad_cap = pack_fn_module(
+                    &[(0x0000, vec![(TY_STR, tc_safe)])],
+                    0,
+                    &[(0x7EC0, TY_STR, tc_safe)],
+                    TY_STRUCT,
+                    0x0000,
+                    &[
+                        vec![0x7E00, 0x7F63, TY_STRUCT, pack_tc(false, CAP_ID_DB_W), TOK_SYM_SCHEMA, 0x0000, TOK_FIELD_KV, 0x0000, 0x7EC0, TOK_INS_END],
+                        vec![0x7F4A, 0x7E00, TOK_INS_END],
+                    ],
+                );
+                assert_verifier_clone_eq(&bad_cap, false, "bad_cap")?;
+
+                let bad_leak = pack_fn_module(
+                    &[],
+                    0,
+                    &[(0x7EC0, TY_I64, tc_safe)],
+                    TY_I64,
+                    0x0000,
+                    &[
+                        vec![0x7E00, 0x7F01, TY_ARENA, tc_safe, TOK_IMM_I32, 0x0100, 0x0000, TOK_INS_END],
+                        vec![0x7F4A, 0x7EC0, TOK_INS_END],
+                    ],
+                );
+                assert_verifier_clone_eq(&bad_leak, false, "bad_leak")?;
+
+                let bad_ssa = pack_fn_module(
+                    &[],
+                    0,
+                    &[(0x7EC0, TY_I64, tc_safe)],
+                    TY_I64,
+                    0x0000,
+                    &[
+                        vec![0x7E05, 0x7F06, TY_I64, tc_safe, 0x7EC0, TOK_INS_END],
+                        vec![0x7F4A, 0x7E05, TOK_INS_END],
+                    ],
+                );
+                assert_verifier_clone_eq(&bad_ssa, false, "bad_ssa")?;
+
+                let bad_op = pack_fn_module(
+                    &[],
+                    0,
+                    &[(0x7EC0, TY_I64, tc_safe)],
+                    TY_I64,
+                    0x0000,
+                    &[
+                        vec![0x7E00, 0x7F99, TY_I64, tc_safe, 0x7EC0, TOK_INS_END],
+                        vec![0x7F4A, 0x7E00, TOK_INS_END],
+                    ],
+                );
+                assert_verifier_clone_eq(&bad_op, false, "bad_op")?;
+
+                let bad_lbl = assemble_omni_text_to_u16("PARAM $0 I64 SAFE\nRET_TY I64\nJMP 12\nRET $0\n")?;
+                assert_verifier_clone_eq(&bad_lbl, false, "bad_unresolved_label")?;
+
+                // Active reader borrow drop violation (dropping %0 while %1 borrows %0)
+                let bad_borrow_drop = pack_fn_module(
+                    &[],
+                    0,
+                    &[(0x7EC0, TY_I64, tc_safe)],
+                    TY_I64,
+                    0x0000,
+                    &[
+                        vec![0x7E00, 0x7F01, TY_ARENA, tc_safe, TOK_IMM_I32, 0x0100, 0x0000, TOK_INS_END],
+                        vec![0x7E01, 0x7F02, TY_ARENA, tc_safe, 0x7E00, TOK_INS_END],
+                        vec![0x7F05, 0x7E00, TOK_INS_END],
+                        vec![0x7F4A, 0x7EC0, TOK_INS_END],
+                    ],
+                );
+                assert_verifier_clone_eq(&bad_borrow_drop, false, "bad_borrow_drop")?;
+                Ok(7)
             }
-            return slen(b);
-        }
-    ";
-    if execute_omni_surface_program_with_budgets(vm_buf_blowup_surface, vec![], None, None).is_ok() {
-        return Err("VM memory budget failed to reject runaway byte-buffer growth in ISET".into());
-    }
-    checks += 3;
+            WsTask::FuelMemBudget => {
+                // 3. Fuel & memory budget differential (Monolith VM vs Workspace VM)
+                let inf_u16 = assemble_omni_text_to_u16("PARAM $0 I64 SAFE\nRET_TY I64\nLABEL 1\nJMP 1\nRET $0\n")?;
+                let m_inf = monolith::decode_omni_token_stream(&inf_u16)?;
+                let w_inf = decode_omni_token_stream(&inf_u16)?;
+                let mut m_step_vm = monolith::OmniBinaryVm::with_budgets(64, 1024);
+                let mut w_step_vm = OmniBinaryVm::with_budgets(64, 1024);
+                if m_step_vm.execute_function(&m_inf, 0, vec![monolith::OmniValue::Int(1)]).is_ok()
+                    || w_step_vm.execute_function(&w_inf, 0, vec![OmniValue::Int(1)]).is_ok()
+                {
+                    return Err("VM failed to enforce step_limit=64".into());
+                }
 
-    // 6o. Phase 5: Zero Long-Lived Intermediate IR Direct Emission & Direct `verify_u16_stream`
-    for &(g_name, surf_src, ref expected_u16) in surface_goldens {
-        let direct_u16 = compile_omni_surface_to_u16(surf_src)?;
-        let via_asm_u16 = assemble_omni_text_to_u16(&compile_omni_surface_to_asm(surf_src)?)?;
-        let reps = verify_u16_stream(&direct_u16)?;
-        if direct_u16 != via_asm_u16 || &direct_u16 != expected_u16 || reps.len() != 1 || !reps[0].passed {
-            return Err(format!("Zero-IR direct u16 emission or verify_u16_stream mismatch on '{}'", g_name));
-        }
-    }
-    checks += 1;
-
-    // 6p. Deep Audit Regressions: 50-Trit (>35) @PACK5 + Dynamic Loop IGET in AOT, Sentinel 243..=255 Rejection, & Uncalled Helper Verification
-    let surf_pack5_50 = "
-        #[cap(AI)]
-        fn pack5_50_dynamic_golden(limit: i64) -> i64 {
-            let v = [
-                +1t, -1t, 0t, +1t, +1t, -1t, 0t, -1t, +1t, +1t,
-                +1t, -1t, 0t, +1t, +1t, -1t, 0t, -1t, +1t, +1t,
-                +1t, -1t, 0t, +1t, +1t, -1t, 0t, -1t, +1t, +1t,
-                +1t, -1t, 0t, +1t, +1t, -1t, 0t, -1t, +1t, +1t,
-                +1t, -1t, 0t, +1t, +1t, -1t, 0t, -1t, +1t, +1t
-            ];
-            let dot = tdot(v, v);
-            let gate = egate(v);
-            let acc = 0;
-            let idx = 0;
-            while idx < limit {
-                acc += iget(v, idx);
-                idx += 1;
+                let arena_64mb = pack_fn_module(
+                    &[],
+                    0,
+                    &[(0x7EC0, TY_I64, tc_safe)],
+                    TY_I64,
+                    0x0000,
+                    &[
+                        vec![0x7E00, 0x7F01, TY_ARENA, tc_safe, TOK_IMM_I32, 0x0400, 0x0000, TOK_INS_END],
+                        vec![0x7F05, 0x7E00, TOK_INS_END],
+                        vec![0x7F4A, 0x7EC0, TOK_INS_END],
+                    ],
+                );
+                assert_verifier_clone_eq(&arena_64mb, true, "arena_64mb")?;
+                let m_mod_64mb = monolith::decode_omni_token_stream(&arena_64mb)?;
+                let w_mod_64mb = decode_omni_token_stream(&arena_64mb)?;
+                if monolith::OmniBinaryVm::new().execute_function(&m_mod_64mb, 0, vec![monolith::OmniValue::Int(77)])?
+                    != monolith::OmniValue::Int(77)
+                    || OmniBinaryVm::new().execute_function(&w_mod_64mb, 0, vec![OmniValue::Int(77)])? != OmniValue::Int(77)
+                {
+                    return Err("Default 256 MiB VM failed 64 MiB ARENA execution".into());
+                }
+                if monolith::OmniBinaryVm::with_budgets(1000, 1024)
+                    .execute_function(&m_mod_64mb, 0, vec![monolith::OmniValue::Int(77)])
+                    .is_ok()
+                    || OmniBinaryVm::with_budgets(1000, 1024)
+                        .execute_function(&w_mod_64mb, 0, vec![OmniValue::Int(77)])
+                        .is_ok()
+                {
+                    return Err("VM failed to reject 64 MiB ARENA under 1024-byte budget".into());
+                }
+                Ok(3)
             }
-            return dot * 100 + acc * 10 + gate;
-        }
-    ";
-    let (v_50, b_50) = execute_omni_surface_aot_first(surf_pack5_50, vec![OmniValue::Int(50)])?;
-    let vm_50 = execute_omni_surface_program_with_budgets(surf_pack5_50, vec![OmniValue::Int(50)], None, None)?;
-    let m_elf_50 = monolith::compile_omni_surface_to_x86_64_elf(surf_pack5_50, 50, 0, 0)?;
-    let w_elf_50 = compile_omni_surface_to_x86_64_elf(surf_pack5_50, 50, 0, 0)?;
-    if b_50 != "aot" || v_50 != OmniValue::Int(4101) || vm_50 != OmniValue::Int(4101) || m_elf_50 != w_elf_50 {
-        return Err("50-trit (>35) @PACK5 + dynamic loop IGET AOT/VM differential mismatch".into());
-    }
+            WsTask::Golden(idx) => {
+                // 4. Full Golden Set Differential across Monolith & Workspace (Items 2, 4, 5)
+                let (asm, inputs, expected, label) = GOLDENS[idx];
+                assert_golden_monolith_vs_workspace(asm, inputs, expected, &stage1_mod_for_lanes, label)?;
+                Ok(1)
+            }
+            WsTask::Corpus(idx) => {
+                // 5. All 64 Corpus Samples Differential (Monolith Verifier + VM vs Workspace Verifier + VM)
+                let (_, stream, m_args, m_expected) = monolith::build_transpiled_seed_stream(idx);
+                assert_verifier_clone_eq(&stream, true, &format!("corpus_{}", idx))?;
+                let m_mod = monolith::decode_omni_token_stream(&stream)?;
+                let w_mod = decode_omni_token_stream(&stream)?;
+                let w_args: Vec<OmniValue> = m_args.iter().map(to_ws_val).collect();
+                let w_expected = to_ws_val(&m_expected);
 
-    let corrupt_pack5_asm = "
-        CAP_MASK 16
-        RET_TY I64
-        %0 = ANEW 0
-        %0 = ISET %0 250
-        %1 = UNPACK5 %0 5
-        %2 = EGATE %1
-        RET %2
-    ";
-    let corrupt_u16 = assemble_omni_text_to_u16(corrupt_pack5_asm)?;
-    let corrupt_mod = decode_omni_token_stream(&corrupt_u16)?;
-    let mut c_vm = OmniBinaryVm::new();
-    if compile_pure_u16_to_wasm(&corrupt_u16).is_ok()
-        || compile_pure_u16_to_x86_64_elf_with_args(&corrupt_u16, 0, 0, 0).is_ok()
-        || c_vm.execute_function(&corrupt_mod, 0, vec![]).is_ok()
-    {
-        return Err("Corrupt @PACK5 sentinel byte (250 > 242) was not rejected across AOT and VM".into());
-    }
+                let mut m_vm = monolith::OmniBinaryVm::new();
+                let mut w_vm = OmniBinaryVm::new();
+                let m_actual = m_vm.execute_function(&m_mod, m_mod.functions[0].fn_idx, m_args)?;
+                let w_actual = w_vm.execute_function(&w_mod, w_mod.functions[0].fn_idx, w_args)?;
+                if to_ws_val(&m_actual) != w_actual || w_actual != w_expected {
+                    return Err(format!(
+                        "Corpus #{} differential mismatch: {:?} vs {:?}",
+                        idx, m_actual, w_actual
+                    ));
+                }
+                Ok(1)
+            }
+            WsTask::SurfaceGolden(idx) => {
+                // 6. Surface Language (`omni-lang`) Differential (Monolith vs Workspace vs Assembler Vec<u16> Identity)
+                let (g_name, surf_src, ref expected_u16) = surface_goldens_for_lanes[idx];
+                let m_asm = monolith::compile_omni_surface_to_asm(surf_src)?;
+                let w_asm = compile_omni_surface_to_asm(surf_src)?;
+                if m_asm != w_asm {
+                    return Err(format!("Surface ASM mismatch on '{}': monolith != omni-lang", g_name));
+                }
+                let m_u16 = monolith::compile_omni_surface_to_u16(surf_src)?;
+                let w_u16 = compile_omni_surface_to_u16(surf_src)?;
+                if m_u16 != w_u16 || &w_u16 != expected_u16 {
+                    return Err(format!("Surface Vec<u16> mismatch on '{}'", g_name));
+                }
+                assert_verifier_clone_eq(&w_u16, true, g_name)?;
+                Ok(1)
+            }
+            WsTask::BadSurface => {
+                // 6b. Line & column error diagnostics differential (undefined vars, bad types, bad control flow)
+                let bad_surface_cases: &[(&str, &str, &str)] = &[
+                    ("undefined_var", "fn bad(x: i64) -> i64 {\n    let r = missing_y + 1;\n    return r;\n}", "line 2, col 13: Undefined variable 'missing_y'"),
+                    ("unknown_intrinsic", "fn bad(x: i64) -> i64 {\n    let r = foo_bar(x);\n    return r;\n}", "line 2, col 13: Unknown surface intrinsic or function 'foo_bar'"),
+                    ("unknown_type", "fn bad(x: float128) -> i64 {\n    return x;\n}", "line 1, col 11: Unknown surface type 'float128'"),
+                    ("mutate_param", "fn bad(x: i64) -> i64 {\n    x = x + 1;\n    return x;\n}", "line 2, col 5: Cannot reassign immutable function parameter 'x'"),
+                    ("bad_control_flow_unresolved_goto", "fn bad(x: i64) -> i64 {\n    goto 9;\n    return x;\n}", "line 2, col 10: Unresolved branch target label 9"),
+                    ("bad_control_flow_missing_match_arm", "fn bad(x: trit) -> i64 {\n    let r = match_trit x { neg => 1, zero => 2 };\n    return r;\n}", "line 2, col 13: match_trit missing 'pos' arm"),
+                ];
+                let mut c = 0usize;
+                for &(c_name, bad_src, expected_loc) in bad_surface_cases {
+                    let m_err = match monolith::compile_omni_surface_to_u16(bad_src) {
+                        Err(e) => e,
+                        Ok(_) => return Err(format!("Monolith surface compiler failed to reject '{}'", c_name)),
+                    };
+                    let w_err = match compile_omni_surface_to_u16(bad_src) {
+                        Err(e) => e,
+                        Ok(_) => return Err(format!("Workspace surface compiler failed to reject '{}'", c_name)),
+                    };
+                    if m_err != w_err || !w_err.contains(expected_loc) {
+                        return Err(format!(
+                            "Surface diagnostic mismatch on '{}': expected '{}', got m='{}' w='{}'",
+                            c_name, expected_loc, m_err, w_err
+                        ));
+                    }
+                    c += 1;
+                }
+                Ok(c)
+            }
+            WsTask::SurfaceTaintCap => {
+                // 6c. Surface-level taint & capability rejection differential
+                let surf_untr_ret = "fn bad_untr_ret(x: i64 @untrusted) -> i64 { return x; }";
+                let u16_untr_ret = compile_omni_surface_to_u16(surf_untr_ret)?;
+                assert_verifier_clone_eq(&u16_untr_ret, false, "surf_untr_ret")?;
 
-    let uncalled_tainted_helper = "
-        fn bad_helper(u: i64 @untrusted) -> i64 {
-            return u;
-        }
-        fn main(x: i64) -> i64 {
-            return x + 1;
-        }
-    ";
-    if execute_omni_surface_program_with_budgets(uncalled_tainted_helper, vec![OmniValue::Int(5)], None, None).is_ok()
-        || execute_omni_surface_program(uncalled_tainted_helper, vec![OmniValue::Int(5)]).is_ok()
-    {
-        return Err("Uncalled helper function with taint violation was not rejected before execution".into());
-    }
-    checks += 3;
+                let surf_untr_sink = "#[cap(AI)] fn bad_untr_sink(x: i64 @untrusted) -> trit { let g = egate(x); return g; }";
+                let u16_untr_sink = compile_omni_surface_to_u16(surf_untr_sink)?;
+                assert_verifier_clone_eq(&u16_untr_sink, false, "surf_untr_sink")?;
 
-    // 6q..6u. AI-First Surface Additions Differential: Golden Size Gate, Strict Single-Form Grammar,
-    // Machine-Readable Error Codes, Full-Stack Route + DB/KV Host ABI, and Version-Locked Harness
+                let surf_missing_cap = "fn bad_missing_cap(x: i64) -> trit { let g = egate(x); return g; }";
+                let u16_missing_cap = compile_omni_surface_to_u16(surf_missing_cap)?;
+                assert_verifier_clone_eq(&u16_missing_cap, false, "surf_missing_cap")?;
+
+                let surf_good_san = "#[cap(AI)] fn good_san(s: str @untrusted) -> str { let clean = san_prm(s); return clean; }";
+                let u16_good_san = compile_omni_surface_to_u16(surf_good_san)?;
+                assert_verifier_clone_eq(&u16_good_san, true, "surf_good_san")?;
+                Ok(4)
+            }
+            WsTask::DecisionHook => {
+                // 6d. Decision hook golden (`egate` / `0x7F35`)
+                let u16_decision = compile_omni_surface_to_u16(SURF_DECISION_HOOK)?;
+                assert_verifier_clone_eq(&u16_decision, true, "decision_hook_golden")?;
+                if execute_omni_surface_program(SURF_DECISION_HOOK, vec![OmniValue::Int(30), OmniValue::Int(10)])? != OmniValue::Trit(1)
+                    || execute_omni_surface_program(SURF_DECISION_HOOK, vec![OmniValue::Int(5), OmniValue::Int(20)])? != OmniValue::Trit(-1)
+                    || execute_omni_surface_program(SURF_DECISION_HOOK, vec![OmniValue::Int(12), OmniValue::Int(12)])? != OmniValue::Trit(0)
+                {
+                    return Err("Decision hook golden execution mismatch".into());
+                }
+                Ok(1)
+            }
+            WsTask::Pack5TritVec => {
+                // 6e. Pack5 lowering for trit values golden (10 trits -> 2 @PACK5 bytes vs 80 i64 bytes)
+                let u16_pack5 = compile_omni_surface_to_u16(SURF_PACK5)?;
+                assert_verifier_clone_eq(&u16_pack5, true, "pack5_trit_vec_golden")?;
+                if execute_omni_surface_program(SURF_PACK5, vec![])? != OmniValue::Int(2455) {
+                    return Err("Pack5 trit vector golden execution mismatch".into());
+                }
+                Ok(1)
+            }
+            WsTask::MultiFn => {
+                // 6f. Multi-function `.omni` program golden (`CALL_I64` / `0x7F48`)
+                let surf_multi_fn = "
+                    fn weighted_term(x: i64, w: i64) -> i64 {
+                        let p = x * w;
+                        let s = p + 5;
+                        return s;
+                    }
+
+                    fn main(a: i64, b: i64) -> i64 {
+                        let left = weighted_term(a, 3);
+                        let right = weighted_term(b, 2);
+                        let total = left + right;
+                        return total;
+                    }
+                ";
+                if execute_omni_surface_program(surf_multi_fn, vec![OmniValue::Int(10), OmniValue::Int(20)])? != OmniValue::Int(80) {
+                    return Err("Multi-function surface program execution mismatch".into());
+                }
+                Ok(1)
+            }
+            WsTask::ModuleInclude => {
+                // 6g. Module/file `include` linker + circular include detection
+                let mut vfs = BTreeMap::new();
+                vfs.insert(
+                    String::from("trit_helper.omni"),
+                    String::from("fn score_to_trit(v: i64, thresh: i64) -> trit { let c = v <=> thresh; return c; }"),
+                );
+                let main_with_inc = "
+                    include \"trit_helper.omni\";
+                    fn main(x: i64) -> i64 {
+                        let t = score_to_trit(x, 50);
+                        let out = sel_trit(t, 10, 20, 30);
+                        return out;
+                    }
+                ";
+                let expanded = resolve_omni_surface_includes(main_with_inc, None, Some(&vfs))?;
+                if execute_omni_surface_program(&expanded, vec![OmniValue::Int(75)])? != OmniValue::Int(30) {
+                    return Err("Module include execution mismatch".into());
+                }
+                let mut bad_vfs = BTreeMap::new();
+                bad_vfs.insert(String::from("loop.omni"), String::from("include \"loop.omni\"; fn f(x: i64) -> i64 { return x; }"));
+                if resolve_omni_surface_includes("include \"loop.omni\"; fn main(x: i64) -> i64 { return x; }", None, Some(&bad_vfs)).is_ok() {
+                    return Err("Module include failed to reject circular include".into());
+                }
+                Ok(2)
+            }
+            WsTask::WhileAot => {
+                // 6h. Phase 4: Pre-conditioned `while` loop + `<=` / `+=` + Surface-to-ELF / Stage-1 / Wasm AOT Differential
+                let while_surf = "
+                    fn while_sum_even_golden(limit: i64) -> i64 {
+                        let acc = 0;
+                        let i = 2;
+                        while i <= limit {
+                            acc += i;
+                            i += 2;
+                        }
+                        return acc;
+                    }
+                ";
+                let m_while_u16 = monolith::compile_omni_surface_to_u16(while_surf)?;
+                let w_while_u16 = compile_omni_surface_to_u16(while_surf)?;
+                if m_while_u16 != w_while_u16 {
+                    return Err("Surface while_sum_even_golden u16 mismatch between monolith and workspace".into());
+                }
+                assert_verifier_clone_eq(&w_while_u16, true, "while_sum_even_golden")?;
+                let m_while_elf = monolith::compile_omni_surface_to_x86_64_elf(while_surf, 10, 0, 0)?;
+                let w_while_elf = compile_omni_surface_to_x86_64_elf(while_surf, 10, 0, 0)?;
+                let m_while_wasm = monolith::compile_omni_surface_to_wasm(while_surf)?;
+                let w_while_wasm = compile_omni_surface_to_wasm(while_surf)?;
+                let w_while_wasm_val = execute_omni_surface_wasm_i64(while_surf, &[10])?;
+                let mut s1_vm = OmniBinaryVm::new();
+                let s1_while_elf = match s1_vm.execute_function(
+                    &stage1_mod_for_lanes,
+                    0,
+                    vec![OmniValue::U16Array(w_while_u16), OmniValue::Int(10), OmniValue::Int(0), OmniValue::Int(0)],
+                )? {
+                    OmniValue::Bytes(b) => b,
+                    _ => return Err("Stage-1 did not return Bytes on while_sum_even_golden".into()),
+                };
+                if m_while_elf != w_while_elf
+                    || w_while_elf != s1_while_elf
+                    || m_while_wasm != w_while_wasm
+                    || w_while_wasm_val != 30
+                    || execute_omni_surface_program(while_surf, vec![OmniValue::Int(10)])? != OmniValue::Int(30)
+                {
+                    return Err("Surface while_sum_even_golden AOT/Stage-1/Wasm differential mismatch".into());
+                }
+                Ok(2)
+            }
+            WsTask::ArenaBorrow => {
+                // 6i. Phase 4: Surface Linear Memory Arena & Borrow Checker Differential
+                let arena_ok_u16 = compile_omni_surface_to_u16(ARENA_OK_SURF)?;
+                assert_verifier_clone_eq(&arena_ok_u16, true, "arena_lifecycle_golden")?;
+                if execute_omni_surface_program(ARENA_OK_SURF, vec![OmniValue::Int(8)])? != OmniValue::Int(50) {
+                    return Err("Surface arena_lifecycle_golden execution mismatch".into());
+                }
+
+                let arena_leak_u16 = compile_omni_surface_to_u16("fn bad_surface_arena_leak(x: i64) -> i64 { let a = arena(4096); return x; }")?;
+                assert_verifier_clone_eq(&arena_leak_u16, false, "bad_surface_arena_leak")?;
+
+                let borrow_conflict_u16 = compile_omni_surface_to_u16(
+                    "fn bad_surface_borrow_conflict(x: i64) -> i64 { let a = arena(4096); let r = borrow_r(a); drop(a); drop(r); return x; }",
+                )?;
+                assert_verifier_clone_eq(&borrow_conflict_u16, false, "bad_surface_borrow_conflict")?;
+                Ok(3)
+            }
+            WsTask::StrPipeline => {
+                // 6j. Phase 4: Surface String Literals (`@ENG` Taint), Sanitizers, `scat`, `s2i`/`i2s`, and `fnv1a` Differential
+                let bad_str_u16 = compile_omni_surface_to_u16("fn bad_unsanitized_str_lit() -> str { let s = \"raw <script> span\"; return s; }")?;
+                assert_verifier_clone_eq(&bad_str_u16, false, "bad_unsanitized_str_lit")?;
+
+                let good_str_pipeline = "
+                    #[cap(AI)]
+                    fn str_pipeline_golden(n: i64) -> i64 {
+                        let raw = \"120\";
+                        let clean = san_prm(raw);
+                        let parsed = s2i(clean);
+                        let num_s = i2s(n);
+                        let joined = scat(clean, num_s);
+                        let len = slen(joined);
+                        let h = fnv1a(clean);
+                        let cmp = h <=> 0;
+                        let bonus = sel_trit(cmp, 5, 0, 5);
+                        return parsed + len + bonus;
+                    }
+                ";
+                let good_str_u16 = compile_omni_surface_to_u16(good_str_pipeline)?;
+                assert_verifier_clone_eq(&good_str_u16, true, "str_pipeline_golden")?;
+                if execute_omni_surface_program(good_str_pipeline, vec![OmniValue::Int(45)])? != OmniValue::Int(130) {
+                    return Err("Surface str_pipeline_golden execution mismatch".into());
+                }
+                Ok(2)
+            }
+            WsTask::BareExpr => {
+                // 6k. Phase 4: Bare-Expression `eval` / `repl` Wrapper Differential
+                if execute_omni_surface_program("egate(30 - 10)", vec![])? != OmniValue::Trit(1)
+                    || execute_omni_surface_program("10 <= 10", vec![])? != OmniValue::Trit(1)
+                    || execute_omni_surface_program("san_dom(\"<b>ok</b>\")", vec![])?
+                        != OmniValue::Str(String::from("&lt;b&gt;ok&lt;/b&gt;"))
+                {
+                    return Err("Bare-expression wrap_omni_surface_snippet execution mismatch".into());
+                }
+                Ok(1)
+            }
+            WsTask::Pack5DirectAot => {
+                // 6l. Phase 5: Direct @PACK5 Trit Operations & Pack5/EGATE AOT (x86-64 ELF64 + 64-bit Wasm) Differential
+                let p5_a = pack5_encode(&[1, -1, 0, 1, 1, -1, 0, -1, 1, 1]);
+                let p5_b = pack5_encode(&[1, 1, 0, -1, 1, -1, 0, 1, 1, -1]);
+                let direct_dot = pack5_tdot_direct(&p5_a, &p5_b, 10).map_err(|e| e.to_string())?;
+                let m_direct_dot = monolith::pack5_tdot_direct(&p5_a, &p5_b, 10).map_err(|e| e.to_string())?;
+                let direct_sum = pack5_sum_direct(&p5_a, 10).map_err(|e| e.to_string())?;
+                let m_direct_sum = monolith::pack5_sum_direct(&p5_a, 10).map_err(|e| e.to_string())?;
+                if direct_dot != m_direct_dot || direct_dot != 0 || direct_sum != m_direct_sum || direct_sum != 2 {
+                    return Err("Direct @PACK5 tdot/sum mismatch between monolith and workspace".into());
+                }
+                let m_p5_elf = monolith::compile_omni_surface_to_x86_64_elf(SURF_PACK5, 0, 0, 0)?;
+                let w_p5_elf = compile_omni_surface_to_x86_64_elf(SURF_PACK5, 0, 0, 0)?;
+                let m_p5_wasm_val = monolith::execute_omni_surface_wasm_i64(SURF_PACK5, &[])?;
+                let w_p5_wasm_val = execute_omni_surface_wasm_i64(SURF_PACK5, &[])?;
+                let w_dec_wasm_val = execute_omni_surface_wasm_i64(SURF_DECISION_HOOK, &[30, 10])?;
+                if m_p5_elf != w_p5_elf || m_p5_wasm_val != 2455 || w_p5_wasm_val != 2455 || w_dec_wasm_val != 1 {
+                    return Err("Phase 5 @PACK5 / EGATE AOT (ELF64 + Wasm) differential mismatch".into());
+                }
+                let surf_pack5_direct = "
+                    #[cap(AI)]
+                    fn pack5_direct_golden() -> i64 {
+                        let p = pack5_bytes([+1t, -1t, 0t, +1t, +1t, -1t, 0t, -1t, +1t, +1t]);
+                        let dot = pack5_tdot(p, p);
+                        let gate = pack5_gate(p);
+                        let len = pack5_len(p);
+                        return len * 100 + dot * 10 + gate;
+                    }
+                ";
+                if execute_omni_surface_wasm_i64(surf_pack5_direct, &[])? != 281
+                    || execute_omni_surface_program(surf_pack5_direct, vec![])? != OmniValue::Int(281)
+                {
+                    return Err("Phase 5 pack5_bytes direct AOT execution mismatch".into());
+                }
+                Ok(3)
+            }
+            WsTask::AotFirstAndStage1 => {
+                // 6m. Phase 5: AOT-First Hot-Path Dispatcher & Stage-1 Surface-to-ELF Differential
+                let (aot_v1, backend1) = execute_omni_surface_aot_first(SURF_PACK5, vec![])?;
+                let (aot_v2, backend2) = execute_omni_surface_aot_first(SURF_DECISION_HOOK, vec![OmniValue::Int(5), OmniValue::Int(20)])?;
+                let (aot_v3, backend3) = execute_omni_surface_aot_first(ARENA_OK_SURF, vec![OmniValue::Int(8)])?;
+                if backend1 != "aot" || aot_v1 != OmniValue::Int(2455)
+                    || backend2 != "aot" || aot_v2 != OmniValue::Trit(-1)
+                    || backend3 != "aot" || aot_v3 != OmniValue::Int(50)
+                {
+                    return Err("execute_omni_surface_aot_first failed to dispatch hot numeric/@PACK5/arena paths to AOT".into());
+                }
+                let s1_seed0_elf = compile_omni_surface_via_stage1_to_elf(surface_goldens_for_lanes[0].1, 30, 15, 0)?;
+                let aot_seed0_elf = compile_omni_surface_to_x86_64_elf(surface_goldens_for_lanes[0].1, 30, 15, 0)?;
+                if s1_seed0_elf != aot_seed0_elf {
+                    return Err("compile_omni_surface_via_stage1_to_elf mismatch against direct x86-64 AOT".into());
+                }
+                Ok(2)
+            }
+            WsTask::Budgets => {
+                // 6n. Phase 5: Explicit Step & Memory Budgets (`#[step_budget(N)]`, `#[mem_budget(N)]`) across AOT & VM
+                let inf_surface = "
+                    #[step_budget(150)]
+                    fn runaway_loop(x: i64) -> i64 {
+                        let acc = x;
+                        while +1t {
+                            acc += 1;
+                        }
+                        return acc;
+                    }
+                ";
+                if execute_omni_surface_program(inf_surface, vec![OmniValue::Int(1)]).is_ok()
+                    || execute_omni_surface_program_with_budgets(inf_surface, vec![OmniValue::Int(1)], Some(150), None).is_ok()
+                    || monolith::execute_omni_surface_program(inf_surface, vec![monolith::OmniValue::Int(1)]).is_ok()
+                {
+                    return Err("Step budget failed to halt runaway surface loop in AOT/VM".into());
+                }
+                let mem_blowup_surface = "
+                    #[mem_budget(512)]
+                    fn runaway_alloc(x: i64) -> i64 {
+                        let a = arena(4096);
+                        drop(a);
+                        return x;
+                    }
+                ";
+                if execute_omni_surface_program(mem_blowup_surface, vec![OmniValue::Int(1)]).is_ok()
+                    || execute_omni_surface_program_with_budgets(mem_blowup_surface, vec![OmniValue::Int(1)], None, Some(512)).is_ok()
+                    || monolith::execute_omni_surface_program(mem_blowup_surface, vec![monolith::OmniValue::Int(1)]).is_ok()
+                {
+                    return Err("Memory budget failed to reject oversized arena in AOT/VM".into());
+                }
+                let vm_buf_blowup_surface = "
+                    #[mem_budget(256)]
+                    fn runaway_buf() -> i64 {
+                        let b = anew(0);
+                        let i = 0;
+                        while i < 100 {
+                            b = iset_i64(b, i);
+                            i += 1;
+                        }
+                        return slen(b);
+                    }
+                ";
+                if execute_omni_surface_program_with_budgets(vm_buf_blowup_surface, vec![], None, None).is_ok() {
+                    return Err("VM memory budget failed to reject runaway byte-buffer growth in ISET".into());
+                }
+                Ok(3)
+            }
+            WsTask::ZeroIrDirect => {
+                // 6o. Phase 5: Zero Long-Lived Intermediate IR Direct Emission & Direct `verify_u16_stream`
+                for &(g_name, surf_src, ref expected_u16) in surface_goldens_for_lanes.iter() {
+                    let direct_u16 = compile_omni_surface_to_u16(surf_src)?;
+                    let via_asm_u16 = assemble_omni_text_to_u16(&compile_omni_surface_to_asm(surf_src)?)?;
+                    let reps = verify_u16_stream(&direct_u16)?;
+                    if direct_u16 != via_asm_u16 || &direct_u16 != expected_u16 || reps.len() != 1 || !reps[0].passed {
+                        return Err(format!("Zero-IR direct u16 emission or verify_u16_stream mismatch on '{}'", g_name));
+                    }
+                }
+                Ok(1)
+            }
+            WsTask::DeepAudit => {
+                // 6p. Deep Audit Regressions: 50-Trit (>35) @PACK5 + Dynamic Loop IGET in AOT, Sentinel 243..=255 Rejection, & Uncalled Helper Verification
+                let surf_pack5_50 = "
+                    #[cap(AI)]
+                    fn pack5_50_dynamic_golden(limit: i64) -> i64 {
+                        let v = [
+                            +1t, -1t, 0t, +1t, +1t, -1t, 0t, -1t, +1t, +1t,
+                            +1t, -1t, 0t, +1t, +1t, -1t, 0t, -1t, +1t, +1t,
+                            +1t, -1t, 0t, +1t, +1t, -1t, 0t, -1t, +1t, +1t,
+                            +1t, -1t, 0t, +1t, +1t, -1t, 0t, -1t, +1t, +1t,
+                            +1t, -1t, 0t, +1t, +1t, -1t, 0t, -1t, +1t, +1t
+                        ];
+                        let dot = tdot(v, v);
+                        let gate = egate(v);
+                        let acc = 0;
+                        let idx = 0;
+                        while idx < limit {
+                            acc += iget(v, idx);
+                            idx += 1;
+                        }
+                        return dot * 100 + acc * 10 + gate;
+                    }
+                ";
+                let (v_50, b_50) = execute_omni_surface_aot_first(surf_pack5_50, vec![OmniValue::Int(50)])?;
+                let vm_50 = execute_omni_surface_program_with_budgets(surf_pack5_50, vec![OmniValue::Int(50)], None, None)?;
+                let m_elf_50 = monolith::compile_omni_surface_to_x86_64_elf(surf_pack5_50, 50, 0, 0)?;
+                let w_elf_50 = compile_omni_surface_to_x86_64_elf(surf_pack5_50, 50, 0, 0)?;
+                if b_50 != "aot" || v_50 != OmniValue::Int(4101) || vm_50 != OmniValue::Int(4101) || m_elf_50 != w_elf_50 {
+                    return Err("50-trit (>35) @PACK5 + dynamic loop IGET AOT/VM differential mismatch".into());
+                }
+
+                let corrupt_pack5_asm = "
+                    CAP_MASK 16
+                    RET_TY I64
+                    %0 = ANEW 0
+                    %0 = ISET %0 250
+                    %1 = UNPACK5 %0 5
+                    %2 = EGATE %1
+                    RET %2
+                ";
+                let corrupt_u16 = assemble_omni_text_to_u16(corrupt_pack5_asm)?;
+                let corrupt_mod = decode_omni_token_stream(&corrupt_u16)?;
+                let mut c_vm = OmniBinaryVm::new();
+                if compile_pure_u16_to_wasm(&corrupt_u16).is_ok()
+                    || compile_pure_u16_to_x86_64_elf_with_args(&corrupt_u16, 0, 0, 0).is_ok()
+                    || c_vm.execute_function(&corrupt_mod, 0, vec![]).is_ok()
+                {
+                    return Err("Corrupt @PACK5 sentinel byte (250 > 242) was not rejected across AOT and VM".into());
+                }
+
+                let uncalled_tainted_helper = "
+                    fn bad_helper(u: i64 @untrusted) -> i64 {
+                        return u;
+                    }
+                    fn main(x: i64) -> i64 {
+                        return x + 1;
+                    }
+                ";
+                if execute_omni_surface_program_with_budgets(uncalled_tainted_helper, vec![OmniValue::Int(5)], None, None).is_ok()
+                    || execute_omni_surface_program(uncalled_tainted_helper, vec![OmniValue::Int(5)]).is_ok()
+                {
+                    return Err("Uncalled helper function with taint violation was not rejected before execution".into());
+                }
+                Ok(3)
+            }
+            WsTask::M3aLock => {
+                let m3a_ws = omni_lang::run_m3_fe_lock_selftests()?;
+                let m3a_mono = monolith::run_m3_fe_lock_selftests()?;
+                if m3a_ws != m3a_mono {
+                    return Err(format!("Monolith vs workspace 13M3a count mismatch: {} != {}", m3a_mono, m3a_ws));
+                }
+                Ok(m3a_ws)
+            }
+            WsTask::M3bGate => {
+                let m3b_ws = omni_lang::run_m3_gate_selftests()?;
+                let m3b_mono = monolith::run_m3_gate_selftests()?;
+                if m3b_ws != m3b_mono {
+                    return Err(format!("Monolith vs workspace 13M3b count mismatch: {} != {}", m3b_mono, m3b_ws));
+                }
+                Ok(m3b_ws)
+            }
+            WsTask::M3FeRows => {
+                // M3-01: monolith vs workspace canonical frontend dumps, row for row.
+                let m3_ws = omni_lang::m3_fe_lock_rows()?;
+                let m3_mono = monolith::m3_fe_lock_rows()?;
+                if m3_ws != m3_mono {
+                    return Err("Monolith vs workspace M3 frontend lock rows mismatch".into());
+                }
+                Ok(m3_ws.len())
+            }
+            WsTask::HarnessAndAgentDiff => {
+                if omni_harness_spec_json() != monolith::omni_harness_spec_json() {
+                    return Err("Monolith vs workspace omni_harness_spec_json mismatch".into());
+                }
+                let strict_prog = "#[strict] fn main(a: i64, b: i64) -> i64 { let s: i64 = a + b; return s; }";
+                if compile_omni_surface_strict_to_u16(strict_prog)? != monolith::compile_omni_surface_strict_to_u16(strict_prog)? {
+                    return Err("Monolith vs workspace compile_omni_surface_strict_to_u16 mismatch".into());
+                }
+                let h_ws = run_omni_harness_json(strict_prog, vec![OmniValue::Int(10), OmniValue::Int(32)], true, true);
+                let h_m = monolith::run_omni_harness_json(strict_prog, vec![monolith::OmniValue::Int(10), monolith::OmniValue::Int(32)], true, true);
+                if h_ws != h_m {
+                    return Err(format!("Monolith vs workspace run_omni_harness_json mismatch: {} != {}", h_m, h_ws));
+                }
+                let broken_agent_src = "fn main(a: i64, b: i64) -> trit {\n    let g: trit = egate(a - b);\n    return g;\n}";
+                let ad_ws = run_omni_agent_driver_json(broken_agent_src, vec![OmniValue::Int(30), OmniValue::Int(10)], true, 3, OMNI_HARNESS_CONTRACT_VERSION);
+                let ad_m = monolith::run_omni_agent_driver_json(broken_agent_src, vec![monolith::OmniValue::Int(30), monolith::OmniValue::Int(10)], true, 3, OMNI_HARNESS_CONTRACT_VERSION);
+                if ad_ws != ad_m || !ad_ws.starts_with("{\"ok\":true") {
+                    return Err(format!("Monolith vs workspace run_omni_agent_driver_json mismatch: {} != {}", ad_m, ad_ws));
+                }
+                if omni_repair_strategies_json() != monolith::omni_repair_strategies_json() {
+                    return Err("Monolith vs workspace omni_repair_strategies_json mismatch".into());
+                }
+                if inspect_omni_surface_program(strict_prog, true)? != monolith::inspect_omni_surface_program(strict_prog, true)? {
+                    return Err("Monolith vs workspace inspect_omni_surface_program mismatch".into());
+                }
+                Ok(0)
+            }
+            WsTask::Phase7KernelEq => {
+                if build_phase7_pure_omni_verifier_kernel_stream()? != monolith::build_phase7_pure_omni_verifier_kernel_stream()? {
+                    return Err("Monolith vs workspace build_phase7_pure_omni_verifier_kernel_stream mismatch".into());
+                }
+                Ok(0)
+            }
+            WsTask::PhaseAFrontendEq => {
+                if omni_lang::build_phase_a_pure_omni_frontend_kernel_stream()? != monolith::build_phase_a_pure_omni_frontend_kernel_stream()? {
+                    return Err("Monolith vs workspace build_phase_a_pure_omni_frontend_kernel_stream mismatch".into());
+                }
+                Ok(0)
+            }
+            WsTask::PhaseBDriverEq => {
+                if omni_lang::build_phase_b_pure_omni_driver_stream()? != monolith::build_phase_b_pure_omni_driver_stream()? {
+                    return Err("Monolith vs workspace build_phase_b_pure_omni_driver_stream mismatch".into());
+                }
+                Ok(0)
+            }
+            WsTask::PhaseCHostEq => {
+                if omni_lang::build_phase_c_pure_omni_host_stream()? != monolith::build_phase_c_pure_omni_host_stream()? {
+                    return Err("Monolith vs workspace build_phase_c_pure_omni_host_stream mismatch".into());
+                }
+                Ok(0)
+            }
+            WsTask::PhaseDBootstrapEq => {
+                if omni_lang::run_phase_d_pure_omni_selfhost_bootstrap()? != monolith::run_phase_d_pure_omni_selfhost_bootstrap()? {
+                    return Err("Monolith vs workspace run_phase_d_pure_omni_selfhost_bootstrap mismatch".into());
+                }
+                Ok(0)
+            }
+            WsTask::CoreSuiteEq => {
+                if omni_lang::build_pure_omni_core_suite_stream()? != monolith::build_pure_omni_core_suite_stream()? {
+                    return Err("Monolith vs workspace build_pure_omni_core_suite_stream mismatch".into());
+                }
+                Ok(0)
+            }
+            #[cfg(all(unix, target_arch = "x86_64"))]
+            WsTask::Stage1FixedPoint => {
+                // 7. Stage-1 == Stage-2 Self-Compilation Fixed Point
+                use std::os::unix::fs::PermissionsExt;
+                use std::process::Command;
+                let s1_elf_bytes = compile_pure_u16_to_x86_64_elf_with_args(&stage1_u16_for_lanes, 45, 40, 90)?;
+                let s1_bin = "/tmp/ws_stage1_self.elf";
+                let s1_bc  = "/tmp/ws_stage1_self.omni_bc";
+                fs::write(s1_bin, &s1_elf_bytes).map_err(|e| e.to_string())?;
+                fs::write(s1_bc, encode_u16_stream_to_bytes(&stage1_u16_for_lanes)).map_err(|e| e.to_string())?;
+                let mut perms = fs::metadata(s1_bin).map_err(|e| e.to_string())?.permissions();
+                perms.set_mode(0o755);
+                fs::set_permissions(s1_bin, perms).map_err(|e| e.to_string())?;
+                let s2_out = Command::new(s1_bin).arg(s1_bc).output().map_err(|e| e.to_string())?;
+                if !s2_out.status.success() || s2_out.stdout != s1_elf_bytes {
+                    return Err("Workspace Stage-1 == Stage-2 self-compilation fixed point failed".into());
+                }
+                Ok(1)
+            }
+            WsTask::M2Guards => {
+                // M2. Milestone 2 foundation guards (workspace crates vs committed spec/m2 records).
+                run_workspace_m2_guards()
+            }
+        }
+    })?;
+    let mut checks: usize = counts.into_iter().sum();
+
+    // Wave B (main thread): compound suites that internally fan out across all lanes and
+    // run sequential lockstep-shadow / stdout-emitting checks without racing on globals.
     let ai_first_checks = run_ai_first_surface_selftests()?;
     let m_ai_first_checks = monolith::run_ai_first_surface_selftests()?;
     if ai_first_checks != m_ai_first_checks {
-        return Err(format!("Monolith vs workspace AI-first selftest count mismatch: {} != {}", m_ai_first_checks, ai_first_checks));
-    }
-    // 13M3a / 13M3b run here, not inside run_ai_first_surface_selftests, so the AI-first twin
-    // count check above still compares like with like (d2d6c13 chain length).
-    let m3a_ws = omni_lang::run_m3_fe_lock_selftests()?;
-    let m3a_mono = monolith::run_m3_fe_lock_selftests()?;
-    if m3a_ws != m3a_mono {
-        return Err(format!("Monolith vs workspace 13M3a count mismatch: {} != {}", m3a_mono, m3a_ws));
-    }
-    checks += m3a_ws;
-    let m3b_ws = omni_lang::run_m3_gate_selftests()?;
-    let m3b_mono = monolith::run_m3_gate_selftests()?;
-    if m3b_ws != m3b_mono {
-        return Err(format!("Monolith vs workspace 13M3b count mismatch: {} != {}", m3b_mono, m3b_ws));
-    }
-    checks += m3b_ws;
-    // M3-01: monolith vs workspace canonical frontend dumps, row for row.
-    let m3_ws = omni_lang::m3_fe_lock_rows()?;
-    let m3_mono = monolith::m3_fe_lock_rows()?;
-    if m3_ws != m3_mono {
-        return Err("Monolith vs workspace M3 frontend lock rows mismatch".into());
-    }
-    checks += m3_ws.len();
-    if omni_harness_spec_json() != monolith::omni_harness_spec_json() {
-        return Err("Monolith vs workspace omni_harness_spec_json mismatch".into());
-    }
-    let strict_prog = "#[strict] fn main(a: i64, b: i64) -> i64 { let s: i64 = a + b; return s; }";
-    if compile_omni_surface_strict_to_u16(strict_prog)? != monolith::compile_omni_surface_strict_to_u16(strict_prog)? {
-        return Err("Monolith vs workspace compile_omni_surface_strict_to_u16 mismatch".into());
-    }
-    let h_ws = run_omni_harness_json(strict_prog, vec![OmniValue::Int(10), OmniValue::Int(32)], true, true);
-    let h_m = monolith::run_omni_harness_json(strict_prog, vec![monolith::OmniValue::Int(10), monolith::OmniValue::Int(32)], true, true);
-    if h_ws != h_m {
-        return Err(format!("Monolith vs workspace run_omni_harness_json mismatch: {} != {}", h_m, h_ws));
-    }
-    let broken_agent_src = "fn main(a: i64, b: i64) -> trit {\n    let g: trit = egate(a - b);\n    return g;\n}";
-    let ad_ws = run_omni_agent_driver_json(broken_agent_src, vec![OmniValue::Int(30), OmniValue::Int(10)], true, 3, OMNI_HARNESS_CONTRACT_VERSION);
-    let ad_m = monolith::run_omni_agent_driver_json(broken_agent_src, vec![monolith::OmniValue::Int(30), monolith::OmniValue::Int(10)], true, 3, OMNI_HARNESS_CONTRACT_VERSION);
-    if ad_ws != ad_m || !ad_ws.starts_with("{\"ok\":true") {
-        return Err(format!("Monolith vs workspace run_omni_agent_driver_json mismatch: {} != {}", ad_m, ad_ws));
-    }
-    if omni_repair_strategies_json() != monolith::omni_repair_strategies_json() {
-        return Err("Monolith vs workspace omni_repair_strategies_json mismatch".into());
-    }
-    if inspect_omni_surface_program(strict_prog, true)? != monolith::inspect_omni_surface_program(strict_prog, true)? {
-        return Err("Monolith vs workspace inspect_omni_surface_program mismatch".into());
-    }
-    if build_phase7_pure_omni_verifier_kernel_stream()? != monolith::build_phase7_pure_omni_verifier_kernel_stream()? {
-        return Err("Monolith vs workspace build_phase7_pure_omni_verifier_kernel_stream mismatch".into());
-    }
-    if omni_lang::build_phase_a_pure_omni_frontend_kernel_stream()? != monolith::build_phase_a_pure_omni_frontend_kernel_stream()? {
-        return Err("Monolith vs workspace build_phase_a_pure_omni_frontend_kernel_stream mismatch".into());
-    }
-    if omni_lang::build_phase_b_pure_omni_driver_stream()? != monolith::build_phase_b_pure_omni_driver_stream()? {
-        return Err("Monolith vs workspace build_phase_b_pure_omni_driver_stream mismatch".into());
-    }
-    if omni_lang::build_phase_c_pure_omni_host_stream()? != monolith::build_phase_c_pure_omni_host_stream()? {
-        return Err("Monolith vs workspace build_phase_c_pure_omni_host_stream mismatch".into());
-    }
-    if omni_lang::run_phase_d_pure_omni_selfhost_bootstrap()? != monolith::run_phase_d_pure_omni_selfhost_bootstrap()? {
-        return Err("Monolith vs workspace run_phase_d_pure_omni_selfhost_bootstrap mismatch".into());
+        return Err(format!(
+            "Monolith vs workspace AI-first selftest count mismatch: {} != {}",
+            m_ai_first_checks, ai_first_checks
+        ));
     }
     if omni_lang::run_pure_omni_acceptance_diff()? != monolith::run_pure_omni_acceptance_diff()? {
         return Err("Monolith vs workspace run_pure_omni_acceptance_diff mismatch".into());
     }
-    if omni_lang::build_pure_omni_core_suite_stream()? != monolith::build_pure_omni_core_suite_stream()? {
-        return Err("Monolith vs workspace build_pure_omni_core_suite_stream mismatch".into());
-    }
     checks += ai_first_checks;
 
-    // 7. Stage-1 == Stage-2 Self-Compilation Fixed Point
-    #[cfg(all(unix, target_arch = "x86_64"))]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        use std::process::Command;
-        let s1_elf_bytes = compile_pure_u16_to_x86_64_elf_with_args(&stage1_u16, 45, 40, 90)?;
-        let s1_bin = "/tmp/ws_stage1_self.elf";
-        let s1_bc  = "/tmp/ws_stage1_self.omni_bc";
-        fs::write(s1_bin, &s1_elf_bytes).map_err(|e| e.to_string())?;
-        fs::write(s1_bc, encode_u16_stream_to_bytes(&stage1_u16)).map_err(|e| e.to_string())?;
-        let mut perms = fs::metadata(s1_bin).map_err(|e| e.to_string())?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(s1_bin, perms).map_err(|e| e.to_string())?;
-        let s2_out = Command::new(s1_bin).arg(s1_bc).output().map_err(|e| e.to_string())?;
-        if !s2_out.status.success() || s2_out.stdout != s1_elf_bytes {
-            return Err("Workspace Stage-1 == Stage-2 self-compilation fixed point failed".into());
-        }
-        checks += 1;
-    }
-
-
-    // M2. Milestone 2 foundation guards (workspace crates vs committed spec/m2 records).
-    checks += run_workspace_m2_guards()?;
     Ok(checks)
 }
 

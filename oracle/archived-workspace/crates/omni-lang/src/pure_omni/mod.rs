@@ -992,59 +992,79 @@ pub fn run_pure_omni_acceptance_diff() -> Result<usize, String> {
     let acc_cases = run_omni_acceptance_diff(None)?;
     total_verified += acc_cases;
 
-    let (g1_u16, g2_u16, g1_elf, g2_elf) = run_phase_d_pure_omni_selfhost_bootstrap()?;
-    if g1_u16 != g2_u16 || g1_elf != g2_elf {
-        return Err(String::from("pure-omni-diff: Generation-1 != Generation-2 self-host fixed point"));
+    enum PureDiffItem {
+        PhaseDBootstrap,
+        AgentRepair,
+        RealProgram(&'static str),
     }
-    total_verified += 1;
 
-    // Verify agent-driver repair loop paired with Pure-Omni driver produces identical repaired output
-    let broken_src = "fn main(a: i64, b: i64) -> trit {\n    let g: trit = egate(a - b);\n    return g;\n}";
-    let rep = run_omni_agent_repair_loop(
-        broken_src,
-        vec![OmniValue::Int(30), OmniValue::Int(10)],
-        true,
-        4,
-        OMNI_HARNESS_CONTRACT_VERSION,
-    )?;
-    let pure_repaired_json = run_pure_omni_driver_json(
-        &rep.final_source,
-        vec![OmniValue::Int(30), OmniValue::Int(10)],
-        true,
-        true,
-    );
-    if !rep.ok || pure_repaired_json != rep.final_json {
-        return Err(format!(
-            "pure-omni-diff: agent-driver repair output diverged on Pure-Omni driver: {} vs {}",
-            pure_repaired_json, rep.final_json
-        ));
-    }
-    total_verified += 1;
-
-    // Verify all 6 Phase S1..S3 real Pure-Omni programs (`pure/programs/*.omni`) under differential lock
-    let real_programs = [
-        "pure/programs/ternary_neural_router.omni",
-        "pure/programs/arena_audit_pipeline.omni",
-        "pure/programs/policy_consensus_engine.omni",
-        "pure/programs/kv_ledger_service.omni",
-        "pure/programs/compiler_self_audit.omni",
-        "pure/programs/pack5_decision_controller.omni",
+    let tail_items = vec![
+        PureDiffItem::PhaseDBootstrap,
+        PureDiffItem::AgentRepair,
+        PureDiffItem::RealProgram("pure/programs/ternary_neural_router.omni"),
+        PureDiffItem::RealProgram("pure/programs/arena_audit_pipeline.omni"),
+        PureDiffItem::RealProgram("pure/programs/policy_consensus_engine.omni"),
+        PureDiffItem::RealProgram("pure/programs/kv_ledger_service.omni"),
+        PureDiffItem::RealProgram("pure/programs/compiler_self_audit.omni"),
+        PureDiffItem::RealProgram("pure/programs/pack5_decision_controller.omni"),
     ];
-    for p_path in &real_programs {
-        let src = lookup_omni_stdlib_module(p_path)
-            .ok_or_else(|| format!("pure-omni-diff: missing built-in real program '{}'", p_path))?;
-        let (pure_u16, pure_sm) = compile_omni_surface_via_pure_omni_frontend_with_sourcemap(src, true)?;
-        let (rust_u16, rust_sm) = compile_omni_surface_to_u16_with_sourcemap(src, true)?;
-        verify_module_via_phase7_pure_omni_kernel(&pure_u16)?;
-        if pure_u16 != rust_u16 || pure_sm.offset_to_span != rust_sm.offset_to_span || pure_u16.len() < 150 {
-            return Err(format!(
-                "pure-omni-diff: real program '{}' Vec<u16> or sourcemap diverged (len={})",
-                p_path,
-                pure_u16.len()
-            ));
+
+    let tail_counts = crate::lanes::run_selftest_items_in_lanes(tail_items, |item| match item {
+        PureDiffItem::PhaseDBootstrap => {
+            let (g1_u16, g2_u16, g1_elf, g2_elf) = run_phase_d_pure_omni_selfhost_bootstrap()?;
+            if g1_u16 != g2_u16 || g1_elf != g2_elf {
+                return Err(String::from(
+                    "pure-omni-diff: Generation-1 != Generation-2 self-host fixed point",
+                ));
+            }
+            Ok(1usize)
         }
-        total_verified += 1;
-    }
+        PureDiffItem::AgentRepair => {
+            let broken_src =
+                "fn main(a: i64, b: i64) -> trit {\n    let g: trit = egate(a - b);\n    return g;\n}";
+            let rep = run_omni_agent_repair_loop(
+                broken_src,
+                vec![OmniValue::Int(30), OmniValue::Int(10)],
+                true,
+                4,
+                OMNI_HARNESS_CONTRACT_VERSION,
+            )?;
+            let pure_repaired_json = run_pure_omni_driver_json(
+                &rep.final_source,
+                vec![OmniValue::Int(30), OmniValue::Int(10)],
+                true,
+                true,
+            );
+            if !rep.ok || pure_repaired_json != rep.final_json {
+                return Err(format!(
+                    "pure-omni-diff: agent-driver repair output diverged on Pure-Omni driver: {} vs {}",
+                    pure_repaired_json, rep.final_json
+                ));
+            }
+            Ok(1usize)
+        }
+        PureDiffItem::RealProgram(p_path) => {
+            let src = lookup_omni_stdlib_module(p_path).ok_or_else(|| {
+                format!("pure-omni-diff: missing built-in real program '{}'", p_path)
+            })?;
+            let (pure_u16, pure_sm) =
+                compile_omni_surface_via_pure_omni_frontend_with_sourcemap(src, true)?;
+            let (rust_u16, rust_sm) = compile_omni_surface_to_u16_with_sourcemap(src, true)?;
+            verify_module_via_phase7_pure_omni_kernel(&pure_u16)?;
+            if pure_u16 != rust_u16
+                || pure_sm.offset_to_span != rust_sm.offset_to_span
+                || pure_u16.len() < 150
+            {
+                return Err(format!(
+                    "pure-omni-diff: real program '{}' Vec<u16> or sourcemap diverged (len={})",
+                    p_path,
+                    pure_u16.len()
+                ));
+            }
+            Ok(1usize)
+        }
+    })?;
+    total_verified += tail_counts.into_iter().sum::<usize>();
 
     Ok(total_verified)
 }
@@ -2697,99 +2717,59 @@ fn main(x: i64, y: i64) -> i64 {
         checks += 2;
     }
 
-    // 13AB. Section 4: Compositional Verification Invariants (`spec/trusted_core.md`)
-    checks += run_compositional_invariant_selftests()?;
-
-    // 13AC. Section 7: Phase 7 Pure-Omni Self-Hosted Verifier Kernel, Fixed-Point ELF64 Proof & Narrow-Host Runner
-    checks += run_phase7_pure_omni_selftests()?;
-
-    // 13AD. Phase A: Pure-Omni Surface Frontend (`omni-pure-frontend-v1.0.0`)
-    checks += run_phase_a_pure_omni_frontend_selftests()?;
-
-    // 13AE. Phase B: Pure-Omni Driver & Verifier Kernel Integration (`omni-pure-driver-v1.0.0`)
-    checks += run_phase_b_pure_omni_driver_selftests()?;
-
-    // 13AF. Phase C: Pure-Omni Host Runtime over Narrow Host (`omni-pure-host-v1.0.0`)
-    checks += run_phase_c_pure_omni_host_selftests()?;
-
-    // 13AG. Phase D: Pure-Omni Self-Hosting Bootstrap Fixed Point (`omni-pure-selfhost-v1.0.0`)
-    checks += run_phase_d_pure_omni_bootstrap_selftests()?;
-
-    // 13AH. Phase E: Full Pure-Omni Differential Lock (`pure-omni-diff`)
-    checks += run_phase_e_pure_omni_diff_selftests()?;
-
-    // 13AI. Pure-Omni Core Codebase (`pure/*.omni` + `std/*.omni`) & Multi-Module Self-Host Suite
-    checks += run_pure_omni_core_suite_selftests()?;
-
-    // 13AJ. Pure-Core Completion Phase 1: Full Surface Language Coverage in Pure-Omni Frontend
-    checks += run_pure_core_phase1_frontend_coverage_selftests()?;
-
-    // 13AK. Pure-Core Completion Phase 2: High-Value Tooling in Pure Omni
-    checks += run_pure_core_phase2_tooling_selftests()?;
-
-    // 13AL. Pure-Core Completion Phase 3: Complete Pure-Omni Host Runtime as Primary Path
-    checks += run_pure_core_phase3_host_runtime_selftests()?;
-
-    // 13AM. Pure-Core Completion Phase 4: Expand Pure Self-Host Compiler & Lock the Larger Fixed Point
-    checks += run_pure_core_phase4_selfhost_fixed_point_selftests()?;
-
-    // 13AN. Pure-Core Completion Phase 5: Pure-Omni Default Workflows & Legacy-Rust Differential
-    checks += run_pure_core_phase5_default_workflow_selftests()?;
-
-    // 13AO. Strengthening Phase S1: Real Pure-Omni Programs (`pure/programs/*.omni`)
-    checks += run_pure_core_phase_s1_real_programs_selftests()?;
-
-    // 13AP. Strengthening Phase S2: Deepened Pure Tooling for Larger Pure Codebases
-    checks += run_pure_core_phase_s2_deepened_tooling_selftests()?;
-
-    // 13AQ. Strengthening Phase S3: Unique Primitives & Pure Helpers (`std/pack5.omni`, `std/decision.omni`, `std/resource.omni`)
-    checks += run_pure_core_phase_s3_unique_primitives_selftests()?;
-
-    // 13AR. Strengthening Phase S4: Hardening, Health Metrics & Friction Reduction
-    checks += run_pure_core_phase_s4_metrics_and_friction_selftests()?;
-
-    // 13AS. Host FS/DB capability root-jail (PATH_ESCAPE)
-    checks += run_host_sandbox_selftests()?;
-
-    // 13AT. Pure-Omni verifier engine differential against the Rust twin
-    let n_engine = run_verifier_engine_diff_selftests()?;
-    if n_engine < 40 {
-        return Err(format!(
-            "Omni verifier engine differential compared only {n_engine} cases (expected at least 40)"
-        ));
+    // 13AB..13BG: Independent pure-Omni, verifier-engine, ISA, and frozen-hash suites
+    // executed across adaptive parallel lanes with fixed-order deterministic aggregation.
+    fn run_verifier_engine_diff_checked_ws() -> Result<usize, String> {
+        let n_engine = run_verifier_engine_diff_selftests()?;
+        if n_engine < 40 {
+            return Err(format!(
+                "Omni verifier engine differential compared only {n_engine} cases (expected at least 40)"
+            ));
+        }
+        Ok(1)
     }
-    checks += 1;
+    fn run_isa_table_drift_checked_ws() -> Result<usize, String> {
+        let (n_isa, n_isa_neg) = crate::isa_table::run_isa_table_drift_selftests()?;
+        if n_isa != 128 * 4 + 81 * 6 || n_isa_neg != 9 {
+            return Err(format!(
+                "isa-table drift lock compared {n_isa} fields / {n_isa_neg} negatives (expected 998 / 9)"
+            ));
+        }
+        Ok(2)
+    }
+    let independent_suites: &[crate::lanes::SelftestLaneTask] = &[
+        ("compositional_invariants", run_compositional_invariant_selftests),
+        ("phase7_pure_omni", run_phase7_pure_omni_selftests),
+        ("phase_a_frontend", run_phase_a_pure_omni_frontend_selftests),
+        ("phase_b_driver", run_phase_b_pure_omni_driver_selftests),
+        ("phase_c_host", run_phase_c_pure_omni_host_selftests),
+        ("phase_d_bootstrap", run_phase_d_pure_omni_bootstrap_selftests),
+        ("phase_e_diff", run_phase_e_pure_omni_diff_selftests),
+        ("pure_core_suite", run_pure_omni_core_suite_selftests),
+        ("pure_core_p1", run_pure_core_phase1_frontend_coverage_selftests),
+        ("pure_core_p2", run_pure_core_phase2_tooling_selftests),
+        ("pure_core_p3", run_pure_core_phase3_host_runtime_selftests),
+        ("pure_core_p4", run_pure_core_phase4_selfhost_fixed_point_selftests),
+        ("pure_core_p5", run_pure_core_phase5_default_workflow_selftests),
+        ("pure_core_s1", run_pure_core_phase_s1_real_programs_selftests),
+        ("pure_core_s2", run_pure_core_phase_s2_deepened_tooling_selftests),
+        ("pure_core_s3", run_pure_core_phase_s3_unique_primitives_selftests),
+        ("pure_core_s4", run_pure_core_phase_s4_metrics_and_friction_selftests),
+        ("host_sandbox", run_host_sandbox_selftests),
+        ("verifier_engine_diff", run_verifier_engine_diff_checked_ws),
+        ("if_pos_join_slot", run_if_pos_join_slot_selftests),
+        ("isa_table_drift", run_isa_table_drift_checked_ws),
+        ("buffer_flow_parity", run_buffer_flow_parity_selftests),
+        ("isa_b_multibyte_parity", run_isa_b_multibyte_parity_selftests),
+        ("label_cap_16", run_label_cap_16_selftests),
+        ("frozen_hash_pin", run_frozen_hash_pin_selftests),
+        ("stage1_unsupported_gate", run_stage1_unsupported_gate_selftests),
+    ];
+    checks += crate::lanes::run_selftest_tasks_in_lanes(independent_suites)?;
 
-    // 13AU. Value-returning if_pos/match_trit join slot is a single contiguous SSA dest
-    checks += run_if_pos_join_slot_selftests()?;
-
-    // 13AV. Lockstep shadow mode on compile / run / serve
+    // Sequential: toggles global lockstep shadow mode / emits stdout line (`Vera P1 x=7: ...`).
     checks += run_lockstep_shadow_selftests()?;
-
-    // 13AW. Vera P1 byte-readback sibling (VM + Wasm + x86 assert; Stage-1 record-only)
     checks += run_byte_readback_parity_selftests()?;
-
-    // 13BA. M3-03 shared ISA table (`pure/isa/table.omni`) drift lock vs OMNI_ISA_TABLE + assembler mnemonics
-    let (n_isa, n_isa_neg) = crate::isa_table::run_isa_table_drift_selftests()?;
-    if n_isa != 128 * 4 + 81 * 6 || n_isa_neg != 9 {
-        return Err(format!("isa-table drift lock compared {n_isa} fields / {n_isa_neg} negatives (expected 998 / 9)"));
-    }
-    checks += 2;
-
-    // 13BB. Per-buffer storage: pack5_flow / two_bufs / append-copy (VM + Wasm + run path; x86 P6)
-    checks += run_buffer_flow_parity_selftests()?;
-
-    // 13BC. ISA-B 3-op IGET / 4-op ISET patches (VM + Wasm + run + x86 assert; Stage-1 must reject)
-    checks += run_isa_b_multibyte_parity_selftests()?;
-
-    // 13BE. C4 label cap 16: 16-label surface fn on VM / Wasm / x86-64 / Stage-1; 17 rejected
-    checks += run_label_cap_16_selftests()?;
-
-    // 13BF. C1 frozen-hash pin: 5 frozen artifacts (Phase D bc/elf, 18-module suite, Stage-1 bc/elf)
-    checks += run_frozen_hash_pin_selftests()?;
-
-    // 13BG. C2 Stage-1 up-front rejection of unsupported opcodes (DROP, IMOD, pack5/ternary-AI)
-    checks += run_stage1_unsupported_gate_selftests()?;
 
     Ok(checks)
 }
