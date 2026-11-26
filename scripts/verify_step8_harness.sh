@@ -43,7 +43,7 @@ else
 fi
 
 PATH="$TMP/shim:/usr/bin:/bin" bash scripts/build_pure_driver.sh "$PURE_DIR"
-for f in omnic_pure.elf audit_diff.elf audit_decompile.elf m2_lint.elf audit_view_gate.elf proposer_loop.elf core_gates.elf extra_gates.elf; do
+for f in omnic_pure.elf audit_diff.elf audit_decompile.elf m2_lint.elf audit_view_gate.elf proposer_loop.elf proposer_live.elf core_gates.elf extra_gates.elf judge_cli.elf p7_gates.elf; do
   if [ -x "$PURE_DIR/$f" ]; then
     pass "built & executable: $PURE_DIR/$f ($(wc -c < "$PURE_DIR/$f") B)"
   else
@@ -93,18 +93,116 @@ for f in spec/m2/lint/*.omni; do
   fi
 done
 
-echo "=== [4/5] Pure-Omni Selftest Orchestrator ==="
-if "$PURE_BIN" selftest > "$TMP/p_st.txt" && grep -q 'PURE-HARNESS PASS' "$TMP/p_st.txt"; then
-  pass "omnic_pure.elf selftest PASS ($(tail -n 1 "$TMP/p_st.txt"))"
+echo "=== [4/6] Pure-Omni Selftest Orchestrator & Standalone Judge Harness ==="
+if "$PURE_BIN" selftest > "$TMP/p_st.txt" \
+   && grep -q '^\[AUDIT-VIEW PASS\]' "$TMP/p_st.txt" \
+   && grep -q '^\[PROPOSER-LOOP PASS\]' "$TMP/p_st.txt" \
+   && grep -q '^\[PURE-HARNESS PASS\]' "$TMP/p_st.txt"; then
+  pass "omnic_pure.elf selftest PASS (clean 3-line redirected output)"
 else
-  fail "omnic_pure.elf selftest FAIL"
+  cat "$TMP/p_st.txt" >&2 || true
+  fail "omnic_pure.elf selftest FAIL or garbled redirected output"
 fi
 
-echo "=== [5/5] Negative Controls (Fail-Closed) ==="
+if "$PURE_BIN" compile spec/m7/judge_harness.omni "$TMP/judge_h.omni_bc"; then
+  pass "spec/m7/judge_harness.omni standalone compile PASS ($(wc -c < "$TMP/judge_h.omni_bc") B)"
+else
+  fail "spec/m7/judge_harness.omni standalone compile FAIL"
+fi
+
+echo "=== [5/6] Live Proposer Path Checks (Step 11 Part E) ==="
+# 1. p7-measure & p7-canary exit 0 on standard targets
+if "$PURE_BIN" p7-measure > "$TMP/p7m.txt" && grep -q '^\[P7-MEASURE PASS\] 4 targets' "$TMP/p7m.txt" && [ "$(wc -l < "$TMP/p7m.txt")" -eq 5 ]; then
+  pass "p7-measure PASS (4 target rows + summary banner)"
+else
+  cat "$TMP/p7m.txt" >&2 || true
+  fail "p7-measure FAIL"
+fi
+
+if "$PURE_BIN" p7-canary > "$TMP/p7c.txt" && grep -q '^\[P7-CANARY PASS\] canary_a=+1t canary_b=0t canary_c=-1t frozen5=OK' "$TMP/p7c.txt"; then
+  pass "p7-canary PASS ($(cat "$TMP/p7c.txt"))"
+else
+  cat "$TMP/p7c.txt" >&2 || true
+  fail "p7-canary FAIL"
+fi
+
+# 2. propose-run --dry-run against a fixture candidate produces stage logs & writes nothing to Git
+cat > "$TMP/fix_base.omni" <<'EOF'
+fn main(x: i64, y: i64) -> i64 {
+    let a: i64 = x * 3;
+    let a1: i64 = a + 0;
+    let b: i64 = y + 7;
+    let b1: i64 = b * 1;
+    return a1 + b1;
+}
+EOF
+cat > "$TMP/fix_cand.omni" <<'EOF'
+fn main(x: i64, y: i64) -> i64 {
+    let a: i64 = x * 3;
+    let b: i64 = y + 7;
+    return a + b;
+}
+EOF
+
+mkdir -p "$TMP/gitrepo/pure/programs"
+cp "$TMP/fix_base.omni" "$TMP/gitrepo/pure/programs/fixture_opt.omni"
+git -C "$TMP/gitrepo" init -b main >/dev/null 2>&1
+git -C "$TMP/gitrepo" config user.email "omni-flywheel@local"
+git -C "$TMP/gitrepo" config user.name "Omni Flywheel"
+git -C "$TMP/gitrepo" add pure/programs/fixture_opt.omni
+git -C "$TMP/gitrepo" commit -m "baseline fixture" >/dev/null 2>&1
+MAIN_BEFORE=$(git -C "$TMP/gitrepo" rev-parse main)
+
+if "$PURE_BIN" propose-run --repo "$TMP/gitrepo" --target pure/programs/fixture_opt.omni --candidate "$TMP/fix_cand.omni" --dry-run > "$TMP/dry.txt" \
+   && grep -q '^\[PROPOSE-RUN LIVE\]' "$TMP/dry.txt" \
+   && grep -q '^verdict=+1t ADOPT' "$TMP/dry.txt" \
+   && ! git -C "$TMP/gitrepo" rev-parse --verify flywheel/auto >/dev/null 2>&1 \
+   && [ "$(git -C "$TMP/gitrepo" rev-parse main)" = "$MAIN_BEFORE" ]; then
+  pass "propose-run --dry-run PASS (stage logs emitted, zero Git writes)"
+else
+  cat "$TMP/dry.txt" >&2 || true
+  fail "propose-run --dry-run FAIL"
+fi
+
+# 3. Fixture ADOPT path: lands exactly 1 commit on flywheel/auto and 0 on main
+if "$PURE_BIN" propose-run --repo "$TMP/gitrepo" --target pure/programs/fixture_opt.omni --candidate "$TMP/fix_cand.omni" > "$TMP/adopt.txt" \
+   && grep -q '^verdict=+1t ADOPT' "$TMP/adopt.txt" \
+   && [ "$(git -C "$TMP/gitrepo" rev-parse main)" = "$MAIN_BEFORE" ] \
+   && [ "$(git -C "$TMP/gitrepo" rev-list --count main..flywheel/auto)" -eq 1 ]; then
+  pass "fixture ADOPT path PASS (1 commit on flywheel/auto, 0 on main)"
+else
+  cat "$TMP/adopt.txt" >&2 || true
+  fail "fixture ADOPT path FAIL"
+fi
+
+# 4. Fixture Stage 0 refusal: candidate touching pure/verifier_engine.omni refused at Stage 0 with -1t
+set +e
+"$PURE_BIN" propose-run --target pure/verifier_engine.omni --candidate "$TMP/fix_cand.omni" --dry-run > "$TMP/s0ref.txt" 2>&1
+S0_RC=$?
+set -e
+if [ "$S0_RC" -ne 0 ] && grep -q 'STAGE 0 REJECT.*-1t' "$TMP/s0ref.txt"; then
+  pass "fixture Stage 0 TCB refusal PASS (pure/verifier_engine.omni rejected -1t, rc=$S0_RC)"
+else
+  cat "$TMP/s0ref.txt" >&2 || true
+  fail "fixture Stage 0 TCB refusal FAIL (rc=$S0_RC)"
+fi
+
+echo "=== [6/6] Negative Controls (Fail-Closed) ==="
 if "$PURE_BIN" audit-view --inject-broken-decompile >/dev/null 2>&1; then
   fail "negative control: --inject-broken-decompile was NOT caught"
 else
   pass "negative control: deliberately broken decompile caught fail-closed by audit-view gate"
+fi
+
+set +e
+"$PURE_DIR/proposer_loop.elf" --unknown-flag-test > "$TMP/badarg.txt" 2>&1
+BADARG_RC=$?
+set -e
+if [ "$BADARG_RC" -eq 2 ] && grep -q '^usage:' "$TMP/badarg.txt"; then
+  pass "negative control: unknown flag to proposer_loop.elf exited rc=2 with usage line"
+else
+  cat "$TMP/badarg.txt" >&2 || true
+  fail "negative control: unknown flag to proposer_loop.elf exited rc=$BADARG_RC (want 2)"
 fi
 
 echo "=============================================================================="

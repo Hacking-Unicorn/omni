@@ -1,0 +1,167 @@
+// ==============================================================================
+// pure/m7/judge_cli.omni (Step 11) — Standalone Native Pure-Omni M7 Judge CLI
+// ==============================================================================
+// Wraps the real `pure/m7/judge.omni`, `pure/m7/heal.omni`, and `pure/m7/learn.omni`
+// modules (zero rule changes) as a standalone Linux x86-64 ELF (`judge_cli.elf`).
+//
+// Usage:
+//   judge_cli.elf <req_file>
+//
+// Request file format (one value per line):
+//   line 0: gates_ok (1=all gates ok, 0=gate failed)
+//   line 1: base_bc_words (i64)
+//   line 2: cand_bc_words (i64)
+//   line 3: base_elf_bytes (i64)
+//   line 4: cand_elf_bytes (i64)
+//   line 5: err_code (0=none, 1..5=healable, 10..13=fatal)
+//   line 6: attempt (0..N)
+//   line 7: learn_table_path (e.g. /tmp/omni_learn.bin, or "-" to skip)
+//   line 8: heal_log_path (e.g. /tmp/omni_heal.bin, or "-" to skip)
+//
+// Outputs:
+//   verdict=+1t ADOPT | learn_updates=<N> | heal_action=<A>
+//   (or 0t HOLD / -1t REJECT)
+// Exit code: 0 on valid evaluation (verdict in stdout), 2 on bad args.
+// ==============================================================================
+
+include "judge.omni";
+include "heal.omni";
+include "learn.omni";
+include "../m2/util.omni";
+include "../driver/sys_util.omni";
+
+// Finds start offset and length of line `want_ln` in `w[base..base+nb]`.
+// Stores `(off, len)` at `w[160]` and `w[168]`.
+#[strict]
+fn jc_get_line(w: bytes, base: i64, nb: i64, want_ln: i64) -> bytes {
+    let cur_ln: i64 = 0;
+    let pos: i64 = 0;
+    let found_off: i64 = 0;
+    let found_len: i64 = 0;
+    while nb - pos <=> 0 {
+        let ls: i64 = pos;
+        let g: i64 = m2u_lt(pos, nb) * (1 - m2u_eq(ld_u8(w, base + pos), 10));
+        while g <=> 0 {
+            pos = pos + 1;
+            g = m2u_lt(pos, nb) * (1 - m2u_eq(ld_u8(w, base + pos), 10));
+        }
+        let le: i64 = pos;
+        let hit: i64 = m2u_eq(cur_ln, want_ln);
+        found_off = m2u_sel(hit, base + ls, found_off);
+        found_len = m2u_sel(hit, le - ls, found_len);
+        pos = pos + m2u_lt(pos, nb);
+        cur_ln = cur_ln + 1;
+    }
+    return iset_patch_i64(iset_patch_i64(w, 160, found_off), 168, found_len);
+}
+
+// Parses line `ln` of request in Band B as i64.
+#[strict]
+fn jc_line_i64(w: bytes, nb: i64, ln: i64) -> i64 {
+    let u: bytes = jc_get_line(w, su_band_b(), nb, ln);
+    return su_parse_i64(u, ld_u64(u, 160), ld_u64(u, 168));
+}
+
+// Updates persistent 512-B learn table at `path_cstr` with `verdict`, returns total_updates (or -1).
+#[strict]
+#[cap(SYS)]
+fn jc_update_learn(path_cstr: bytes, verdict: trit) -> i64 {
+    let tbl: bytes = anew(0);
+    let i: i64 = 0;
+    while 64 - i <=> 0 { tbl = iset_i64(tbl, 0); i = i + 1; }
+    let nr: i64 = su_read_file_into(tbl, path_cstr, 0, 512);
+    let ok_existing: i64 = if_pos m2u_ge(nr, 512) <=> 0 { m2u_ge(p7_learn_verify(tbl), 0) } else { 0 };
+    tbl = if_pos ok_existing <=> 0 { tbl } else { p7_learn_init(tbl) };
+    tbl = p7_learn_update(tbl, 1, 0, verdict);
+    let nw: i64 = su_write_file_from(tbl, path_cstr, 0, 512, 420);
+    let upd: i64 = p7_learn_verify(tbl);
+    return m2u_sel(m2u_eq(nw, 512), upd, 0 - 1);
+}
+
+// Runs `p7_heal_decide` + appends 16-B record to 4 KiB heal log at `path_cstr`, returns action (0..3).
+#[strict]
+#[cap(SYS)]
+fn jc_update_heal(path_cstr: bytes, err_code: i64, attempt: i64, hash_lo32: i64) -> i64 {
+    let act: i64 = p7_heal_decide(err_code, attempt, 3, 1);
+    let log: bytes = anew(0);
+    let i: i64 = 0;
+    while 512 - i <=> 0 { log = iset_i64(log, 0); i = i + 1; }
+    let nr: i64 = su_read_file_into(log, path_cstr, 0, 4096);
+    let ok_ex: i64 = if_pos m2u_ge(nr, 16) <=> 0 { m2u_ge(p7_heal_log_verify(log), 0) } else { 0 };
+    log = if_pos ok_ex <=> 0 { log } else { st_u32(st_u32(log, 0, 0), 4, 0) };
+    log = p7_heal_log_push(log, attempt, err_code, act, hash_lo32);
+    let nw: i64 = su_write_file_from(log, path_cstr, 0, 4096, 420);
+    return act + nw * 0;
+}
+
+// Formats and writes `verdict=<+1t ADOPT|0t HOLD|-1t REJECT> | learn_updates=<N> | heal_action=<A>\n`.
+#[strict]
+#[cap(SYS)]
+fn jc_print_verdict(arena: bytes, v_i64: i64, learn_upd: i64, heal_act: i64) -> i64 {
+    let w: bytes = iset_patch_i64(arena, 0, 0);
+    // "verdict="
+    w = su_out4(su_out4(w, 118, 101, 114, 100), 105, 99, 116, 61);
+    w = if_pos m2u_eq(v_i64, 1) <=> 0 {
+        su_out4(su_out4(su_out4(w, 43, 49, 116, 32), 65, 68, 79, 80), 84, 0, 0, 0)
+    } else { if_pos m2u_eq(v_i64, 0) <=> 0 {
+        su_out4(su_out4(w, 48, 116, 32, 72), 79, 76, 68, 0)
+    } else {
+        su_out4(su_out4(su_out4(w, 45, 49, 116, 32), 82, 69, 74, 69), 67, 84, 0, 0)
+    } };
+    // " | learn_updates="
+    w = su_out4(su_out4(su_out4(su_out4(w, 32, 124, 32, 108), 101, 97, 114, 110), 95, 117, 112, 100), 97, 116, 101, 115);
+    w = su_out_i64(su_out_u8(w, 61), learn_upd);
+    // " | heal_action="
+    w = su_out4(su_out4(su_out4(su_out4(w, 32, 124, 32, 104), 101, 97, 108, 95), 97, 99, 116, 105), 111, 110, 61, 0);
+    w = su_out_u8(su_out_i64(w, heal_act), 10);
+    let nw: i64 = sys_write(1, w, su_band_a(), ld_u64(w, 0));
+    return 0 + nw * 0;
+}
+
+#[strict]
+#[cap(SYS)]
+fn main() -> i64 {
+    let w: bytes = su_load_cmdline(su_alloc_arena());
+    let argc: i64 = su_argc(w);
+    let rc: i64 = if_pos m2u_lt(argc, 2) <=> 0 {
+        2
+    } else {
+        let req_p: bytes = su_make_cstr(w, su_arg_off(w, 1), su_arg_len(w, 1));
+        let nb: i64 = su_read_file_into(w, req_p, su_band_b(), 4096);
+        if_pos m2u_lt(nb, 1) <=> 0 {
+            2
+        } else {
+            let gates_ok: i64 = jc_line_i64(w, nb, 0);
+            let base_w: i64 = jc_line_i64(w, nb, 1);
+            let cand_w: i64 = jc_line_i64(w, nb, 2);
+            let base_elf: i64 = jc_line_i64(w, nb, 3);
+            let cand_elf: i64 = jc_line_i64(w, nb, 4);
+            let err_code: i64 = jc_line_i64(w, nb, 5);
+            let attempt: i64 = jc_line_i64(w, nb, 6);
+            // Real pure/m7/judge.omni evaluation (noise band 0 on deterministic metrics; 5-run consensus).
+            let t_w: trit = p7_judge_5runs(base_w, cand_w, base_w, cand_w, base_w, cand_w, base_w, cand_w, base_w, cand_w, 0);
+            let t_e: trit = p7_judge_5runs(base_elf, cand_elf, base_elf, cand_elf, base_elf, cand_elf, base_elf, cand_elf, base_elf, cand_elf, 0);
+            let suite_v: trit = p7_combine2(t_w, t_e);
+            let final_v: trit = p7_adopt_rule(gates_ok, suite_v);
+            let v_i64: i64 = p7_trit_to_i64(final_v);
+            // Learn persistence (line 7)
+            let u7: bytes = jc_get_line(w, su_band_b(), nb, 7);
+            let l7_off: i64 = ld_u64(u7, 160);
+            let l7_len: i64 = ld_u64(u7, 168);
+            let has_learn: i64 = m2u_ge(l7_len, 2);
+            let learn_upd: i64 = if_pos has_learn <=> 0 {
+                jc_update_learn(su_make_cstr(u7, l7_off, l7_len), final_v)
+            } else { 0 };
+            // Heal persistence on REJECT with err_code != 0 (line 8)
+            let u8: bytes = jc_get_line(u7, su_band_b(), nb, 8);
+            let l8_off: i64 = ld_u64(u8, 160);
+            let l8_len: i64 = ld_u64(u8, 168);
+            let has_heal: i64 = m2u_ge(l8_len, 2) * (1 - m2u_eq(err_code, 0));
+            let heal_act: i64 = if_pos has_heal <=> 0 {
+                jc_update_heal(su_make_cstr(u8, l8_off, l8_len), err_code, attempt, (cand_w ^ cand_elf) & 2147483647)
+            } else { p7_heal_decide(err_code, attempt, 3, 1) };
+            jc_print_verdict(u8, v_i64, learn_upd, heal_act)
+        }
+    };
+    return sys_exit(rc);
+}

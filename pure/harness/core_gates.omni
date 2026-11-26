@@ -307,9 +307,26 @@ fn cg_print_b2(arena: bytes) -> i64 {
 fn cg_run_selftest(w: bytes) -> i64 {
     let empty: bytes = anew(0);
     let ok1: i64 = cg_gate_frozen(w) * cg_gate_m2_fp(w) * cg_gate_p2a(w) * cg_gate_ver_and_mac(w);
-    let r_av: i64 = if_pos ok1 <=> 0 { sys_spawn(cg_tool(w, 4), empty) } else { 1 };
-    let r_pl: i64 = if_pos m2u_eq(r_av, 0) <=> 0 { sys_spawn(cg_tool(w, 5), empty) } else { 1 };
-    return if_pos ok1 * m2u_eq(r_av, 0) * m2u_eq(r_pl, 0) <=> 0 { cg_print_selftest_ok(w) } else { 1 };
+    let av_out: bytes = cg_tmp(120);
+    let pl_out: bytes = cg_tmp(121);
+    let r_av: i64 = if_pos ok1 <=> 0 { su_spawn_capture(cg_tool(w, 4), empty, av_out, 420) } else { 1 };
+    let r_pl: i64 = if_pos m2u_eq(r_av, 0) <=> 0 { su_spawn_capture(cg_tool(w, 5), empty, pl_out, 420) } else { 1 };
+    let ok_all: i64 = ok1 * m2u_eq(r_av, 0) * m2u_eq(r_pl, 0);
+    let rc: i64 = if_pos ok_all <=> 0 {
+        let nav: i64 = su_read_file_into(w, av_out, su_band_b(), 4096);
+        let u: bytes = iset_patch_i64(w, 0, 0);
+        u = if_pos m2u_lt(0, nav) <=> 0 { su_out_copy(u, su_band_b(), nav) } else { u };
+        let npl: i64 = su_read_file_into(u, pl_out, su_band_b(), 4096);
+        u = if_pos m2u_lt(0, npl) <=> 0 { su_out_copy(u, su_band_b(), npl) } else { u };
+        u = su_out4(su_out4(su_out4(su_out4(u, 91, 80, 85, 82), 69, 45, 72, 65), 82, 78, 69, 83), 83, 32, 80, 65);
+        u = su_out4(su_out4(su_out4(su_out4(u, 83, 83, 93, 32), 102, 114, 111, 122), 101, 110, 43, 109), 50, 45, 102, 112);
+        u = su_out4(su_out4(su_out4(su_out4(u, 43, 112, 50, 97), 43, 118, 101, 114), 43, 97, 117, 100), 105, 116, 45, 118);
+        u = su_out4(su_out4(su_out4(u, 105, 101, 119, 43), 112, 114, 111, 112), 111, 115, 101, 114);
+        u = su_out_u8(u, 10);
+        let nw: i64 = sys_write(1, u, su_band_a(), ld_u64(u, 0));
+        0 + nw * 0
+    } else { 1 };
+    return rc;
 }
 
 #[strict]

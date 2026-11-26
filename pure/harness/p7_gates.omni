@@ -1,0 +1,292 @@
+// ==============================================================================
+// pure/harness/p7_gates.omni (Step 11 Part A) — Live Native `p7-measure` & `p7-canary`
+// ==============================================================================
+// Implements:
+//   - `p7-measure [target.omni]` : 5-run sequential deterministic measurement
+//     (`bc_words`, `elf_bytes`, `fnv`, `var=0`) via `omnic_pure.elf` (`compile` + `compile-elf`).
+//   - `p7-canary` : Stage 2 canary ruler proof per `spec/m7/PROPOSER_LOOP_DESIGN.md` §4 Stage 2:
+//       * Frozen-5 check (`core_gates.elf m2-frozen`)
+//       * Canary A (Tier-1 peephole identity elimination) -> `+1t` ADOPT via `judge_cli.elf`
+//       * Canary B (neutral baseline vs baseline)         -> `0t` HOLD  via `judge_cli.elf`
+//       * Canary C (semantic/gate regression)             -> `-1t` REJECT via `judge_cli.elf`
+// ==============================================================================
+
+include "../m2/util.omni";
+include "../driver/sys_util.omni";
+
+// tid: 0=omnic_pure.elf, 1=m3.elf, 2=m2.elf, 3=verifier.elf, 4=core_gates.elf, 5=judge_cli.elf
+#[strict]
+fn p7g_tool(arena: bytes, tid: i64) -> bytes {
+    let a0_off: i64 = su_arg_off(arena, 0);
+    let a0_len: i64 = su_arg_len(arena, 0);
+    let slash: i64 = 0 - 1;
+    let i: i64 = 0;
+    while a0_len - i <=> 0 {
+        slash = m2u_sel(m2u_eq(ld_u8(arena, a0_off + i), 47), i, slash);
+        i = i + 1;
+    }
+    let b: bytes = anew(0);
+    let k: i64 = 0;
+    let pfx: i64 = m2u_sel(m2u_ge(slash, 0), slash + 1, 0);
+    while pfx - k <=> 0 { b = iset(b, ld_u8(arena, a0_off + k)); k = k + 1; }
+    let r: bytes = if_pos m2u_eq(tid, 0) <=> 0 {
+        iset(b, 111, 109, 110, 105, 99, 95, 112, 117, 114, 101, 46, 101, 108, 102, 0)
+    } else { if_pos m2u_eq(tid, 1) <=> 0 {
+        iset(b, 109, 51, 46, 101, 108, 102, 0)
+    } else { if_pos m2u_eq(tid, 2) <=> 0 {
+        iset(b, 109, 50, 46, 101, 108, 102, 0)
+    } else { if_pos m2u_eq(tid, 3) <=> 0 {
+        iset(b, 118, 101, 114, 105, 102, 105, 101, 114, 46, 101, 108, 102, 0)
+    } else { if_pos m2u_eq(tid, 4) <=> 0 {
+        iset(b, 99, 111, 114, 101, 95, 103, 97, 116, 101, 115, 46, 101, 108, 102, 0)
+    } else {
+        iset(b, 106, 117, 100, 103, 101, 95, 99, 108, 105, 46, 101, 108, 102, 0)
+    } } } } };
+    return r;
+}
+
+#[strict]
+fn p7g_tmp(tag: i64) -> bytes {
+    let p: bytes = anew(0);
+    p = iset(p, 47, 116, 109, 112, 47, 111, 109, 110, 105, 95, 112, 55, 103, 95);
+    return iset(p, tag, 0);
+}
+
+#[strict]
+fn p7g_out_cstr(w: bytes, s: bytes) -> bytes {
+    let u: bytes = w;
+    let n: i64 = slen(s) - 1;
+    let i: i64 = 0;
+    while n - i <=> 0 { u = su_out_u8(u, ld_u8(s, i)); i = i + 1; }
+    return u;
+}
+
+// Helper: invokes `omnic_pure.elf compile` & `compile-elf` via `/bin/sh`.
+// Writes `bc_words` at `w[160]`, `elf_bytes` at `w[168]`, `elf_fnv` at `w[176]`.
+#[strict]
+#[cap(SYS)]
+fn p7g_measure_once(w: bytes, path_cstr: bytes) -> bytes {
+    let bc_p: bytes = p7g_tmp(98);
+    let elf_p: bytes = p7g_tmp(101);
+    let sh_p: bytes = p7g_tmp(115);
+    let omnic: bytes = p7g_tool(w, 0);
+    let u: bytes = p7g_out_cstr(iset_patch_i64(w, 0, 0), omnic);
+    u = p7g_out_cstr(su_out4(su_out4(su_out4(u, 32, 99, 111, 109), 112, 105, 108, 101), 32, 34, 0, 0), path_cstr);
+    u = su_out4(su_out4(su_out4(su_out4(u, 34, 32, 47, 116), 109, 112, 47, 111), 109, 110, 105, 95), 112, 55, 103, 95);
+    u = p7g_out_cstr(su_out4(su_out4(u, 98, 32, 38, 38), 32, 0, 0, 0), omnic);
+    u = su_out4(su_out4(su_out4(u, 32, 99, 111, 109), 112, 105, 108, 101), 45, 101, 108, 102);
+    u = su_out4(su_out4(su_out4(su_out4(u, 32, 47, 116, 109), 112, 47, 111, 109), 110, 105, 95, 112), 55, 103, 95, 98);
+    u = su_out4(su_out4(su_out4(su_out4(u, 32, 47, 116, 109), 112, 47, 111, 109), 110, 105, 95, 112), 55, 103, 95, 101);
+    u = su_out_u8(u, 10);
+    let nw: i64 = su_write_file_from(u, sh_p, su_band_a(), ld_u64(u, 0), 493);
+    let sh_bin: bytes = anew(0);
+    sh_bin = iset(sh_bin, 47, 98, 105, 110, 47, 115, 104, 0);
+    let rc: i64 = if_pos m2u_ge(nw, 1) <=> 0 { su_spawn_capture(sh_bin, sh_p, p7g_tmp(111), 420) } else { 1 };
+    let nb_bc: i64 = if_pos m2u_eq(rc, 0) <=> 0 { su_read_file_into(u, bc_p, su_band_b(), 250000) } else { 0 - 1 };
+    let nb_elf: i64 = if_pos m2u_ge(nb_bc, 4) <=> 0 { su_read_file_into(u, elf_p, su_band_b(), 250000) } else { 0 - 1 };
+    let ok: i64 = m2u_eq(rc, 0) * m2u_ge(nb_bc, 4) * m2u_ge(nb_elf, 120);
+    let fnv: i64 = if_pos ok <=> 0 { su_fnv1a64(u, su_band_b(), nb_elf) } else { 0 };
+    let u2: bytes = iset_patch_i64(iset_patch_i64(u, 160, m2u_sel(ok, nb_bc >> 1, 0 - 1)), 168, m2u_sel(ok, nb_elf, 0 - 1));
+    return iset_patch_i64(u2, 176, fnv);
+}
+
+// Runs 5 sequential measurements of `path_cstr`, asserts 0-variance on `bc_words` & `elf_bytes`.
+// Stores `ok` (1/0) at `w[184]`, `bc_words` at `w[160]`, `elf_bytes` at `w[168]`, `fnv` at `w[176]`.
+#[strict]
+#[cap(SYS)]
+fn p7g_measure_5runs(w: bytes, path_cstr: bytes) -> bytes {
+    let u: bytes = p7g_measure_once(w, path_cstr);
+    let w0: i64 = ld_u64(u, 160);
+    let e0: i64 = ld_u64(u, 168);
+    let f0: i64 = ld_u64(u, 176);
+    let ok: i64 = m2u_ge(w0, 2) * m2u_ge(e0, 120);
+    let r: i64 = 1;
+    while 5 - r <=> 0 {
+        u = if_pos ok <=> 0 { p7g_measure_once(u, path_cstr) } else { u };
+        ok = ok * m2u_eq(ld_u64(u, 160), w0) * m2u_eq(ld_u64(u, 168), e0) * m2u_eq(ld_u64(u, 176), f0);
+        r = r + 1;
+    }
+    u = iset_patch_i64(iset_patch_i64(u, 160, w0), 168, e0);
+    return iset_patch_i64(iset_patch_i64(u, 176, f0), 184, ok);
+}
+
+// Appends a measurement row `<path>\t<bc_words>\t<elf_bytes>\t<fnv>\tvar=0\n` into Band A output cursor.
+#[strict]
+fn p7g_append_row(w: bytes, path_cstr: bytes, bw: i64, be: i64, fnv: i64) -> bytes {
+    let u: bytes = p7g_out_cstr(w, path_cstr);
+    u = su_out_u8(u, 9);
+    u = su_out_u8(su_out_i64(u, bw), 9);
+    u = su_out_u8(su_out_i64(u, be), 9);
+    u = su_out_u8(su_out_hex(u, fnv, 16), 9);
+    return su_out4(su_out4(u, 118, 97, 114, 61), 48, 10, 0, 0);
+}
+
+#[strict]
+#[cap(SYS)]
+fn p7g_emit_row(w: bytes, path_cstr: bytes) -> i64 {
+    let u: bytes = p7g_append_row(iset_patch_i64(w, 0, 0), path_cstr, ld_u64(w, 160), ld_u64(w, 168), ld_u64(w, 176));
+    let nw: i64 = sys_write(1, u, su_band_a(), ld_u64(u, 0));
+    return 0 + nw * 0;
+}
+
+// Invokes `judge_cli.elf` with `(gates_ok, base_w, cand_w, base_elf, cand_elf, err_code)` and returns `+1`, `0`, or `-1`.
+#[strict]
+#[cap(SYS)]
+fn p7g_call_judge(w: bytes, gates_ok: i64, base_w: i64, cand_w: i64, base_elf: i64, cand_elf: i64, err_code: i64) -> i64 {
+    let u: bytes = iset_patch_i64(w, 0, 0);
+    u = su_out_u8(su_out_i64(u, gates_ok), 10);
+    u = su_out_u8(su_out_i64(u, base_w), 10);
+    u = su_out_u8(su_out_i64(u, cand_w), 10);
+    u = su_out_u8(su_out_i64(u, base_elf), 10);
+    u = su_out_u8(su_out_i64(u, cand_elf), 10);
+    u = su_out_u8(su_out_i64(u, err_code), 10);
+    u = su_out_u8(su_out_i64(u, 0), 10);
+    u = su_out4(u, 45, 10, 45, 10);
+    let req_p: bytes = p7g_tmp(114);
+    let out_p: bytes = p7g_tmp(106);
+    let nw: i64 = su_write_file_from(u, req_p, su_band_a(), ld_u64(u, 0), 420);
+    let rc: i64 = if_pos m2u_ge(nw, 1) <=> 0 { su_spawn_capture(p7g_tool(u, 5), req_p, out_p, 420) } else { 1 };
+    let nb: i64 = if_pos m2u_eq(rc, 0) <=> 0 { su_read_file_into(u, out_p, su_band_b(), 256) } else { 0 };
+    // Output starts with "verdict=+1t" (byte 8 == '+') or "verdict=0t" (byte 8 == '0') or "verdict=-1t" (byte 8 == '-')
+    let c8: i64 = m2u_sel(m2u_ge(nb, 10), ld_u8(u, su_band_b() + 8), 0);
+    return m2u_sel(m2u_eq(c8, 43), 1, m2u_sel(m2u_eq(c8, 48), 0, 0 - 1));
+}
+
+// Runs `p7-measure` on standard 4 non-TCB targets (or single target if `argc >= 3`).
+// Buffers all 4 rows before writing stdout once so redirected file output is never overwritten.
+#[strict]
+#[cap(SYS)]
+fn p7g_cmd_measure(w: bytes, argc: i64) -> i64 {
+    let rc: i64 = if_pos m2u_ge(argc, 3) <=> 0 {
+        let p: bytes = su_make_cstr(w, su_arg_off(w, 2), su_arg_len(w, 2));
+        let u: bytes = p7g_measure_5runs(w, p);
+        if_pos ld_u64(u, 184) <=> 0 { p7g_emit_row(u, p) } else { 1 }
+    } else {
+        let p1: bytes = anew(0);
+        p1 = iset(p1, 112, 117, 114, 101, 47, 112, 114, 111, 103, 114, 97, 109, 115, 47, 99, 111);
+        p1 = iset(p1, 109, 112, 105, 108, 101, 114, 95, 115, 101, 108, 102, 95, 97, 117, 100, 105);
+        p1 = iset(p1, 116, 46, 111, 109, 110, 105, 0);
+        let p2: bytes = anew(0);
+        p2 = iset(p2, 112, 117, 114, 101, 47, 112, 114, 111, 103, 114, 97, 109, 115, 47, 107, 118);
+        p2 = iset(p2, 95, 108, 101, 100, 103, 101, 114, 95, 115, 101, 114, 118, 105, 99, 101, 46);
+        p2 = iset(p2, 111, 109, 110, 105, 0);
+        let p3: bytes = anew(0);
+        p3 = iset(p3, 112, 117, 114, 101, 47, 112, 114, 111, 103, 114, 97, 109, 115, 47, 112, 97);
+        p3 = iset(p3, 99, 107, 53, 95, 100, 101, 99, 105, 115, 105, 111, 110, 95, 99, 111, 110);
+        p3 = iset(p3, 116, 114, 111, 108, 108, 101, 114, 46, 111, 109, 110, 105, 0);
+        let p4: bytes = anew(0);
+        p4 = iset(p4, 112, 117, 114, 101, 47, 109, 53, 47, 122, 101, 114, 111, 95, 114, 117, 115);
+        p4 = iset(p4, 116, 95, 100, 114, 105, 118, 101, 114, 46, 111, 109, 110, 105, 0);
+        let u1: bytes = p7g_measure_5runs(w, p1);
+        let w1: i64 = ld_u64(u1, 160); let e1: i64 = ld_u64(u1, 168); let f1: i64 = ld_u64(u1, 176); let ok1: i64 = ld_u64(u1, 184);
+        let u2: bytes = p7g_measure_5runs(u1, p2);
+        let w2: i64 = ld_u64(u2, 160); let e2: i64 = ld_u64(u2, 168); let f2: i64 = ld_u64(u2, 176); let ok2: i64 = ok1 * ld_u64(u2, 184);
+        let u3: bytes = p7g_measure_5runs(u2, p3);
+        let w3: i64 = ld_u64(u3, 160); let e3: i64 = ld_u64(u3, 168); let f3: i64 = ld_u64(u3, 176); let ok3: i64 = ok2 * ld_u64(u3, 184);
+        let u4: bytes = p7g_measure_5runs(u3, p4);
+        let w4: i64 = ld_u64(u4, 160); let e4: i64 = ld_u64(u4, 168); let f4: i64 = ld_u64(u4, 176); let ok4: i64 = ok3 * ld_u64(u4, 184);
+        if_pos ok4 <=> 0 {
+            let b: bytes = p7g_append_row(iset_patch_i64(u4, 0, 0), p1, w1, e1, f1);
+            b = p7g_append_row(b, p2, w2, e2, f2);
+            b = p7g_append_row(b, p3, w3, e3, f3);
+            b = p7g_append_row(b, p4, w4, e4, f4);
+            b = su_out4(su_out4(su_out4(su_out4(b, 91, 80, 55, 45), 77, 69, 65, 83), 85, 82, 69, 32), 80, 65, 83, 83);
+            b = su_out4(su_out4(su_out4(su_out4(b, 93, 32, 52, 32), 116, 97, 114, 103), 101, 116, 115, 32), 124, 32, 53, 32);
+            b = su_out4(su_out4(su_out4(su_out4(b, 114, 117, 110, 115), 32, 124, 32, 48), 45, 118, 97, 114), 10, 0, 0, 0);
+            let nw: i64 = sys_write(1, b, su_band_a(), ld_u64(b, 0));
+            0 + nw * 0
+        } else { 1 }
+    };
+    return rc;
+}
+
+// Runs `p7-canary` (Stage 2 ruler proof via frozen-5 + real `judge_cli.elf` on Canary A/B/C).
+#[strict]
+#[cap(SYS)]
+fn p7g_cmd_canary(w: bytes) -> i64 {
+    // 1. Frozen-5 check via core_gates.elf m2-frozen
+    let arg_fr: bytes = anew(0);
+    arg_fr = iset(arg_fr, 109, 50, 45, 102, 114, 111, 122, 101, 110, 0);
+    let rc_fr: i64 = su_spawn_capture(p7g_tool(w, 4), arg_fr, p7g_tmp(102), 420);
+    // 2. Real canary measurement: baseline (`x*3 + 0 + (y+7)*1`) vs Canary A (identity eliminated: `x*3 + (y+7)`)
+    let f_base: bytes = p7g_tmp(65);
+    let f_opt: bytes = p7g_tmp(66);
+    // Write baseline .omni
+    let u: bytes = iset_patch_i64(w, 0, 0);
+    u = su_out4(su_out4(su_out4(su_out4(u, 102, 110, 32, 109), 97, 105, 110, 40), 120, 58, 32, 105), 54, 52, 44, 32);
+    u = su_out4(su_out4(su_out4(su_out4(u, 121, 58, 32, 105), 54, 52, 41, 32), 45, 62, 32, 105), 54, 52, 32, 123);
+    u = su_out4(su_out4(su_out4(su_out4(u, 32, 108, 101, 116), 32, 97, 58, 32), 105, 54, 52, 32), 61, 32, 120, 32);
+    u = su_out4(su_out4(su_out4(su_out4(u, 42, 32, 51, 59), 32, 108, 101, 116), 32, 97, 49, 58), 32, 105, 54, 52);
+    u = su_out4(su_out4(su_out4(su_out4(u, 32, 61, 32, 97), 32, 43, 32, 48), 59, 32, 108, 101), 116, 32, 98, 58);
+    u = su_out4(su_out4(su_out4(su_out4(u, 32, 105, 54, 52), 32, 61, 32, 121), 32, 43, 32, 55), 59, 32, 108, 101);
+    u = su_out4(su_out4(su_out4(su_out4(u, 116, 32, 98, 49), 58, 32, 105, 54), 52, 32, 61, 32), 98, 32, 42, 32);
+    u = su_out4(su_out4(su_out4(su_out4(u, 49, 59, 32, 114), 101, 116, 117, 114), 110, 32, 97, 49), 32, 43, 32, 98);
+    u = su_out4(u, 49, 59, 32, 125);
+    let n1: i64 = su_write_file_from(u, f_base, su_band_a(), ld_u64(u, 0), 420);
+    // Write Canary A optimized .omni (`fn main(x: i64, y: i64) -> i64 { let a: i64 = x * 3; let b: i64 = y + 7; return a + b; }`)
+    u = iset_patch_i64(u, 0, 0);
+    u = su_out4(su_out4(su_out4(su_out4(u, 102, 110, 32, 109), 97, 105, 110, 40), 120, 58, 32, 105), 54, 52, 44, 32);
+    u = su_out4(su_out4(su_out4(su_out4(u, 121, 58, 32, 105), 54, 52, 41, 32), 45, 62, 32, 105), 54, 52, 32, 123);
+    u = su_out4(su_out4(su_out4(su_out4(u, 32, 108, 101, 116), 32, 97, 58, 32), 105, 54, 52, 32), 61, 32, 120, 32);
+    u = su_out4(su_out4(su_out4(su_out4(u, 42, 32, 51, 59), 32, 108, 101, 116), 32, 98, 58, 32), 105, 54, 52, 32);
+    u = su_out4(su_out4(su_out4(su_out4(u, 61, 32, 121, 32), 43, 32, 55, 59), 32, 114, 101, 116), 117, 114, 110, 32);
+    u = su_out4(su_out4(u, 97, 32, 43, 32), 98, 59, 32, 125);
+    let n2: i64 = su_write_file_from(u, f_opt, su_band_a(), ld_u64(u, 0), 420);
+    let mb: bytes = p7g_measure_5runs(u, f_base);
+    let bw: i64 = ld_u64(mb, 160);
+    let be: i64 = ld_u64(mb, 168);
+    let ok_b: i64 = ld_u64(mb, 184);
+    let mo: bytes = p7g_measure_5runs(mb, f_opt);
+    let ow: i64 = ld_u64(mo, 160);
+    let oe: i64 = ld_u64(mo, 168);
+    let ok_o: i64 = ld_u64(mo, 184);
+    // Judge Canary A (+1t), Canary B (0t), Canary C (-1t) via real `judge_cli.elf` (`pure/m7/judge.omni`).
+    let va: i64 = p7g_call_judge(mo, 1, bw, ow, be, oe, 0);
+    let vb: i64 = p7g_call_judge(mo, 1, bw, bw, be, be, 0);
+    let vc: i64 = p7g_call_judge(mo, 0, bw, ow, be, oe, 5);
+    let ok: i64 = m2u_eq(rc_fr, 0) * m2u_ge(n1, 1) * m2u_ge(n2, 1) * ok_b * ok_o
+        * m2u_eq(va, 1) * m2u_eq(vb, 0) * m2u_eq(vc, 0 - 1);
+    let rc: i64 = if_pos ok <=> 0 {
+        let out: bytes = iset_patch_i64(mo, 0, 0);
+        // "[P7-CANARY PASS] canary_a=+1t canary_b=0t canary_c=-1t frozen5=OK | pure/m7/judge.omni\n"
+        out = su_out4(su_out4(su_out4(su_out4(out, 91, 80, 55, 45), 67, 65, 78, 65), 82, 89, 32, 80), 65, 83, 83, 93);
+        out = su_out4(su_out4(su_out4(su_out4(out, 32, 99, 97, 110), 97, 114, 121, 95), 97, 61, 43, 49), 116, 32, 99, 97);
+        out = su_out4(su_out4(su_out4(su_out4(out, 110, 97, 114, 121), 95, 98, 61, 48), 116, 32, 99, 97), 110, 97, 114, 121);
+        out = su_out4(su_out4(su_out4(su_out4(out, 95, 99, 61, 45), 49, 116, 32, 102), 114, 111, 122, 101), 110, 53, 61, 79);
+        out = su_out4(su_out4(su_out4(su_out4(out, 75, 32, 124, 32), 112, 117, 114, 101), 47, 109, 55, 47), 106, 117, 100, 103);
+        out = su_out4(su_out4(out, 101, 46, 111, 109), 110, 105, 10, 0);
+        let nw: i64 = sys_write(1, out, su_band_a(), ld_u64(out, 0));
+        0 + nw * 0
+    } else { 1 };
+    return rc;
+}
+
+#[strict]
+#[cap(SYS)]
+fn main() -> i64 {
+    let w: bytes = su_load_cmdline(su_alloc_arena());
+    let argc: i64 = su_argc(w);
+    let rc: i64 = if_pos m2u_lt(argc, 2) <=> 0 {
+        2
+    } else {
+        let o: i64 = su_arg_off(w, 1);
+        let l: i64 = su_arg_len(w, 1);
+        let c0: i64 = ld_u8(w, o);
+        let c3: i64 = m2u_sel(m2u_ge(l, 4), ld_u8(w, o + 3), 0);
+        if_pos m2u_eq(c0, 47) <=> 0 {
+            // Request file containing target path (newline-terminated) for `p7-measure <target>`
+            let nb: i64 = su_read_file_into(w, su_make_cstr(w, o, l), su_band_b(), 512);
+            let tl: i64 = m2u_sel(m2u_ge(nb, 2), nb - m2u_eq(ld_u8(w, su_band_b() + nb - 1), 10), 0);
+            if_pos m2u_ge(tl, 1) <=> 0 {
+                let p: bytes = su_make_cstr(w, su_band_b(), tl);
+                let u: bytes = p7g_measure_5runs(w, p);
+                if_pos ld_u64(u, 184) <=> 0 { p7g_emit_row(u, p) } else { 1 }
+            } else { 2 }
+        } else { if_pos m2u_eq(c3, 109) <=> 0 {
+            p7g_cmd_measure(w, argc)
+        } else { if_pos m2u_eq(c3, 99) <=> 0 {
+            p7g_cmd_canary(w)
+        } else { 2 } } }
+    };
+    return sys_exit(rc);
+}
