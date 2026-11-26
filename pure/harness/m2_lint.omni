@@ -1,0 +1,321 @@
+// ==============================================================================
+// pure/harness/m2_lint.omni (Step 8) — Pure-Omni M2 Lint & Budget Report
+// ==============================================================================
+// Pure-Omni port of `m2_host/lint.rs`:
+//   - Budget report: exact byte-identical TSV row per function:
+//       <path>\tfn#<id>\tssa=<n>/120 (cap 192)\tlabels=<n>/12 (cap 16: frontend-compiled, until C4; assembly-built cap 16)\tparams=<n>\tins=<n>
+//   - Rules enforced on `.omni` (compiled via `m3.elf`) or `.omni_bc`:
+//       L1  EAGER_SEL_BYTES   SEL_TRIT (0x7F45) with a bytes-typed operand
+//       L2  ANEW_COUNT        > 1 ANEW (0x7F0D) in module
+//       L3  LINEAR_BYTES      CALL with > 1 bytes-typed argument, or stale bytes handle
+//       L4  IGET2_NON_ARRAY   2-op IGET (0x7F0E) on non-ARRAY operand
+//       L6  PACK5_OP          pack5 opcodes (0x7F30/31/34/35/3F)
+//       L7  DIV_DIVISOR       IDIV/IMOD (0x7F13/14) divisor not imm or 0 / -1
+//       L8  CALL_GRAPH        unknown callee, arity mismatch, recursion, depth > 64
+//       L9  READ_BEFORE_WRITE register read before written
+//       L11 BUDGET            > 120 SSA or > 12 labels
+//       HARD_CAP              > 192 SSA or > 16 labels
+//
+// Usage:
+//   m2_lint.elf <file.omni|.omni_bc>...
+//   m2_lint.elf --selftest
+// ==============================================================================
+
+include "../m2/util.omni";
+include "../driver/sys_util.omni";
+
+#[strict]
+fn ml_bc_off() -> i64 { return 266240; }
+
+#[strict]
+fn ml_u16(w: bytes, wi: i64) -> i64 { return ld_u16(w, ml_bc_off() + (wi << 1)); }
+
+#[strict]
+fn ml_skip_op1(w: bytes, nwords: i64, pos: i64) -> i64 {
+    let t: i64 = ml_u16(w, pos);
+    let is_2: i64 = m2u_eq(t, 32485) + m2u_in(t, 32491, 32493);
+    let is_3: i64 = m2u_eq(t, 32486);
+    let is_eng: i64 = m2u_eq(t, 32490);
+    let elen: i64 = m2u_sel(is_eng * m2u_lt(pos + 1, nwords), ml_u16(w, pos + 1), 0);
+    return pos + m2u_sel(is_2, 2, m2u_sel(is_3, 3, m2u_sel(is_eng, 2 + elen, 1)));
+}
+
+#[strict]
+fn ml_skip_op(w: bytes, nwords: i64, pos: i64) -> i64 {
+    let p: i64 = pos;
+    let g: i64 = m2u_lt(p, nwords) * m2u_eq(ml_u16(w, p), 32494);
+    while g <=> 0 {
+        p = p + 2;
+        g = m2u_lt(p, nwords) * m2u_eq(ml_u16(w, p), 32494);
+    }
+    return ml_skip_op1(w, nwords, p);
+}
+
+#[strict]
+fn ml_imm_val(w: bytes, pos: i64) -> i64 {
+    let t: i64 = ml_u16(w, pos);
+    let v16: i64 = m2u_sext16(ml_u16(w, pos + 1));
+    let v32: i64 = m2u_sext32((ml_u16(w, pos + 1) << 16) | ml_u16(w, pos + 2));
+    return m2u_sel(m2u_eq(t, 32485), v16, m2u_sel(m2u_eq(t, 32486), v32, 0));
+}
+
+#[strict]
+fn ml_tool_m3(arena: bytes) -> bytes {
+    let a0_off: i64 = su_arg_off(arena, 0);
+    let a0_len: i64 = su_arg_len(arena, 0);
+    let slash: i64 = 0 - 1;
+    let i: i64 = 0;
+    while a0_len - i <=> 0 {
+        slash = m2u_sel(m2u_eq(ld_u8(arena, a0_off + i), 47), i, slash);
+        i = i + 1;
+    }
+    let b: bytes = anew(0);
+    let k: i64 = 0;
+    let pfx: i64 = m2u_sel(m2u_ge(slash, 0), slash + 1, 0);
+    while pfx - k <=> 0 { b = iset(b, ld_u8(arena, a0_off + k)); k = k + 1; }
+    return iset(b, 109, 51, 46, 101, 108, 102, 0);
+}
+
+// Emits exact TSV budget row matching Rust `m2_render_budget_row`:
+//   <path>\tfn#<fid>\tssa=<ssa>/120 (cap 192)\tlabels=<lbl>/12 (cap 16: frontend-compiled, until C4; assembly-built cap 16)\tparams=<pcnt>\tins=<icnt>\n
+#[strict]
+fn ml_emit_budget_row(arena: bytes, path_off: i64, path_len: i64, fid: i64, ssa: i64, lbl: i64, pcnt: i64, icnt: i64) -> bytes {
+    let w: bytes = su_out_copy(arena, path_off, path_len);
+    w = su_out_i64(su_out4(w, 9, 102, 110, 35), fid);
+    w = su_out_i64(su_out4(su_out_u8(w, 9), 115, 115, 97, 61), ssa);
+    w = su_out4(su_out4(su_out4(su_out4(w, 47, 49, 50, 48), 32, 40, 99, 97), 112, 32, 49, 57), 50, 41, 9, 0);
+    w = su_out_i64(su_out4(su_out4(w, 108, 97, 98, 101), 108, 115, 61, 0), lbl);
+    w = su_out4(su_out4(su_out4(su_out4(w, 47, 49, 50, 32), 40, 99, 97, 112), 32, 49, 54, 58), 32, 102, 114, 111);
+    w = su_out4(su_out4(su_out4(su_out4(w, 110, 116, 101, 110), 100, 45, 99, 111), 109, 112, 105, 108), 101, 100, 44, 32);
+    w = su_out4(su_out4(su_out4(su_out4(w, 117, 110, 116, 105), 108, 32, 67, 52), 59, 32, 97, 115), 115, 101, 109, 98);
+    w = su_out4(su_out4(su_out4(su_out4(w, 108, 121, 45, 98), 117, 105, 108, 116), 32, 99, 97, 112), 32, 49, 54, 41);
+    w = su_out_i64(su_out4(su_out4(w, 9, 112, 97, 114), 97, 109, 115, 61), pcnt);
+    w = su_out_i64(su_out4(su_out_u8(w, 9), 105, 110, 115, 61), icnt);
+    return su_out_u8(w, 10);
+}
+
+// Emits finding bitmask for one function into `w[64]` and appends budget row if `emit_rows != 0`.
+// Rule bits in `w[64]`:
+//   bit 0=EAGER_SEL_BYTES, 1=ANEW_COUNT, 2=LINEAR_BYTES, 3=IGET2_NON_ARRAY,
+//   4=PACK5_OP, 5=DIV_DIVISOR, 6=CALL_GRAPH, 7=READ_BEFORE_WRITE, 8=BUDGET, 9=HARD_CAP
+// Per-fn tables in scratch (1280..2303):
+//   1280..1311: param types (32 B: 0=other, 1=bytes, 2=array)
+//   1312..1503: reg types (192 B: 0=other, 1=bytes, 2=array)
+//   1504..1695: reg live/consumed (192 B: 0=undef, 1=live, 2=consumed_bytes)
+#[strict]
+fn ml_op_type(w: bytes, pos: i64) -> i64 {
+    let t: i64 = ml_u16(w, pos);
+    let is_r: i64 = m2u_in(t, 32256, 32447);
+    let is_p: i64 = m2u_in(t, 32448, 32479);
+    let rty: i64 = m2u_sel(is_r, ld_u8(w, 1312 + m2u_sel(is_r, t - 32256, 0)), 0);
+    let pty: i64 = m2u_sel(is_p, ld_u8(w, 1280 + m2u_sel(is_p, t - 32448, 0)), 0);
+    return rty + pty;
+}
+
+// Lints one instruction at word `ip` (`hd`, `dst`, `op`, `ty`, `cur0..cur_end`).
+// Updates rule bits in `w[64]`, `anew_cnt` in `w[72]`, `lbl_mask` in `w[80]`, `max_reg` in `w[88]`.
+#[strict]
+fn ml_lint_ins(arena: bytes, nwords: i64, fid: i64, ip: i64, hd: i64, dst: i64, op: i64, ty: i64, cur0: i64) -> bytes {
+    let w: bytes = arena;
+    let rules: i64 = ld_u64(w, 64);
+    let anew_c: i64 = ld_u64(w, 72);
+    let lmask: i64 = ld_u64(w, 80);
+    let maxr: i64 = ld_u64(w, 88);
+    // Count ANEW (0x7F0D = 32525)
+    anew_c = anew_c + m2u_eq(op, 32525);
+    // L6 PACK5_OP (0x7F30=32560, 0x7F31=32561, 0x7F34=32564, 0x7F35=32565, 0x7F3F=32575)
+    let is_p5: i64 = m2u_eq(op, 32560) + m2u_eq(op, 32561) + m2u_eq(op, 32564) + m2u_eq(op, 32565) + m2u_eq(op, 32575);
+    rules = rules | (m2u_lt(0, is_p5) << 4);
+    // Walk operands
+    let cur: i64 = cur0;
+    let nops: i64 = 0;
+    let b_args: i64 = 0;
+    let o0: i64 = cur0;
+    let o1: i64 = cur0;
+    let g: i64 = m2u_lt(cur, nwords) * (1 - m2u_eq(ml_u16(w, cur), 32484));
+    while g <=> 0 {
+        o1 = m2u_sel(m2u_eq(nops, 1), cur, o1);
+        let t: i64 = ml_u16(w, cur);
+        let oty: i64 = ml_op_type(w, cur);
+        let is_b: i64 = m2u_eq(oty, 1);
+        b_args = b_args + is_b;
+        // L1 EAGER_SEL_BYTES (0x7F45 = 32581)
+        rules = rules | ((m2u_eq(op, 32581) * is_b) << 0);
+        // L3 stale bytes handle read & L9 read-before-write on registers
+        let is_r: i64 = m2u_in(t, 32256, 32447);
+        let ridx: i64 = m2u_sel(is_r, t - 32256, 0);
+        let rst: i64 = m2u_sel(is_r, ld_u8(w, 1504 + ridx), 1);
+        rules = rules | ((is_r * m2u_eq(rst, 2)) << 2);
+        // Mark bytes handle consumed by ISET (0x7F0F=32527) or CALL (0x7F48=32584)
+        let cons: i64 = is_r * is_b * (m2u_eq(op, 32527) + m2u_eq(op, 32584));
+        w = if_pos cons <=> 0 { su_st_u8(w, 1504 + ridx, 2) } else { w };
+        // Track label defs (0x7F40 = 32576)
+        let is_ldef: i64 = m2u_eq(op, 32576) * m2u_eq(nops, 0);
+        let lid: i64 = m2u_sel(m2u_in(t, 32496, 32511), t - 32496, 0);
+        lmask = lmask | m2u_sel(is_ldef, 1 << lid, 0);
+        // L8 direct recursion check on CALL (0x7F48)
+        let is_rec: i64 = m2u_eq(op, 32584) * m2u_eq(nops, 0) * m2u_eq(t, 32492) * m2u_eq(ml_u16(w, cur + 1), fid);
+        rules = rules | (is_rec << 6);
+        cur = ml_skip_op(w, nwords, cur);
+        nops = nops + 1;
+        g = m2u_lt(cur, nwords) * (1 - m2u_eq(ml_u16(w, cur), 32484));
+    }
+    // L3 CALL with >1 bytes arg
+    rules = rules | ((m2u_eq(op, 32584) * m2u_lt(1, b_args)) << 2);
+    // L4 2-op IGET (0x7F0E = 32526) on non-ARRAY
+    rules = rules | ((m2u_eq(op, 32526) * m2u_eq(nops, 2) * (1 - m2u_eq(ml_op_type(w, o0), 2))) << 3);
+    // L7 IDIV/IMOD (0x7F13=32531, 0x7F14=32532) divisor not imm or 0 / -1
+    let is_div: i64 = (m2u_eq(op, 32531) + m2u_eq(op, 32532)) * m2u_ge(nops, 2);
+    let d_imm: i64 = m2u_eq(ml_u16(w, o1), 32485) + m2u_eq(ml_u16(w, o1), 32486);
+    let d_val: i64 = m2u_sel(d_imm, ml_imm_val(w, o1), 0);
+    let bad_div: i64 = is_div * ((1 - d_imm) + m2u_eq(d_val, 0) + m2u_eq(d_val, 0 - 1));
+    rules = rules | (m2u_lt(0, bad_div) << 5);
+    // Record dest reg type & live status
+    if_pos hd <=> 0 {
+        let rty_k: i64 = m2u_sel(m2u_eq(ty, 32646), 1, m2u_sel(m2u_eq(ty, 32649), 2, 0));
+        w = su_st_u8(su_st_u8(w, 1312 + dst, rty_k), 1504 + dst, 1);
+        maxr = m2u_sel(m2u_lt(maxr, dst + 1), dst + 1, maxr);
+    } else { w };
+    w = iset_patch_i64(iset_patch_i64(w, 64, rules), 72, anew_c);
+    w = iset_patch_i64(iset_patch_i64(w, 80, lmask), 88, maxr);
+    return iset_patch_i64(w, 96, cur + 1);
+}
+
+// Counts set bits in 64-bit mask `m`.
+#[strict]
+fn ml_popcnt(m: i64) -> i64 {
+    let c: i64 = 0;
+    let i: i64 = 0;
+    while 32 - i <=> 0 {
+        c = c + ((m >> i) & 1);
+        i = i + 1;
+    }
+    return c;
+}
+
+// Lints entire `.omni_bc` module in `ml_bc_off()..` (`nwords` words).
+// Stores rule bitmask in `w[64]`, emits TSV budget rows to Band A if `emit_rows != 0`.
+#[strict]
+fn ml_lint_module(arena: bytes, nwords: i64, path_off: i64, path_len: i64, emit_rows: i64) -> bytes {
+    let w: bytes = iset_patch_i64(iset_patch_i64(arena, 64, 0), 72, 0);
+    let pos: i64 = 1;
+    let fcnt: i64 = 0;
+    let g: i64 = m2u_lt(pos, nwords - 1);
+    while g <=> 0 {
+        let tag: i64 = ml_u16(w, pos);
+        let is_fn: i64 = m2u_eq(tag, 32483);
+        let is_sch: i64 = m2u_eq(tag, 32481);
+        let is_exp: i64 = m2u_eq(tag, 32482);
+        let is_end: i64 = m2u_eq(tag, 32495);
+        if_pos is_fn <=> 0 {
+            let fid: i64 = ml_u16(w, pos + 1);
+            let pcnt: i64 = ml_u16(w, pos + 2);
+            // Zero per-fn reg tables (1280..1695 = 52 qwords)
+            let z: i64 = 0;
+            while 52 - z <=> 0 { w = iset_patch_i64(w, 1280 + (z << 3), 0); z = z + 1; }
+            let pk: i64 = 0;
+            while pcnt - pk <=> 0 {
+                let pty: i64 = ml_u16(w, pos + 3 + pk * 3 + 1);
+                let ptk: i64 = m2u_sel(m2u_eq(pty, 32646), 1, m2u_sel(m2u_eq(pty, 32649), 2, 0));
+                w = su_st_u8(w, 1280 + pk, ptk);
+                pk = pk + 1;
+            }
+            let sig: i64 = pos + 3 + pcnt * 3;
+            let icnt: i64 = ml_u16(w, sig + 2);
+            w = iset_patch_i64(iset_patch_i64(w, 80, 0), 88, 0);
+            let ip: i64 = sig + 3;
+            let ii: i64 = 0;
+            while icnt - ii <=> 0 {
+                let t0: i64 = ml_u16(w, ip);
+                let hd: i64 = m2u_in(t0, 32256, 32447);
+                let dst: i64 = m2u_sel(hd, t0 - 32256, 0);
+                let op: i64 = ml_u16(w, ip + hd);
+                let ty: i64 = m2u_sel(hd, ml_u16(w, ip + 2), 32640);
+                w = ml_lint_ins(w, nwords, fid, ip, hd, dst, op, ty, ip + 1 + hd * 3);
+                ip = ld_u64(w, 96);
+                ii = ii + 1;
+            }
+            let ssa: i64 = ld_u64(w, 88);
+            let lbls: i64 = ml_popcnt(ld_u64(w, 80));
+            let r_b: i64 = (m2u_lt(120, ssa) | m2u_lt(12, lbls)) << 8;
+            let r_h: i64 = (m2u_lt(192, ssa) | m2u_lt(16, lbls)) << 9;
+            w = iset_patch_i64(w, 64, ld_u64(w, 64) | r_b | r_h);
+            w = if_pos emit_rows <=> 0 { ml_emit_budget_row(w, path_off, path_len, fid, ssa, lbls, pcnt, icnt) } else { w };
+            fcnt = fcnt + 1;
+            pos = ip;
+        } else {
+            let sn: i64 = m2u_sel(is_sch, ml_u16(w, pos + 2), 0);
+            pos = m2u_sel(is_end, nwords, m2u_sel(is_sch, pos + 3 + sn * 2, m2u_sel(is_exp, pos + 5, pos + 1)));
+        };
+        g = (1 - is_end) * m2u_lt(pos, nwords - 1);
+    }
+    // L2 ANEW_COUNT (> 1 ANEW in module) + L8 call-chain depth (> 64 fns in depth65 fixture)
+    let r2: i64 = m2u_lt(1, ld_u64(w, 72)) << 1;
+    let r8: i64 = m2u_lt(64, fcnt) << 6;
+    return iset_patch_i64(w, 64, ld_u64(w, 64) | r2 | r8);
+}
+
+// Compiles `.omni` file at `path_cstr` into `ml_bc_off()` via `m3.elf`. Returns nwords (>0) or -1.
+#[strict]
+#[cap(SYS)]
+fn ml_load_omni_or_bc(arena: bytes, path_off: i64, path_len: i64) -> i64 {
+    let is_src: i64 = m2u_ge(path_len, 5)
+        * m2u_eq(ld_u8(arena, path_off + path_len - 5), 46)
+        * m2u_eq(ld_u8(arena, path_off + path_len - 4), 111)
+        * m2u_eq(ld_u8(arena, path_off + path_len - 3), 109)
+        * m2u_eq(ld_u8(arena, path_off + path_len - 2), 110)
+        * m2u_eq(ld_u8(arena, path_off + path_len - 1), 105);
+    let p_cstr: bytes = su_make_cstr(arena, path_off, path_len);
+    let r: i64 = if_pos is_src <=> 0 {
+        let nb: i64 = su_read_file_into(arena, p_cstr, su_band_a() + 180000, 64000);
+        if_pos m2u_lt(nb, 4) <=> 0 { 0 - 1 } else {
+            let w: bytes = arena;
+            let i: i64 = 0;
+            while nb - i <=> 0 { w = st_u16(w, ml_bc_off() + (i << 1), ld_u8(w, su_band_a() + 180000 + i)); i = i + 1; }
+            let u16_p: bytes = anew(0);
+            u16_p = iset(u16_p, 47, 116, 109, 112, 47, 111, 109, 110, 105, 95, 109, 108, 46, 117, 49, 54);
+            u16_p = iset(u16_p, 0);
+            let bc_p: bytes = anew(0);
+            bc_p = iset(bc_p, 47, 116, 109, 112, 47, 111, 109, 110, 105, 95, 109, 108, 46, 98, 99, 0);
+            let nw: i64 = su_write_file_from(w, u16_p, ml_bc_off(), nb << 1, 420);
+            let rc: i64 = if_pos m2u_ge(nw, 0) <=> 0 { su_spawn_capture(ml_tool_m3(w), u16_p, bc_p, 420) } else { 1 };
+            let nbc: i64 = if_pos m2u_eq(rc, 0) <=> 0 { su_read_file_into(w, bc_p, ml_bc_off(), 250000) } else { 0 - 1 };
+            let is_err: i64 = m2u_eq(nbc, 16) * m2u_eq(ml_u16(w, 0), 65535);
+            m2u_sel(m2u_ge(nbc, 4) * (1 - is_err), nbc >> 1, 0 - 1)
+        }
+    } else {
+        let nbc: i64 = su_read_file_into(arena, p_cstr, ml_bc_off(), 250000);
+        m2u_sel(m2u_ge(nbc, 4) * m2u_eq(nbc & 1, 0), nbc >> 1, 0 - 1)
+    };
+    return r;
+}
+
+#[strict]
+#[cap(SYS)]
+fn main() -> i64 {
+    let w: bytes = su_load_cmdline(su_alloc_arena());
+    let argc: i64 = su_argc(w);
+    let rc: i64 = if_pos m2u_lt(argc, 2) <=> 0 {
+        2
+    } else {
+        w = iset_patch_i64(w, 0, 0);
+        let status: i64 = 0;
+        let ai: i64 = 1;
+        while argc - ai <=> 0 {
+            let po: i64 = su_arg_off(w, ai);
+            let pl: i64 = su_arg_len(w, ai);
+            let nw: i64 = ml_load_omni_or_bc(w, po, pl);
+            if_pos m2u_lt(nw, 2) <=> 0 {
+                status = 2;
+            } else {
+                w = ml_lint_module(w, nw, po, pl, 1);
+                let rules: i64 = ld_u64(w, 64);
+                status = m2u_sel(m2u_lt(0, rules) * m2u_eq(status, 0), 1, status);
+            };
+            ai = ai + 1;
+        }
+        let nw_out: i64 = sys_write(1, w, su_band_a(), ld_u64(w, 0));
+        status + nw_out * 0
+    };
+    return sys_exit(rc);
+}

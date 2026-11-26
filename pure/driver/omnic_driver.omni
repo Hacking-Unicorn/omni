@@ -23,8 +23,25 @@
 include "../link/elf_link.omni";
 include "sys_util.omni";
 
+// Builds `<dir_of_argv0>/<tool_name>\0` for harness tools (tid: 5=m2_lint, 6=audit_view_gate, 7=proposer_loop, 8=core_gates).
+#[strict]
+fn od_tool_path_hi(b: bytes, tid: i64) -> bytes {
+    let r: bytes = if_pos m2u_eq(tid, 5) <=> 0 {
+        iset(b, 109, 50, 95, 108, 105, 110, 116, 46, 101, 108, 102, 0)
+    } else { if_pos m2u_eq(tid, 6) <=> 0 {
+        let u: bytes = iset(b, 97, 117, 100, 105, 116, 95, 118, 105, 101, 119, 95, 103, 97, 116, 101, 46);
+        iset(u, 101, 108, 102, 0)
+    } else { if_pos m2u_eq(tid, 7) <=> 0 {
+        let u: bytes = iset(b, 112, 114, 111, 112, 111, 115, 101, 114, 95, 108, 111, 111, 112, 46, 101, 108);
+        iset(u, 102, 0)
+    } else {
+        iset(b, 99, 111, 114, 101, 95, 103, 97, 116, 101, 115, 46, 101, 108, 102, 0)
+    } } };
+    return r;
+}
+
 // Builds `<dir_of_argv0>/<tool_name>\0` where `tid`:
-//   0="m3.elf", 1="m2.elf", 2="verifier.elf", 3="audit_decompile.elf", 4="audit_diff.elf".
+//   0="m3.elf", 1="m2.elf", 2="verifier.elf", 3="audit_decompile.elf", 4="audit_diff.elf", 5..8=harness tools.
 #[strict]
 fn od_tool_path(arena: bytes, tid: i64) -> bytes {
     let a0_off: i64 = su_arg_off(arena, 0);
@@ -51,9 +68,11 @@ fn od_tool_path(arena: bytes, tid: i64) -> bytes {
     } else { if_pos m2u_eq(tid, 3) <=> 0 {
         let u: bytes = iset(b, 97, 117, 100, 105, 116, 95, 100, 101, 99, 111, 109, 112, 105, 108, 101, 46);
         iset(u, 101, 108, 102, 0)
-    } else {
+    } else { if_pos m2u_eq(tid, 4) <=> 0 {
         iset(b, 97, 117, 100, 105, 116, 95, 100, 105, 102, 102, 46, 101, 108, 102, 0)
-    } } } };
+    } else {
+        od_tool_path_hi(b, tid)
+    } } } } };
     return r;
 }
 
@@ -430,12 +449,14 @@ fn od_cmd_audit(arena: bytes, argc: i64, which: i64) -> i64 {
 
 // Classifies argv[1] subcommand:
 //   1=compile/compile-surface, 2=compile-elf, 3=link-elf, 4=run, 5=decompile, 6=inspect, 7=audit-diff, 8=version
+//   9=m2-lint, 10=audit-view, 11=proposer-loop/propose-run, 12=core_gates (m2-frozen/m2-fixed-point/p2a-syscalls/b2-pure-verifier/selftest)
 #[strict]
 fn od_classify_cmd(arena: bytes) -> i64 {
     let o: i64 = su_arg_off(arena, 1);
     let l: i64 = su_arg_len(arena, 1);
     let c0: i64 = m2u_sel(m2u_ge(l, 1), ld_u8(arena, o), 0);
     let c1: i64 = m2u_sel(m2u_ge(l, 2), ld_u8(arena, o + 1), 0);
+    let c6: i64 = m2u_sel(m2u_ge(l, 7), ld_u8(arena, o + 6), 0);
     let c7: i64 = m2u_sel(m2u_ge(l, 8), ld_u8(arena, o + 7), 0);
     let is_c: i64 = m2u_eq(l, 7) * m2u_eq(c0, 99) * m2u_eq(c1, 111);
     let is_cs: i64 = m2u_eq(l, 15) * m2u_eq(c0, 99) * m2u_eq(c7, 45);
@@ -444,9 +465,17 @@ fn od_classify_cmd(arena: bytes) -> i64 {
     let is_rn: i64 = m2u_eq(l, 3) * m2u_eq(c0, 114) * m2u_eq(c1, 117);
     let is_dc: i64 = m2u_eq(l, 9) * m2u_eq(c0, 100) * m2u_eq(c1, 101);
     let is_in: i64 = m2u_eq(l, 7) * m2u_eq(c0, 105) * m2u_eq(c1, 110);
-    let is_ad: i64 = m2u_eq(l, 10) * m2u_eq(c0, 97) * m2u_eq(c1, 117);
+    let is_ad: i64 = m2u_eq(l, 10) * m2u_eq(c0, 97) * m2u_eq(c6, 100);
+    let is_av: i64 = m2u_eq(l, 10) * m2u_eq(c0, 97) * m2u_eq(c6, 118);
+    let is_ml: i64 = m2u_eq(l, 7) * m2u_eq(c0, 109) * m2u_eq(c1, 50);
+    let is_pl: i64 = (m2u_eq(l, 13) + m2u_eq(l, 11)) * m2u_eq(c0, 112) * m2u_eq(c1, 114);
+    let is_cg: i64 = (m2u_eq(l, 9) * m2u_eq(c0, 109) * m2u_eq(c1, 50))
+        + (m2u_eq(l, 14) * m2u_eq(c0, 109) * m2u_eq(c1, 50))
+        + (m2u_eq(l, 12) * m2u_eq(c0, 112) * m2u_eq(c1, 50))
+        + (m2u_eq(l, 16) * m2u_eq(c0, 98) * m2u_eq(c1, 50))
+        + (m2u_eq(l, 8) * m2u_eq(c0, 115) * m2u_eq(c1, 101));
     let is_ver: i64 = (m2u_eq(l, 9) * m2u_eq(c0, 45) * m2u_eq(c1, 45)) + (m2u_eq(l, 2) * m2u_eq(c0, 45) * m2u_eq(c1, 86)) + (m2u_eq(l, 7) * m2u_eq(c0, 118));
-    return (is_c + is_cs) * 1 + is_ce * 2 + is_le * 3 + is_rn * 4 + is_dc * 5 + is_in * 6 + is_ad * 7 + is_ver * 8;
+    return (is_c + is_cs) * 1 + is_ce * 2 + is_le * 3 + is_rn * 4 + is_dc * 5 + is_in * 6 + is_ad * 7 + is_ver * 8 + is_ml * 9 + is_av * 10 + is_pl * 11 + is_cg * 12;
 }
 
 // Implements `compile-elf <in.omni|.omni_bc> <out.elf> [a0 a1 a2]`.
@@ -477,6 +506,26 @@ fn od_cmd_compile_elf(w: bytes, argc: i64) -> i64 {
 
 #[strict]
 #[cap(SYS)]
+fn od_dispatch_harness(w: bytes, argc: i64, cmd: i64) -> i64 {
+    let empty: bytes = anew(0);
+    let rc: i64 = if_pos m2u_eq(cmd, 9) <=> 0 {
+        let a: bytes = if_pos m2u_ge(argc, 3) <=> 0 { su_make_cstr(w, su_arg_off(w, 2), su_arg_len(w, 2)) } else { empty };
+        sys_spawn(od_tool_path(w, 5), a)
+    } else { if_pos m2u_eq(cmd, 10) <=> 0 {
+        let a: bytes = if_pos m2u_ge(argc, 3) <=> 0 { su_make_cstr(w, su_arg_off(w, 2), su_arg_len(w, 2)) } else { empty };
+        sys_spawn(od_tool_path(w, 6), a)
+    } else { if_pos m2u_eq(cmd, 11) <=> 0 {
+        sys_spawn(od_tool_path(w, 7), empty)
+    } else { if_pos m2u_eq(cmd, 12) <=> 0 {
+        sys_spawn(od_tool_path(w, 8), su_make_cstr(w, su_arg_off(w, 1), su_arg_len(w, 1)))
+    } else {
+        2
+    } } } };
+    return rc;
+}
+
+#[strict]
+#[cap(SYS)]
 fn od_dispatch_hi(w: bytes, argc: i64, cmd: i64) -> i64 {
     let rc: i64 = if_pos m2u_eq(cmd, 4) <=> 0 {
         od_cmd_run(w, argc)
@@ -489,7 +538,7 @@ fn od_dispatch_hi(w: bytes, argc: i64, cmd: i64) -> i64 {
         let nw: i64 = sys_write(1, v, su_band_a(), ld_u64(v, 0));
         0 + nw * 0
     } else {
-        2
+        od_dispatch_harness(w, argc, cmd)
     } } };
     return rc;
 }
