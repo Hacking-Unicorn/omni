@@ -23,12 +23,6 @@ fn m2mg_t_oob() -> i64 { return 7; }
 #[strict]
 fn m2mg_t_cap() -> i64 { return 8; }
 #[strict]
-fn m2mg_entry_fn() -> i64 { return 9; }
-#[strict]
-fn m2mg_entry_bytes() -> i64 { return 10; }
-#[strict]
-fn m2mg_cur_bytes() -> i64 { return 11; }
-#[strict]
 fn m2mg_arr_mask() -> i64 { return 12; }
 #[strict]
 fn m2mg_lbase() -> i64 { return 13; }
@@ -1104,6 +1098,147 @@ fn m2m_emit_ctl_group(arena: bytes, arr: array, n: i64, ops_start: i64, nops: i6
     return r3;
 }
 
+// Phase 2a: emits raw Linux x86-64 `sys_spawn` (`kind` = 5, 3 operands; fork+execve+wait4).
+#[strict]
+fn m2m_emit_sys_spawn(arena: bytes, p1: i64, p2: i64, d: i64, pass: i64) -> bytes {
+    let w: bytes = m2m_load_op(arena, p1, 0);
+    w = m2x_b3(w, 73, 137, 192);                            // 49 89 C0
+    w = m2x_b4(w, 133, 192, 15, 132);                       // 85 C0 0F 84
+    w = m2m_trap_rel32(w, m2mg_t_oob(), pass);
+    w = m2x_b3(w, 68, 137, 193);                            // 44 89 C1
+    w = m2x_b3(w, 72, 255, 201);                            // 48 FF C9
+    w = m2x_b4(w, 73, 193, 232, 32);                        // 49 C1 E8 20
+    w = m2x_b3(w, 76, 1, 193);                              // 4C 01 C1
+    w = m2x_b4(w, 128, 60, 11, 0);                          // 80 3C 0B 00
+    w = m2a_emit_u16(w, 34063);                             // 0F 85
+    w = m2m_trap_rel32(w, m2mg_t_oob(), pass);
+    w = m2x_b4(w, 78, 141, 4, 3);                           // 4E 8D 04 03
+    w = m2m_load_op(w, p2, 0);
+    w = m2x_b4(w, 73, 137, 193, 133);                       // 49 89 C1 85
+    w = m2x_b4(w, 192, 117, 5, 77);                         // C0 75 05 4D
+    w = m2x_b4(w, 49, 201, 235, 27);                        // 31 C9 EB 1B
+    w = m2x_b3(w, 68, 137, 201);                            // 44 89 C9
+    w = m2x_b3(w, 72, 255, 201);                            // 48 FF C9
+    w = m2x_b4(w, 73, 193, 233, 32);                        // 49 C1 E9 20
+    w = m2x_b3(w, 76, 1, 201);                              // 4C 01 C9
+    w = m2x_b4(w, 128, 60, 11, 0);                          // 80 3C 0B 00
+    w = m2a_emit_u16(w, 34063);                             // 0F 85
+    w = m2m_trap_rel32(w, m2mg_t_oob(), pass);
+    w = m2x_b4(w, 78, 141, 12, 11);                         // 4E 8D 0C 0B
+    w = m2x_b3(w, 65, 83, 184);                             // 41 53 B8
+    w = m2a_emit_u32(w, 57);                                // SYS_fork
+    w = m2x_b4(w, 15, 5, 72, 133);                          // 0F 05 48 85
+    w = m2x_b3(w, 192, 120, 80);                            // C0 78 50
+    w = m2x_b4(w, 117, 36, 106, 0);                         // 75 24 6A 00
+    w = m2x_b4(w, 65, 81, 65, 80);                          // 41 51 41 50
+    w = m2x_b3(w, 76, 137, 199);                            // 4C 89 C7
+    w = m2x_b3(w, 72, 137, 230);                            // 48 89 E6
+    w = m2x_b4(w, 72, 141, 84, 36);                         // 48 8D 54 24
+    w = m2x_b3(w, 16, 184, 59);                             // 10 B8 3B
+    w = m2x_b3(w, 0, 0, 0);                                 // 00 00 00
+    w = m2x_b3(w, 15, 5, 191);                              // 0F 05 BF
+    w = m2a_emit_u32(w, 127);                               // 7F 00 00 00
+    w = m2a_emit_u8(w, 184);                                // B8
+    w = m2a_emit_u32(w, 60);                                // SYS_exit
+    w = m2x_b4(w, 15, 5, 72, 131);                          // 0F 05 48 83
+    w = m2x_b4(w, 236, 8, 72, 137);                         // EC 08 48 89
+    w = m2x_b4(w, 199, 72, 137, 230);                       // C7 48 89 E6
+    w = m2x_b4(w, 49, 210, 69, 49);                         // 31 D2 45 31
+    w = m2x_b3(w, 210, 184, 61);                            // D2 B8 3D
+    w = m2x_b3(w, 0, 0, 0);                                 // 00 00 00
+    w = m2x_b4(w, 15, 5, 72, 133);                          // 0F 05 48 85
+    w = m2x_b3(w, 192, 120, 11);                            // C0 78 0B
+    w = m2x_b3(w, 139, 4, 36);                              // 8B 04 24
+    w = m2x_b4(w, 193, 232, 8, 37);                         // C1 E8 08 25
+    w = m2a_emit_u32(w, 255);                               // FF 00 00 00
+    w = m2x_b4(w, 72, 131, 196, 8);                         // 48 83 C4 08
+    w = m2a_emit_u16(w, 23361);                             // 41 5B pop r11
+    return m2m_store_rax(w, d);
+}
+
+// Phase 2a: dispatches `0x7F73` Linux x86-64 syscall intrinsics (kind 0..5).
+#[strict]
+fn m2m_emit_syscall(arena: bytes, arr: array, n: i64, p0: i64, p1: i64, p2: i64, p3: i64, d: i64, pass: i64) -> bytes {
+    let kind: i64 = m2d_uval(p0);
+    let p4: i64 = m2d_operand(arr, n, m2d_next(p3));
+    let c_rw: trit = m2u_in(kind, 0, 1) <=> 0;
+    let c_open: trit = m2u_eq(kind, 2) <=> 0;
+    let c_ce: trit = m2u_in(kind, 3, 4) <=> 0;
+    let c_sp: trit = m2u_eq(kind, 5) <=> 0;
+    let r1: bytes = if_pos c_rw {
+        let t: bytes = m2m_load_op(arena, p2, 0);
+        t = m2x_b3(t, 73, 137, 192);                        // 49 89 C0
+        t = m2m_load_op(t, p3, 0);
+        t = m2m_load_op(t, p4, 1);
+        t = m2x_b3(t, 72, 133, 192);                        // 48 85 C0
+        t = m2a_emit_u16(t, 34831);                         // 0F 88
+        t = m2m_trap_rel32(t, m2mg_t_oob(), pass);
+        t = m2x_b3(t, 72, 133, 201);                        // 48 85 C9
+        t = m2a_emit_u16(t, 34831);                         // 0F 88
+        t = m2m_trap_rel32(t, m2mg_t_oob(), pass);
+        t = m2x_b4(t, 72, 141, 52, 8);                      // 48 8D 34 08
+        t = m2x_b3(t, 72, 57, 198);                         // 48 39 C6
+        t = m2a_emit_u16(t, 33295);                         // 0F 82
+        t = m2m_trap_rel32(t, m2mg_t_oob(), pass);
+        t = m2x_b3(t, 68, 137, 194);                        // 44 89 C2
+        t = m2x_b3(t, 72, 57, 214);                         // 48 39 D6
+        t = m2a_emit_u16(t, 34575);                         // 0F 87
+        t = m2m_trap_rel32(t, m2mg_t_oob(), pass);
+        t = m2x_b4(t, 73, 193, 232, 32);                    // 49 C1 E8 20
+        t = m2x_b3(t, 76, 1, 192);                          // 4C 01 C0
+        t = m2x_b4(t, 72, 141, 52, 3);                      // 48 8D 34 03
+        t = m2x_b3(t, 73, 137, 201);                        // 49 89 C9
+        t = m2m_load_op(t, p1, 0);
+        t = m2x_b3(t, 72, 137, 199);                        // 48 89 C7
+        t = m2x_b3(t, 76, 137, 202);                        // 4C 89 CA
+        t = m2a_emit_u8(t, 184);                            // B8
+        t = m2a_emit_u32(t, kind);
+        t = m2x_b4(t, 65, 83, 15, 5);                       // 41 53 0F 05
+        t = m2a_emit_u16(t, 23361);                         // 41 5B
+        m2m_store_rax(t, d)
+    } else {
+        arena
+    };
+    let r2: bytes = if_pos c_open {
+        let t: bytes = m2m_load_op(r1, p1, 0);
+        t = m2x_b3(t, 73, 137, 192);                        // 49 89 C0
+        t = m2x_b4(t, 133, 192, 15, 132);                   // 85 C0 0F 84
+        t = m2m_trap_rel32(t, m2mg_t_oob(), pass);
+        t = m2x_b3(t, 68, 137, 193);                        // 44 89 C1
+        t = m2x_b3(t, 72, 255, 201);                        // 48 FF C9
+        t = m2x_b4(t, 73, 193, 232, 32);                    // 49 C1 E8 20
+        t = m2x_b3(t, 76, 1, 193);                          // 4C 01 C1
+        t = m2x_b4(t, 128, 60, 11, 0);                      // 80 3C 0B 00
+        t = m2a_emit_u16(t, 34063);                         // 0F 85
+        t = m2m_trap_rel32(t, m2mg_t_oob(), pass);
+        t = m2x_b4(t, 74, 141, 60, 3);                      // 4A 8D 3C 03
+        t = m2m_load_op(t, p2, 0);
+        t = m2x_b3(t, 72, 137, 198);                        // 48 89 C6
+        t = m2m_load_op(t, p3, 0);
+        t = m2x_b3(t, 72, 137, 194);                        // 48 89 C2
+        t = m2a_emit_u8(t, 184);                            // B8
+        t = m2a_emit_u32(t, 2);
+        t = m2x_b4(t, 65, 83, 15, 5);                       // 41 53 0F 05
+        t = m2a_emit_u16(t, 23361);                         // 41 5B
+        m2m_store_rax(t, d)
+    } else {
+        r1
+    };
+    let r3: bytes = if_pos c_ce {
+        let nr: i64 = m2u_sel(m2u_eq(kind, 3), 3, 60);
+        let t: bytes = m2m_load_op(r2, p1, 0);
+        t = m2x_b4(t, 72, 137, 199, 184);                   // 48 89 C7 B8
+        t = m2a_emit_u32(t, nr);
+        t = m2x_b4(t, 65, 83, 15, 5);                       // 41 53 0F 05
+        t = m2a_emit_u16(t, 23361);                         // 41 5B
+        m2m_store_rax(t, d)
+    } else {
+        r2
+    };
+    let r4: bytes = if_pos c_sp { m2m_emit_sys_spawn(r3, p1, p2, d, pass) } else { r3 };
+    return r4;
+}
+
 // Dispatches one instruction in multi-mode.
 #[strict]
 fn m2m_emit_one_ins(arena: bytes, arr: array, n: i64, cur: i64, pass: i64, is_bytes: i64) -> bytes {
@@ -1122,12 +1257,14 @@ fn m2m_emit_one_ins(arena: bytes, arr: array, n: i64, cur: i64, pass: i64, is_by
     let c_iset: trit = m2u_eq(op, 32527) <=> 0;
     let c_alu: trit = (m2u_in(op, 32528, 32557) + m2u_eq(op, 32565) + m2u_eq(op, 32575)) <=> 0;
     let c_ctl: trit = m2u_in(op, 32576, 32586) <=> 0;
+    let c_sys: trit = m2u_eq(op, 32627) <=> 0;
     let r1: bytes = if_pos c_basic { m2m_emit_basic(arena, op, d, p0) } else { arena };
     let r2: bytes = if_pos c_iget { m2m_emit_iget(r1, nops, p0, p1, p2, d, pass) } else { r1 };
     let r3: bytes = if_pos c_iset { m2m_emit_iset(r2, arr, n, ops_start, nops, d, pass) } else { r2 };
     let r4: bytes = if_pos c_alu { m2m_emit_alu_group(r3, op, d, p0, p1, p2) } else { r3 };
     let r5: bytes = if_pos c_ctl { m2m_emit_ctl_group(r4, arr, n, ops_start, nops, op, d, p0, p1, p2, p3, pass, is_bytes) } else { r4 };
-    return r5;
+    let r6: bytes = if_pos c_sys { m2m_emit_syscall(r5, arr, n, p0, p1, p2, p3, d, pass) } else { r5 };
+    return r6;
 }
 
 // Scans one function body to find max_reg (for frame size) and returns next word offset after body.

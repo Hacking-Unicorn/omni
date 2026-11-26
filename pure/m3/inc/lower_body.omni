@@ -591,6 +591,46 @@ fn m3w_emit_call_done(arena: bytes, src: array, nid: i64, treg: i64, arg_base: i
     return r;
 }
 
+// Classifies Phase 2a Linux x86-64 syscall intrinsics (0=none, 1=sys_read..6=sys_spawn).
+#[strict]
+fn m3w_sys_cls(hlow: i64) -> i64 {
+    return m2u_eq(hlow, 2079304479) * 1
+        + m2u_eq(hlow, 46962718) * 2
+        + m2u_eq(hlow, 1176470999) * 3
+        + m2u_eq(hlow, 1138020337) * 4
+        + m2u_eq(hlow, 773572539) * 5
+        + m2u_eq(hlow, 504962702) * 6;
+}
+
+// Emits Phase 2a syscall intrinsic `scls` (1..6) as `0x7F73 TY_I64 TC_BASE imm(kind) args...`.
+#[strict]
+fn m3w_emit_sys_intr(arena: bytes, scls: i64, nargs: i64, treg: i64, arg_base: i64, fl: i64, fc: i64) -> bytes {
+    let want: i64 = m2u_eq(scls, 1) * 4 + m2u_eq(scls, 2) * 4 + m2u_eq(scls, 3) * 3
+        + m2u_eq(scls, 4) * 1 + m2u_eq(scls, 5) * 1 + m2u_eq(scls, 6) * 2;
+    let r: bytes = if_pos m2u_eq(nargs, want) <=> 0 {
+        let u: bytes = m3w_resolve_dst(arena, treg, fl, fc);
+        if_pos m2u_eq(ld_u64(u, 40), 0) <=> 0 {
+            let dst: i64 = ld_u64(u, 288);
+            let w: bytes = m3w_emit_u16(u, dst);
+            w = m3w_emit_u16(w, 32627); // 0x7F73 (CAP_ID_SYS, sink_requires_safe=true)
+            w = m3w_emit_u16(w, 32641); // TY_I64
+            w = m3w_emit_u16(w, 32704); // TC_BASE
+            w = m3w_emit_op(w, (1 << 48) | (scls - 1));
+            let k: i64 = 0;
+            while nargs - k <=> 0 {
+                w = m3w_emit_op(w, ld_u64(w, arg_base + (k << 3)));
+                k = k + 1;
+            }
+            w = m3w_emit_u16(w, 32484); // TOK_INS_END
+            w = iset_patch_i64(w, 248, ld_u64(w, 248) + 1);
+            iset_patch_i64(w, 288, dst)
+        } else { u }
+    } else {
+        m3a_set_err(arena, m3err_arity(), fl, fc)
+    };
+    return r;
+}
+
 // Emits a value-producing intrinsic or user `CALL @fnN` with evaluated args at `arg_base`.
 #[strict]
 fn m3w_emit_call_expr(arena: bytes, src: array, nv: i64, nlen: i64, hlow: i64, nargs: i64, treg: i64, arg_base: i64, fl: i64, fc: i64) -> bytes {
@@ -623,7 +663,12 @@ fn m3w_emit_call_expr(arena: bytes, src: array, nv: i64, nlen: i64, hlow: i64, n
             if_pos hcls <=> 0 {
                 m3w_emit_host_intr(arena, hcls, nargs, treg, arg_base, fl, fc)
             } else {
-                m3w_emit_user_call(arena, src, nv, nlen, nargs, treg, arg_base, fl, fc)
+                let scls: i64 = m3w_sys_cls(hlow);
+                if_pos scls <=> 0 {
+                    m3w_emit_sys_intr(arena, scls, nargs, treg, arg_base, fl, fc)
+                } else {
+                    m3w_emit_user_call(arena, src, nv, nlen, nargs, treg, arg_base, fl, fc)
+                }
             }
         }
     };

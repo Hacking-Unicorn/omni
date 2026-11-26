@@ -2547,7 +2547,11 @@ pub fn encode_asm_ins_packet_u16(line: &str, ret_ty: u16) -> Result<Vec<u16>, St
         } else {
             (parts[2], false)
         };
-        let (op_tok, ty_tok) = parse_op_mnemonic(op_mnem, ret_ty)?;
+        let (op_tok, ty_tok) = if op_mnem == "SYS_CALL" {
+            (0x7F73, TY_I64)
+        } else {
+            parse_op_mnemonic(op_mnem, ret_ty)?
+        };
         let ins_tc = if untr_suffix { pack_tc(true, CAP_ID_PURE) } else { tc_safe };
         let mut pkt = vec![REG_BASE + d_idx, op_tok, ty_tok, ins_tc];
         for &op_s in &parts[3..] {
@@ -4457,6 +4461,37 @@ impl SurfaceLowerCtx {
         let mut op_args = Vec::with_capacity(args.len());
         for a in args {
             op_args.push(self.eval_to_operand(a)?);
+        }
+        // Phase 2a: Linux x86-64 raw syscall intrinsics (0x7F73, CAP_ID_SYS, sink_requires_safe=true).
+        // Encoded as `SYS_CALL <kind> <args...>`:
+        //   0 = sys_read(fd, buf, off, len)
+        //   1 = sys_write(fd, buf, off, len)
+        //   2 = sys_open(path_buf, flags, mode)
+        //   3 = sys_close(fd)
+        //   4 = sys_exit(code)
+        //   5 = sys_spawn(prog_buf, arg1_buf)
+        let sys_spec: Option<(u16, usize)> = match low.as_str() {
+            "sys_read" => Some((0, 4)),
+            "sys_write" => Some((1, 4)),
+            "sys_open" => Some((2, 3)),
+            "sys_close" => Some((3, 1)),
+            "sys_exit" => Some((4, 1)),
+            "sys_spawn" => Some((5, 2)),
+            _ => None,
+        };
+        if let Some((kind, want_arity)) = sys_spec {
+            if op_args.len() != want_arity {
+                return Err(format!(
+                    "error[ARITY_MISMATCH] line {}, col {}: Intrinsic '{}' expects {} arguments, got {}",
+                    line, col, name, want_arity, op_args.len()
+                ));
+            }
+            let mut s = format!("SYS_CALL {}", kind);
+            for a in &op_args {
+                s.push(' ');
+                s.push_str(a);
+            }
+            return Ok(s);
         }
         let unary_mnem = match low.as_str() {
             "iabs" | "abs" => Some("IABS"),
@@ -18728,7 +18763,7 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
             ));
         }
         for ins in &func.instructions {
-            if !is_x86_64_aot_supported_opcode(ins.op_tok) && ins.op_tok != 0x7F48 {
+            if !is_x86_64_aot_supported_opcode(ins.op_tok) && ins.op_tok != 0x7F48 && ins.op_tok != 0x7F73 {
                 let lbl = decode_opcode_token(ins.op_tok).map(|s| s.debug_label).unwrap_or("OP_UNKNOWN");
                 return Err(format!(
                     "Opcode 0x{:04X} ({}) in fn#{} is not lowered by multi-function x86-64 AOT",
@@ -19439,6 +19474,138 @@ pub fn compile_pure_u16_to_x86_64_elf_multi_mode(
                     } else {
                         emit_load_op(&mut code, &ins.operands[0], false);
                         code.extend_from_slice(&[0xC9, 0xC3]); // leave; ret
+                    }
+                }
+                0x7F73 => {
+                    // Phase 2a: Linux x86-64 raw syscall intrinsics (CAP_ID_SYS, sink_requires_safe=true).
+                    // op0 = imm kind: 0=sys_read, 1=sys_write, 2=sys_open, 3=sys_close, 4=sys_exit, 5=sys_spawn.
+                    let kind = match ins.operands.first() {
+                        Some(BinOperand::ImmInt(k)) => *k,
+                        _ => return Err(String::from("error[SYSCALL_KIND]: 0x7F73 requires immediate kind 0..5")),
+                    };
+                    match kind {
+                        0 | 1 => {
+                            // sys_read(fd, buf, off, len) / sys_write(fd, buf, off, len)
+                            if ins.operands.len() != 5 {
+                                return Err(format!("error[SYSCALL_ARITY]: sys_read/write expects 5 operands, got {}", ins.operands.len()));
+                            }
+                            emit_load_op(&mut code, &ins.operands[2], false); // rax = buf desc
+                            code.extend_from_slice(&[0x49, 0x89, 0xC0]); // mov r8, rax
+                            emit_load_op(&mut code, &ins.operands[3], false); // rax = off
+                            emit_load_op(&mut code, &ins.operands[4], true);  // rcx = len
+                            code.extend_from_slice(&[0x48, 0x85, 0xC0, 0x0F, 0x88]); // test rax,rax; js T_OOB
+                            trap_relocs.push((code.len(), 1));
+                            code.extend_from_slice(&[0, 0, 0, 0]);
+                            code.extend_from_slice(&[0x48, 0x85, 0xC9, 0x0F, 0x88]); // test rcx,rcx; js T_OOB
+                            trap_relocs.push((code.len(), 1));
+                            code.extend_from_slice(&[0, 0, 0, 0]);
+                            code.extend_from_slice(&[0x48, 0x8D, 0x34, 0x08]); // lea rsi, [rax+rcx]
+                            code.extend_from_slice(&[0x48, 0x39, 0xC6, 0x0F, 0x82]); // cmp rsi,rax; jb T_OOB
+                            trap_relocs.push((code.len(), 1));
+                            code.extend_from_slice(&[0, 0, 0, 0]);
+                            code.extend_from_slice(&[0x44, 0x89, 0xC2]); // mov edx, r8d
+                            code.extend_from_slice(&[0x48, 0x39, 0xD6, 0x0F, 0x87]); // cmp rsi,rdx; ja T_OOB
+                            trap_relocs.push((code.len(), 1));
+                            code.extend_from_slice(&[0, 0, 0, 0]);
+                            code.extend_from_slice(&[0x49, 0xC1, 0xE8, 0x20]); // shr r8, 32
+                            code.extend_from_slice(&[0x4C, 0x01, 0xC0]); // add rax, r8
+                            code.extend_from_slice(&[0x48, 0x8D, 0x34, 0x03]); // lea rsi, [rbx+rax]
+                            code.extend_from_slice(&[0x49, 0x89, 0xC9]); // mov r9, rcx
+                            emit_load_op(&mut code, &ins.operands[1], false); // rax = fd
+                            code.extend_from_slice(&[0x48, 0x89, 0xC7]); // mov rdi, rax
+                            code.extend_from_slice(&[0x4C, 0x89, 0xCA]); // mov rdx, r9
+                            code.push(0xB8);
+                            code.extend_from_slice(&(kind as u32).to_le_bytes()); // mov eax, 0/1
+                            code.extend_from_slice(&[0x41, 0x53, 0x0F, 0x05, 0x41, 0x5B]); // push r11; syscall; pop r11
+                            if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                        }
+                        2 => {
+                            // sys_open(path_buf, flags, mode)
+                            if ins.operands.len() != 4 {
+                                return Err(format!("error[SYSCALL_ARITY]: sys_open expects 4 operands, got {}", ins.operands.len()));
+                            }
+                            emit_load_op(&mut code, &ins.operands[1], false); // rax = path_buf desc
+                            code.extend_from_slice(&[0x49, 0x89, 0xC0, 0x85, 0xC0, 0x0F, 0x84]); // mov r8,rax; test eax,eax; jz T_OOB
+                            trap_relocs.push((code.len(), 1));
+                            code.extend_from_slice(&[0, 0, 0, 0]);
+                            code.extend_from_slice(&[0x44, 0x89, 0xC1, 0x48, 0xFF, 0xC9, 0x49, 0xC1, 0xE8, 0x20, 0x4C, 0x01, 0xC1]);
+                            code.extend_from_slice(&[0x80, 0x3C, 0x0B, 0x00, 0x0F, 0x85]); // cmp byte [rbx+rcx],0; jne T_OOB
+                            trap_relocs.push((code.len(), 1));
+                            code.extend_from_slice(&[0, 0, 0, 0]);
+                            code.extend_from_slice(&[0x4A, 0x8D, 0x3C, 0x03]); // lea rdi, [rbx+r8]
+                            emit_load_op(&mut code, &ins.operands[2], false); // flags
+                            code.extend_from_slice(&[0x48, 0x89, 0xC6]); // mov rsi, rax
+                            emit_load_op(&mut code, &ins.operands[3], false); // mode
+                            code.extend_from_slice(&[0x48, 0x89, 0xC2]); // mov rdx, rax
+                            code.extend_from_slice(&[0xB8, 0x02, 0x00, 0x00, 0x00]); // mov eax, 2 (SYS_open)
+                            code.extend_from_slice(&[0x41, 0x53, 0x0F, 0x05, 0x41, 0x5B]); // push r11; syscall; pop r11
+                            if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                        }
+                        3 | 4 => {
+                            // sys_close(fd) / sys_exit(code)
+                            if ins.operands.len() != 2 {
+                                return Err(format!("error[SYSCALL_ARITY]: sys_close/exit expects 2 operands, got {}", ins.operands.len()));
+                            }
+                            emit_load_op(&mut code, &ins.operands[1], false);
+                            code.extend_from_slice(&[0x48, 0x89, 0xC7, 0xB8]); // mov rdi, rax; mov eax, imm32
+                            let nr: u32 = if kind == 3 { 3 } else { 60 };
+                            code.extend_from_slice(&nr.to_le_bytes());
+                            code.extend_from_slice(&[0x41, 0x53, 0x0F, 0x05, 0x41, 0x5B]); // push r11; syscall; pop r11
+                            if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                        }
+                        5 => {
+                            // sys_spawn(prog_buf, arg1_buf) -> fork + execve + wait4 -> child exit code
+                            if ins.operands.len() != 3 {
+                                return Err(format!("error[SYSCALL_ARITY]: sys_spawn expects 3 operands, got {}", ins.operands.len()));
+                            }
+                            emit_load_op(&mut code, &ins.operands[1], false); // prog_buf
+                            code.extend_from_slice(&[0x49, 0x89, 0xC0, 0x85, 0xC0, 0x0F, 0x84]);
+                            trap_relocs.push((code.len(), 1));
+                            code.extend_from_slice(&[0, 0, 0, 0]);
+                            code.extend_from_slice(&[0x44, 0x89, 0xC1, 0x48, 0xFF, 0xC9, 0x49, 0xC1, 0xE8, 0x20, 0x4C, 0x01, 0xC1]);
+                            code.extend_from_slice(&[0x80, 0x3C, 0x0B, 0x00, 0x0F, 0x85]);
+                            trap_relocs.push((code.len(), 1));
+                            code.extend_from_slice(&[0, 0, 0, 0]);
+                            code.extend_from_slice(&[0x4E, 0x8D, 0x04, 0x03]); // lea r8, [rbx+r8]
+                            emit_load_op(&mut code, &ins.operands[2], false); // arg1_buf
+                            code.extend_from_slice(&[0x49, 0x89, 0xC1, 0x85, 0xC0, 0x75, 0x05, 0x4D, 0x31, 0xC9, 0xEB, 0x1B]);
+                            code.extend_from_slice(&[0x44, 0x89, 0xC9, 0x48, 0xFF, 0xC9, 0x49, 0xC1, 0xE9, 0x20, 0x4C, 0x01, 0xC9]);
+                            code.extend_from_slice(&[0x80, 0x3C, 0x0B, 0x00, 0x0F, 0x85]);
+                            trap_relocs.push((code.len(), 1));
+                            code.extend_from_slice(&[0, 0, 0, 0]);
+                            code.extend_from_slice(&[0x4E, 0x8D, 0x0C, 0x0B]); // lea r9, [rbx+r9]
+                            // fork + child execve + parent wait4
+                            code.extend_from_slice(&[
+                                0x41, 0x53,                         // push r11
+                                0xB8, 57, 0, 0, 0, 0x0F, 0x05,      // mov eax, 57 (SYS_fork); syscall
+                                0x48, 0x85, 0xC0,                   // test rax, rax
+                                0x78, 0x50,                         // js done (pop r11)
+                                0x75, 0x24,                         // jnz parent (sub rsp, 8)
+                                // child (36 bytes)
+                                0x6A, 0x00, 0x41, 0x51, 0x41, 0x50, // push 0; push r9; push r8
+                                0x4C, 0x89, 0xC7,                   // mov rdi, r8
+                                0x48, 0x89, 0xE6,                   // mov rsi, rsp
+                                0x48, 0x8D, 0x54, 0x24, 0x10,       // lea rdx, [rsp+16]
+                                0xB8, 59, 0, 0, 0, 0x0F, 0x05,      // mov eax, 59 (SYS_execve); syscall
+                                0xBF, 127, 0, 0, 0,                 // mov edi, 127
+                                0xB8, 60, 0, 0, 0, 0x0F, 0x05,      // mov eax, 60 (SYS_exit); syscall
+                                // parent (44 bytes)
+                                0x48, 0x83, 0xEC, 0x08,             // sub rsp, 8
+                                0x48, 0x89, 0xC7,                   // mov rdi, rax
+                                0x48, 0x89, 0xE6,                   // mov rsi, rsp
+                                0x31, 0xD2, 0x45, 0x31, 0xD2,       // xor edx, edx; xor r10d, r10d
+                                0xB8, 61, 0, 0, 0, 0x0F, 0x05,      // mov eax, 61 (SYS_wait4); syscall
+                                0x48, 0x85, 0xC0, 0x78, 0x0B,       // test rax, rax; js +11
+                                0x8B, 0x04, 0x24,                   // mov eax, [rsp]
+                                0xC1, 0xE8, 0x08,                   // shr eax, 8
+                                0x25, 0xFF, 0x00, 0x00, 0x00,       // and eax, 0xFF
+                                0x48, 0x83, 0xC4, 0x08,             // add rsp, 8
+                                // done
+                                0x41, 0x5B,                         // pop r11
+                            ]);
+                            if let Some(d) = ins.dest_reg { emit_store_rax(&mut code, d); }
+                        }
+                        other => return Err(format!("error[SYSCALL_KIND]: unsupported syscall kind {}", other)),
                     }
                 }
                 _ => {}
@@ -24518,6 +24685,7 @@ pub fn run_m2_foundation_selftests() -> Result<usize, String> {
         ("m3_modular", selftest_m3_modular),
         ("audit_view", selftest_audit_view),
         ("proposer_loop", selftest_proposer_loop),
+        ("p2a_syscalls", selftest_p2a_syscall_intrinsics),
         ("s5_refreeze", selftest_s5_refreeze),
         ("s6_cleanup", selftest_s6_cleanup),
         ("b4_pure_launcher", selftest_b4_pure_launcher_count),
@@ -25128,13 +25296,26 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
         "m3-modular" => match selftest_m3_modular() {
             Ok(n) => {
                 println!(
-                    "[M3-MODULAR PASS] {} checks | mod_parse (42265 w) + m3_standalone (25515 w) + elf_link (3582 w) all < 65536 w | Pure-Omni linked m3.elf ({} B, 0x{:016X}) 0-word diff on all 6 pure/programs/*",
+                    "[M3-MODULAR PASS] {} checks | mod_parse (42265 w) + m3_standalone (26223 w) + elf_link (3582 w) all < 65536 w | Pure-Omni linked m3.elf ({} B, 0x{:016X}) 0-word diff on all 6 pure/programs/*",
                     n, NATIVE_M3_ELF_BYTES, NATIVE_M3_ELF_FNV
                 );
                 0
             }
             Err(e) => {
                 eprintln!("[M3-MODULAR FAIL] {}", e);
+                1
+            }
+        },
+        "p2a-syscalls" => match selftest_p2a_syscall_intrinsics() {
+            Ok(n) => {
+                println!(
+                    "[P2A-SYSCALLS PASS] {} checks | M3 0-word diff + #[cap(SYS)] & @untrusted negative controls + M2 0-byte diff (>=10 raw 0F 05 sites) + live Linux kernel sys_open/write/read/close/spawn/exit + OOB trap",
+                    n
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("[P2A-SYSCALLS FAIL] {}", e);
                 1
             }
         },
@@ -25780,7 +25961,7 @@ fn main() {
             "harness" | "--harness" => {
                 std::process::exit(run_omni_harness_cli(&cli_args[2..]));
             }
-            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "m3-modular" | "audit-view" | "proposer-loop" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" | "p7-heal" | "p7-adapt" | "p7-learn" | "a1-pure-default" | "a2-pure-include" | "a3-macro-quarantine" | "b2-pure-verifier" | "b4-pure-launcher" | "s2-security" | "s4-honesty" | "s3-perf" | "s5-refreeze" | "s6-cleanup" | "api-stage1" | "api-stage2" | "api-stage2-emit" | "api-stage2-5" => {
+            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "m3-modular" | "p2a-syscalls" | "audit-view" | "proposer-loop" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" | "p7-heal" | "p7-adapt" | "p7-learn" | "a1-pure-default" | "a2-pure-include" | "a3-macro-quarantine" | "b2-pure-verifier" | "b4-pure-launcher" | "s2-security" | "s4-honesty" | "s3-perf" | "s5-refreeze" | "s6-cleanup" | "api-stage1" | "api-stage2" | "api-stage2-emit" | "api-stage2-5" => {
                 std::process::exit(run_m2_cli(&cli_args[1..]));
             }
             "decompile" | "--decompile" => {
