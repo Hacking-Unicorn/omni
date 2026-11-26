@@ -1,0 +1,356 @@
+// ==============================================================================
+// pure/driver/sys_util.omni (Step 7) — Pure-Omni Linux Syscall & Buffer Utilities
+// ==============================================================================
+// Shared zero-Rust runtime helpers for the Pure-Omni `omnic` driver and audit
+// tools. Uses Step 6 M2 raw `0F 05` syscall intrinsics (`sys_open`, `sys_read`,
+// `sys_write`, `sys_close`, `sys_spawn`, `sys_exit`) and `/proc/self/cmdline`
+// + `/proc/self/fd/1` so zero M2/M3/M4/verifier pins move in Step 7.
+//
+// Arena layout (512 KiB = 524,288 B):
+//   0      .. 255    : state qwords (0=out_len, 24=aux0) / elf_link state
+//   256    .. 2303   : elf_link export table (untouched by sys_util)
+//   2304   .. 2311   : argc (u64)
+//   2312   .. 2823   : argv table (32 x 16 B: [off:u64, len:u64])
+//   2824   .. 3071   : format/read scratch (248 B)
+//   3072   .. 4095   : /proc/self/cmdline raw bytes (1,024 B)
+//   4096   .. 266239 : Band A (256 KiB)
+//   266240 .. 524287 : Band B (252 KiB)
+// ==============================================================================
+
+#[strict]
+fn su_band_a() -> i64 { return 4096; }
+#[strict]
+fn su_band_b() -> i64 { return 266240; }
+#[strict]
+fn su_cmdline_off() -> i64 { return 3072; }
+
+// Allocates a zeroed 512 KiB flat arena (`anew(0)` + 65,536 x 8 B, 8x unrolled).
+#[strict]
+fn su_alloc_arena() -> bytes {
+    let w: bytes = anew(0);
+    let i: i64 = 0;
+    while 8192 - i <=> 0 {
+        w = iset_i64(w, 0); w = iset_i64(w, 0); w = iset_i64(w, 0); w = iset_i64(w, 0);
+        w = iset_i64(w, 0); w = iset_i64(w, 0); w = iset_i64(w, 0); w = iset_i64(w, 0);
+        i = i + 1;
+    }
+    return w;
+}
+
+// Writes one byte `v & 255` into `arena` at `off` without clobbering `off + 1`.
+#[strict]
+fn su_st_u8(arena: bytes, off: i64, v: i64) -> bytes {
+    let nxt: i64 = ld_u8(arena, off + 1);
+    return st_u16(arena, off, (v & 255) | (nxt << 8));
+}
+
+// Appends one byte to Band A output cursor (`arena[0]`).
+#[strict]
+fn su_out_u8(arena: bytes, b: i64) -> bytes {
+    let n: i64 = ld_u64(arena, 0);
+    let r: bytes = if_pos m2u_lt(n, 260000) <=> 0 {
+        let u: bytes = su_st_u8(arena, su_band_a() + n, b);
+        iset_patch_i64(u, 0, n + 1)
+    } else { arena };
+    return r;
+}
+
+// Copies `len` bytes from `arena[src_off..]` to Band A output cursor.
+#[strict]
+fn su_out_copy(arena: bytes, src_off: i64, len: i64) -> bytes {
+    let w: bytes = arena;
+    let i: i64 = 0;
+    while len - i <=> 0 {
+        let b: i64 = ld_u8(w, src_off + i);
+        w = su_out_u8(w, b);
+        i = i + 1;
+    }
+    return w;
+}
+
+// Appends a signed decimal i64 to Band A output cursor.
+#[strict]
+fn su_out_i64(arena: bytes, val: i64) -> bytes {
+    let w: bytes = arena;
+    let is_neg: i64 = m2u_lt(val, 0);
+    w = if_pos is_neg <=> 0 { su_out_u8(w, 45) } else { w };
+    let v: i64 = m2u_sel(is_neg, 0 - val, val);
+    let is_z: i64 = m2u_eq(v, 0);
+    let r: bytes = if_pos is_z <=> 0 {
+        su_out_u8(w, 48)
+    } else {
+        let cnt: i64 = 0;
+        let cur: i64 = v;
+        while cur <=> 0 {
+            let d: i64 = cur % 10;
+            w = su_st_u8(w, 2944 + cnt, 48 + d);
+            cur = cur / 10;
+            cnt = cnt + 1;
+        }
+        let j: i64 = cnt - 1;
+        while j + 1 <=> 0 {
+            w = su_out_u8(w, ld_u8(w, 2944 + j));
+            j = j - 1;
+        }
+        w
+    };
+    return r;
+}
+
+// Appends a signed decimal i64 with explicit '+' for >= 0 (e.g. "+12", "-4", "+0").
+#[strict]
+fn su_out_signed_i64(arena: bytes, val: i64) -> bytes {
+    let w: bytes = if_pos m2u_ge(val, 0) <=> 0 { su_out_u8(arena, 43) } else { arena };
+    return su_out_i64(w, val);
+}
+
+// Appends a 16-digit uppercase hex u64 ("0x...") or 4-digit hex u16 (`ndig` = 4 or 16).
+#[strict]
+fn su_out_hex(arena: bytes, val: i64, ndig: i64) -> bytes {
+    let w: bytes = su_out_u8(arena, 48);
+    w = su_out_u8(w, 120);
+    let i: i64 = ndig - 1;
+    while i + 1 <=> 0 {
+        let nib: i64 = (val >> (i * 4)) & 15;
+        let ch: i64 = m2u_sel(m2u_lt(nib, 10), 48 + nib, 55 + nib);
+        w = su_out_u8(w, ch);
+        i = i - 1;
+    }
+    return w;
+}
+
+// Appends "true" (v != 0) or "false" (v == 0).
+#[strict]
+fn su_out_bool(arena: bytes, v: i64) -> bytes {
+    let r: bytes = if_pos v <=> 0 {
+        let u: bytes = su_out_u8(arena, 116);
+        u = su_out_u8(u, 114);
+        u = su_out_u8(u, 117);
+        su_out_u8(u, 101)
+    } else {
+        let u: bytes = su_out_u8(arena, 102);
+        u = su_out_u8(u, 97);
+        u = su_out_u8(u, 108);
+        u = su_out_u8(u, 115);
+        su_out_u8(u, 101)
+    };
+    return r;
+}
+
+// Appends up to 4 ASCII bytes (0 bytes skipped) for compact literal emission.
+#[strict]
+fn su_out4(arena: bytes, c0: i64, c1: i64, c2: i64, c3: i64) -> bytes {
+    let w: bytes = if_pos c0 <=> 0 { su_out_u8(arena, c0) } else { arena };
+    w = if_pos c1 <=> 0 { su_out_u8(w, c1) } else { w };
+    w = if_pos c2 <=> 0 { su_out_u8(w, c2) } else { w };
+    w = if_pos c3 <=> 0 { su_out_u8(w, c3) } else { w };
+    return w;
+}
+
+// Builds a NUL-terminated `bytes` buffer from `arena[off..off+len]` for `sys_open`/`sys_spawn`.
+#[strict]
+fn su_make_cstr(arena: bytes, off: i64, len: i64) -> bytes {
+    let b: bytes = anew(0);
+    let i: i64 = 0;
+    while len - i <=> 0 {
+        b = iset(b, ld_u8(arena, off + i));
+        i = i + 1;
+    }
+    b = iset(b, 0);
+    return b;
+}
+
+// Returns 1 if `arena[o1..o1+l1] == arena[o2..o2+l2]`, else 0.
+#[strict]
+fn su_eq_bytes(arena: bytes, o1: i64, l1: i64, o2: i64, l2: i64) -> i64 {
+    let ok: i64 = m2u_eq(l1, l2);
+    let i: i64 = 0;
+    let g: i64 = ok * m2u_lt(0, l1);
+    while g <=> 0 {
+        ok = ok * m2u_eq(ld_u8(arena, o1 + i), ld_u8(arena, o2 + i));
+        i = i + 1;
+        g = ok * m2u_lt(i, l1);
+    }
+    return ok;
+}
+
+// Parses a signed decimal i64 from `arena[off..off+len]`.
+#[strict]
+fn su_parse_i64(arena: bytes, off: i64, len: i64) -> i64 {
+    let is_neg: i64 = m2u_lt(0, len) * m2u_eq(ld_u8(arena, off), 45);
+    let i: i64 = is_neg;
+    let acc: i64 = 0;
+    while len - i <=> 0 {
+        let d: i64 = ld_u8(arena, off + i) - 48;
+        let ok: i64 = m2u_in(d, 0, 9);
+        acc = m2u_sel(ok, acc * 10 + d, acc);
+        i = i + 1;
+    }
+    return m2u_sel(is_neg, 0 - acc, acc);
+}
+
+// Computes FNV-1a64 hash over `arena[off..off+len]`.
+#[strict]
+fn su_fnv1a64(arena: bytes, off: i64, len: i64) -> i64 {
+    // 0xcbf29ce484222325 built from 16-bit safe constants (immune to 32-bit literal truncation)
+    let h: i64 = (52210 << 48) | (40164 << 32) | (33826 << 16) | 8997;
+    // 0x00000100000001b3
+    let prime: i64 = (256 << 32) | 435;
+    let i: i64 = 0;
+    while len - i <=> 0 {
+        h = (h ^ ld_u8(arena, off + i)) * prime;
+        i = i + 1;
+    }
+    return h;
+}
+
+// Reads `/proc/self/cmdline` into `arena[3072..4095]` and populates `argv[0..31]` at `2312..2823`.
+#[strict]
+#[cap(SYS)]
+fn su_load_cmdline(arena: bytes) -> bytes {
+    // "/proc/self/cmdline\0" (19 bytes)
+    let p: bytes = anew(0);
+    p = iset(p, 47, 112, 114, 111, 99, 47, 115, 101, 108, 102, 47, 99, 109, 100, 108, 105);
+    p = iset(p, 110, 101, 0);
+    let fd: i64 = sys_open(p, 0, 0);
+    let n: i64 = if_pos m2u_ge(fd, 0) <=> 0 {
+        let nr: i64 = sys_read(fd, arena, su_cmdline_off(), 1023);
+        let c: i64 = sys_close(fd);
+        nr + c * 0
+    } else { 0 };
+    let w: bytes = arena;
+    let argc: i64 = 0;
+    let pos: i64 = 0;
+    let g: i64 = m2u_lt(pos, n) * m2u_lt(argc, 32);
+    while g <=> 0 {
+        let start: i64 = pos;
+        let g2: i64 = m2u_lt(pos, n) * (1 - m2u_eq(ld_u8(w, su_cmdline_off() + pos), 0));
+        while g2 <=> 0 {
+            pos = pos + 1;
+            g2 = m2u_lt(pos, n) * (1 - m2u_eq(ld_u8(w, su_cmdline_off() + pos), 0));
+        }
+        w = iset_patch_i64(w, 2312 + (argc << 4), su_cmdline_off() + start);
+        w = iset_patch_i64(w, 2312 + (argc << 4) + 8, pos - start);
+        argc = argc + 1;
+        pos = pos + 1;
+        g = m2u_lt(pos, n) * m2u_lt(argc, 32);
+    }
+    return iset_patch_i64(w, 2304, argc);
+}
+
+#[strict]
+fn su_argc(arena: bytes) -> i64 { return ld_u64(arena, 2304); }
+#[strict]
+fn su_arg_off(arena: bytes, idx: i64) -> i64 { return ld_u64(arena, 2312 + (idx << 4)); }
+#[strict]
+fn su_arg_len(arena: bytes, idx: i64) -> i64 { return ld_u64(arena, 2312 + (idx << 4) + 8); }
+
+// Reads an entire file at `path_cstr` into `arena[dst_off..dst_off+max_len]`. Returns bytes read or < 0.
+#[strict]
+#[cap(SYS)]
+fn su_read_file_into(arena: bytes, path_cstr: bytes, dst_off: i64, max_len: i64) -> i64 {
+    let fd: i64 = sys_open(path_cstr, 0, 0);
+    let r: i64 = if_pos m2u_ge(fd, 0) <=> 0 {
+        let total: i64 = 0;
+        let g: i64 = 1;
+        while g <=> 0 {
+            let rem: i64 = max_len - total;
+            let got: i64 = if_pos rem <=> 0 { sys_read(fd, arena, dst_off + total, rem) } else { 0 };
+            total = total + m2u_sel(m2u_lt(0, got), got, 0);
+            g = m2u_lt(0, got) * m2u_lt(total, max_len);
+        }
+        let c: i64 = sys_close(fd);
+        total + c * 0
+    } else {
+        0 - 1
+    };
+    return r;
+}
+
+// Writes `arena[src_off..src_off+len]` to `path_cstr` with mode `mode` (420=0644, 493=0755).
+#[strict]
+#[cap(SYS)]
+fn su_write_file_from(arena: bytes, path_cstr: bytes, src_off: i64, len: i64, mode: i64) -> i64 {
+    let fd: i64 = sys_open(path_cstr, 577, mode);
+    let r: i64 = if_pos m2u_ge(fd, 0) <=> 0 {
+        let sent: i64 = 0;
+        let ok: i64 = 1;
+        let g: i64 = m2u_lt(sent, len);
+        while g <=> 0 {
+            let nw: i64 = sys_write(fd, arena, src_off + sent, len - sent);
+            ok = ok * m2u_lt(0, nw);
+            sent = sent + m2u_sel(m2u_lt(0, nw), nw, 0);
+            g = ok * m2u_lt(sent, len);
+        }
+        let c: i64 = sys_close(fd);
+        m2u_sel(ok, sent, 0 - 1) + c * 0
+    } else {
+        0 - 1
+    };
+    return r;
+}
+
+// Spawns `prog_cstr` with stdin redirected from `in_cstr` (if `has_in != 0`) and stdout
+// captured into `out_cstr` (`mode`), preserving and restoring this process's fd 0 and fd 1.
+#[strict]
+#[cap(SYS)]
+fn su_spawn_pipe(prog_cstr: bytes, in_cstr: bytes, out_cstr: bytes, mode: i64) -> i64 {
+    // Save original fd 0 and fd 1 via /proc/self/fd/0 and /proc/self/fd/1
+    let p_fd0: bytes = anew(0);
+    p_fd0 = iset(p_fd0, 47, 112, 114, 111, 99, 47, 115, 101, 108, 102, 47, 102, 100, 47, 48, 0);
+    let saved0: i64 = sys_open(p_fd0, 0, 0);
+    let p_fd1: bytes = anew(0);
+    p_fd1 = iset(p_fd1, 47, 112, 114, 111, 99, 47, 115, 101, 108, 102, 47, 102, 100, 47, 49, 0);
+    let saved1: i64 = sys_open(p_fd1, 1, 0);
+    // Redirect fd 0 -> in_cstr, fd 1 -> out_cstr
+    let c0: i64 = sys_close(0);
+    let new0: i64 = sys_open(in_cstr, 0, 0);
+    let c1: i64 = sys_close(1);
+    let new1: i64 = sys_open(out_cstr, 577, mode);
+    let empty: bytes = anew(0);
+    let rc: i64 = if_pos (m2u_eq(new0, 0) * m2u_eq(new1, 1)) <=> 0 {
+        sys_spawn(prog_cstr, empty)
+    } else {
+        0 - 1
+    };
+    // Restore fd 0 and fd 1
+    let c0b: i64 = sys_close(0);
+    let pr0: bytes = anew(0);
+    pr0 = iset(pr0, 47, 112, 114, 111, 99, 47, 115, 101, 108, 102, 47, 102, 100, 47);
+    pr0 = iset(pr0, 48 + saved0, 0);
+    let r0: i64 = sys_open(pr0, 0, 0);
+    let cs0: i64 = sys_close(saved0);
+    let c1b: i64 = sys_close(1);
+    let pr1: bytes = anew(0);
+    pr1 = iset(pr1, 47, 112, 114, 111, 99, 47, 115, 101, 108, 102, 47, 102, 100, 47);
+    pr1 = iset(pr1, 48 + saved1, 0);
+    let r1: i64 = sys_open(pr1, 1, 0);
+    let cs1: i64 = sys_close(saved1);
+    return rc + (c0 + c1 + c0b + r0 + cs0 + c1b + r1 + cs1) * 0;
+}
+
+// Spawns `prog_cstr` with `arg1_cstr`, capturing its stdout into `out_cstr` (`mode`) while
+// preserving and restoring this process's original stdout (fd 1) via `/proc/self/fd/<saved>`.
+#[strict]
+#[cap(SYS)]
+fn su_spawn_capture(prog_cstr: bytes, arg1_cstr: bytes, out_cstr: bytes, mode: i64) -> i64 {
+    // Save original fd 1 via "/proc/self/fd/1\0"
+    let p_fd1: bytes = anew(0);
+    p_fd1 = iset(p_fd1, 47, 112, 114, 111, 99, 47, 115, 101, 108, 102, 47, 102, 100, 47, 49, 0);
+    let saved: i64 = sys_open(p_fd1, 1, 0);
+    let c1: i64 = sys_close(1);
+    let new_fd1: i64 = sys_open(out_cstr, 577, mode);
+    let rc: i64 = if_pos m2u_eq(new_fd1, 1) <=> 0 {
+        sys_spawn(prog_cstr, arg1_cstr)
+    } else {
+        0 - 1
+    };
+    let c2: i64 = sys_close(1);
+    // Restore original fd 1 from "/proc/self/fd/<saved>\0" (saved is 3..9)
+    let p_rest: bytes = anew(0);
+    p_rest = iset(p_rest, 47, 112, 114, 111, 99, 47, 115, 101, 108, 102, 47, 102, 100, 47);
+    p_rest = iset(p_rest, 48 + saved, 0);
+    let r1: i64 = sys_open(p_rest, 1, 0);
+    let c3: i64 = sys_close(saved);
+    return rc + (c1 + c2 + r1 + c3) * 0;
+}

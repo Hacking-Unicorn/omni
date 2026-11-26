@@ -1,0 +1,520 @@
+// ==============================================================================
+// pure/driver/omnic_driver.omni (Step 7) — Pure-Omni Native `omnic` CLI Driver
+// ==============================================================================
+// Standalone native Linux x86-64 ELF64 driver (`omnic_pure.elf`), compiled
+// entirely by the Pure-Omni chain (`m3.elf` + `m2.elf`) with ZERO `rustc`.
+//
+// Ported core subcommands:
+//   - compile <in.omni> <out.omni_bc>
+//   - compile-elf <in.omni|.omni_bc> <out.elf> [a0 a1 a2]
+//   - link-elf <m0.omni_bc> <m1.omni_bc> [...] -o <out.elf>
+//   - run <in.omni|.omni_bc> [a0 a1 a2]       (native x86-64 exec path)
+//   - decompile <in.omni_bc|.omni>            (via Pure-Omni audit_decompile.elf)
+//   - inspect --m3 <in.omni_bc|.omni>         (via Pure-Omni audit_decompile.elf)
+//   - audit-diff <before> <after> [--tsv]     (via Pure-Omni audit_diff.elf)
+//   - --version | -V | version
+//
+// Arena layout (512 KiB via `pure/driver/sys_util.omni`):
+//   0      .. 511    : sys_util + elf_link state (0=out_len/err, 8=argc, 256..2303 used by elf_link)
+//   4096   .. 266239 : Band A (256 KiB: ELF link output / file buffer / text out)
+//   266240 .. 524287 : Band B (252 KiB: source read / u16 expansion / temp)
+// ==============================================================================
+
+include "../link/elf_link.omni";
+include "sys_util.omni";
+
+// Builds `<dir_of_argv0>/<tool_name>\0` where `tid`:
+//   0="m3.elf", 1="m2.elf", 2="verifier.elf", 3="audit_decompile.elf", 4="audit_diff.elf".
+#[strict]
+fn od_tool_path(arena: bytes, tid: i64) -> bytes {
+    let a0_off: i64 = su_arg_off(arena, 0);
+    let a0_len: i64 = su_arg_len(arena, 0);
+    let slash: i64 = 0 - 1;
+    let i: i64 = 0;
+    while a0_len - i <=> 0 {
+        slash = m2u_sel(m2u_eq(ld_u8(arena, a0_off + i), 47), i, slash);
+        i = i + 1;
+    }
+    let b: bytes = anew(0);
+    let k: i64 = 0;
+    let pfx: i64 = m2u_sel(m2u_ge(slash, 0), slash + 1, 0);
+    while pfx - k <=> 0 {
+        b = iset(b, ld_u8(arena, a0_off + k));
+        k = k + 1;
+    }
+    let r: bytes = if_pos m2u_eq(tid, 0) <=> 0 {
+        iset(b, 109, 51, 46, 101, 108, 102, 0)
+    } else { if_pos m2u_eq(tid, 1) <=> 0 {
+        iset(b, 109, 50, 46, 101, 108, 102, 0)
+    } else { if_pos m2u_eq(tid, 2) <=> 0 {
+        iset(b, 118, 101, 114, 105, 102, 105, 101, 114, 46, 101, 108, 102, 0)
+    } else { if_pos m2u_eq(tid, 3) <=> 0 {
+        let u: bytes = iset(b, 97, 117, 100, 105, 116, 95, 100, 101, 99, 111, 109, 112, 105, 108, 101, 46);
+        iset(u, 101, 108, 102, 0)
+    } else {
+        iset(b, 97, 117, 100, 105, 116, 95, 100, 105, 102, 102, 46, 101, 108, 102, 0)
+    } } } };
+    return r;
+}
+
+// Returns 1 if `arena[off..off+len]` ends with ".omni" (5 bytes).
+#[strict]
+fn od_ends_omni(arena: bytes, off: i64, len: i64) -> i64 {
+    let ok: i64 = m2u_ge(len, 5);
+    let e: i64 = off + m2u_sel(ok, len - 5, 0);
+    return ok * m2u_eq(ld_u8(arena, e), 46) * m2u_eq(ld_u8(arena, e + 1), 111)
+        * m2u_eq(ld_u8(arena, e + 2), 109) * m2u_eq(ld_u8(arena, e + 3), 110)
+        * m2u_eq(ld_u8(arena, e + 4), 105);
+}
+
+// Checks if `arena[off..off+len]` contains a top-level `macro ` directive (quarantined).
+#[strict]
+fn od_has_macro(arena: bytes, off: i64, len: i64) -> i64 {
+    let found: i64 = 0;
+    let i: i64 = 0;
+    let at_sol: i64 = 1;
+    while len - i <=> 0 {
+        let ch: i64 = ld_u8(arena, off + i);
+        let hit: i64 = at_sol * m2u_ge(len, i + 6)
+            * m2u_eq(ch, 109) * m2u_eq(ld_u8(arena, off + i + 1), 97)
+            * m2u_eq(ld_u8(arena, off + i + 2), 99) * m2u_eq(ld_u8(arena, off + i + 3), 114)
+            * m2u_eq(ld_u8(arena, off + i + 4), 111) * m2u_eq(ld_u8(arena, off + i + 5), 32);
+        found = found | hit;
+        at_sol = m2u_eq(ch, 10) + at_sol * (m2u_eq(ch, 32) + m2u_eq(ch, 9));
+        i = i + 1;
+    }
+    return found;
+}
+
+// Helper: reads an included file (`base_dir + path` first matching Rust, then repo-relative) into Band A.
+#[strict]
+#[cap(SYS)]
+fn od_read_include(w: bytes, src_off: i64, ps: i64, pe: i64, base_off: i64, base_len: i64) -> bytes {
+    let cur_out: i64 = ld_u64(w, 0);
+    let pb: bytes = anew(0);
+    let bi: i64 = 0;
+    while base_len - bi <=> 0 {
+        pb = iset(pb, ld_u8(w, base_off + bi));
+        bi = bi + 1;
+    }
+    let pi: i64 = ps;
+    while pe - pi <=> 0 {
+        pb = iset(pb, ld_u8(w, src_off + pi));
+        pi = pi + 1;
+    }
+    pb = iset(pb, 0);
+    let nr: i64 = su_read_file_into(w, pb, su_band_a() + cur_out, 250000 - cur_out);
+    let nr2: i64 = if_pos m2u_lt(nr, 0) <=> 0 {
+        let inc_cstr: bytes = su_make_cstr(w, src_off + ps, pe - ps);
+        su_read_file_into(w, inc_cstr, su_band_a() + cur_out, 250000 - cur_out)
+    } else { nr };
+    let r: bytes = if_pos m2u_ge(nr2, 0) <=> 0 {
+        su_out_u8(iset_patch_i64(w, 0, cur_out + nr2), 10)
+    } else {
+        iset_patch_i64(w, 24, 1)
+    };
+    return r;
+}
+
+// Helper: scans forward from `pos` to end of line (`\n` inclusive).
+#[strict]
+fn od_line_end(w: bytes, src_off: i64, pos: i64, src_len: i64) -> i64 {
+    let p: i64 = pos;
+    let g: i64 = m2u_lt(p, src_len) * (1 - m2u_eq(ld_u8(w, src_off + p), 10));
+    while g <=> 0 {
+        p = p + 1;
+        g = m2u_lt(p, src_len) * (1 - m2u_eq(ld_u8(w, src_off + p), 10));
+    }
+    return p + m2u_lt(p, src_len);
+}
+
+// Helper: skips leading spaces/tabs on a line.
+#[strict]
+fn od_skip_ws(w: bytes, src_off: i64, ls: i64, le: i64) -> i64 {
+    let p: i64 = ls;
+    let gs: i64 = m2u_lt(p, le) * (m2u_eq(ld_u8(w, src_off + p), 32) + m2u_eq(ld_u8(w, src_off + p), 9));
+    while gs <=> 0 {
+        p = p + 1;
+        gs = m2u_lt(p, le) * (m2u_eq(ld_u8(w, src_off + p), 32) + m2u_eq(ld_u8(w, src_off + p), 9));
+    }
+    return p;
+}
+
+// Expands `include "<path>";` lines from `arena[src_off..src_off+src_len]` into Band A (`4096..`).
+// Stores expanded byte length in `arena[0]`. Returns updated arena (or sets `arena[24]=1` on error).
+#[strict]
+#[cap(SYS)]
+fn od_expand_includes_pass(arena: bytes, src_off: i64, src_len: i64, base_off: i64, base_len: i64) -> bytes {
+    let w: bytes = iset_patch_i64(iset_patch_i64(arena, 0, 0), 24, 0);
+    let pos: i64 = 0;
+    while src_len - pos <=> 0 {
+        let ls: i64 = pos;
+        let le: i64 = od_line_end(w, src_off, pos, src_len);
+        pos = le;
+        let p: i64 = od_skip_ws(w, src_off, ls, le);
+        let is_inc: i64 = m2u_ge(le, p + 10)
+            * m2u_eq(ld_u8(w, src_off + p), 105) * m2u_eq(ld_u8(w, src_off + p + 1), 110)
+            * m2u_eq(ld_u8(w, src_off + p + 2), 99) * m2u_eq(ld_u8(w, src_off + p + 3), 108)
+            * m2u_eq(ld_u8(w, src_off + p + 4), 117) * m2u_eq(ld_u8(w, src_off + p + 5), 100)
+            * m2u_eq(ld_u8(w, src_off + p + 6), 101) * m2u_eq(ld_u8(w, src_off + p + 7), 32)
+            * m2u_eq(ld_u8(w, src_off + p + 8), 34);
+        w = if_pos is_inc <=> 0 {
+            let ps: i64 = p + 9;
+            let pe: i64 = ps;
+            let gq: i64 = m2u_lt(pe, le) * (1 - m2u_eq(ld_u8(w, src_off + pe), 34));
+            while gq <=> 0 {
+                pe = pe + 1;
+                gq = m2u_lt(pe, le) * (1 - m2u_eq(ld_u8(w, src_off + pe), 34));
+            }
+            od_read_include(w, src_off, ps, pe, base_off, base_len)
+        } else {
+            su_out_copy(w, src_off + ls, le - ls)
+        };
+    }
+    return w;
+}
+
+// Helper: encodes expanded ASCII in Band A (n2 bytes) -> u16-LE, spawns `m3.elf` + `verifier.elf`.
+#[strict]
+#[cap(SYS)]
+fn od_run_m3_and_verify(w2: bytes, n2: i64, out_bc_cstr: bytes) -> i64 {
+    let w: bytes = w2;
+    let ui: i64 = 0;
+    while n2 - ui <=> 0 {
+        w = st_u16(w, su_band_b() + (ui << 1), ld_u8(w, su_band_a() + ui));
+        ui = ui + 1;
+    }
+    let u16_p: bytes = anew(0);
+    u16_p = iset(u16_p, 47, 116, 109, 112, 47, 111, 109, 110, 105, 99, 95, 112, 55, 95, 115, 114);
+    u16_p = iset(u16_p, 99, 46, 117, 49, 54, 0);
+    let nw: i64 = su_write_file_from(w, u16_p, su_band_b(), n2 << 1, 420);
+    let m3_elf: bytes = od_tool_path(w, 0);
+    let rc_m3: i64 = if_pos m2u_ge(nw, 0) <=> 0 { su_spawn_capture(m3_elf, u16_p, out_bc_cstr, 420) } else { 1 };
+    let r: i64 = if_pos m2u_eq(rc_m3, 0) <=> 0 {
+        let bc_len: i64 = su_read_file_into(w, out_bc_cstr, su_band_b(), 250000);
+        let is_err: i64 = m2u_eq(bc_len, 16) * m2u_eq(ld_u16(w, su_band_b()), 65535);
+        if_pos (m2u_lt(bc_len, 4) + is_err) <=> 0 {
+            1
+        } else {
+            let ver_out: bytes = anew(0);
+            ver_out = iset(ver_out, 47, 116, 109, 112, 47, 111, 109, 110, 105, 99, 95, 112, 55, 95, 118);
+            ver_out = iset(ver_out, 101, 114, 46, 98, 105, 110, 0);
+            let ver_elf: bytes = od_tool_path(w, 2);
+            let rc_v: i64 = su_spawn_capture(ver_elf, out_bc_cstr, ver_out, 420);
+            let vn: i64 = su_read_file_into(w, ver_out, 2824, 64);
+            let vok: i64 = m2u_eq(rc_v, 0) * m2u_ge(vn, 2) * m2u_eq(ld_u16(w, 2824), 0);
+            m2u_sel(vok, 0, 1)
+        }
+    } else { 1 };
+    return r;
+}
+
+// Compiles `.omni` file at `in_off..in_len` -> `out_bc_cstr` via native `m3.elf` + `verifier.elf`.
+#[strict]
+#[cap(SYS)]
+fn od_compile_omni(arena: bytes, in_off: i64, in_len: i64, out_bc_cstr: bytes) -> i64 {
+    let in_cstr: bytes = su_make_cstr(arena, in_off, in_len);
+    let nb: i64 = su_read_file_into(arena, in_cstr, su_band_b(), 120000);
+    let r: i64 = if_pos m2u_lt(nb, 0) <=> 0 {
+        1
+    } else {
+        let slash: i64 = 0 - 1;
+        let si: i64 = 0;
+        while in_len - si <=> 0 {
+            slash = m2u_sel(m2u_eq(ld_u8(arena, in_off + si), 47), si, slash);
+            si = si + 1;
+        }
+        let base_len: i64 = m2u_sel(m2u_ge(slash, 0), slash + 1, 0);
+        let w1: bytes = od_expand_includes_pass(arena, su_band_b(), nb, in_off, base_len);
+        let e1: i64 = ld_u64(w1, 24);
+        let n1: i64 = ld_u64(w1, 0);
+        let ci: i64 = 0;
+        while n1 - ci <=> 0 {
+            w1 = su_st_u8(w1, su_band_b() + ci, ld_u8(w1, su_band_a() + ci));
+            ci = ci + 1;
+        }
+        let w2: bytes = od_expand_includes_pass(w1, su_band_b(), n1, in_off, base_len);
+        let e2: i64 = ld_u64(w2, 24);
+        let n2: i64 = ld_u64(w2, 0);
+        let has_mac: i64 = od_has_macro(w2, su_band_a(), n2);
+        if_pos (e1 + e2 + has_mac) <=> 0 {
+            1
+        } else {
+            od_run_m3_and_verify(w2, n2, out_bc_cstr)
+        }
+    };
+    return r;
+}
+
+// Compiles `.omni_bc` -> native ELF64 via `m2.elf` and optionally patches default CLI args `[a0, a1, a2]`.
+#[strict]
+#[cap(SYS)]
+fn od_compile_elf_bc(arena: bytes, bc_cstr: bytes, out_elf_cstr: bytes, has_args: i64, a0: i64, a1: i64, a2: i64) -> i64 {
+    let m2_elf: bytes = od_tool_path(arena, 1);
+    let rc: i64 = su_spawn_capture(m2_elf, bc_cstr, out_elf_cstr, 493);
+    let r: i64 = if_pos m2u_eq(rc, 0) <=> 0 {
+        if_pos has_args <=> 0 {
+            let nb: i64 = su_read_file_into(arena, out_elf_cstr, su_band_a(), 256000);
+            let ok_patch: i64 = m2u_ge(nb, 265) * m2u_eq(ld_u16(arena, su_band_a() + 221), 47176);
+            if_pos ok_patch <=> 0 {
+                let w: bytes = iset_patch_i64(arena, su_band_a() + 223, a0);
+                w = iset_patch_i64(w, su_band_a() + 237, a1);
+                w = iset_patch_i64(w, su_band_a() + 252, a2);
+                let nw: i64 = su_write_file_from(w, out_elf_cstr, su_band_a(), nb, 493);
+                m2u_sel(m2u_eq(nw, nb), 0, 1)
+            } else { 0 }
+        } else { 0 }
+    } else { 1 };
+    return r;
+}
+
+// Helper: lowers and concatenates `m_cnt` modules into `el_out_base()`, then runs `el_scan_exports` + `el_patch_imports`.
+#[strict]
+#[cap(SYS)]
+fn od_link_modules(w0: bytes, m_cnt: i64, out_idx: i64) -> i64 {
+    let w: bytes = w0;
+    let tmp_m: bytes = anew(0);
+    tmp_m = iset(tmp_m, 47, 116, 109, 112, 47, 111, 109, 110, 105, 99, 95, 112, 55, 95, 108);
+    tmp_m = iset(tmp_m, 109, 46, 101, 108, 102, 0);
+    let m2_elf: bytes = od_tool_path(w, 1);
+    let out_len: i64 = 0;
+    let ok: i64 = 1;
+    let k: i64 = 0;
+    while m_cnt - k <=> 0 {
+        let arg_i: i64 = ld_u64(w, 2824 + (k << 3));
+        let bc_c: bytes = su_make_cstr(w, su_arg_off(w, arg_i), su_arg_len(w, arg_i));
+        let rc_m: i64 = su_spawn_capture(m2_elf, bc_c, tmp_m, 420);
+        let nb: i64 = if_pos m2u_eq(rc_m, 0) <=> 0 { su_read_file_into(w, tmp_m, su_band_b(), 250000) } else { 0 - 1 };
+        ok = ok * m2u_eq(rc_m, 0) * m2u_ge(nb, 176);
+        let src_start: i64 = m2u_sel(m2u_eq(k, 0), 0, 176);
+        let copy_len: i64 = m2u_sel(ok, nb - src_start, 0);
+        let ob: i64 = el_out_base() + out_len;
+        let ci: i64 = 0;
+        while copy_len - ci <=> 0 {
+            w = su_st_u8(w, ob + ci, ld_u8(w, su_band_b() + src_start + ci));
+            ci = ci + 1;
+        }
+        out_len = out_len + copy_len;
+        k = k + 1;
+    }
+    let r: i64 = if_pos ok <=> 0 {
+        w = el_scan_exports(w, out_len);
+        w = if_pos m2u_eq(ld_u64(w, 0), 0) <=> 0 { el_patch_imports(w, out_len) } else { w };
+        if_pos m2u_eq(ld_u64(w, 0), 0) <=> 0 {
+            let ob0: i64 = el_out_base();
+            w = iset_patch_i64(w, ob0 + 96, out_len);
+            w = iset_patch_i64(w, ob0 + 104, out_len);
+            let out_c: bytes = su_make_cstr(w, su_arg_off(w, out_idx), su_arg_len(w, out_idx));
+            let nw: i64 = su_write_file_from(w, out_c, ob0, out_len, 493);
+            m2u_sel(m2u_eq(nw, out_len), 0, 1)
+        } else { 1 }
+    } else { 1 };
+    return r;
+}
+
+// Implements `link-elf <m0.omni_bc> <m1.omni_bc> [...] -o <out.elf>` in-process via `pure/link/elf_link.omni`.
+#[strict]
+#[cap(SYS)]
+fn od_cmd_link_elf(arena: bytes, argc: i64) -> i64 {
+    let w: bytes = el_init_arena(arena);
+    let out_idx: i64 = 0 - 1;
+    let m_cnt: i64 = 0;
+    let i: i64 = 2;
+    while argc - i <=> 0 {
+        let ao: i64 = su_arg_off(w, i);
+        let al: i64 = su_arg_len(w, i);
+        let is_o: i64 = m2u_eq(al, 2) * m2u_eq(ld_u8(w, ao), 45) * m2u_eq(ld_u8(w, ao + 1), 111);
+        out_idx = m2u_sel(is_o * m2u_lt(i + 1, argc), i + 1, out_idx);
+        let skip: i64 = is_o + m2u_eq(i, out_idx);
+        w = if_pos (1 - skip) <=> 0 { iset_patch_i64(w, 2824 + (m_cnt << 3), i) } else { w };
+        m_cnt = m_cnt + (1 - skip);
+        i = i + 1;
+    }
+    let r: i64 = if_pos (m2u_lt(m_cnt, 2) + m2u_lt(out_idx, 0)) <=> 0 {
+        2
+    } else {
+        od_link_modules(w, m_cnt, out_idx)
+    };
+    return r;
+}
+
+// Helper: executes compiled ELF `tmp_elf` and prints `Int(<val>)\n`.
+#[strict]
+#[cap(SYS)]
+fn od_exec_and_print(arena: bytes, tmp_elf: bytes) -> i64 {
+    let tmp_out: bytes = anew(0);
+    tmp_out = iset(tmp_out, 47, 116, 109, 112, 47, 111, 109, 110, 105, 99, 95, 112, 55, 95, 114);
+    tmp_out = iset(tmp_out, 46, 111, 117, 116, 0);
+    let empty: bytes = anew(0);
+    let rc_r: i64 = su_spawn_capture(tmp_elf, empty, tmp_out, 420);
+    let nb: i64 = if_pos m2u_eq(rc_r, 0) <=> 0 { su_read_file_into(arena, tmp_out, 1536, 64) } else { 0 };
+    let r: i64 = if_pos m2u_ge(nb, 8) <=> 0 {
+        let val: i64 = ld_u64(arena, 1536);
+        let w: bytes = iset_patch_i64(arena, 0, 0);
+        w = su_out4(su_out_i64(su_out4(w, 73, 110, 116, 40), val), 41, 10, 0, 0);
+        let nw: i64 = sys_write(1, w, su_band_a(), ld_u64(w, 0));
+        0 + nw * 0
+    } else { 1 };
+    return r;
+}
+
+// Implements `run <in.omni|.omni_bc> [a0 a1 a2]` on the native x86-64 exec path.
+#[strict]
+#[cap(SYS)]
+fn od_cmd_run(arena: bytes, argc: i64) -> i64 {
+    let r: i64 = if_pos m2u_lt(argc, 3) <=> 0 {
+        2
+    } else {
+        let in_off: i64 = su_arg_off(arena, 2);
+        let in_len: i64 = su_arg_len(arena, 2);
+        let tmp_bc: bytes = anew(0);
+        tmp_bc = iset(tmp_bc, 47, 116, 109, 112, 47, 111, 109, 110, 105, 99, 95, 112, 55, 95, 114);
+        tmp_bc = iset(tmp_bc, 46, 98, 99, 0);
+        let is_src: i64 = od_ends_omni(arena, in_off, in_len);
+        let rc_c: i64 = if_pos is_src <=> 0 { od_compile_omni(arena, in_off, in_len, tmp_bc) } else { 0 };
+        if_pos m2u_eq(rc_c, 0) <=> 0 {
+            let bc_cstr: bytes = if_pos is_src <=> 0 { tmp_bc } else { su_make_cstr(arena, in_off, in_len) };
+            let tmp_elf: bytes = anew(0);
+            tmp_elf = iset(tmp_elf, 47, 116, 109, 112, 47, 111, 109, 110, 105, 99, 95, 112, 55, 95, 114);
+            tmp_elf = iset(tmp_elf, 46, 101, 108, 102, 0);
+            let a0: i64 = if_pos m2u_ge(argc, 4) <=> 0 { su_parse_i64(arena, su_arg_off(arena, 3), su_arg_len(arena, 3)) } else { 0 };
+            let a1: i64 = if_pos m2u_ge(argc, 5) <=> 0 { su_parse_i64(arena, su_arg_off(arena, 4), su_arg_len(arena, 4)) } else { 0 };
+            let a2: i64 = if_pos m2u_ge(argc, 6) <=> 0 { su_parse_i64(arena, su_arg_off(arena, 5), su_arg_len(arena, 5)) } else { 0 };
+            let rc_e: i64 = od_compile_elf_bc(arena, bc_cstr, tmp_elf, m2u_ge(argc, 4), a0, a1, a2);
+            if_pos m2u_eq(rc_e, 0) <=> 0 { od_exec_and_print(arena, tmp_elf) } else { 1 }
+        } else { 1 }
+    };
+    return r;
+}
+
+// Dispatches `decompile`, `inspect --m3`, and `audit-diff` to Pure-Omni audit ELFs.
+#[strict]
+#[cap(SYS)]
+fn od_cmd_audit(arena: bytes, argc: i64, which: i64) -> i64 {
+    // which: 1=decompile, 2=inspect --m3, 3=audit-diff
+    let r: i64 = if_pos m2u_in(which, 1, 2) <=> 0 {
+        let arg_i: i64 = m2u_sel(m2u_eq(which, 1), 2, 3);
+        if_pos m2u_lt(argc, arg_i + 1) <=> 0 {
+            2
+        } else {
+            let ioff: i64 = su_arg_off(arena, arg_i);
+            let ilen: i64 = su_arg_len(arena, arg_i);
+            let tmp_bc: bytes = anew(0);
+            tmp_bc = iset(tmp_bc, 47, 116, 109, 112, 47, 111, 109, 110, 105, 99, 95, 112, 55, 95, 100);
+            tmp_bc = iset(tmp_bc, 99, 46, 98, 99, 0);
+            let is_src: i64 = od_ends_omni(arena, ioff, ilen);
+            let rc_c: i64 = if_pos is_src <=> 0 { od_compile_omni(arena, ioff, ilen, tmp_bc) } else { 0 };
+            if_pos m2u_eq(rc_c, 0) <=> 0 {
+                let bc_c: bytes = if_pos is_src <=> 0 { tmp_bc } else { su_make_cstr(arena, ioff, ilen) };
+                sys_spawn(od_tool_path(arena, 3), bc_c)
+            } else { 1 }
+        }
+    } else {
+        // audit-diff <before> <after> [--tsv]
+        if_pos m2u_lt(argc, 4) <=> 0 {
+            2
+        } else {
+            let w: bytes = iset_patch_i64(arena, 0, 0);
+            w = su_out_u8(su_out_copy(w, su_arg_off(w, 2), su_arg_len(w, 2)), 10);
+            w = su_out_u8(su_out_copy(w, su_arg_off(w, 3), su_arg_len(w, 3)), 10);
+            w = if_pos m2u_ge(argc, 5) <=> 0 { su_out_u8(su_out_copy(w, su_arg_off(w, 4), su_arg_len(w, 4)), 10) } else { w };
+            let req_p: bytes = anew(0);
+            req_p = iset(req_p, 47, 116, 109, 112, 47, 111, 109, 110, 105, 99, 95, 112, 55, 95, 97);
+            req_p = iset(req_p, 100, 46, 114, 101, 113, 0);
+            let nw: i64 = su_write_file_from(w, req_p, su_band_a(), ld_u64(w, 0), 420);
+            if_pos m2u_ge(nw, 0) <=> 0 { sys_spawn(od_tool_path(w, 4), req_p) } else { 1 }
+        }
+    };
+    return r;
+}
+
+// Classifies argv[1] subcommand:
+//   1=compile/compile-surface, 2=compile-elf, 3=link-elf, 4=run, 5=decompile, 6=inspect, 7=audit-diff, 8=version
+#[strict]
+fn od_classify_cmd(arena: bytes) -> i64 {
+    let o: i64 = su_arg_off(arena, 1);
+    let l: i64 = su_arg_len(arena, 1);
+    let c0: i64 = m2u_sel(m2u_ge(l, 1), ld_u8(arena, o), 0);
+    let c1: i64 = m2u_sel(m2u_ge(l, 2), ld_u8(arena, o + 1), 0);
+    let c7: i64 = m2u_sel(m2u_ge(l, 8), ld_u8(arena, o + 7), 0);
+    let is_c: i64 = m2u_eq(l, 7) * m2u_eq(c0, 99) * m2u_eq(c1, 111);
+    let is_cs: i64 = m2u_eq(l, 15) * m2u_eq(c0, 99) * m2u_eq(c7, 45);
+    let is_ce: i64 = m2u_eq(l, 11) * m2u_eq(c0, 99) * m2u_eq(c7, 45);
+    let is_le: i64 = m2u_eq(l, 8) * m2u_eq(c0, 108) * m2u_eq(c1, 105);
+    let is_rn: i64 = m2u_eq(l, 3) * m2u_eq(c0, 114) * m2u_eq(c1, 117);
+    let is_dc: i64 = m2u_eq(l, 9) * m2u_eq(c0, 100) * m2u_eq(c1, 101);
+    let is_in: i64 = m2u_eq(l, 7) * m2u_eq(c0, 105) * m2u_eq(c1, 110);
+    let is_ad: i64 = m2u_eq(l, 10) * m2u_eq(c0, 97) * m2u_eq(c1, 117);
+    let is_ver: i64 = (m2u_eq(l, 9) * m2u_eq(c0, 45) * m2u_eq(c1, 45)) + (m2u_eq(l, 2) * m2u_eq(c0, 45) * m2u_eq(c1, 86)) + (m2u_eq(l, 7) * m2u_eq(c0, 118));
+    return (is_c + is_cs) * 1 + is_ce * 2 + is_le * 3 + is_rn * 4 + is_dc * 5 + is_in * 6 + is_ad * 7 + is_ver * 8;
+}
+
+// Implements `compile-elf <in.omni|.omni_bc> <out.elf> [a0 a1 a2]`.
+#[strict]
+#[cap(SYS)]
+fn od_cmd_compile_elf(w: bytes, argc: i64) -> i64 {
+    let r: i64 = if_pos m2u_lt(argc, 4) <=> 0 {
+        2
+    } else {
+        let ioff: i64 = su_arg_off(w, 2);
+        let ilen: i64 = su_arg_len(w, 2);
+        let tmp_bc: bytes = anew(0);
+        tmp_bc = iset(tmp_bc, 47, 116, 109, 112, 47, 111, 109, 110, 105, 99, 95, 112, 55, 95, 99);
+        tmp_bc = iset(tmp_bc, 101, 46, 98, 99, 0);
+        let is_src: i64 = od_ends_omni(w, ioff, ilen);
+        let rc_c: i64 = if_pos is_src <=> 0 { od_compile_omni(w, ioff, ilen, tmp_bc) } else { 0 };
+        if_pos m2u_eq(rc_c, 0) <=> 0 {
+            let bc_c: bytes = if_pos is_src <=> 0 { tmp_bc } else { su_make_cstr(w, ioff, ilen) };
+            let out_c: bytes = su_make_cstr(w, su_arg_off(w, 3), su_arg_len(w, 3));
+            let a0: i64 = if_pos m2u_ge(argc, 5) <=> 0 { su_parse_i64(w, su_arg_off(w, 4), su_arg_len(w, 4)) } else { 0 };
+            let a1: i64 = if_pos m2u_ge(argc, 6) <=> 0 { su_parse_i64(w, su_arg_off(w, 5), su_arg_len(w, 5)) } else { 0 };
+            let a2: i64 = if_pos m2u_ge(argc, 7) <=> 0 { su_parse_i64(w, su_arg_off(w, 6), su_arg_len(w, 6)) } else { 0 };
+            od_compile_elf_bc(w, bc_c, out_c, m2u_ge(argc, 5), a0, a1, a2)
+        } else { 1 }
+    };
+    return r;
+}
+
+#[strict]
+#[cap(SYS)]
+fn od_dispatch_hi(w: bytes, argc: i64, cmd: i64) -> i64 {
+    let rc: i64 = if_pos m2u_eq(cmd, 4) <=> 0 {
+        od_cmd_run(w, argc)
+    } else { if_pos m2u_in(cmd, 5, 7) <=> 0 {
+        od_cmd_audit(w, argc, cmd - 4)
+    } else { if_pos m2u_eq(cmd, 8) <=> 0 {
+        let v: bytes = iset_patch_i64(w, 0, 0);
+        v = su_out4(su_out4(su_out4(v, 111, 109, 110, 105), 32, 50, 46, 48), 46, 48, 32, 40);
+        v = su_out4(su_out4(su_out4(v, 112, 117, 114, 101), 45, 111, 109, 110), 105, 41, 10, 0);
+        let nw: i64 = sys_write(1, v, su_band_a(), ld_u64(v, 0));
+        0 + nw * 0
+    } else {
+        2
+    } } };
+    return rc;
+}
+
+#[strict]
+#[cap(SYS)]
+fn main() -> i64 {
+    let w: bytes = su_load_cmdline(su_alloc_arena());
+    let argc: i64 = su_argc(w);
+    let rc: i64 = if_pos m2u_lt(argc, 2) <=> 0 {
+        2
+    } else {
+        let cmd: i64 = od_classify_cmd(w);
+        if_pos m2u_eq(cmd, 1) <=> 0 {
+            if_pos m2u_lt(argc, 4) <=> 0 { 2 } else {
+                let out_c: bytes = su_make_cstr(w, su_arg_off(w, 3), su_arg_len(w, 3));
+                od_compile_omni(w, su_arg_off(w, 2), su_arg_len(w, 2), out_c)
+            }
+        } else { if_pos m2u_eq(cmd, 2) <=> 0 {
+            od_cmd_compile_elf(w, argc)
+        } else { if_pos m2u_eq(cmd, 3) <=> 0 {
+            od_cmd_link_elf(w, argc)
+        } else {
+            od_dispatch_hi(w, argc, cmd)
+        } } }
+    };
+    return sys_exit(rc);
+}
