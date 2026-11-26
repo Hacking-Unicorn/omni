@@ -30,6 +30,41 @@ fn audit_ty_name(ty_tok: u16) -> Option<&'static str> {
     }
 }
 
+/// Resolves a type token or marks the enclosing function `APPROXIMATE` (never silently defaults to `i64`).
+fn audit_ty_or_approx(ty_tok: u16, approx: &mut bool) -> String {
+    match audit_ty_name(ty_tok) {
+        Some(name) => String::from(name),
+        None => {
+            *approx = true;
+            format!("/* [LITERAL_TY 0x{:04X}] */ i64", ty_tok)
+        }
+    }
+}
+
+/// Validates module framing (`TOK_MOD_BEGIN .. TOK_MOD_END`) so truncated/unframed bytecode
+/// fails closed instead of silently decoding as an empty 0-function module.
+fn audit_validate_framing(stream: &[u16]) -> Result<(), String> {
+    if stream.len() < 2 {
+        return Err(format!(
+            "audit-view: truncated bytecode stream (len={} < 2)",
+            stream.len()
+        ));
+    }
+    if stream[0] != TOK_MOD_BEGIN {
+        return Err(format!(
+            "audit-view: missing TOK_MOD_BEGIN (got 0x{:04X})",
+            stream[0]
+        ));
+    }
+    if stream[stream.len() - 1] != TOK_MOD_END {
+        return Err(format!(
+            "audit-view: truncated bytecode stream missing TOK_MOD_END (last=0x{:04X})",
+            stream[stream.len() - 1]
+        ));
+    }
+    Ok(())
+}
+
 fn audit_cap_names(mask: CapMask) -> Vec<&'static str> {
     const CAPS: &[(u16, &str)] = &[
         (CAP_ID_DB_R, "DB_R"),
@@ -356,7 +391,7 @@ fn audit_emit_single_ins(
             if let (Some(dst), Some(rhs)) = (ins.dest_reg, audit_format_rhs(ins)) {
                 let reg_idx = dst.saturating_sub(REG_BASE);
                 if declared.insert(dst) {
-                    let ty_s = audit_ty_name(ins.ty_tok).unwrap_or("i64");
+                    let ty_s = audit_ty_or_approx(ins.ty_tok, approx);
                     out.push_str(&format!("{}let v{}: {} = {};\n", indent, reg_idx, ty_s, rhs));
                 } else {
                     out.push_str(&format!("{}v{} = {};\n", indent, reg_idx, rhs));
@@ -439,8 +474,7 @@ fn audit_emit_block(
                                         audit_arm_tail_expr(insns, else_start, else_end, dst, Some(l_end)),
                                     ) {
                                         let reg_idx = dst.saturating_sub(REG_BASE);
-                                        let ty_s = audit_ty_name(insns[then_end - 1].ty_tok)
-                                            .unwrap_or("i64");
+                                        let ty_s = audit_ty_or_approx(insns[then_end - 1].ty_tok, approx);
                                         let is_new = declared.insert(dst);
                                         let lhs = if is_new {
                                             format!("let v{}: {} = ", reg_idx, ty_s)
@@ -586,8 +620,7 @@ fn audit_emit_block(
                                     ) {
                                         if neg_s == nt && zero_s == zt && pos_s == pt {
                                             let reg_idx = dst.saturating_sub(REG_BASE);
-                                            let ty_s = audit_ty_name(insns[neg_e - 1].ty_tok)
-                                                .unwrap_or("i64");
+                                            let ty_s = audit_ty_or_approx(insns[neg_e - 1].ty_tok, approx);
                                             let is_new = declared.insert(dst);
                                             let lhs = if is_new {
                                                 format!("let v{}: {} = ", reg_idx, ty_s)
@@ -665,7 +698,11 @@ fn audit_emit_block(
 /// Decompiles a raw `.omni_bc` token stream into deterministic, readable M3 surface text.
 /// No source map is required. Marks reconstructed vs approximate sections explicitly.
 pub fn decompile_u16_stream_to_m3(stream: &[u16]) -> Result<DecompileReport, String> {
+    audit_validate_framing(stream)?;
     let module = decode_omni_token_stream(stream)?;
+    if module.functions.is_empty() {
+        return Err(String::from("audit-view: module contains 0 functions"));
+    }
     let stream_hash = fnv1a_64_hash(&encode_u16_stream_to_bytes(stream));
     let mut fn_blocks: Vec<(u16, bool, String, String)> = Vec::with_capacity(module.functions.len());
     let mut functions_exact = 0usize;
@@ -688,33 +725,11 @@ pub fn decompile_u16_stream_to_m3(stream: &[u16]) -> Result<DecompileReport, Str
             &mut approx,
         );
 
-        let mut header = String::new();
-        let marker = if approx {
-            functions_approximate += 1;
-            format!(
-                "fn_{}:APPROXIMATE (literal opcode/branch fallback)",
-                func.fn_idx
-            )
-        } else {
-            functions_exact += 1;
-            format!("fn_{}:RECONSTRUCTED", func.fn_idx)
-        };
-        header.push_str(&format!(
-            "// [AUDIT-VIEW: {}] fn_idx={} ins={} cap_mask=0x{:04X} verified={}\n",
-            if approx {
-                "APPROXIMATE — contains literal opcode/branch fallback"
-            } else {
-                "RECONSTRUCTED"
-            },
-            func.fn_idx,
-            func.instructions.len(),
-            func.cap_mask,
-            rep.passed
-        ));
+        let mut attrs = String::new();
         if func.cap_mask != 0 {
             let caps = audit_cap_names(func.cap_mask);
             if !caps.is_empty() {
-                header.push_str(&format!("#[cap({})]\n", caps.join(", ")));
+                attrs.push_str(&format!("#[cap({})]\n", caps.join(", ")));
             }
         }
         let n_fns = module.functions.len();
@@ -727,17 +742,20 @@ pub fn decompile_u16_stream_to_m3(stream: &[u16]) -> Result<DecompileReport, Str
         };
         if func.fn_idx as usize != expected_idx {
             if func.fn_idx <= 15 {
-                header.push_str(&format!("#[fn_id({})]\n", func.fn_idx));
+                attrs.push_str(&format!("#[fn_id({})]\n", func.fn_idx));
             } else {
                 approx = true;
-                header.push_str(&format!("// [LITERAL_OP] fn_idx={} (>15, non-positional)\n", func.fn_idx));
+                attrs.push_str(&format!(
+                    "// [LITERAL_OP] fn_idx={} (>15, non-positional)\n",
+                    func.fn_idx
+                ));
             }
         }
 
         let mut param_strs = Vec::with_capacity(func.params.len());
         for &(p_tok, ty_tok, tc_tok) in &func.params {
             let p_idx = p_tok.saturating_sub(PAR_BASE);
-            let ty_s = audit_ty_name(ty_tok).unwrap_or("i64");
+            let ty_s = audit_ty_or_approx(ty_tok, &mut approx);
             let (untrusted, _, _) = unpack_tc(tc_tok);
             if untrusted {
                 param_strs.push(format!("p{}: {} @untrusted", p_idx, ty_s));
@@ -745,7 +763,31 @@ pub fn decompile_u16_stream_to_m3(stream: &[u16]) -> Result<DecompileReport, Str
                 param_strs.push(format!("p{}: {}", p_idx, ty_s));
             }
         }
-        let ret_s = audit_ty_name(func.ret_ty_tok).unwrap_or("i64");
+        let ret_s = audit_ty_or_approx(func.ret_ty_tok, &mut approx);
+
+        let marker = if approx {
+            functions_approximate += 1;
+            format!(
+                "fn_{}:APPROXIMATE (literal opcode/branch/type fallback)",
+                func.fn_idx
+            )
+        } else {
+            functions_exact += 1;
+            format!("fn_{}:RECONSTRUCTED", func.fn_idx)
+        };
+        let mut header = format!(
+            "// [AUDIT-VIEW: {}] fn_idx={} ins={} cap_mask=0x{:04X} verified={}\n",
+            if approx {
+                "APPROXIMATE — contains literal opcode/branch/type fallback"
+            } else {
+                "RECONSTRUCTED"
+            },
+            func.fn_idx,
+            func.instructions.len(),
+            func.cap_mask,
+            rep.passed
+        );
+        header.push_str(&attrs);
         header.push_str(&format!(
             "fn fn_{}({}) -> {} {{\n{}}}\n",
             func.fn_idx,
@@ -929,8 +971,15 @@ pub fn summarize_proposer_diff(
     before_label: &str,
     after_label: &str,
 ) -> Result<ProposerDiffSummary, String> {
+    audit_validate_framing(before)?;
+    audit_validate_framing(after)?;
     let before_mod = decode_omni_token_stream(before)?;
     let after_mod = decode_omni_token_stream(after)?;
+    if before_mod.functions.is_empty() || after_mod.functions.is_empty() {
+        return Err(String::from(
+            "audit-diff: before or after module contains 0 functions",
+        ));
+    }
 
     let before_fnv1a64 = fnv1a_64_hash(&encode_u16_stream_to_bytes(before));
     let after_fnv1a64 = fnv1a_64_hash(&encode_u16_stream_to_bytes(after));
@@ -1308,6 +1357,10 @@ pub fn selftest_audit_view() -> Result<usize, String> {
             "arena_lifecycle_golden",
             "fn arena_lifecycle_golden(x: i64) -> i64 { let a = arena(4096); let r = borrow_r(a); let res = x + 42; drop(r); drop(a); return res; }",
         ),
+        (
+            "cap_and_taint_san_golden",
+            "#[cap(AI)] fn cap_and_taint_san_golden(s: str @untrusted) -> str { let clean = san_prm(s); return clean; }",
+        ),
     ];
 
     for &(name, src) in roundtrip_goldens {
@@ -1461,15 +1514,30 @@ pub fn selftest_audit_view() -> Result<usize, String> {
             b6_rep.m3_source
         ));
     }
-    let _ = compile_omni_surface_to_u16(&b6_rep.m3_source).map_err(|e| {
+    let b6_recompiled = compile_omni_surface_to_u16(&b6_rep.m3_source).map_err(|e| {
         format!(
             "audit-view: B6 decompiled M3 failed to recompile: {}\n{}",
             e, b6_rep.m3_source
         )
     })?;
+    // Non-tautological execution proof: running the recompiled B6 stream on (0, 0) must still
+    // produce the clobbered result 1024 (not 10024), proving the decompiler preserved the bug verbatim.
+    let b6_mod = decode_omni_token_stream(&b6_recompiled)?;
+    let b6_val = OmniBinaryVm::new().execute_function(
+        &b6_mod,
+        0,
+        vec![OmniValue::Int(0), OmniValue::Int(0)],
+    )?;
+    if b6_val != OmniValue::Int(1024) {
+        return Err(format!(
+            "audit-view: recompiled B6 stream returned {:?} instead of clobbered Int(1024)",
+            b6_val
+        ));
+    }
     checks += 1;
 
-    // 4. Approximate fallback test: irreducible branch / non-surface opcode must be marked APPROXIMATE.
+    // 4. Approximate fallback tests:
+    //    4a. Non-surface opcode (EMBED 0x7F7D) -> APPROXIMATE + LITERAL_OP
     let approx_stream = pack_fn_module(
         &[],
         0,
@@ -1491,6 +1559,52 @@ pub fn selftest_audit_view() -> Result<usize, String> {
             "audit-view: approximate fallback was not explicitly marked:\n{}",
             approx_rep.m3_source
         ));
+    }
+    checks += 1;
+
+    //    4b. Non-scalar type token (TY_STRUCT) must NOT silently default to `i64` as RECONSTRUCTED.
+    let struct_ty_stream = pack_fn_module(
+        &[],
+        0,
+        &[(PAR_BASE, TY_STRUCT, tc_safe)],
+        TY_STRUCT,
+        0,
+        &[vec![0x7F4A, PAR_BASE, TOK_INS_END]],
+    );
+    let struct_ty_rep = decompile_u16_stream_to_m3(&struct_ty_stream)?;
+    if struct_ty_rep.is_exact
+        || struct_ty_rep.functions_approximate != 1
+        || !struct_ty_rep.m3_source.contains("APPROXIMATE")
+        || !struct_ty_rep.m3_source.contains("LITERAL_TY")
+    {
+        return Err(format!(
+            "audit-view: unknown/non-scalar type TY_STRUCT was silently marked exact:\n{}",
+            struct_ty_rep.m3_source
+        ));
+    }
+    checks += 1;
+
+    //    4c. Negative controls: truncated / empty / corrupt bytecode MUST fail closed on BOTH
+    //        `decompile_u16_stream_to_m3` and `summarize_proposer_diff`.
+    let malformed_cases: &[(&str, &[u16])] = &[
+        ("empty", &[]),
+        ("only_mod_begin", &[TOK_MOD_BEGIN]),
+        ("empty_0_fn", &[TOK_MOD_BEGIN, TOK_MOD_END]),
+        ("bad_tag", &[TOK_MOD_BEGIN, 0x1234, TOK_MOD_END]),
+    ];
+    for &(label, bad) in malformed_cases {
+        if decompile_u16_stream_to_m3(bad).is_ok() {
+            return Err(format!(
+                "audit-view: malformed stream '{}' unexpectedly succeeded in decompile",
+                label
+            ));
+        }
+        if summarize_proposer_diff(bad, bad, label, label).is_ok() {
+            return Err(format!(
+                "audit-view: malformed stream '{}' unexpectedly succeeded in audit-diff",
+                label
+            ));
+        }
     }
     checks += 1;
 
