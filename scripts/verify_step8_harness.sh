@@ -205,6 +205,43 @@ else
   fail "negative control: unknown flag to proposer_loop.elf exited rc=$BADARG_RC (want 2)"
 fi
 
+# Step 11b: Native sys_clock_ns() kernel execution + #[cap(SYS)] negative control (ERR_MISSING_CAP=1003)
+cat > "$TMP/clk_ok.omni" <<'EOF'
+#[strict]
+#[cap(SYS)]
+fn main() -> i64 {
+    let t0: i64 = sys_clock_ns();
+    let i: i64 = 0;
+    let s: i64 = 0;
+    while 20000 - i <=> 0 { s = s + i; i = i + 1; }
+    let t1: i64 = sys_clock_ns();
+    return (t1 - t0) + s * 0;
+}
+EOF
+if "$PURE_BIN" compile-elf "$TMP/clk_ok.omni" "$TMP/clk_ok.elf"; then
+  chmod +x "$TMP/clk_ok.elf"
+  CLK_NS=$("$TMP/clk_ok.elf" | od -An -td8 | tr -d ' \n')
+  if [ "${CLK_NS:-0}" -gt 0 ]; then
+    pass "Step 11b native sys_clock_ns() live Linux kernel exec PASS (elapsed=${CLK_NS} ns)"
+  else
+    fail "Step 11b native sys_clock_ns() returned non-positive elapsed=${CLK_NS}"
+  fi
+else
+  fail "Step 11b native sys_clock_ns() compile-elf FAIL"
+fi
+
+cat > "$TMP/clk_nocap.omni" <<'EOF'
+#[strict]
+fn main() -> i64 {
+    return sys_clock_ns();
+}
+EOF
+if "$PURE_BIN" compile "$TMP/clk_nocap.omni" "$TMP/clk_nocap.omni_bc" >/dev/null 2>&1; then
+  fail "Step 11b negative control: sys_clock_ns() without #[cap(SYS)] was NOT rejected"
+else
+  pass "Step 11b negative control: sys_clock_ns() without #[cap(SYS)] rejected fail-closed"
+fi
+
 echo "=============================================================================="
 echo "[STEP8 SUMMARY] PASS=$PASS FAIL=$FAIL"
 echo "=============================================================================="

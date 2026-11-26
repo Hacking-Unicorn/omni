@@ -81,11 +81,11 @@ fn cg_check_pin(arena: bytes, p: bytes, want_sz: i64, want_h: i64) -> i64 {
 #[strict]
 #[cap(SYS)]
 fn cg_gate_frozen(arena: bytes) -> i64 {
-    // pure/m2/m2.omni_bc: 87338 B (43669w), 0xD7BD0CCE85021C91
+    // pure/m2/m2.omni_bc: 87836 B (43918w), 0x74FB1652CC0E974B (Step 11b sys_clock_ns)
     let p_m2: bytes = anew(0);
     p_m2 = iset(p_m2, 112, 117, 114, 101, 47, 109, 50, 47, 109, 50, 46, 111, 109, 110, 105, 95);
     p_m2 = iset(p_m2, 98, 99, 0);
-    let ok1: i64 = cg_check_pin(arena, p_m2, 87338, (55229 << 48) | (3278 << 32) | (34050 << 16) | 7313);
+    let ok1: i64 = cg_check_pin(arena, p_m2, 87836, (29947 << 48) | (5714 << 32) | (52238 << 16) | 38731);
     // pure/m3/m3.omni_bc: 132498 B (66249w), 0x0E3052A4BE00D599
     let p_m3: bytes = anew(0);
     p_m3 = iset(p_m3, 112, 117, 114, 101, 47, 109, 51, 47, 109, 51, 46, 111, 109, 110, 105, 95);
@@ -116,9 +116,9 @@ fn cg_gate_m2_fp(arena: bytes) -> i64 {
     let s2: bytes = cg_tmp(66);
     let rc1: i64 = su_spawn_capture(cg_tool(arena, 1), p_m2, s1, 493);
     let rc2: i64 = if_pos m2u_eq(rc1, 0) <=> 0 { su_spawn_capture(s1, p_m2, s2, 493) } else { 1 };
-    let want_h: i64 = (2652 << 48) | (54709 << 32) | (22279 << 16) | 43533;
-    let ok1: i64 = m2u_eq(rc1, 0) * cg_check_pin(arena, s1, 125539, want_h);
-    let ok2: i64 = m2u_eq(rc2, 0) * cg_check_pin(arena, s2, 125539, want_h);
+    let want_h: i64 = (43615 << 48) | (33974 << 32) | (43589 << 16) | 47953;
+    let ok1: i64 = m2u_eq(rc1, 0) * cg_check_pin(arena, s1, 126152, want_h);
+    let ok2: i64 = m2u_eq(rc2, 0) * cg_check_pin(arena, s2, 126152, want_h);
     return ok1 * ok2;
 }
 

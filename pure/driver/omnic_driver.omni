@@ -225,7 +225,7 @@ fn od_run_m3_and_verify(w2: bytes, n2: i64, out_bc_cstr: bytes) -> i64 {
             let ver_elf: bytes = od_tool_path(w, 2);
             let rc_v: i64 = su_spawn_capture(ver_elf, out_bc_cstr, ver_out, 420);
             let vn: i64 = su_read_file_into(w, ver_out, 2824, 64);
-            let vok: i64 = m2u_eq(rc_v, 0) * m2u_ge(vn, 2) * m2u_eq(ld_u16(w, 2824), 0);
+            let vok: i64 = m2u_eq(rc_v, 0) * m2u_ge(vn, 48) * m2u_eq(ld_u64(w, 2824), 0) * m2u_eq(ld_u64(w, 2824 + 40), 0);
             m2u_sel(vok, 0, 1)
         }
     } else { 1 };

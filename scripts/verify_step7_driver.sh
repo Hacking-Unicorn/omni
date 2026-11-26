@@ -78,7 +78,7 @@ fi
 
 echo "=== [4/8] Pure-Omni compile-elf ==="
 for pair in \
-  "pure/m2/m2.omni_bc:m2:125539" \
+  "pure/m2/m2.omni_bc:m2:126152" \
   "pure/m4/m4.omni_bc:m4:90402" \
   "pure/verifier_standalone.omni_bc:verifier:37907"
 do
@@ -102,11 +102,11 @@ chmod +x "$TMP/p_pack5.elf"
 NATIVE_PACK5=$("$TMP/p_pack5.elf" | od -An -td8 | tr -d ' \n')
 pass "compile-elf pack5_decision_controller.omni 45 10 40 ($(wc -c < "$TMP/p_pack5.elf") B, native=${NATIVE_PACK5})"
 
-echo "=== [5/8] Pure-Omni link-elf (exact 206,946 B m3.elf == bootstrap/m3.elf) ==="
+echo "=== [5/8] Pure-Omni link-elf (exact 207,015 B m3.elf == bootstrap/m3.elf) ==="
 "$PURE_BIN" link-elf pure/m3/m3_standalone.omni_bc pure/m3/mod_parse.omni_bc -o "$TMP/p_m3.elf"
 m3_sz=$(wc -c < "$TMP/p_m3.elf")
-if cmp -s "$TMP/p_m3.elf" bootstrap/m3.elf && [ "$m3_sz" = "206946" ]; then
-  pass "link-elf m3_standalone + mod_parse -> m3.elf (0-byte diff vs bootstrap/m3.elf, 206,946 B)"
+if cmp -s "$TMP/p_m3.elf" bootstrap/m3.elf && [ "$m3_sz" = "207015" ]; then
+  pass "link-elf m3_standalone + mod_parse -> m3.elf (0-byte diff vs bootstrap/m3.elf, 207,015 B)"
 else
   fail "link-elf m3.elf mismatch (sz=${m3_sz})"
 fi
