@@ -7675,7 +7675,8 @@ pub fn selftest_s4_honesty() -> Result<usize, String> {
     let monolith_lines = count_lines("omni_rust_bootstrap.rs")?;
     let m2_host_lines = count_lines("m2_host/decode_diff.rs")?
         + count_lines("m2_host/lint.rs")?
-        + count_lines("m2_host/audit_view.rs")?;
+        + count_lines("m2_host/audit_view.rs")?
+        + count_lines("m2_host/proposer_loop.rs")?;
     let pure_default_lines = count_lines("host_runtime/pure_default.rs")?;
     let p4_shim_lines = count_lines("p4_shim/mod.rs")?;
     let seed0_lines = count_lines("seed0/omni_seed0.rs")?;
