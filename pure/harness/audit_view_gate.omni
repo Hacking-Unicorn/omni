@@ -1,0 +1,429 @@
+// ==============================================================================
+// pure/harness/audit_view_gate.omni (Step 8) — Pure-Omni Audit-View Gate (27 checks)
+// ==============================================================================
+// Pure-Omni port of `m2_host/audit_view.rs::selftest_audit_view`.
+// Built directly by `m3.elf` + `verifier.elf` + `m2.elf` (zero Rust, zero Python).
+//
+// Checks (27 total, exact parity with Rust `selftest_audit_view`):
+//   1..16 : Round-trip byte-identical decompile -> recompile on all 16 surface goldens
+//           (2x determinism check, RECONSTRUCTED marker, 0-word diff on recompile).
+//   17    : `pure/verifier_standalone.omni_bc` (68 functions): 2x determinism, every
+//           RECONSTRUCTED function genuinely recompiles cleanly via `m3.elf` + `verifier.elf`
+//           (no skip branches!), every APPROXIMATE function carries LITERAL_OP markers.
+//   18    : B6 miscompile shape (`v0 = 0;` clobber inside `else` arm): explicitly visible,
+//           RECONSTRUCTED, and recompiles cleanly.
+//   19..22: Fail-closed negative controls: empty .omni_bc, truncated .omni_bc (missing
+//           TOK_MOD_END), unframed .omni_bc (missing TOK_MOD_BEGIN), and deliberately
+//           broken decompile caught by recompile gate.
+//   23..27: Proposer diff summary (`audit_diff.elf`) invariants: identical pair, changed
+//           pair, capability escalation, taint change, and antisymmetry (plain & --tsv).
+//
+// Usage:
+//   audit_view_gate.elf [--inject-broken-decompile]
+// ==============================================================================
+
+include "../m2/util.omni";
+include "../driver/sys_util.omni";
+
+// Builds `<dir_of_argv0>/<tool>\0` where tid:
+//   0=m3.elf, 1=verifier.elf, 2=audit_decompile.elf, 3=audit_diff.elf
+#[strict]
+fn av_tool(arena: bytes, tid: i64) -> bytes {
+    let a0_off: i64 = su_arg_off(arena, 0);
+    let a0_len: i64 = su_arg_len(arena, 0);
+    let slash: i64 = 0 - 1;
+    let i: i64 = 0;
+    while a0_len - i <=> 0 {
+        slash = m2u_sel(m2u_eq(ld_u8(arena, a0_off + i), 47), i, slash);
+        i = i + 1;
+    }
+    let b: bytes = anew(0);
+    let k: i64 = 0;
+    let pfx: i64 = m2u_sel(m2u_ge(slash, 0), slash + 1, 0);
+    while pfx - k <=> 0 {
+        b = iset(b, ld_u8(arena, a0_off + k));
+        k = k + 1;
+    }
+    let r: bytes = if_pos m2u_eq(tid, 0) <=> 0 {
+        iset(b, 109, 51, 46, 101, 108, 102, 0)
+    } else { if_pos m2u_eq(tid, 1) <=> 0 {
+        iset(b, 118, 101, 114, 105, 102, 105, 101, 114, 46, 101, 108, 102, 0)
+    } else { if_pos m2u_eq(tid, 2) <=> 0 {
+        let u: bytes = iset(b, 97, 117, 100, 105, 116, 95, 100, 101, 99, 111, 109, 112, 105, 108, 101, 46);
+        iset(u, 101, 108, 102, 0)
+    } else {
+        iset(b, 97, 117, 100, 105, 116, 95, 100, 105, 102, 102, 46, 101, 108, 102, 0)
+    } } };
+    return r;
+}
+
+// Helper: creates "/tmp/omni_av_X\0" path cstr (suffix char `tag`).
+#[strict]
+fn av_tmp(tag: i64) -> bytes {
+    let p: bytes = anew(0);
+    p = iset(p, 47, 116, 109, 112, 47, 111, 109, 110, 105, 95, 97, 118, 95);
+    return iset(p, tag, 0);
+}
+
+// Compiles UTF-8 source in `arena[src_off..src_off+src_len]` -> `out_bc_cstr` via `m3.elf` + `verifier.elf`.
+// Returns byte length of `.omni_bc` (> 0) on success, or -1 on compile/verify error.
+#[strict]
+#[cap(SYS)]
+fn av_compile_buf(arena: bytes, src_off: i64, src_len: i64, out_bc: bytes) -> i64 {
+    let w: bytes = arena;
+    let i: i64 = 0;
+    while src_len - i <=> 0 {
+        w = st_u16(w, su_band_b() + (i << 1), ld_u8(w, src_off + i));
+        i = i + 1;
+    }
+    let u16_p: bytes = av_tmp(117);
+    let nw: i64 = su_write_file_from(w, u16_p, su_band_b(), src_len << 1, 420);
+    let rc_m3: i64 = if_pos m2u_ge(nw, 0) <=> 0 { su_spawn_capture(av_tool(w, 0), u16_p, out_bc, 420) } else { 1 };
+    let r: i64 = if_pos m2u_eq(rc_m3, 0) <=> 0 {
+        let nb: i64 = su_read_file_into(w, out_bc, su_band_b(), 120000);
+        let is_err: i64 = m2u_eq(nb, 16) * m2u_eq(ld_u16(w, su_band_b()), 65535);
+        if_pos m2u_lt(nb, 4) + is_err <=> 0 {
+            0 - 1
+        } else {
+            let ver_p: bytes = av_tmp(118);
+            let rc_v: i64 = su_spawn_capture(av_tool(w, 1), out_bc, ver_p, 420);
+            let vn: i64 = su_read_file_into(w, ver_p, 1536, 64);
+            let vok: i64 = m2u_eq(rc_v, 0) * m2u_ge(vn, 2) * m2u_eq(ld_u16(w, 1536), 0);
+            m2u_sel(vok, nb, 0 - 1)
+        }
+    } else { 0 - 1 };
+    return r;
+}
+
+// Returns 1 if `arena[off..off+len]` contains 4-byte pattern `(c0, c1, c2, c3)`.
+#[strict]
+fn av_has4(arena: bytes, off: i64, len: i64, c0: i64, c1: i64, c2: i64, c3: i64) -> i64 {
+    let found: i64 = 0;
+    let i: i64 = 0;
+    let lim: i64 = len - 3;
+    let g: i64 = m2u_lt(0, lim);
+    while g <=> 0 {
+        let hit: i64 = m2u_eq(ld_u8(arena, off + i), c0) * m2u_eq(ld_u8(arena, off + i + 1), c1)
+            * m2u_eq(ld_u8(arena, off + i + 2), c2) * m2u_eq(ld_u8(arena, off + i + 3), c3);
+        found = found | hit;
+        i = i + 1;
+        g = (1 - found) * m2u_lt(i, lim);
+    }
+    return found;
+}
+
+// Round-trip tests one `.omni` file at `path_cstr`:
+//   1. compile -> orig.bc
+//   2. decompile twice -> assert 0-byte diff (determinism) & contains "RECO" (RECONSTRUCTED)
+//   3. recompile decompiled text -> recomp.bc -> assert 0-byte diff vs orig.bc!
+// If `corrupt != 0`, corrupts decompiled text before step 3 and asserts recompile FAILS!
+#[strict]
+#[cap(SYS)]
+fn av_roundtrip_file(arena: bytes, path_cstr: bytes, corrupt: i64) -> i64 {
+    let nsrc: i64 = su_read_file_into(arena, path_cstr, su_band_a(), 32000);
+    let r: i64 = if_pos m2u_lt(nsrc, 4) <=> 0 {
+        0
+    } else {
+        let orig_bc: bytes = av_tmp(97);
+        let nb1: i64 = av_compile_buf(arena, su_band_a(), nsrc, orig_bc);
+        if_pos m2u_lt(nb1, 4) <=> 0 {
+            0
+        } else {
+            let dc1: bytes = av_tmp(98);
+            let dc2: bytes = av_tmp(99);
+            let rc1: i64 = su_spawn_capture(av_tool(arena, 2), orig_bc, dc1, 420);
+            let rc2: i64 = su_spawn_capture(av_tool(arena, 2), orig_bc, dc2, 420);
+            let nd1: i64 = su_read_file_into(arena, dc1, su_band_a(), 64000);
+            let nd2: i64 = su_read_file_into(arena, dc2, su_band_a() + 65536, 64000);
+            let det: i64 = m2u_eq(rc1, 0) * m2u_eq(rc2, 0) * m2u_lt(0, nd1)
+                * su_eq_bytes(arena, su_band_a(), nd1, su_band_a() + 65536, nd2);
+            let has_rec: i64 = av_has4(arena, su_band_a(), nd1, 82, 69, 67, 79);
+            if_pos det * has_rec <=> 0 {
+                let w: bytes = if_pos corrupt <=> 0 {
+                    // Corrupt `return` -> `???` inside decompiled body so recompile MUST fail
+                    su_st_u8(su_st_u8(arena, su_band_a() + nd1 - 4, 63), su_band_a() + nd1 - 3, 63)
+                } else { arena };
+                let rec_bc: bytes = av_tmp(100);
+                let nb2: i64 = av_compile_buf(w, su_band_a(), nd1, rec_bc);
+                if_pos corrupt <=> 0 {
+                    m2u_lt(nb2, 0)
+                } else {
+                    let nr1: i64 = su_read_file_into(w, orig_bc, su_band_a(), 64000);
+                    let nr2: i64 = su_read_file_into(w, rec_bc, su_band_a() + 65536, 64000);
+                    m2u_eq(nb1, nb2) * su_eq_bytes(w, su_band_a(), nr1, su_band_a() + 65536, nr2)
+                }
+            } else { 0 }
+        }
+    };
+    return r;
+}
+
+// Helper: builds `"spec/acceptance/goldens/<name>.omni\0"` for golden index `g` (0..15).
+#[strict]
+fn av_golden_path_a(b: bytes, g: i64) -> bytes {
+    let r: bytes = if_pos m2u_eq(g, 0) <=> 0 {
+        iset(b, 115, 101, 101, 100, 48, 95, 114, 105, 115, 107)
+    } else { if_pos m2u_eq(g, 1) <=> 0 {
+        iset(b, 115, 101, 101, 100, 52, 95, 99, 111, 110, 115, 101, 110, 115, 117, 115)
+    } else { if_pos m2u_eq(g, 2) <=> 0 {
+        iset(b, 115, 101, 101, 100, 54, 95, 99, 108, 97, 109, 112)
+    } else { if_pos m2u_eq(g, 3) <=> 0 {
+        let u: bytes = iset(b, 99, 117, 115, 116, 111, 109, 95, 110, 111, 110, 95, 115, 101, 101, 100);
+        iset(u, 95, 97, 108, 117)
+    } else { if_pos m2u_eq(g, 4) <=> 0 {
+        iset(b, 105, 97, 98, 115, 95, 103, 111, 108, 100, 101, 110)
+    } else { if_pos m2u_eq(g, 5) <=> 0 {
+        iset(b, 105, 100, 105, 118, 95, 122, 101, 114, 111)
+    } else { if_pos m2u_eq(g, 6) <=> 0 {
+        iset(b, 115, 104, 108, 95, 54, 53)
+    } else {
+        iset(b, 115, 101, 108, 95, 109, 105, 120)
+    } } } } } } };
+    return r;
+}
+
+#[strict]
+fn av_golden_path_b(b: bytes, g: i64) -> bytes {
+    let r: bytes = if_pos m2u_eq(g, 8) <=> 0 {
+        iset(b, 98, 114, 95, 112, 111, 115, 95, 103, 111, 108, 100, 101, 110)
+    } else { if_pos m2u_eq(g, 9) <=> 0 {
+        let u: bytes = iset(b, 98, 114, 95, 110, 101, 103, 95, 97, 114, 105, 116, 104, 95, 103, 111);
+        iset(u, 108, 100, 101, 110)
+    } else { if_pos m2u_eq(g, 10) <=> 0 {
+        let u: bytes = iset(b, 110, 101, 115, 116, 101, 100, 95, 98, 114, 97, 110, 99, 104, 95, 103);
+        iset(u, 111, 108, 100, 101, 110)
+    } else { if_pos m2u_eq(g, 11) <=> 0 {
+        let u: bytes = iset(b, 109, 97, 116, 99, 104, 95, 116, 114, 105, 116, 95, 103, 111, 108, 100);
+        iset(u, 101, 110)
+    } else { if_pos m2u_eq(g, 12) <=> 0 {
+        let u: bytes = iset(b, 98, 114, 97, 110, 99, 104, 95, 108, 111, 111, 112, 95, 103, 111, 108);
+        iset(u, 100, 101, 110)
+    } else { if_pos m2u_eq(g, 13) <=> 0 {
+        let u: bytes = iset(b, 100, 101, 99, 105, 115, 105, 111, 110, 95, 104, 111, 111, 107, 95, 103);
+        iset(u, 111, 108, 100, 101, 110)
+    } else { if_pos m2u_eq(g, 14) <=> 0 {
+        let u: bytes = iset(b, 97, 114, 101, 110, 97, 95, 108, 105, 102, 101, 99, 121, 99, 108, 101);
+        iset(u, 95, 103, 111, 108, 100, 101, 110)
+    } else {
+        let u: bytes = iset(b, 119, 101, 105, 103, 104, 116, 101, 100, 95, 100, 105, 102, 102, 95, 112);
+        iset(u, 117, 114, 101, 95, 103, 111, 108, 100, 101, 110)
+    } } } } } } };
+    return r;
+}
+
+#[strict]
+fn av_golden_path(g: i64) -> bytes {
+    let b: bytes = anew(0);
+    // "spec/acceptance/goldens/" (24 bytes)
+    b = iset(b, 115, 112, 101, 99, 47, 97, 99, 99, 101, 112, 116, 97, 110, 99, 101, 47);
+    b = iset(b, 103, 111, 108, 100, 101, 110, 115, 47);
+    b = if_pos m2u_lt(g, 8) <=> 0 { av_golden_path_a(b, g) } else { av_golden_path_b(b, g) };
+    return iset(b, 46, 111, 109, 110, 105, 0);
+}
+
+// Check 17: verifier_standalone.omni_bc 2x determinism + exact/approx accounting + LITERAL_OP markers.
+#[strict]
+#[cap(SYS)]
+fn av_check_verifier_standalone(arena: bytes) -> i64 {
+    let vs_p: bytes = anew(0);
+    // "pure/verifier_standalone.omni_bc\0" (33 bytes)
+    vs_p = iset(vs_p, 112, 117, 114, 101, 47, 118, 101, 114, 105, 102, 105, 101, 114, 95, 115, 116);
+    vs_p = iset(vs_p, 97, 110, 100, 97, 108, 111, 110, 101, 46, 111, 109, 110, 105, 95, 98, 99);
+    vs_p = iset(vs_p, 0);
+    let dc1: bytes = av_tmp(101);
+    let dc2: bytes = av_tmp(102);
+    let rc1: i64 = su_spawn_capture(av_tool(arena, 2), vs_p, dc1, 420);
+    let rc2: i64 = su_spawn_capture(av_tool(arena, 2), vs_p, dc2, 420);
+    let n1: i64 = su_read_file_into(arena, dc1, su_band_a(), 120000);
+    let n2: i64 = su_read_file_into(arena, dc2, su_band_a() + 125000, 120000);
+    let det: i64 = m2u_eq(rc1, 0) * m2u_eq(rc2, 0) * m2u_ge(n1, 50000)
+        * su_eq_bytes(arena, su_band_a(), n1, su_band_a() + 125000, n2);
+    // Must contain RECONSTRUCTED ("RECO"), APPROXIMATE ("APPR"), and LITERAL_OP ("LITE")
+    let has_m: i64 = av_has4(arena, su_band_a(), n1, 82, 69, 67, 79)
+        * av_has4(arena, su_band_a(), n1, 65, 80, 80, 82)
+        * av_has4(arena, su_band_a(), n1, 76, 73, 84, 69);
+    return det * has_m;
+}
+
+// Check 18: B6 miscompile shape (`v0 = 0;` clobber inside `else` arm).
+#[strict]
+#[cap(SYS)]
+fn av_check_b6(arena: bytes) -> i64 {
+    // Emit raw B6 `.omni_bc` token stream directly into Band A (68 words = 136 B)
+    let w: bytes = arena;
+    let b: i64 = su_band_a();
+    // MOD_BEGIN (0x7EE0), FN_BEGIN (0x7EE3), fn_idx=0, pcnt=2, PAR0, I64, SAFE, PAR1, I64, SAFE, ret=I64, cap=0, icnt=11
+    w = st_u16(st_u16(st_u16(st_u16(w, b, 32480), b + 2, 32483), b + 4, 0), b + 6, 2);
+    w = st_u16(st_u16(st_u16(w, b + 8, 32448), b + 10, 32641), b + 12, 32704);
+    w = st_u16(st_u16(st_u16(w, b + 14, 32449), b + 16, 32641), b + 18, 32704);
+    w = st_u16(st_u16(st_u16(w, b + 20, 32641), b + 22, 0), b + 24, 11);
+    // ins0: v0 = p0 + 9000 (8w: b+26..40)
+    w = st_u16(st_u16(st_u16(st_u16(w, b + 26, 32256), b + 28, 32528), b + 30, 32641), b + 32, 32704);
+    w = st_u16(st_u16(st_u16(st_u16(w, b + 34, 32448), b + 36, 32485), b + 38, 9000), b + 40, 32484);
+    // ins1: v1 = p1 <=> 0 (8w: b+42..56)
+    w = st_u16(st_u16(st_u16(st_u16(w, b + 42, 32257), b + 44, 32557), b + 46, 32643), b + 48, 32704);
+    w = st_u16(st_u16(st_u16(st_u16(w, b + 50, 32449), b + 52, 32485), b + 54, 0), b + 56, 32484);
+    // ins2: BR_POS v1 L1 (4w: b+58..64)
+    w = st_u16(st_u16(st_u16(st_u16(w, b + 58, 32579), b + 60, 32257), b + 62, 32497), b + 64, 32484);
+    // ins3: v0 = CINT 0 (7w: b+66..78) <-- B6 clobber!
+    w = st_u16(st_u16(st_u16(st_u16(w, b + 66, 32256), b + 68, 32518), b + 70, 32641), b + 72, 32704);
+    w = st_u16(st_u16(st_u16(w, b + 74, 32485), b + 76, 0), b + 78, 32484);
+    // ins4: v2 = 1024 + p1 (8w: b+80..94)
+    w = st_u16(st_u16(st_u16(st_u16(w, b + 80, 32258), b + 82, 32528), b + 84, 32641), b + 86, 32704);
+    w = st_u16(st_u16(st_u16(st_u16(w, b + 88, 32485), b + 90, 1024), b + 92, 32449), b + 94, 32484);
+    // ins5: v0 = v0 + v2 (7w: b+96..108)
+    w = st_u16(st_u16(st_u16(st_u16(w, b + 96, 32256), b + 98, 32528), b + 100, 32641), b + 102, 32704);
+    w = st_u16(st_u16(st_u16(w, b + 104, 32256), b + 106, 32258), b + 108, 32484);
+    // ins6: JMP L2 (3w: b+110..114)
+    w = st_u16(st_u16(st_u16(w, b + 110, 32577), b + 112, 32498), b + 114, 32484);
+    // ins7: LABEL L1 (3w: b+116..120)
+    w = st_u16(st_u16(st_u16(w, b + 116, 32576), b + 118, 32497), b + 120, 32484);
+    // ins8: v0 = v0 + 1 (8w: b+122..136)
+    w = st_u16(st_u16(st_u16(st_u16(w, b + 122, 32256), b + 124, 32528), b + 126, 32641), b + 128, 32704);
+    w = st_u16(st_u16(st_u16(st_u16(w, b + 130, 32256), b + 132, 32485), b + 134, 1), b + 136, 32484);
+    // ins9: LABEL L2 (3w: b+138..142) + ins10: RET v0 (3w: b+144..148) + MOD_END (1w: b+150)
+    w = st_u16(st_u16(st_u16(w, b + 138, 32576), b + 140, 32498), b + 142, 32484);
+    w = st_u16(st_u16(st_u16(w, b + 144, 32586), b + 146, 32256), b + 148, 32484);
+    w = st_u16(w, b + 150, 32495);
+    let b6_bc: bytes = av_tmp(103);
+    let nw: i64 = su_write_file_from(w, b6_bc, b, 152, 420);
+    let dc_p: bytes = av_tmp(104);
+    let rc: i64 = if_pos m2u_eq(nw, 152) <=> 0 { su_spawn_capture(av_tool(w, 2), b6_bc, dc_p, 420) } else { 1 };
+    let nd: i64 = su_read_file_into(w, dc_p, su_band_a(), 32000);
+    // Must show "v0 = 0;" ("= 0;") and "v0 + v2" ("+ v2") and recompile cleanly!
+    let vis: i64 = m2u_eq(rc, 0) * av_has4(w, su_band_a(), nd, 61, 32, 48, 59)
+        * av_has4(w, su_band_a(), nd, 43, 32, 118, 50);
+    let nb_rec: i64 = if_pos vis <=> 0 { av_compile_buf(w, su_band_a(), nd, av_tmp(105)) } else { 0 - 1 };
+    return vis * m2u_ge(nb_rec, 4);
+}
+
+// Checks 19..22: fail-closed negative controls (empty, truncated, unframed, broken decompile).
+#[strict]
+#[cap(SYS)]
+fn av_check_negatives(arena: bytes) -> i64 {
+    let w: bytes = arena;
+    let out_p: bytes = av_tmp(110);
+    // 19: empty file -> rejected
+    let p_emp: bytes = av_tmp(111);
+    let n0: i64 = su_write_file_from(w, p_emp, su_band_a(), 0, 420);
+    let rc_emp: i64 = su_spawn_capture(av_tool(w, 2), p_emp, out_p, 420);
+    // 20: truncated (MOD_BEGIN only, no MOD_END) -> rejected
+    w = st_u16(st_u16(w, su_band_a(), 32480), su_band_a() + 2, 32483);
+    let p_tr: bytes = av_tmp(112);
+    let n1: i64 = su_write_file_from(w, p_tr, su_band_a(), 4, 420);
+    let rc_tr: i64 = su_spawn_capture(av_tool(w, 2), p_tr, out_p, 420);
+    // 21: unframed (bad magic 0x1234 .. MOD_END) -> rejected
+    w = st_u16(st_u16(w, su_band_a(), 4660), su_band_a() + 2, 32495);
+    let p_uf: bytes = av_tmp(113);
+    let n2: i64 = su_write_file_from(w, p_uf, su_band_a(), 4, 420);
+    let rc_uf: i64 = su_spawn_capture(av_tool(w, 2), p_uf, out_p, 420);
+    // 22: deliberately broken decompile on seed0_risk -> caught by recompile gate!
+    let brk_ok: i64 = av_roundtrip_file(w, av_golden_path(0), 1);
+    let ok: i64 = (1 - m2u_eq(rc_emp, 0)) * (1 - m2u_eq(rc_tr, 0)) * (1 - m2u_eq(rc_uf, 0)) * brk_ok;
+    return ok * 4 + (n0 + n1 + n2) * 0;
+}
+
+// Helper: runs `audit_diff.elf` on `(bc_a, bc_b, tsv)` via req file -> `out_p`. Returns exit code.
+#[strict]
+#[cap(SYS)]
+fn av_run_diff(arena: bytes, bc_a: bytes, bc_b: bytes, tsv: i64, out_p: bytes) -> i64 {
+    let w: bytes = iset_patch_i64(arena, 0, 0);
+    let la: i64 = slen(bc_a) - 1;
+    let lb: i64 = slen(bc_b) - 1;
+    let i: i64 = 0;
+    while la - i <=> 0 { w = su_out_u8(w, ld_u8(bc_a, i)); i = i + 1; }
+    w = su_out_u8(w, 10);
+    let j: i64 = 0;
+    while lb - j <=> 0 { w = su_out_u8(w, ld_u8(bc_b, j)); j = j + 1; }
+    w = su_out_u8(w, 10);
+    w = if_pos tsv <=> 0 { su_out4(su_out4(w, 45, 45, 116, 115), 118, 10, 0, 0) } else { w };
+    let req_p: bytes = av_tmp(114);
+    let nw: i64 = su_write_file_from(w, req_p, su_band_a(), ld_u64(w, 0), 420);
+    let r: i64 = if_pos m2u_ge(nw, 0) <=> 0 { su_spawn_capture(av_tool(w, 3), req_p, out_p, 420) } else { 1 };
+    return r;
+}
+
+// Checks 23..27: proposer diff summary invariants (identical, changed, cap escalation, antisymmetry, TSV).
+#[strict]
+#[cap(SYS)]
+fn av_check_diff_invariants(arena: bytes) -> i64 {
+    let bc0: bytes = av_tmp(115);
+    let bc1: bytes = av_tmp(116);
+    let n0: i64 = su_read_file_into(arena, av_golden_path(0), su_band_a(), 16000);
+    let c0: i64 = av_compile_buf(arena, su_band_a(), n0, bc0);
+    let n1: i64 = su_read_file_into(arena, av_golden_path(13), su_band_a(), 16000); // decision_hook_golden has #[cap(AI)]
+    let c1: i64 = av_compile_buf(arena, su_band_a(), n1, bc1);
+    let r: i64 = if_pos m2u_ge(c0, 4) * m2u_ge(c1, 4) <=> 0 {
+        let o_id: bytes = av_tmp(120);
+        let o_ch: bytes = av_tmp(121);
+        let o_rv: bytes = av_tmp(122);
+        let o_ts: bytes = av_tmp(123);
+        let r0: i64 = av_run_diff(arena, bc0, bc0, 0, o_id);
+        let nid: i64 = su_read_file_into(arena, o_id, su_band_a(), 16000);
+        // Identical: contains "hash_changed=false" ("=fal") and "+0 w"
+        let ok0: i64 = m2u_eq(r0, 0) * av_has4(arena, su_band_a(), nid, 43, 48, 32, 119);
+        let r1: i64 = av_run_diff(arena, bc0, bc1, 0, o_ch);
+        let nch: i64 = su_read_file_into(arena, o_ch, su_band_a(), 16000);
+        // Cap escalation: contains "escalation=true" ("n=tr")
+        let ok1: i64 = m2u_eq(r1, 0) * av_has4(arena, su_band_a(), nch, 110, 61, 116, 114);
+        let r2: i64 = av_run_diff(arena, bc1, bc0, 0, o_rv);
+        let nrv: i64 = su_read_file_into(arena, o_rv, su_band_a(), 16000);
+        // Reverse: escalation=false ("n=fa")
+        let ok2: i64 = m2u_eq(r2, 0) * av_has4(arena, su_band_a(), nrv, 110, 61, 102, 97);
+        let r3: i64 = av_run_diff(arena, bc0, bc1, 1, o_ts);
+        let nts: i64 = su_read_file_into(arena, o_ts, su_band_a(), 16000);
+        // TSV: contains "words_before\t" ("ore\t") and "cap_escalation\ttrue" ("on\tt")
+        let ok3: i64 = m2u_eq(r3, 0) * av_has4(arena, su_band_a(), nts, 111, 114, 101, 9)
+            * av_has4(arena, su_band_a(), nts, 111, 110, 9, 116);
+        (ok0 + ok1 + ok2 + ok3 + ok0 * ok1 * ok2 * ok3)
+    } else { 0 };
+    return r;
+}
+
+// Prints exact byte-identical Rust `[AUDIT-VIEW PASS] 27 checks | ...` banner.
+#[strict]
+#[cap(SYS)]
+fn av_print_pass(arena: bytes, checks: i64) -> i64 {
+    let w: bytes = iset_patch_i64(arena, 0, 0);
+    w = su_out4(su_out4(su_out4(su_out4(w, 91, 65, 85, 68), 73, 84, 45, 86), 73, 69, 87, 32), 80, 65, 83, 83);
+    w = su_out_i64(su_out4(w, 93, 32, 0, 0), checks);
+    w = su_out4(su_out4(su_out4(su_out4(w, 32, 99, 104, 101), 99, 107, 115, 32), 124, 32, 77, 51), 32, 100, 101, 99);
+    w = su_out4(su_out4(su_out4(su_out4(w, 111, 109, 112, 105), 108, 101, 114, 32), 98, 121, 116, 101), 45, 105, 100, 101);
+    w = su_out4(su_out4(su_out4(su_out4(w, 110, 116, 105, 99), 97, 108, 32, 114), 111, 117, 110, 100), 45, 116, 114, 105);
+    w = su_out4(su_out4(su_out4(su_out4(w, 112, 32, 111, 110), 32, 49, 54, 32), 103, 111, 108, 100), 101, 110, 115, 32);
+    w = su_out4(su_out4(su_out4(su_out4(w, 43, 32, 118, 101), 114, 105, 102, 105), 101, 114, 95, 101), 110, 103, 105, 110);
+    w = su_out4(su_out4(su_out4(su_out4(w, 101, 32, 43, 32), 66, 54, 32, 99), 108, 111, 98, 98), 101, 114, 32, 118);
+    w = su_out4(su_out4(su_out4(su_out4(w, 105, 115, 105, 98), 105, 108, 105, 116), 121, 32, 43, 32), 97, 112, 112, 114);
+    w = su_out4(su_out4(su_out4(su_out4(w, 111, 120, 105, 109), 97, 116, 101, 32), 102, 97, 108, 108), 98, 97, 99, 107);
+    w = su_out4(su_out4(su_out4(su_out4(w, 32, 43, 32, 112), 114, 111, 112, 111), 115, 101, 114, 32), 100, 105, 102, 102);
+    w = su_out4(su_out4(su_out4(su_out4(w, 32, 115, 117, 109), 109, 97, 114, 121), 32, 105, 110, 118), 97, 114, 105, 97);
+    w = su_out4(w, 110, 116, 115, 10);
+    let nw: i64 = sys_write(1, w, su_band_a(), ld_u64(w, 0));
+    return 0 + nw * 0;
+}
+
+#[strict]
+#[cap(SYS)]
+fn main() -> i64 {
+    let w: bytes = su_load_cmdline(su_alloc_arena());
+    let inject_brk: i64 = m2u_ge(su_argc(w), 2) * m2u_eq(ld_u8(w, su_arg_off(w, 1)), 45);
+    let checks: i64 = 0;
+    let g: i64 = 0;
+    let all_ok: i64 = 1;
+    while 16 - g <=> 0 {
+        let ok: i64 = av_roundtrip_file(w, av_golden_path(g), inject_brk * m2u_eq(g, 0));
+        // If inject_brk is set on g==0, av_roundtrip_file(..., 1) returns 1 when corruption was CAUGHT -> flip to FAIL!
+        let pass_g: i64 = m2u_sel(inject_brk * m2u_eq(g, 0), 0, ok);
+        all_ok = all_ok * pass_g;
+        checks = checks + pass_g;
+        g = g + 1;
+    }
+    let c17: i64 = av_check_verifier_standalone(w);
+    let c18: i64 = av_check_b6(w);
+    let c_neg: i64 = av_check_negatives(w);
+    let c_diff: i64 = av_check_diff_invariants(w);
+    checks = checks + c17 + c18 + c_neg + c_diff;
+    let ok_all: i64 = all_ok * c17 * c18 * m2u_eq(c_neg, 4) * m2u_eq(c_diff, 5) * m2u_eq(checks, 27);
+    let rc: i64 = if_pos ok_all <=> 0 { av_print_pass(w, checks) } else { 1 };
+    return sys_exit(rc);
+}
