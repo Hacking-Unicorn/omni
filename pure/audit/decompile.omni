@@ -1,0 +1,645 @@
+include "../m2/util.omni";
+include "../driver/sys_util.omni";
+include "decompile_rhs.omni";
+#[strict]
+fn dc_tmp_base() -> i64 { return 195904; }
+#[strict]
+fn dc_emit_indent(arena: bytes,depth: i64) -> bytes {
+let w: bytes = arena;
+let i: i64 = 0;
+while depth - i <=> 0 {
+w = su_out4(w,32,32,32,32);
+i = i + 1;
+}
+return w;
+}
+#[strict]
+fn dc_decl_insert(arena: bytes,reg: i64) -> bytes {
+let word_i: i64 = reg >> 6;
+let bit_i: i64 = reg & 63;
+let off: i64 = 112 + (word_i << 3);
+let cur: i64 = ld_u64(arena,off);
+let mask: i64 = 1 << bit_i;
+let is_new: i64 = m2u_eq(cur & mask,0);
+let w: bytes = iset_patch_i64(arena,off,cur | mask);
+return iset_patch_i64(w,168,is_new);
+}
+#[strict]
+fn dc_emit_lhs(arena: bytes,reg: i64,ty: i64) -> bytes {
+let w: bytes = dc_decl_insert(arena,reg);
+let is_new: i64 = ld_u64(w,168);
+let r: bytes = if_pos is_new <=> 0 {
+let u: bytes = su_out4(su_out_i64(su_out4(su_out_u8(w,108),101,116,32,118),reg),58,32,0,0);
+su_out4(dc_emit_ty(u,ty),32,61,32,0)
+} else {
+su_out4(su_out_i64(su_out_u8(w,118),reg),32,61,32,0)
+};
+return r;
+}
+#[strict]
+fn dc_emit_br_fallback(arena: bytes,idx: i64,op: i64,depth: i64) -> bytes {
+let w: bytes = iset_patch_i64(dc_emit_indent(arena,depth),72,1);
+w = su_out4(su_out4(su_out4(su_out4(w,47,47,32,91),76,73,84,69),82,65,76,95),79,80,32,64);
+w = su_out4(su_out_hex(w,dc_ins_woff(w,idx),4),93,32,79,80);
+w = if_pos m2u_eq(op,32578) <=> 0 {
+su_out4(su_out4(su_out4(w,95,55,70,52),50,95,66,82),95,84,82,73)
+} else { if_pos m2u_eq(op,32579) <=> 0 {
+su_out4(su_out4(su_out4(w,95,55,70,52),51,95,66,82),95,80,79,83)
+} else {
+su_out4(su_out4(su_out4(w,95,55,70,52),52,95,66,82),95,78,69,71)
+} };
+w = if_pos m2u_eq(op,32578) <=> 0 { su_out_u8(w,84) } else { w };
+return su_out_u8(dc_emit_op_args(su_out_u8(w,32),idx,0,0),10);
+}
+#[strict]
+fn dc_emit_gen_fallback(arena: bytes,idx: i64,op: i64,dst: i64,depth: i64) -> bytes {
+let w: bytes = iset_patch_i64(dc_emit_indent(arena,depth),72,1);
+w = su_out4(su_out4(su_out4(su_out4(w,47,47,32,91),76,73,84,69),82,65,76,95),79,80,32,64);
+w = su_out4(su_out_hex(w,dc_ins_woff(w,idx),4),93,32,0,0);
+w = if_pos m2u_ge(dst,0) <=> 0 { su_out4(su_out_i64(su_out_u8(w,118),dst),32,61,32,0) } else { w };
+w = if_pos m2u_eq(op,32575) <=> 0 { su_out4(su_out4(su_out4(su_out4(w,79,80,95,55),70,51,70,95),84,76,79,71),73,67,32,40) } else { su_out4(su_out4(su_out4(w,79,80,95,85),78,75,78,79),87,78,32,40) };
+w = su_out4(su_out_hex(w,op,4),41,32,0,0);
+return su_out_u8(dc_emit_op_args(w,idx,0,1),10);
+}
+#[strict]
+fn dc_emit_single_hi(w: bytes,idx: i64,op: i64,depth: i64) -> bytes {
+let dst: i64 = dc_ins_dest(w,idx);
+let r: bytes = if_pos m2u_in(op,32578,32580) <=> 0 {
+dc_emit_br_fallback(w,idx,op,depth)
+} else { if_pos m2u_ge(dst,0) * dc_can_rhs(w,idx) <=> 0 {
+let u: bytes = dc_emit_lhs(dc_emit_indent(w,depth),dst,dc_ins_ty(w,idx));
+su_out4(dc_emit_rhs(u,idx),59,10,0,0)
+} else {
+dc_emit_gen_fallback(w,idx,op,dst,depth)
+} };
+return r;
+}
+#[strict]
+fn dc_emit_single(w: bytes,idx: i64,depth: i64) -> bytes {
+let op: i64 = dc_ins_op(w,idx);
+let nops: i64 = dc_ins_nops(w,idx);
+let r: bytes = if_pos m2u_eq(op,32576) <=> 0 {
+let u: bytes = su_out4(su_out4(dc_emit_indent(w,depth),108,97,98,101),108,32,0,0);
+su_out4(su_out_i64(u,dc_label_id(u,idx,0)),59,10,0,0)
+} else { if_pos m2u_eq(op,32577) <=> 0 {
+let u: bytes = su_out4(su_out_u8(dc_emit_indent(w,depth),103),111,116,111,32);
+su_out4(su_out_i64(u,dc_label_id(u,idx,0)),59,10,0,0)
+} else { if_pos m2u_eq(op,32517) * m2u_ge(nops,1) <=> 0 {
+let u: bytes = su_out_u8(su_out4(dc_emit_indent(w,depth),100,114,111,112),40);
+su_out4(dc_emit_op(u,dc_ins_op0(u,idx)),41,59,10,0)
+} else { if_pos m2u_eq(op,32586) <=> 0 {
+let u: bytes = su_out4(su_out4(dc_emit_indent(w,depth),114,101,116,117),114,110,0,0);
+if_pos m2u_ge(nops,1) <=> 0 { su_out4(dc_emit_op(su_out_u8(u,32),dc_ins_op0(u,idx)),59,10,0,0) }
+else { su_out4(u,59,10,0,0) }
+} else {
+dc_emit_single_hi(w,idx,op,depth)
+} } } };
+return r;
+}
+#[strict]
+fn dc_arm_tail_nested(w: bytes,start: i64,end: i64,dst: i64,l_outer: i64) -> i64 {
+let br: i64 = start;
+let found: i64 = 0;
+let g: i64 = m2u_lt(br,end);
+while g <=> 0 {
+let bop: i64 = dc_ins_op(w,br);
+let is_br: i64 = (m2u_eq(bop,32579) + m2u_eq(bop,32580)) * m2u_ge(dc_ins_nops(w,br),2);
+let lt: i64 = m2u_sel(is_br,dc_label_id(w,br,1),0 - 1);
+let tli: i64 = m2u_sel(m2u_ge(lt,0),dc_find_label(w,br + 1,end,lt),0 - 1);
+let jmp_ok: i64 = m2u_ge(tli,br + 2) * m2u_eq(dc_ins_op(w,m2u_sel(m2u_ge(tli,1),tli - 1,0)),32577)
+* m2u_eq(dc_label_id(w,m2u_sel(m2u_ge(tli,1),tli - 1,0),0),l_outer);
+let sz_ok: i64 = jmp_ok * m2u_eq(br + 2,tli - 1) * m2u_eq(tli + 2,end);
+let ie: i64 = m2u_sel(sz_ok,br + 1,0);
+let it: i64 = m2u_sel(sz_ok,tli + 1,0);
+let ok: i64 = sz_ok * m2u_eq(dc_ins_dest(w,ie),dst) * m2u_eq(dc_ins_dest(w,it),dst)
+* dc_can_rhs(w,ie) * dc_can_rhs(w,it);
+found = m2u_sel(ok,1 | (br << 1) | 65536,found);
+br = br + 1;
+g = m2u_eq(found,0) * m2u_lt(br,end);
+}
+return found;
+}
+#[strict]
+fn dc_arm_tail(w: bytes,start: i64,end: i64,dst: i64,l_outer: i64) -> i64 {
+let r: i64 = if_pos m2u_ge(start,end) <=> 0 {
+0
+} else {
+let nest: i64 = if_pos m2u_ge(l_outer,0) <=> 0 { dc_arm_tail_nested(w,start,end,dst,l_outer) } else { 0 };
+if_pos nest <=> 0 {
+nest
+} else {
+let last: i64 = end - 1;
+let ok: i64 = m2u_eq(dc_ins_dest(w,last),dst) * dc_can_rhs(w,last);
+m2u_sel(ok,1 | (last << 1),0)
+}
+};
+return r;
+}
+#[strict]
+fn dc_emit_tail(w: bytes,tinfo: i64) -> bytes {
+let tidx: i64 = (tinfo >> 1) & 32767;
+let is_n: i64 = (tinfo >> 16) & 1;
+let r: bytes = if_pos is_n <=> 0 {
+let is_pos: i64 = m2u_eq(dc_ins_op(w,tidx),32579);
+let u: bytes = if_pos is_pos <=> 0 {
+su_out4(su_out4(w,105,102,95,112),111,115,32,0)
+} else {
+su_out4(su_out4(w,105,102,95,110),101,103,32,0)
+};
+u = su_out4(dc_emit_op(u,dc_ins_op0(u,tidx)),32,123,32,0);
+u = dc_emit_rhs(u,tidx + 4);
+u = su_out4(su_out4(su_out4(u,32,125,32,101),108,115,101,32),123,32,0,0);
+su_out4(dc_emit_rhs(u,tidx + 1),32,125,0,0)
+} else {
+dc_emit_rhs(w,tidx)
+};
+return r;
+}
+#[strict]
+fn dc_push_frame(arena: bytes,kind: i64,a: i64,b: i64,depth: i64) -> bytes {
+let sp: i64 = ld_u64(arena,136);
+let f: i64 = 256 + (sp << 6);
+let w: bytes = iset_patch_i64(arena,f,kind);
+w = iset_patch_i64(w,f + 8,a);
+w = iset_patch_i64(w,f + 16,b);
+w = iset_patch_i64(w,f + 24,depth);
+w = iset_patch_i64(w,f + 32,ld_u64(w,112));
+w = iset_patch_i64(w,f + 40,ld_u64(w,120));
+w = iset_patch_i64(w,f + 48,ld_u64(w,128));
+return iset_patch_i64(w,136,sp + 1);
+}
+#[strict]
+fn dc_emit_if_hdr(w: bytes,br_idx: i64) -> bytes {
+let is_pos: i64 = m2u_eq(dc_ins_op(w,br_idx),32579);
+let u: bytes = if_pos is_pos <=> 0 {
+su_out4(su_out4(w,105,102,95,112),111,115,32,0)
+} else {
+su_out4(su_out4(w,105,102,95,110),101,103,32,0)
+};
+return su_out4(dc_emit_op(u,dc_ins_op0(u,br_idx)),32,123,0,0);
+}
+#[strict]
+fn dc_try_if_join(w: bytes,i: i64,depth: i64,then_s: i64,then_e: i64,else_s: i64,else_e: i64,end_li: i64,l_end: i64) -> bytes {
+let has_both: i64 = m2u_lt(else_s,else_e) * m2u_lt(then_s,then_e);
+let ed: i64 = m2u_sel(has_both,dc_ins_dest(w,m2u_sel(has_both,else_e - 1,0)),0 - 1);
+let td: i64 = m2u_sel(has_both,dc_ins_dest(w,m2u_sel(has_both,then_e - 1,0)),0 - 1);
+let jdst: i64 = m2u_sel(has_both * m2u_ge(ed,0) * m2u_eq(ed,td),ed,0 - 1);
+let ti: i64 = m2u_sel(m2u_ge(jdst,0),dc_arm_tail(w,then_s,then_e,jdst,l_end),0);
+let ei: i64 = m2u_sel(m2u_ge(jdst,0),dc_arm_tail(w,else_s,else_e,jdst,l_end),0);
+let r: bytes = if_pos m2u_lt(0,ti) * m2u_lt(0,ei) <=> 0 {
+let tt: i64 = (ti >> 1) & 32767;
+let et: i64 = (ei >> 1) & 32767;
+let u: bytes = dc_emit_lhs(dc_emit_indent(w,depth),jdst,dc_ins_ty(w,then_e - 1));
+u = dc_emit_if_hdr(u,i);
+if_pos m2u_eq(then_s,tt) * m2u_eq(else_s,et) <=> 0 {
+u = dc_emit_tail(su_out_u8(u,32),ti);
+u = su_out4(su_out4(su_out4(u,32,125,32,101),108,115,101,32),123,32,0,0);
+u = su_out4(su_out4(dc_emit_tail(u,ei),32,125,59,10),0,0,0,0);
+iset_patch_i64(iset_patch_i64(u,176,1),184,end_li + 1)
+} else {
+u = su_out_u8(u,10);
+u = dc_push_frame(u,2,ei,0,depth);
+u = dc_push_frame(u,0,else_s,et,depth + 1);
+u = dc_push_frame(u,1,ti,0,depth);
+u = dc_push_frame(u,0,then_s,tt,depth + 1);
+iset_patch_i64(iset_patch_i64(u,176,1),184,end_li + 1)
+}
+} else { if_pos has_both <=> 0 {
+let u: bytes = su_out_u8(dc_emit_if_hdr(dc_emit_indent(w,depth),i),10);
+u = dc_push_frame(u,4,0,0,depth);
+u = dc_push_frame(u,0,else_s,else_e,depth + 1);
+u = dc_push_frame(u,3,0,0,depth);
+u = dc_push_frame(u,0,then_s,then_e,depth + 1);
+iset_patch_i64(iset_patch_i64(u,176,1),184,end_li + 1)
+} else {
+iset_patch_i64(w,176,0)
+} };
+return r;
+}
+#[strict]
+fn dc_try_if(w: bytes,i: i64,end: i64,depth: i64) -> bytes {
+let op: i64 = dc_ins_op(w,i);
+let is_br: i64 = (m2u_eq(op,32579) + m2u_eq(op,32580)) * m2u_ge(dc_ins_nops(w,i),2);
+let lt: i64 = m2u_sel(is_br,dc_label_id(w,i,1),0 - 1);
+let tli: i64 = m2u_sel(m2u_ge(lt,0),dc_find_label(w,i + 1,end,lt),0 - 1);
+let jmp_i: i64 = m2u_sel(m2u_ge(tli,i + 2),tli - 1,0);
+let has_j: i64 = m2u_ge(tli,i + 2) * m2u_eq(dc_ins_op(w,jmp_i),32577);
+let le: i64 = m2u_sel(has_j,dc_label_id(w,jmp_i,0),0 - 1);
+let eli: i64 = m2u_sel(m2u_ge(le,0),dc_find_label(w,tli + 1,end,le),0 - 1);
+let r: bytes = if_pos m2u_ge(eli,0) <=> 0 {
+dc_try_if_join(w,i,depth,tli + 1,eli,i + 1,jmp_i,eli,le)
+} else {
+iset_patch_i64(w,176,0)
+};
+return r;
+}
+#[strict]
+fn dc_try_match_trit_emit(w: bytes,i: i64,depth: i64,ns: i64,zs: i64,ps: i64,eli: i64) -> bytes {
+let d0: i64 = dc_ins_dest(w,ns);
+let ok: i64 = m2u_ge(d0,0) * m2u_eq(d0,dc_ins_dest(w,zs)) * m2u_eq(d0,dc_ins_dest(w,ps))
+* dc_can_rhs(w,ns) * dc_can_rhs(w,zs) * dc_can_rhs(w,ps);
+let r: bytes = if_pos ok <=> 0 {
+let u: bytes = dc_emit_lhs(dc_emit_indent(w,depth),d0,dc_ins_ty(w,ns));
+u = su_out4(su_out4(su_out4(u,109,97,116,99),104,95,116,114),105,116,32,0);
+u = su_out4(su_out4(su_out4(dc_emit_op(u,dc_ins_op0(u,i)),32,123,32,110),101,103,32,61),62,32,0,0);
+u = su_out4(su_out4(su_out4(dc_emit_rhs(u,ns),44,32,122,101),114,111,32,61),62,32,0,0);
+u = su_out4(su_out4(dc_emit_rhs(u,zs),44,32,112,111),115,32,61,62);
+u = su_out4(dc_emit_rhs(su_out_u8(u,32),ps),32,125,59,10);
+iset_patch_i64(iset_patch_i64(u,176,1),184,eli + 1)
+} else {
+iset_patch_i64(w,176,0)
+};
+return r;
+}
+#[strict]
+fn dc_try_match_trit(w: bytes,i: i64,end: i64,depth: i64) -> bytes {
+let is_mt: i64 = m2u_eq(dc_ins_op(w,i),32578) * m2u_ge(dc_ins_nops(w,i),4);
+let ln: i64 = m2u_sel(is_mt,dc_label_id(w,i,1),0 - 1);
+let lz: i64 = m2u_sel(is_mt,dc_label_id(w,i,2),0 - 1);
+let lp: i64 = m2u_sel(is_mt,dc_label_id(w,i,3),0 - 1);
+let nl: i64 = m2u_sel(m2u_ge(ln,0),dc_find_label(w,i + 1,end,ln),0 - 1);
+let zl: i64 = m2u_sel(m2u_ge(lz,0),dc_find_label(w,i + 1,end,lz),0 - 1);
+let pl: i64 = m2u_sel(m2u_ge(lp,0),dc_find_label(w,i + 1,end,lp),0 - 1);
+let shape: i64 = m2u_eq(nl,i + 1) * m2u_eq(zl,nl + 3) * m2u_eq(pl,zl + 3)
+* m2u_eq(dc_ins_op(w,m2u_sel(m2u_ge(zl,1),zl - 1,0)),32577)
+* m2u_eq(dc_ins_op(w,m2u_sel(m2u_ge(pl,1),pl - 1,0)),32577);
+let lea: i64 = m2u_sel(shape,dc_label_id(w,zl - 1,0),0 - 1);
+let leb: i64 = m2u_sel(shape,dc_label_id(w,pl - 1,0),0 - 2);
+let eli: i64 = m2u_sel(shape * m2u_ge(lea,0) * m2u_eq(lea,leb),dc_find_label(w,pl + 1,end,lea),0 - 1);
+let r: bytes = if_pos m2u_ge(eli,0) * m2u_eq(eli,pl + 2) <=> 0 {
+dc_try_match_trit_emit(w,i,depth,nl + 1,zl + 1,pl + 1,eli)
+} else {
+iset_patch_i64(w,176,0)
+};
+return r;
+}
+#[strict]
+fn dc_any_branch_to(w: bytes,start: i64,end: i64,lbl: i64) -> i64 {
+let k: i64 = start;
+let hit: i64 = 0;
+let g: i64 = m2u_lt(k,end);
+while g <=> 0 {
+let op: i64 = dc_ins_op(w,k);
+let is_b: i64 = m2u_in(op,32577,32580);
+let nops: i64 = m2u_sel(is_b,dc_ins_nops(w,k),0);
+let j: i64 = 0;
+while nops - j <=> 0 {
+let p: i64 = dc_ins_opk(w,k,j);
+let t: i64 = dc_u16(w,p);
+hit = hit | (m2u_in(t,32496,32511) * m2u_eq(t - 32496,lbl));
+j = j + 1;
+}
+k = k + 1;
+g = (1 - hit) * m2u_lt(k,end);
+}
+return hit;
+}
+#[strict]
+fn dc_try_dowhile(w: bytes,i: i64,end: i64,depth: i64) -> bytes {
+let is_l: i64 = m2u_eq(dc_ins_op(w,i),32576);
+let lh: i64 = m2u_sel(is_l,dc_label_id(w,i,0),0 - 1);
+let k: i64 = i + 1;
+let bri: i64 = 0 - 1;
+let g: i64 = m2u_ge(lh,0) * m2u_lt(k,end);
+while g <=> 0 {
+let hit: i64 = m2u_eq(dc_ins_op(w,k),32579) * m2u_ge(dc_ins_nops(w,k),2) * m2u_eq(dc_label_id(w,k,1),lh);
+bri = m2u_sel(hit,k,bri);
+k = k + 1;
+g = (1 - hit) * m2u_lt(k,end);
+}
+let later: i64 = m2u_sel(m2u_ge(bri,0),dc_any_branch_to(w,bri + 1,end,lh),1);
+let ci: i64 = m2u_sel(m2u_ge(bri,i + 2),bri - 1,0);
+let cdst: i64 = m2u_sel(m2u_ge(bri,i + 2),dc_ins_dest(w,ci),0 - 1);
+let breg_t: i64 = m2u_sel(m2u_ge(bri,i + 2),dc_u16(w,dc_ins_op0(w,bri)),0);
+let ok: i64 = (1 - later) * m2u_ge(bri,i + 2) * m2u_ge(cdst,0)
+* m2u_in(breg_t,32256,32447) * m2u_eq(cdst,breg_t - 32256) * dc_can_rhs(w,ci);
+let r: bytes = if_pos ok <=> 0 {
+let u: bytes = su_out4(su_out4(su_out4(dc_emit_indent(w,depth),100,111,95,119),104,105,108,101),32,123,10,0);
+u = dc_push_frame(u,5,ci,0,depth);
+u = dc_push_frame(u,0,i + 1,ci,depth + 1);
+iset_patch_i64(iset_patch_i64(u,176,1),184,bri + 1)
+} else {
+iset_patch_i64(w,176,0)
+};
+return r;
+}
+#[strict]
+fn dc_exec_cont(w: bytes,kind: i64,a: i64,depth: i64) -> bytes {
+let r: bytes = if_pos m2u_eq(kind,1) <=> 0 {
+let u: bytes = dc_emit_tail(dc_emit_indent(w,depth + 1),a);
+u = su_out_u8(u,10);
+su_out4(su_out4(su_out4(dc_emit_indent(u,depth),125,32,101,108),115,101,32,123),10,0,0,0)
+} else { if_pos m2u_eq(kind,2) <=> 0 {
+let u: bytes = su_out_u8(dc_emit_tail(dc_emit_indent(w,depth + 1),a),10);
+su_out4(dc_emit_indent(u,depth),125,59,10,0)
+} else { if_pos m2u_eq(kind,3) <=> 0 {
+su_out4(su_out4(su_out4(dc_emit_indent(w,depth),125,32,101,108),115,101,32,123),10,0,0,0)
+} else { if_pos m2u_eq(kind,4) <=> 0 {
+su_out4(dc_emit_indent(w,depth),125,10,0,0)
+} else {
+let u: bytes = su_out4(dc_emit_indent(w,depth),125,32,0,0);
+su_out4(dc_emit_rhs(u,a),59,10,0,0)
+} } } };
+return r;
+}
+#[strict]
+fn dc_step_block(arena: bytes,i: i64,end: i64,depth: i64) -> bytes {
+let w: bytes = dc_try_if(arena,i,end,depth);
+w = if_pos m2u_eq(ld_u64(w,176),0) <=> 0 { dc_try_match_trit(w,i,end,depth) } else { w };
+w = if_pos m2u_eq(ld_u64(w,176),0) <=> 0 { dc_try_dowhile(w,i,end,depth) } else { w };
+let r: bytes = if_pos ld_u64(w,176) <=> 0 {
+let ni: i64 = ld_u64(w,184);
+w
+} else {
+let u: bytes = dc_emit_single(w,i,depth);
+iset_patch_i64(u,184,i + 1)
+};
+return r;
+}
+#[strict]
+fn dc_emit_body(arena: bytes,icnt: i64) -> bytes {
+let w: bytes = iset_patch_i64(iset_patch_i64(iset_patch_i64(arena,112,0),120,0),128,0);
+w = iset_patch_i64(w,136,0);
+w = dc_push_frame(w,0,0,icnt,1);
+let g: i64 = ld_u64(w,136);
+while g <=> 0 {
+let sp: i64 = g - 1;
+let f: i64 = 256 + (sp << 6);
+let kind: i64 = ld_u64(w,f);
+let a: i64 = ld_u64(w,f + 8);
+let b: i64 = ld_u64(w,f + 16);
+let depth: i64 = ld_u64(w,f + 24);
+w = if_pos m2u_eq(kind,0) <=> 0 {
+if_pos m2u_lt(a,b) <=> 0 {
+w = iset_patch_i64(iset_patch_i64(iset_patch_i64(w,112,ld_u64(w,f + 32)),120,ld_u64(w,f + 40)),128,ld_u64(w,f + 48));
+let u: bytes = dc_step_block(w,a,b,depth);
+let ni: i64 = ld_u64(u,184);
+let v: bytes = iset_patch_i64(u,f + 8,ni);
+v = iset_patch_i64(iset_patch_i64(iset_patch_i64(v,f + 32,ld_u64(v,112)),f + 40,ld_u64(v,120)),f + 48,ld_u64(v,128));
+v
+} else {
+iset_patch_i64(w,136,sp)
+}
+} else {
+let u: bytes = iset_patch_i64(w,136,sp);
+dc_exec_cont(u,kind,a,depth)
+};
+g = ld_u64(w,136);
+}
+return w;
+}
+#[strict]
+fn dc_emit_cap_lo(u: bytes,bit: i64) -> bytes {
+let t0: bytes = if_pos m2u_eq(bit,0) <=> 0 { su_out4(u,68,66,95,82) } else { u };
+let t1: bytes = if_pos m2u_eq(bit,1) <=> 0 { su_out4(t0,68,66,95,87) } else { t0 };
+let t2: bytes = if_pos m2u_eq(bit,2) <=> 0 { su_out4(t1,78,69,84,0) } else { t1 };
+let t3: bytes = if_pos m2u_eq(bit,3) <=> 0 { su_out4(t2,68,79,77,0) } else { t2 };
+return if_pos m2u_eq(bit,4) <=> 0 { su_out4(t3,65,73,0,0) } else { t3 };
+}
+#[strict]
+fn dc_emit_cap_hi(u: bytes,bit: i64) -> bytes {
+let t0: bytes = if_pos m2u_eq(bit,5) <=> 0 { su_out4(su_out4(u,86,73,83,73),79,78,0,0) } else { u };
+let t1: bytes = if_pos m2u_eq(bit,6) <=> 0 { su_out4(su_out_u8(t0,65),85,68,73,79) } else { t0 };
+let t2: bytes = if_pos m2u_eq(bit,7) <=> 0 { su_out4(t1,65,85,84,72) } else { t1 };
+let t3: bytes = if_pos m2u_eq(bit,8) <=> 0 { su_out4(t2,70,83,0,0) } else { t2 };
+return if_pos m2u_eq(bit,9) <=> 0 { su_out4(t3,83,89,83,0) } else { t3 };
+}
+#[strict]
+fn dc_emit_cap_attr(arena: bytes,mask: i64) -> bytes {
+let r: bytes = if_pos mask <=> 0 {
+let w: bytes = su_out4(su_out4(arena,35,91,99,97),112,40,0,0);
+let first: i64 = 1;
+let bit: i64 = 0;
+while 10 - bit <=> 0 {
+let has: i64 = (mask >> bit) & 1;
+w = if_pos has <=> 0 {
+let u: bytes = if_pos first <=> 0 { w } else { su_out4(w,44,32,0,0) };
+dc_emit_cap_hi(dc_emit_cap_lo(u,bit),bit)
+} else { w };
+first = m2u_sel(has,0,first);
+bit = bit + 1;
+}
+su_out4(w,41,93,10,0)
+} else { arena };
+return r;
+}
+#[strict]
+fn dc_emit_fn_marker(arena: bytes,fid: i64,icnt: i64,cmask: i64,approx: i64) -> bytes {
+let w: bytes = su_out4(su_out4(su_out4(su_out4(arena,47,47,32,91),65,85,68,73),84,45,86,73),69,87,58,32);
+w = if_pos approx <=> 0 {
+let u: bytes = su_out4(su_out4(su_out4(w,65,80,80,82),79,88,73,77),65,84,69,32);
+u = su_out4(su_out4(su_out4(u,226,128,148,32),99,111,110,116),97,105,110,115);
+u = su_out4(su_out4(su_out4(u,32,108,105,116),101,114,97,108),32,111,112,99);
+u = su_out4(su_out4(su_out4(u,111,100,101,47),98,114,97,110),99,104,47,116);
+su_out4(su_out4(su_out4(u,121,112,101,32),102,97,108,108),98,97,99,107)
+} else {
+su_out4(su_out4(su_out4(su_out_u8(w,82),69,67,79,78),83,84,82,85),67,84,69,68)
+};
+w = su_out_i64(su_out4(su_out4(su_out4(w,93,32,102,110),95,105,100,120),61,0,0,0),fid);
+w = su_out_i64(su_out4(su_out_u8(w,32),105,110,115,61),icnt);
+w = su_out_hex(su_out4(su_out4(su_out4(w,32,99,97,112),95,109,97,115),107,61,0,0),cmask,4);
+w = su_out4(su_out4(su_out4(w,32,118,101,114),105,102,105,101),100,61,0,0);
+return su_out_u8(su_out_bool(w,ld_u64(w,104)),10);
+}
+#[strict]
+fn dc_emit_fn_sig(arena: bytes,pos: i64,fid: i64,pcnt: i64,ret_ty: i64) -> bytes {
+let w: bytes = su_out_u8(su_out_i64(su_out4(su_out4(arena,102,110,32,102),110,95,0,0),fid),40);
+let pk: i64 = 0;
+while pcnt - pk <=> 0 {
+w = if_pos m2u_lt(0,pk) <=> 0 { su_out4(w,44,32,0,0) } else { w };
+let pt: i64 = dc_u16(w,pos + 3 + pk * 3);
+let pty: i64 = dc_u16(w,pos + 3 + pk * 3 + 1);
+let ptc: i64 = dc_u16(w,pos + 3 + pk * 3 + 2);
+let untr: i64 = ((ptc - 32704) >> 5) & 1;
+w = dc_emit_ty(su_out4(su_out_i64(su_out_u8(w,112),pt - 32448),58,32,0,0),pty);
+w = if_pos untr <=> 0 {
+su_out4(su_out4(su_out4(w,32,64,117,110),116,114,117,115),116,101,100,0)
+} else { w };
+pk = pk + 1;
+}
+w = dc_emit_ty(su_out4(su_out_u8(w,41),32,45,62,32),ret_ty);
+return su_out4(w,32,123,10,0);
+}
+#[strict]
+fn dc_emit_one_fn(arena: bytes,pos: i64,pos_idx: i64,n_fns: i64) -> bytes {
+let fid: i64 = dc_u16(arena,pos + 1);
+let pcnt: i64 = dc_u16(arena,pos + 2);
+let sig: i64 = pos + 3 + pcnt * 3;
+let ret_ty: i64 = dc_u16(arena,sig);
+let cmask: i64 = dc_u16(arena,sig + 1);
+let icnt: i64 = dc_u16(arena,sig + 2);
+let w: bytes = iset_patch_i64(arena,72,0);
+w = dc_parse_insns(w,sig + 3,icnt);
+let next_ip: i64 = ld_u64(w,160);
+w = iset_patch_i64(w,0,dc_tmp_base());
+w = dc_emit_body(w,icnt);
+let body_len: i64 = ld_u64(w,0) - dc_tmp_base();
+let exp_id: i64 = m2u_sel(m2u_eq(pos_idx + 1,n_fns),0,pos_idx + 1);
+let non_pos: i64 = 1 - m2u_eq(fid,exp_id);
+let bad_fid: i64 = non_pos * m2u_lt(15,fid);
+let approx: i64 = ld_u64(w,72) | bad_fid;
+w = iset_patch_i64(w,56,ld_u64(w,56) + (1 - approx));
+w = iset_patch_i64(w,64,ld_u64(w,64) + approx);
+w = iset_patch_i64(w,0,ld_u64(w,96));
+w = dc_emit_fn_marker(su_out_u8(w,10),fid,icnt,cmask,approx);
+w = dc_emit_cap_attr(w,cmask);
+w = if_pos non_pos <=> 0 {
+if_pos bad_fid <=> 0 {
+let u: bytes = su_out4(su_out4(su_out4(su_out4(w,47,47,32,91),76,73,84,69),82,65,76,95),79,80,93,32);
+u = su_out_i64(su_out4(su_out4(u,102,110,95,105),100,120,61,0),fid);
+su_out4(su_out4(su_out4(su_out4(su_out4(su_out4(u,32,40,62,49),53,44,32,110),111,110,45,112),111,115,105,116),105,111,110,97),108,41,10,0)
+} else {
+su_out4(su_out_i64(su_out4(su_out4(w,35,91,102,110),95,105,100,40),fid),41,93,10,0)
+}
+} else { w };
+w = dc_emit_fn_sig(w,pos,fid,pcnt,ret_ty);
+w = su_out4(su_out_copy(w,200000,body_len),125,10,0,0);
+return iset_patch_i64(iset_patch_i64(w,96,ld_u64(w,0)),160,next_ip);
+}
+#[strict]
+fn dc_count_fns(w: bytes,nwords: i64) -> i64 {
+let nfns: i64 = 0;
+let cp: i64 = 1;
+let cg: i64 = m2u_lt(cp,nwords - 1);
+while cg <=> 0 {
+let tag: i64 = dc_u16(w,cp);
+let is_fn: i64 = m2u_eq(tag,32483);
+let is_sch: i64 = m2u_eq(tag,32481);
+let is_exp: i64 = m2u_eq(tag,32482);
+let is_end: i64 = m2u_eq(tag,32495);
+nfns = nfns + is_fn;
+cp = if_pos is_fn <=> 0 {
+let pcnt: i64 = dc_u16(w,cp + 2);
+let sig: i64 = cp + 3 + pcnt * 3;
+let icnt: i64 = dc_u16(w,sig + 2);
+let ip: i64 = sig + 3;
+let ii: i64 = 0;
+while icnt - ii <=> 0 {
+let hd: i64 = m2u_in(dc_u16(w,ip),32256,32447);
+let cur: i64 = ip + 1 + hd * 3;
+let gi: i64 = m2u_lt(cur,nwords) * (1 - m2u_eq(dc_u16(w,cur),32484));
+while gi <=> 0 {
+cur = dc_skip_op(w,nwords,cur);
+gi = m2u_lt(cur,nwords) * (1 - m2u_eq(dc_u16(w,cur),32484));
+}
+ip = cur + 1;
+ii = ii + 1;
+}
+ip
+} else {
+let sn: i64 = m2u_sel(is_sch,dc_u16(w,cp + 2),0);
+m2u_sel(is_end,nwords,m2u_sel(is_sch,cp + 3 + sn * 2,m2u_sel(is_exp,cp + 5,cp + 1)))
+};
+cg = (1 - is_end) * m2u_lt(cp,nwords - 1);
+}
+return nfns;
+}
+#[strict]
+fn dc_emit_top_hdr(arena: bytes,nwords: i64,shash: i64,nfns: i64,nexact: i64,napprox: i64) -> bytes {
+let w: bytes = iset_patch_i64(arena,0,dc_tmp_base());
+w = su_out4(su_out4(su_out4(su_out4(w,47,47,32,61),61,61,32,79),77,78,73,32),65,85,68,73);
+w = su_out4(su_out4(su_out4(su_out4(w,84,32,86,73),69,87,32,40),77,51,32,68),69,67,79,77);
+w = su_out4(su_out4(su_out4(w,80,73,76,69),82,41,32,61),61,61,10,0);
+w = su_out4(su_out4(su_out4(w,47,47,32,83),116,97,116,117),115,58,32,0);
+w = if_pos m2u_eq(napprox,0) <=> 0 {
+let u: bytes = su_out4(su_out4(su_out4(w,82,69,67,79),78,83,84,82),85,67,84,69);
+su_out4(su_out4(su_out_u8(u,68),32,40,101,120),97,99,116,41)
+} else {
+let u: bytes = su_out4(su_out4(su_out4(w,65,80,80,82),79,88,73,77),65,84,69,32);
+u = su_out4(su_out4(su_out4(u,40,99,111,110),116,97,105,110),115,32,108,105);
+u = su_out4(su_out4(su_out4(u,116,101,114,97),108,32,102,97),108,108,98,97);
+su_out4(u,99,107,41,0)
+};
+w = su_out_i64(su_out4(su_out4(su_out_u8(w,32),124,32,119,111),114,100,115,61),nwords);
+w = su_out_hex(su_out4(su_out4(su_out4(w,32,124,32,102),110,118,49,97),54,52,61,0),shash,16);
+w = su_out_i64(su_out4(su_out4(su_out4(su_out_u8(w,32),124,32,102,117),110,99,116,105),111,110,115,61),nfns);
+w = su_out_i64(su_out4(su_out4(w,32,40,101,120),97,99,116,61),nexact);
+w = su_out_i64(su_out4(su_out4(su_out4(su_out4(w,44,32,97,112),112,114,111,120),105,109,97,116),101,61,0,0),napprox);
+return su_out4(w,41,10,0,0);
+}
+#[strict]
+#[cap(SYS)]
+fn dc_check_verified(arena: bytes,bc_cstr: bytes) -> i64 {
+let a0_off: i64 = su_arg_off(arena,0);
+let a0_len: i64 = su_arg_len(arena,0);
+let slash: i64 = 0 - 1;
+let i: i64 = 0;
+while a0_len - i <=> 0 {
+slash = m2u_sel(m2u_eq(ld_u8(arena,a0_off + i),47),i,slash);
+i = i + 1;
+}
+let b: bytes = anew(0);
+let k: i64 = 0;
+let pfx: i64 = m2u_sel(m2u_ge(slash,0),slash + 1,0);
+while pfx - k <=> 0 {
+b = iset(b,ld_u8(arena,a0_off + k));
+k = k + 1;
+}
+b = iset(b,118,101,114,105,102,105,101,114,46,101,108,102,0);
+let out_p: bytes = anew(0);
+out_p = iset(out_p,47,116,109,112,47,111,109,110,105,99,95,112,55,95,100,99);
+out_p = iset(out_p,95,118,101,114,46,98,105,110,0);
+let rc: i64 = su_spawn_capture(b,bc_cstr,out_p,420);
+let r: i64 = if_pos m2u_eq(rc,0) <=> 0 {
+let nb: i64 = su_read_file_into(arena,out_p,1536,64);
+m2u_ge(nb,2) * m2u_eq(ld_u16(arena,1536),0)
+} else { 0 };
+return r;
+}
+#[strict]
+#[cap(SYS)]
+fn dc_render_all(arena: bytes,nwords: i64,shash: i64,nfns: i64) -> i64 {
+let w: bytes = iset_patch_i64(iset_patch_i64(iset_patch_i64(arena,56,0),64,0),96,0);
+let pos: i64 = 1;
+let pos_idx: i64 = 0;
+let g: i64 = m2u_lt(pos,nwords - 1);
+while g <=> 0 {
+let tag: i64 = dc_u16(w,pos);
+let is_fn: i64 = m2u_eq(tag,32483);
+let is_sch: i64 = m2u_eq(tag,32481);
+let is_exp: i64 = m2u_eq(tag,32482);
+let is_end: i64 = m2u_eq(tag,32495);
+w = if_pos is_fn <=> 0 { dc_emit_one_fn(w,pos,pos_idx,nfns) } else { w };
+pos_idx = pos_idx + is_fn;
+pos = if_pos is_fn <=> 0 {
+ld_u64(w,160)
+} else {
+let sn: i64 = m2u_sel(is_sch,dc_u16(w,pos + 2),0);
+m2u_sel(is_end,nwords,m2u_sel(is_sch,pos + 3 + sn * 2,m2u_sel(is_exp,pos + 5,pos + 1)))
+};
+g = (1 - is_end) * m2u_lt(pos,nwords - 1);
+}
+let main_len: i64 = ld_u64(w,96);
+w = dc_emit_top_hdr(w,nwords,shash,nfns,ld_u64(w,56),ld_u64(w,64));
+let hdr_len: i64 = ld_u64(w,0) - dc_tmp_base();
+let nw1: i64 = sys_write(1,w,200000,hdr_len);
+let nw2: i64 = sys_write(1,w,4096,main_len);
+return 0 + (nw1 + nw2) * 0;
+}
+#[strict]
+#[cap(SYS)]
+fn main() -> i64 {
+let w: bytes = su_load_cmdline(su_alloc_arena());
+let rc: i64 = if_pos m2u_lt(su_argc(w),2) <=> 0 {
+2
+} else {
+let p: bytes = su_make_cstr(w,su_arg_off(w,1),su_arg_len(w,1));
+let nb: i64 = su_read_file_into(w,p,dc_in_off(),252000);
+let ok_io: i64 = m2u_ge(nb,4) * m2u_eq(nb & 1,0);
+if_pos ok_io <=> 0 {
+let nwords: i64 = nb >> 1;
+let ok_fr: i64 = m2u_eq(dc_u16(w,0),32480) * m2u_eq(dc_u16(w,nwords - 1),32495);
+if_pos ok_fr <=> 0 {
+let shash: i64 = su_fnv1a64(w,dc_in_off(),nb);
+let nfns: i64 = dc_count_fns(w,nwords);
+if_pos m2u_eq(nfns,0) <=> 0 {
+1
+} else {
+w = iset_patch_i64(iset_patch_i64(w,32,nwords),104,dc_check_verified(w,p));
+dc_render_all(w,nwords,shash,nfns)
+}
+} else { 1 }
+} else { 1 }
+};
+return sys_exit(rc);
+}

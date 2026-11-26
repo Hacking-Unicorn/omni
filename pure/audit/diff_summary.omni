@@ -1,0 +1,563 @@
+// ==============================================================================
+// pure/audit/diff_summary.omni (Step 7) — Pure-Omni Proposer Diff Summary
+// ==============================================================================
+// Pure-Omni port of `m2_host/audit_view.rs` (`summarize_proposer_diff`,
+// `render_plain_language`, `render_canonical_tsv`). Compiled by `m3.elf` + `m2.elf`
+// into a standalone Linux x86-64 ELF64 (`audit_diff.elf`) with zero Rust.
+//
+// Usage:
+//   audit_diff.elf <before.omni_bc> <after.omni_bc> [--tsv]
+//   audit_diff.elf <@req_file>   (newline-separated: before\nafter\ntsv_0_or_1\n)
+//
+// Arena layout (512 KiB):
+//   0      .. 511    : sys_util state (0=out_len, 8=argc, 32..255=summary stats)
+//   512    .. 1023   : argv table (32 x 16 B)
+//   1024   .. 2047   : path/label scratch (1024=before_lbl, 1280=after_lbl, 1536=ver_bin, 1792=verifier_path)
+//   2048   .. 4095   : /proc/self/cmdline
+//   4096   .. 266239 : Band A (output text buffer, 256 KiB; during scan, also holds temp)
+//   266240 .. 397311 : Before .omni_bc raw bytes (128 KiB max)
+//   397312 .. 524287 : After  .omni_bc raw bytes (124 KiB max)
+//   Fn snapshot tables in Band A upper region (offset 200000..256000):
+//     200000 + i*48  : Before fn table (up to 512 fns x 48 B: fn_idx, ins_cnt, cap_mask, taint_mask, arena_bytes, body_hash)
+//     225000 + i*48  : After  fn table (up to 512 fns x 48 B)
+// ==============================================================================
+
+include "../m2/util.omni";
+include "../driver/sys_util.omni";
+
+#[strict]
+fn ad_bef_off() -> i64 { return 266240; }
+#[strict]
+fn ad_aft_off() -> i64 { return 397312; }
+#[strict]
+fn ad_tbl_b() -> i64 { return 200000; }
+#[strict]
+fn ad_tbl_a() -> i64 { return 225000; }
+
+// Reads u16 word `wi` from a raw `.omni_bc` buffer stored at byte offset `base` in `arena`.
+#[strict]
+fn ad_u16(arena: bytes, base: i64, wi: i64) -> i64 {
+    return ld_u16(arena, base + (wi << 1));
+}
+
+// Skips one non-KV operand starting at word `pos` in stream `base..nwords`. Returns next word pos.
+#[strict]
+fn ad_skip_op1(arena: bytes, base: i64, nwords: i64, pos: i64) -> i64 {
+    let t: i64 = ad_u16(arena, base, pos);
+    let is_i16: i64 = m2u_eq(t, 32485);      // 0x7EE5 TOK_IMM_I16
+    let is_i32: i64 = m2u_eq(t, 32486);      // 0x7EE6 TOK_IMM_I32
+    let is_eng: i64 = m2u_eq(t, 32490);      // 0x7EEA TOK_ENG_SPAN
+    let is_sym: i64 = m2u_in(t, 32491, 32493); // 0x7EEB..0x7EED SYM_SCHEMA/FN/SKILL
+    let eng_len: i64 = m2u_sel(is_eng * m2u_lt(pos + 1, nwords), ad_u16(arena, base, pos + 1), 0);
+    let adv: i64 = m2u_sel(is_i16 + is_sym, 2,
+        m2u_sel(is_i32, 3,
+            m2u_sel(is_eng, 2 + eng_len, 1)));
+    return pos + adv;
+}
+
+// Skips one operand (including nested TOK_FIELD_KV = 0x7EEE iteratively, zero recursion).
+#[strict]
+fn ad_skip_op(arena: bytes, base: i64, nwords: i64, pos: i64) -> i64 {
+    let p: i64 = pos;
+    let g: i64 = m2u_lt(p, nwords) * m2u_eq(ad_u16(arena, base, p), 32494);
+    while g <=> 0 {
+        p = p + 2;
+        g = m2u_lt(p, nwords) * m2u_eq(ad_u16(arena, base, p), 32494);
+    }
+    return ad_skip_op1(arena, base, nwords, p);
+}
+
+// Decodes an immediate integer operand at `pos` if `t` is IMM_I16 (0x7EE5) or IMM_I32 (0x7EE6), else 0.
+#[strict]
+fn ad_imm_val(arena: bytes, base: i64, pos: i64) -> i64 {
+    let t: i64 = ad_u16(arena, base, pos);
+    let v16: i64 = m2u_sext16(ad_u16(arena, base, pos + 1));
+    let v32: i64 = m2u_sext32((ad_u16(arena, base, pos + 1) << 16) | ad_u16(arena, base, pos + 2));
+    return m2u_sel(m2u_eq(t, 32485), v16, m2u_sel(m2u_eq(t, 32486), v32, 0));
+}
+
+// Scans all functions in raw `.omni_bc` at `base` (`nwords` words) into snapshot table `tbl_off`.
+// Stores function count at `cnt_slot`, total buf_ops at `buf_slot`, total arena_bytes at `ar_slot`,
+// total ins at `ins_slot`, union cap_mask at `cap_slot`. Returns updated `arena` (or sets `arena[24]=1` on framing error).
+#[strict]
+fn ad_scan_module(arena: bytes, base: i64, nwords: i64, tbl_off: i64, stat_off: i64) -> bytes {
+    let ok_fr: i64 = m2u_ge(nwords, 2) * m2u_eq(ad_u16(arena, base, 0), 32480) * m2u_eq(ad_u16(arena, base, nwords - 1), 32495);
+    let r: bytes = if_pos ok_fr <=> 0 {
+        let w: bytes = arena;
+        let pos: i64 = 1;
+        let fcnt: i64 = 0;
+        let tot_ins: i64 = 0;
+        let tot_ar: i64 = 0;
+        let tot_buf: i64 = 0;
+        let cap_u: i64 = 0;
+        let g: i64 = m2u_lt(pos, nwords - 1);
+        while g <=> 0 {
+            let tag: i64 = ad_u16(w, base, pos);
+            let is_end: i64 = m2u_eq(tag, 32495);
+            let is_sch: i64 = m2u_eq(tag, 32481);
+            let is_exp: i64 = m2u_eq(tag, 32482);
+            let is_fn: i64 = m2u_eq(tag, 32483);
+            if_pos is_fn <=> 0 {
+                let fn_start: i64 = pos;
+                let fid: i64 = ad_u16(w, base, pos + 1);
+                let pcnt: i64 = ad_u16(w, base, pos + 2);
+                let tmask: i64 = 0;
+                let pk: i64 = 0;
+                while pcnt - pk <=> 0 {
+                    let tc: i64 = ad_u16(w, base, pos + 3 + pk * 3 + 2);
+                    let untr: i64 = ((tc - 32704) >> 5) & 1;
+                    tmask = tmask | (untr << pk);
+                    pk = pk + 1;
+                }
+                let sig: i64 = pos + 3 + pcnt * 3;
+                let cmask: i64 = ad_u16(w, base, sig + 1);
+                let icnt: i64 = ad_u16(w, base, sig + 2);
+                let ip: i64 = sig + 3;
+                let ii: i64 = 0;
+                let f_ar: i64 = 0;
+                let f_buf: i64 = 0;
+                while icnt - ii <=> 0 {
+                    let t0: i64 = ad_u16(w, base, ip);
+                    let has_d: i64 = m2u_in(t0, 32256, 32447);
+                    let op: i64 = ad_u16(w, base, ip + has_d);
+                    let op_start: i64 = ip + 1 + has_d * 3;
+                    let is_ar: i64 = m2u_eq(op, 32513);
+                    let ar_sz: i64 = m2u_sel(is_ar, ad_imm_val(w, base, op_start), 0);
+                    f_ar = f_ar + ar_sz;
+                    f_buf = f_buf + m2u_in(op, 32525, 32527);
+                    let cur: i64 = op_start;
+                    let gi: i64 = m2u_lt(cur, nwords) * (1 - m2u_eq(ad_u16(w, base, cur), 32484));
+                    while gi <=> 0 {
+                        cur = ad_skip_op(w, base, nwords, cur);
+                        gi = m2u_lt(cur, nwords) * (1 - m2u_eq(ad_u16(w, base, cur), 32484));
+                    }
+                    ip = cur + 1;
+                    ii = ii + 1;
+                }
+                let bhash: i64 = su_fnv1a64(w, base + (fn_start << 1), (ip - fn_start) << 1);
+                let eoff: i64 = tbl_off + fcnt * 48;
+                w = iset_patch_i64(w, eoff, fid);
+                w = iset_patch_i64(w, eoff + 8, icnt);
+                w = iset_patch_i64(w, eoff + 16, cmask);
+                w = iset_patch_i64(w, eoff + 24, tmask);
+                w = iset_patch_i64(w, eoff + 32, f_ar);
+                w = iset_patch_i64(w, eoff + 40, bhash);
+                fcnt = fcnt + 1;
+                tot_ins = tot_ins + icnt;
+                tot_ar = tot_ar + f_ar;
+                tot_buf = tot_buf + f_buf;
+                cap_u = cap_u | cmask;
+                pos = ip;
+            } else {
+                let sch_n: i64 = m2u_sel(is_sch, ad_u16(w, base, pos + 2), 0);
+                pos = m2u_sel(is_end, nwords, m2u_sel(is_sch, pos + 3 + sch_n * 2, m2u_sel(is_exp, pos + 5, pos + 1)));
+            };
+            g = (1 - is_end) * m2u_lt(pos, nwords - 1) * m2u_lt(fcnt, 512);
+        }
+        w = iset_patch_i64(w, stat_off, fcnt);
+        w = iset_patch_i64(w, stat_off + 8, tot_ins);
+        w = iset_patch_i64(w, stat_off + 16, tot_ar);
+        w = iset_patch_i64(w, stat_off + 24, tot_buf);
+        w = iset_patch_i64(w, stat_off + 32, cap_u);
+        iset_patch_i64(w, 24, m2u_eq(fcnt, 0))
+    } else {
+        iset_patch_i64(arena, 24, 1)
+    };
+    return r;
+}
+
+// Finds `fn_idx == target` in snapshot table `tbl_off` (`cnt` entries). Returns slot index or -1.
+#[strict]
+fn ad_find_fn(arena: bytes, tbl_off: i64, cnt: i64, target: i64) -> i64 {
+    let i: i64 = 0;
+    let found: i64 = 0 - 1;
+    let g: i64 = m2u_lt(0, cnt);
+    while g <=> 0 {
+        let fid: i64 = ld_u64(arena, tbl_off + i * 48);
+        let hit: i64 = m2u_eq(fid, target);
+        found = m2u_sel(hit, i, found);
+        i = i + 1;
+        g = (1 - hit) * m2u_lt(i, cnt);
+    }
+    return found;
+}
+
+// Emits cap name for bits 0..4 (DB_R, DB_W, NET, DOM, AI).
+#[strict]
+fn ad_emit_cap_lo(u: bytes, bit: i64) -> bytes {
+    let t0: bytes = if_pos m2u_eq(bit, 0) <=> 0 { su_out4(u, 68, 66, 95, 82) } else { u };
+    let t1: bytes = if_pos m2u_eq(bit, 1) <=> 0 { su_out4(t0, 68, 66, 95, 87) } else { t0 };
+    let t2: bytes = if_pos m2u_eq(bit, 2) <=> 0 { su_out4(t1, 78, 69, 84, 0) } else { t1 };
+    let t3: bytes = if_pos m2u_eq(bit, 3) <=> 0 { su_out4(t2, 68, 79, 77, 0) } else { t2 };
+    return if_pos m2u_eq(bit, 4) <=> 0 { su_out4(t3, 65, 73, 0, 0) } else { t3 };
+}
+
+// Emits cap name for bits 5..9 (VISION, AUDIO, AUTH, FS, SYS).
+#[strict]
+fn ad_emit_cap_hi(u: bytes, bit: i64) -> bytes {
+    let t5: bytes = if_pos m2u_eq(bit, 5) <=> 0 { su_out4(su_out4(u, 86, 73, 83, 73), 79, 78, 0, 0) } else { u };
+    let t6: bytes = if_pos m2u_eq(bit, 6) <=> 0 { su_out4(su_out4(t5, 65, 85, 68, 73), 79, 0, 0, 0) } else { t5 };
+    let t7: bytes = if_pos m2u_eq(bit, 7) <=> 0 { su_out4(t6, 65, 85, 84, 72) } else { t6 };
+    let t8: bytes = if_pos m2u_eq(bit, 8) <=> 0 { su_out4(t7, 70, 83, 0, 0) } else { t7 };
+    return if_pos m2u_eq(bit, 9) <=> 0 { su_out4(t8, 83, 89, 83, 0) } else { t8 };
+}
+
+// Emits capability names for `mask` separated by `sep` (0=",", 1=", "). If empty and `none_if_empty=1`, emits "none".
+#[strict]
+fn ad_emit_caps(arena: bytes, mask: i64, sp: i64, none_if_empty: i64) -> bytes {
+    let w: bytes = arena;
+    let first: i64 = 1;
+    let bit: i64 = 0;
+    while 10 - bit <=> 0 {
+        let on: i64 = (mask >> bit) & 1;
+        w = if_pos on <=> 0 {
+            let u: bytes = if_pos (1 - first) <=> 0 {
+                let s: bytes = su_out_u8(w, 44);
+                if_pos sp <=> 0 { su_out_u8(s, 32) } else { s }
+            } else { w };
+            ad_emit_cap_hi(ad_emit_cap_lo(u, bit), bit)
+        } else { w };
+        first = m2u_sel(on, 0, first);
+        bit = bit + 1;
+    }
+    let r: bytes = if_pos (first * none_if_empty) <=> 0 {
+        su_out4(w, 110, 111, 110, 101)
+    } else { w };
+    return r;
+}
+
+// Emits a list of fn ids stored at `list_off` (`cnt` u64s). `fmt=0` -> "0,1", `fmt=1` -> "fn_0, fn_1" (or "none").
+#[strict]
+fn ad_emit_fn_list(arena: bytes, list_off: i64, cnt: i64, fmt: i64) -> bytes {
+    let r: bytes = if_pos m2u_eq(cnt, 0) <=> 0 {
+        if_pos fmt <=> 0 { su_out4(arena, 110, 111, 110, 101) } else { arena }
+    } else {
+        let w: bytes = arena;
+        let i: i64 = 0;
+        while cnt - i <=> 0 {
+            w = if_pos i <=> 0 {
+                let u: bytes = su_out_u8(w, 44);
+                if_pos fmt <=> 0 { su_out_u8(u, 32) } else { u }
+            } else { w };
+            w = if_pos fmt <=> 0 { su_out4(w, 102, 110, 95, 0) } else { w };
+            w = su_out_i64(w, ld_u64(w, list_off + (i << 3)));
+            i = i + 1;
+        }
+        w
+    };
+    return r;
+}
+
+// Checks whether a `.omni_bc` file passes `verifier.elf` (returns 1 if verified, 0 otherwise).
+#[strict]
+#[cap(SYS)]
+fn ad_check_verified(arena: bytes, ver_elf: bytes, bc_cstr: bytes) -> i64 {
+    // "/tmp/omnic_p7_ad_ver.bin\0"
+    let out_p: bytes = anew(0);
+    out_p = iset(out_p, 47, 116, 109, 112, 47, 111, 109, 110, 105, 99, 95, 112, 55, 95, 97, 100);
+    out_p = iset(out_p, 95, 118, 101, 114, 46, 98, 105, 110, 0);
+    let rc: i64 = su_spawn_capture(ver_elf, bc_cstr, out_p, 420);
+    let r: i64 = if_pos m2u_eq(rc, 0) <=> 0 {
+        let nb: i64 = su_read_file_into(arena, out_p, 1536, 64);
+        // verifier_standalone writes u16 err_count at word 0 (0 = PASS)
+        m2u_ge(nb, 2) * m2u_eq(ld_u16(arena, 1536), 0)
+    } else { 0 };
+    return r;
+}
+
+// Computes sorted fn_added / fn_removed / fn_modified / fn_unchanged_count + cap_escalation + taint_changed.
+// Lists stored at 250000 (added), 252000 (removed), 254000 (modified). Counts at 256..288.
+#[strict]
+fn ad_diff_tables(arena: bytes) -> bytes {
+    let w: bytes = arena;
+    let cnt_b: i64 = ld_u64(w, 64);
+    let cnt_a: i64 = ld_u64(w, 128);
+    let n_add: i64 = 0;
+    let n_rem: i64 = 0;
+    let n_mod: i64 = 0;
+    let n_unc: i64 = 0;
+    let cap_esc: i64 = 0;
+    let taint_ch: i64 = 0;
+    let fid: i64 = 0;
+    while 256 - fid <=> 0 {
+        let sb: i64 = ad_find_fn(w, ad_tbl_b(), cnt_b, fid);
+        let sa: i64 = ad_find_fn(w, ad_tbl_a(), cnt_a, fid);
+        let hb: i64 = m2u_ge(sb, 0);
+        let ha: i64 = m2u_ge(sa, 0);
+        let both: i64 = hb * ha;
+        let only_a: i64 = ha * (1 - hb);
+        let only_b: i64 = hb * (1 - ha);
+        if_pos only_a <=> 0 {
+            let ea: i64 = ad_tbl_a() + sa * 48;
+            w = iset_patch_i64(w, 250000 + (n_add << 3), fid);
+            n_add = n_add + 1;
+            cap_esc = cap_esc | m2u_lt(0, ld_u64(w, ea + 16));
+            taint_ch = taint_ch | m2u_lt(0, ld_u64(w, ea + 24));
+        } else { w };
+        if_pos only_b <=> 0 {
+            let eb: i64 = ad_tbl_b() + sb * 48;
+            w = iset_patch_i64(w, 252000 + (n_rem << 3), fid);
+            n_rem = n_rem + 1;
+            taint_ch = taint_ch | m2u_lt(0, ld_u64(w, eb + 24));
+        } else { w };
+        if_pos both <=> 0 {
+            let eb: i64 = ad_tbl_b() + sb * 48;
+            let ea: i64 = ad_tbl_a() + sa * 48;
+            let cb: i64 = ld_u64(w, eb + 16);
+            let ca: i64 = ld_u64(w, ea + 16);
+            cap_esc = cap_esc | m2u_lt(0, ca & (65535 ^ cb));
+            taint_ch = taint_ch | (1 - m2u_eq(ld_u64(w, eb + 24), ld_u64(w, ea + 24)));
+            let same: i64 = m2u_eq(ld_u64(w, eb + 40), ld_u64(w, ea + 40));
+            if_pos same <=> 0 {
+                n_unc = n_unc + 1;
+            } else {
+                w = iset_patch_i64(w, 254000 + (n_mod << 3), fid);
+                n_mod = n_mod + 1;
+            };
+        } else { w };
+        fid = fid + 1;
+    }
+    w = iset_patch_i64(w, 256, n_add);
+    w = iset_patch_i64(w, 264, n_rem);
+    w = iset_patch_i64(w, 272, n_mod);
+    w = iset_patch_i64(w, 280, n_unc);
+    w = iset_patch_i64(w, 288, cap_esc);
+    return iset_patch_i64(w, 296, taint_ch);
+}
+
+// Renders canonical TSV top half into Band A.
+#[strict]
+fn ad_render_tsv_top(arena: bytes) -> bytes {
+    let w: bytes = iset_patch_i64(arena, 0, 0);
+    let wb: i64 = ld_u64(w, 32);
+    let wa: i64 = ld_u64(w, 40);
+    let hb: i64 = ld_u64(w, 48);
+    let ha: i64 = ld_u64(w, 56);
+    w = su_out4(su_out4(su_out4(w, 119, 111, 114, 100), 115, 95, 98, 101), 102, 111, 114, 101);
+    w = su_out_u8(su_out_i64(su_out_u8(w, 9), wb), 10);
+    w = su_out4(su_out4(su_out4(w, 119, 111, 114, 100), 115, 95, 97, 102), 116, 101, 114, 9);
+    w = su_out_u8(su_out_i64(w, wa), 10);
+    w = su_out4(su_out4(su_out4(w, 100, 101, 108, 116), 97, 95, 119, 111), 114, 100, 115, 9);
+    w = su_out_u8(su_out_i64(w, wa - wb), 10);
+    w = su_out4(su_out4(su_out4(su_out4(w, 102, 110, 118, 49), 97, 54, 52, 95), 98, 101, 102, 111), 114, 101, 9, 0);
+    w = su_out_u8(su_out_hex(w, hb, 16), 10);
+    w = su_out4(su_out4(su_out4(su_out4(w, 102, 110, 118, 49), 97, 54, 52, 95), 97, 102, 116, 101), 114, 9, 0, 0);
+    w = su_out_u8(su_out_hex(w, ha, 16), 10);
+    w = su_out4(su_out4(su_out4(w, 104, 97, 115, 104), 95, 99, 104, 97), 110, 103, 101, 100);
+    w = su_out_u8(su_out_bool(su_out_u8(w, 9), 1 - m2u_eq(hb, ha)), 10);
+    w = su_out4(su_out4(w, 102, 110, 95, 97), 100, 100, 101, 100);
+    w = su_out_u8(ad_emit_fn_list(su_out_u8(w, 9), 250000, ld_u64(w, 256), 0), 10);
+    w = su_out4(su_out4(su_out4(w, 102, 110, 95, 114), 101, 109, 111, 118), 101, 100, 9, 0);
+    w = su_out_u8(ad_emit_fn_list(w, 252000, ld_u64(w, 264), 0), 10);
+    w = su_out4(su_out4(su_out4(w, 102, 110, 95, 109), 111, 100, 105, 102), 105, 101, 100, 9);
+    w = su_out_u8(ad_emit_fn_list(w, 254000, ld_u64(w, 272), 0), 10);
+    return w;
+}
+
+// Renders canonical TSV bottom half into Band A.
+#[strict]
+fn ad_render_tsv(arena: bytes) -> bytes {
+    let w: bytes = ad_render_tsv_top(arena);
+    let cb: i64 = ld_u64(w, 96);
+    let ca: i64 = ld_u64(w, 160);
+    w = su_out4(su_out4(su_out4(su_out4(w, 102, 110, 95, 117), 110, 99, 104, 97), 110, 103, 101, 100), 95, 99, 111, 117);
+    w = su_out_u8(su_out_i64(su_out4(w, 110, 116, 9, 0), ld_u64(w, 280)), 10);
+    w = su_out4(su_out4(su_out4(w, 99, 97, 112, 115), 95, 97, 100, 100), 101, 100, 9, 0);
+    w = su_out_u8(ad_emit_caps(w, ca & (65535 ^ cb), 0, 0), 10);
+    w = su_out4(su_out4(su_out4(w, 99, 97, 112, 115), 95, 114, 101, 109), 111, 118, 101, 100);
+    w = su_out_u8(ad_emit_caps(su_out_u8(w, 9), cb & (65535 ^ ca), 0, 0), 10);
+    w = su_out4(su_out4(su_out4(su_out4(w, 99, 97, 112, 95), 101, 115, 99, 97), 108, 97, 116, 105), 111, 110, 9, 0);
+    w = su_out_u8(su_out_bool(w, ld_u64(w, 288)), 10);
+    w = su_out4(su_out4(su_out4(su_out4(w, 116, 97, 105, 110), 116, 95, 99, 104), 97, 110, 103, 101), 100, 9, 0, 0);
+    w = su_out_u8(su_out_bool(w, ld_u64(w, 296)), 10);
+    w = su_out4(su_out4(su_out4(su_out4(w, 118, 101, 114, 105), 102, 105, 101, 100), 95, 98, 101, 102), 111, 114, 101, 9);
+    w = su_out_u8(su_out_bool(w, ld_u64(w, 304)), 10);
+    w = su_out4(su_out4(su_out4(su_out4(w, 118, 101, 114, 105), 102, 105, 101, 100), 95, 97, 102, 116), 101, 114, 9, 0);
+    w = su_out_u8(su_out_bool(w, ld_u64(w, 312)), 10);
+    w = su_out4(su_out4(su_out4(su_out4(w, 115, 116, 97, 116), 105, 99, 95, 105), 110, 115, 95, 100), 101, 108, 116, 97);
+    w = su_out_u8(su_out_i64(su_out_u8(w, 9), ld_u64(w, 136) - ld_u64(w, 72)), 10);
+    w = su_out4(su_out4(su_out4(su_out4(w, 115, 116, 97, 116), 105, 99, 95, 97), 114, 101, 110, 97), 95, 98, 121, 116);
+    w = su_out4(su_out4(w, 101, 115, 95, 100), 101, 108, 116, 97);
+    w = su_out_u8(su_out_i64(su_out_u8(w, 9), ld_u64(w, 144) - ld_u64(w, 80)), 10);
+    w = su_out4(su_out4(su_out4(su_out4(w, 115, 116, 97, 116), 105, 99, 95, 98), 117, 102, 95, 111), 112, 115, 95, 100);
+    w = su_out_u8(su_out_i64(su_out_u8(su_out4(w, 101, 108, 116, 97), 9), ld_u64(w, 152) - ld_u64(w, 88)), 10);
+    return w;
+}
+
+// Renders top half of plain-language summary (keeps SSA well under 120).
+#[strict]
+fn ad_render_plain_top(arena: bytes, b_off: i64, b_len: i64, a_off: i64, a_len: i64) -> bytes {
+    let w: bytes = iset_patch_i64(arena, 0, 0);
+    let wb: i64 = ld_u64(w, 32);
+    let wa: i64 = ld_u64(w, 40);
+    let hb: i64 = ld_u64(w, 48);
+    let ha: i64 = ld_u64(w, 56);
+    w = su_out4(su_out4(su_out4(w, 61, 61, 61, 32), 79, 77, 78, 73), 32, 80, 82, 79);
+    w = su_out4(su_out4(su_out4(w, 80, 79, 83, 69), 82, 32, 68, 73), 70, 70, 32, 83);
+    w = su_out4(su_out4(su_out4(w, 85, 77, 77, 65), 82, 89, 32, 61), 61, 61, 10, 0);
+    w = su_out4(su_out4(su_out4(su_out4(w, 66, 101, 102, 111), 114, 101, 58, 32), 32, 32, 32, 32), 32, 32, 32, 32);
+    w = su_out_copy(su_out_u8(w, 32), b_off, b_len);
+    w = su_out_i64(su_out4(w, 32, 40, 0, 0), wb);
+    w = su_out4(su_out4(su_out4(su_out4(w, 32, 119, 111, 114), 100, 115, 44, 32), 70, 78, 86, 45), 49, 97, 54, 52);
+    w = su_out_hex(su_out_u8(w, 61), hb, 16);
+    w = su_out4(su_out4(su_out4(w, 44, 32, 118, 101), 114, 105, 102, 105), 101, 100, 61, 0);
+    w = su_out4(su_out_bool(w, ld_u64(w, 304)), 41, 10, 0, 0);
+    w = su_out4(su_out4(su_out4(su_out4(w, 65, 102, 116, 101), 114, 58, 32, 32), 32, 32, 32, 32), 32, 32, 32, 32);
+    w = su_out_copy(su_out_u8(w, 32), a_off, a_len);
+    w = su_out_i64(su_out4(w, 32, 40, 0, 0), wa);
+    w = su_out4(su_out4(su_out4(su_out4(w, 32, 119, 111, 114), 100, 115, 44, 32), 70, 78, 86, 45), 49, 97, 54, 52);
+    w = su_out_hex(su_out_u8(w, 61), ha, 16);
+    w = su_out4(su_out4(su_out4(w, 44, 32, 118, 101), 114, 105, 102, 105), 101, 100, 61, 0);
+    w = su_out4(su_out_bool(w, ld_u64(w, 312)), 41, 10, 0, 0);
+    w = su_out4(su_out4(su_out4(su_out4(w, 83, 101, 101, 100), 47, 72, 97, 115), 104, 32, 68, 101), 108, 116, 97, 58);
+    w = su_out_signed_i64(su_out_u8(w, 32), wa - wb);
+    w = su_out4(su_out4(su_out4(su_out4(w, 32, 119, 111, 114), 100, 115, 32, 40), 104, 97, 115, 104), 95, 99, 104, 97);
+    return su_out4(su_out_bool(su_out4(su_out4(w, 110, 103, 101, 100), 61, 0, 0, 0), 1 - m2u_eq(hb, ha)), 41, 10, 0, 0);
+}
+
+// Renders middle section of plain-language summary (Functions + Capabilities).
+#[strict]
+fn ad_render_plain_mid(arena: bytes) -> bytes {
+    let w: bytes = arena;
+    let cb: i64 = ld_u64(w, 96);
+    let ca: i64 = ld_u64(w, 160);
+    w = su_out4(su_out4(su_out4(su_out4(w, 70, 117, 110, 99), 116, 105, 111, 110), 115, 58, 32, 32), 32, 32, 32, 32);
+    w = su_out4(su_out4(w, 32, 97, 100, 100), 101, 100, 61, 91);
+    w = ad_emit_fn_list(w, 250000, ld_u64(w, 256), 1);
+    w = su_out4(su_out4(su_out4(w, 93, 44, 32, 114), 101, 109, 111, 118), 101, 100, 61, 91);
+    w = ad_emit_fn_list(w, 252000, ld_u64(w, 264), 1);
+    w = su_out4(su_out4(su_out4(w, 93, 44, 32, 109), 111, 100, 105, 102), 105, 101, 100, 61);
+    w = ad_emit_fn_list(su_out_u8(w, 91), 254000, ld_u64(w, 272), 1);
+    w = su_out4(su_out4(su_out4(su_out4(w, 93, 44, 32, 117), 110, 99, 104, 97), 110, 103, 101, 100), 61, 0, 0, 0);
+    w = su_out_u8(su_out_i64(w, ld_u64(w, 280)), 10);
+    w = su_out4(su_out4(su_out4(su_out4(w, 67, 97, 112, 97), 98, 105, 108, 105), 116, 105, 101, 115), 58, 32, 32, 32);
+    w = su_out4(su_out4(w, 32, 97, 100, 100), 101, 100, 61, 91);
+    w = ad_emit_caps(w, ca & (65535 ^ cb), 1, 1);
+    w = su_out4(su_out4(su_out4(w, 93, 44, 32, 114), 101, 109, 111, 118), 101, 100, 61, 91);
+    w = ad_emit_caps(w, cb & (65535 ^ ca), 1, 1);
+    w = su_out4(su_out4(su_out4(su_out4(w, 93, 44, 32, 101), 115, 99, 97, 108), 97, 116, 105, 111), 110, 61, 0, 0);
+    return su_out_u8(su_out_bool(w, ld_u64(w, 288)), 10);
+}
+
+// Renders bottom half of plain-language summary (Taint + Budget Proxies).
+#[strict]
+fn ad_render_plain_bot(arena: bytes) -> bytes {
+    let w: bytes = ad_render_plain_mid(arena);
+    w = su_out4(su_out4(su_out4(su_out4(w, 84, 97, 105, 110), 116, 32, 83, 117), 114, 102, 97, 99), 101, 58, 32, 32);
+    w = su_out4(su_out4(su_out4(w, 32, 99, 104, 97), 110, 103, 101, 100), 61, 0, 0, 0);
+    w = su_out_u8(su_out_bool(w, ld_u64(w, 296)), 10);
+    w = su_out4(su_out4(su_out4(su_out4(w, 66, 117, 100, 103), 101, 116, 32, 80), 114, 111, 120, 105), 101, 115, 58, 32);
+    w = su_out4(su_out4(su_out4(w, 32, 115, 116, 97), 116, 105, 99, 95), 105, 110, 115, 61);
+    w = su_out_signed_i64(w, ld_u64(w, 136) - ld_u64(w, 72));
+    w = su_out4(su_out4(su_out4(su_out4(w, 44, 32, 115, 116), 97, 116, 105, 99), 95, 97, 114, 101), 110, 97, 95, 98);
+    w = su_out_signed_i64(su_out4(su_out4(w, 121, 116, 101, 115), 61, 0, 0, 0), ld_u64(w, 144) - ld_u64(w, 80));
+    w = su_out4(su_out4(su_out4(su_out4(w, 44, 32, 115, 116), 97, 116, 105, 99), 95, 98, 117, 102), 95, 111, 112, 115);
+    w = su_out_signed_i64(su_out_u8(w, 61), ld_u64(w, 152) - ld_u64(w, 88));
+    w = su_out4(su_out4(su_out4(su_out4(w, 32, 40, 114, 117), 110, 116, 105, 109), 101, 32, 35, 91), 115, 116, 101, 112);
+    w = su_out4(su_out4(su_out4(su_out4(w, 95, 98, 117, 100), 103, 101, 116, 93), 47, 35, 91, 109), 101, 109, 95, 98);
+    w = su_out4(su_out4(su_out4(su_out4(w, 117, 100, 103, 101), 116, 93, 32, 97), 116, 116, 114, 115), 32, 110, 111, 116);
+    w = su_out4(su_out4(su_out4(su_out4(w, 32, 101, 110, 99), 111, 100, 101, 100), 32, 105, 110, 32), 46, 111, 109, 110);
+    return su_out4(su_out4(w, 105, 95, 98, 99), 41, 10, 0, 0);
+}
+
+// Builds sibling verifier path (`<dir_of_argv0>/verifier.elf\0`).
+#[strict]
+fn ad_sibling_verifier(arena: bytes) -> bytes {
+    let a0_off: i64 = su_arg_off(arena, 0);
+    let a0_len: i64 = su_arg_len(arena, 0);
+    let slash: i64 = 0 - 1;
+    let i: i64 = 0;
+    while a0_len - i <=> 0 {
+        slash = m2u_sel(m2u_eq(ld_u8(arena, a0_off + i), 47), i, slash);
+        i = i + 1;
+    }
+    let b: bytes = anew(0);
+    let k: i64 = 0;
+    let pfx: i64 = m2u_sel(m2u_ge(slash, 0), slash + 1, 0);
+    while pfx - k <=> 0 {
+        b = iset(b, ld_u8(arena, a0_off + k));
+        k = k + 1;
+    }
+    b = iset(b, 118, 101, 114, 105, 102, 105, 101, 114, 46, 101, 108, 102, 0);
+    return b;
+}
+
+// Loads 3 newline-separated fields from req file into `arena[1024..]` and populates argv[1..3].
+#[strict]
+#[cap(SYS)]
+fn ad_load_req_file(arena: bytes) -> bytes {
+    let p: bytes = su_make_cstr(arena, su_arg_off(arena, 1), su_arg_len(arena, 1));
+    let n: i64 = su_read_file_into(arena, p, 1024, 1000);
+    let w: bytes = arena;
+    let r: bytes = if_pos m2u_lt(0, n) <=> 0 {
+        let pos: i64 = 0;
+        let idx: i64 = 1;
+        let g: i64 = m2u_lt(pos, n) * m2u_ge(3, idx);
+        while g <=> 0 {
+            let st: i64 = pos;
+            let g2: i64 = m2u_lt(pos, n) * (1 - m2u_eq(ld_u8(w, 1024 + pos), 10));
+            while g2 <=> 0 {
+                pos = pos + 1;
+                g2 = m2u_lt(pos, n) * (1 - m2u_eq(ld_u8(w, 1024 + pos), 10));
+            }
+            w = iset_patch_i64(w, 2312 + (idx << 4), 1024 + st);
+            w = iset_patch_i64(w, 2312 + (idx << 4) + 8, pos - st);
+            idx = idx + 1;
+            pos = pos + 1;
+            g = m2u_lt(pos, n) * m2u_ge(3, idx);
+        }
+        iset_patch_i64(w, 2304, idx)
+    } else { w };
+    return r;
+}
+
+#[strict]
+#[cap(SYS)]
+fn main() -> i64 {
+    let w: bytes = su_load_cmdline(su_alloc_arena());
+    w = if_pos m2u_eq(su_argc(w), 2) <=> 0 { ad_load_req_file(w) } else { w };
+    let argc: i64 = su_argc(w);
+    let rc: i64 = if_pos m2u_lt(argc, 3) <=> 0 {
+        2
+    } else {
+        let b_off: i64 = su_arg_off(w, 1);
+        let b_len: i64 = su_arg_len(w, 1);
+        let a_off: i64 = su_arg_off(w, 2);
+        let a_len: i64 = su_arg_len(w, 2);
+        let is_tsv: i64 = m2u_ge(argc, 4) * m2u_eq(su_arg_len(w, 3), 5) * m2u_eq(ld_u8(w, su_arg_off(w, 3) + 2), 116);
+        let b_cstr: bytes = su_make_cstr(w, b_off, b_len);
+        let a_cstr: bytes = su_make_cstr(w, a_off, a_len);
+        let nb: i64 = su_read_file_into(w, b_cstr, ad_bef_off(), 131072);
+        let na: i64 = su_read_file_into(w, a_cstr, ad_aft_off(), 126976);
+        let ok_io: i64 = m2u_ge(nb, 4) * m2u_ge(na, 4) * m2u_eq(nb & 1, 0) * m2u_eq(na & 1, 0);
+        if_pos ok_io <=> 0 {
+            w = iset_patch_i64(w, 32, nb >> 1);
+            w = iset_patch_i64(w, 40, na >> 1);
+            w = iset_patch_i64(w, 48, su_fnv1a64(w, ad_bef_off(), nb));
+            w = iset_patch_i64(w, 56, su_fnv1a64(w, ad_aft_off(), na));
+            w = ad_scan_module(w, ad_bef_off(), nb >> 1, ad_tbl_b(), 64);
+            let err1: i64 = ld_u64(w, 24);
+            w = ad_scan_module(w, ad_aft_off(), na >> 1, ad_tbl_a(), 128);
+            let err2: i64 = ld_u64(w, 24);
+            if_pos (err1 + err2) <=> 0 {
+                1
+            } else {
+                let ver_elf: bytes = ad_sibling_verifier(w);
+                w = iset_patch_i64(w, 304, ad_check_verified(w, ver_elf, b_cstr));
+                w = iset_patch_i64(w, 312, ad_check_verified(w, ver_elf, a_cstr));
+                w = ad_diff_tables(w);
+                w = if_pos is_tsv <=> 0 {
+                    ad_render_tsv(w)
+                } else {
+                    ad_render_plain_bot(ad_render_plain_top(w, b_off, b_len, a_off, a_len))
+                };
+                let olen: i64 = ld_u64(w, 0);
+                let nw: i64 = sys_write(1, w, su_band_a(), olen);
+                0 + nw * 0
+            }
+        } else {
+            1
+        }
+    };
+    return sys_exit(rc);
+}

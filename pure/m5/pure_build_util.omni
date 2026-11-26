@@ -1,0 +1,245 @@
+// ==============================================================================
+// pure/m5/pure_build_util.omni — Zero-Include Pure-Omni Build Plumbing Utility
+// ==============================================================================
+// Self-contained (zero `include`s) Pure-Omni native ELF64 utility built directly
+// by the cached Pure-Omni toolchain (`m3.elf` + `verifier.elf` + `m2.elf`).
+// Replaces python3 plumbing in `scripts/build_pure_driver.sh` and
+// `scripts/zero_rust_rebuild.sh`:
+//   pure_build_util.elf fnv <file>         -> prints "<bytes> 0x<16-HEX>\n"
+//   pure_build_util.elf widen <in> <out>   -> widens UTF-8 bytes -> u16-LE
+//
+// Arena layout (64 KiB = 65,536 B):
+//   0     .. 255   : state (0=out_len, 8=argc)
+//   256   .. 511   : argv table (16 x 16 B: [off:u64, len:u64])
+//   512   .. 1535  : /proc/self/cmdline raw bytes (1,024 B)
+//   1536  .. 2047  : formatting scratch (512 B)
+//   2048  .. 18431 : read chunk buffer (16 KiB)
+//   18432 .. 51199 : widened u16-LE output buffer (32 KiB)
+// ==============================================================================
+
+#[strict]
+fn pbu_eq(a: i64, b: i64) -> i64 {
+    let t: trit = a <=> b;
+    return sel_trit(t, 0, 1, 0);
+}
+
+#[strict]
+fn pbu_lt(a: i64, b: i64) -> i64 {
+    let t: trit = a <=> b;
+    return sel_trit(t, 1, 0, 0);
+}
+
+#[strict]
+fn pbu_ge(a: i64, b: i64) -> i64 {
+    let t: trit = a <=> b;
+    return sel_trit(t, 0, 1, 1);
+}
+
+#[strict]
+fn pbu_sel(cond: i64, tval: i64, fval: i64) -> i64 {
+    let c: trit = cond <=> 0;
+    return sel_trit(c, fval, fval, tval);
+}
+
+#[strict]
+fn pbu_alloc() -> bytes {
+    let w: bytes = anew(0);
+    let i: i64 = 0;
+    while 1024 - i <=> 0 {
+        w = iset_i64(w, 0); w = iset_i64(w, 0); w = iset_i64(w, 0); w = iset_i64(w, 0);
+        w = iset_i64(w, 0); w = iset_i64(w, 0); w = iset_i64(w, 0); w = iset_i64(w, 0);
+        i = i + 1;
+    }
+    return w;
+}
+
+#[strict]
+fn pbu_st_u8(w: bytes, off: i64, v: i64) -> bytes {
+    let nxt: i64 = ld_u8(w, off + 1);
+    return st_u16(w, off, (v & 255) | (nxt << 8));
+}
+
+#[strict]
+fn pbu_out_u8(w: bytes, b: i64) -> bytes {
+    let n: i64 = ld_u64(w, 0);
+    let u: bytes = pbu_st_u8(w, 1536 + n, b);
+    return iset_patch_i64(u, 0, n + 1);
+}
+
+#[strict]
+fn pbu_out_u64_dec(arena: bytes, val: i64) -> bytes {
+    let w: bytes = arena;
+    let r: bytes = if_pos pbu_eq(val, 0) <=> 0 {
+        pbu_out_u8(w, 48)
+    } else {
+        let cnt: i64 = 0;
+        let cur: i64 = val;
+        while cur <=> 0 {
+            w = pbu_st_u8(w, 1800 + cnt, 48 + (cur % 10));
+            cur = cur / 10;
+            cnt = cnt + 1;
+        }
+        let j: i64 = cnt - 1;
+        while j + 1 <=> 0 {
+            w = pbu_out_u8(w, ld_u8(w, 1800 + j));
+            j = j - 1;
+        }
+        w
+    };
+    return r;
+}
+
+#[strict]
+fn pbu_out_hex64(arena: bytes, val: i64) -> bytes {
+    let w: bytes = pbu_out_u8(pbu_out_u8(arena, 48), 120);
+    let i: i64 = 15;
+    while i + 1 <=> 0 {
+        let nib: i64 = (val >> (i * 4)) & 15;
+        let ch: i64 = pbu_sel(pbu_lt(nib, 10), 48 + nib, 55 + nib);
+        w = pbu_out_u8(w, ch);
+        i = i - 1;
+    }
+    return w;
+}
+
+#[strict]
+fn pbu_make_cstr(w: bytes, off: i64, len: i64) -> bytes {
+    let b: bytes = anew(0);
+    let i: i64 = 0;
+    while len - i <=> 0 {
+        b = iset(b, ld_u8(w, off + i));
+        i = i + 1;
+    }
+    return iset(b, 0);
+}
+
+#[strict]
+#[cap(SYS)]
+fn pbu_load_cmdline(arena: bytes) -> bytes {
+    let p: bytes = anew(0);
+    p = iset(p, 47, 112, 114, 111, 99, 47, 115, 101, 108, 102, 47, 99, 109, 100, 108, 105);
+    p = iset(p, 110, 101, 0);
+    let fd: i64 = sys_open(p, 0, 0);
+    let n: i64 = if_pos pbu_ge(fd, 0) <=> 0 {
+        let nr: i64 = sys_read(fd, arena, 512, 1023);
+        let c: i64 = sys_close(fd);
+        nr + c * 0
+    } else { 0 };
+    let w: bytes = arena;
+    let argc: i64 = 0;
+    let pos: i64 = 0;
+    let g: i64 = pbu_lt(pos, n) * pbu_lt(argc, 16);
+    while g <=> 0 {
+        let st: i64 = pos;
+        let g2: i64 = pbu_lt(pos, n) * (1 - pbu_eq(ld_u8(w, 512 + pos), 0));
+        while g2 <=> 0 {
+            pos = pos + 1;
+            g2 = pbu_lt(pos, n) * (1 - pbu_eq(ld_u8(w, 512 + pos), 0));
+        }
+        w = iset_patch_i64(w, 256 + (argc << 4), 512 + st);
+        w = iset_patch_i64(w, 256 + (argc << 4) + 8, pos - st);
+        argc = argc + 1;
+        pos = pos + 1;
+        g = pbu_lt(pos, n) * pbu_lt(argc, 16);
+    }
+    return iset_patch_i64(w, 8, argc);
+}
+
+#[strict]
+#[cap(SYS)]
+fn pbu_cmd_fnv(w: bytes) -> i64 {
+    let path: bytes = pbu_make_cstr(w, ld_u64(w, 256 + 32), ld_u64(w, 256 + 40));
+    let fd: i64 = sys_open(path, 0, 0);
+    let r: i64 = if_pos pbu_ge(fd, 0) <=> 0 {
+        let h: i64 = (52210 << 48) | (40164 << 32) | (33826 << 16) | 8997;
+        let prime: i64 = (256 << 32) | 435;
+        let total: i64 = 0;
+        let ok: i64 = 1;
+        let g: i64 = 1;
+        while g <=> 0 {
+            let nr: i64 = sys_read(fd, w, 2048, 16384);
+            ok = ok * pbu_ge(nr, 0);
+            let i: i64 = 0;
+            while nr - i <=> 0 {
+                h = (h ^ ld_u8(w, 2048 + i)) * prime;
+                i = i + 1;
+            }
+            total = total + pbu_sel(pbu_lt(0, nr), nr, 0);
+            g = pbu_lt(0, nr);
+        }
+        let c: i64 = sys_close(fd);
+        let u: bytes = iset_patch_i64(w, 0, 0);
+        u = pbu_out_u8(pbu_out_hex64(pbu_out_u8(pbu_out_u64_dec(u, total), 32), h), 10);
+        let nw: i64 = if_pos ok <=> 0 { sys_write(1, u, 1536, ld_u64(u, 0)) } else { 0 };
+        pbu_sel(ok, 0, 1) + (c + nw) * 0
+    } else { 1 };
+    return r;
+}
+
+#[strict]
+#[cap(SYS)]
+fn pbu_write_all(w: bytes, fd: i64, off: i64, len: i64) -> i64 {
+    let sent: i64 = 0;
+    let ok: i64 = 1;
+    let g: i64 = pbu_lt(sent, len);
+    while g <=> 0 {
+        let nw: i64 = sys_write(fd, w, off + sent, len - sent);
+        ok = ok * pbu_lt(0, nw);
+        sent = sent + pbu_sel(pbu_lt(0, nw), nw, 0);
+        g = ok * pbu_lt(sent, len);
+    }
+    return ok;
+}
+
+#[strict]
+#[cap(SYS)]
+fn pbu_cmd_widen(arena: bytes) -> i64 {
+    let w: bytes = arena;
+    let in_p: bytes = pbu_make_cstr(w, ld_u64(w, 256 + 32), ld_u64(w, 256 + 40));
+    let out_p: bytes = pbu_make_cstr(w, ld_u64(w, 256 + 48), ld_u64(w, 256 + 56));
+    let fd_in: i64 = sys_open(in_p, 0, 0);
+    let fd_out: i64 = if_pos pbu_ge(fd_in, 0) <=> 0 { sys_open(out_p, 577, 420) } else { 0 - 1 };
+    let r: i64 = if_pos pbu_ge(fd_out, 0) <=> 0 {
+        let ok: i64 = 1;
+        let g: i64 = 1;
+        while g <=> 0 {
+            let nr: i64 = sys_read(fd_in, w, 2048, 16384);
+            ok = ok * pbu_ge(nr, 0);
+            let i: i64 = 0;
+            while nr - i <=> 0 {
+                w = st_u16(w, 18432 + (i << 1), ld_u8(w, 2048 + i));
+                i = i + 1;
+            }
+            let wok: i64 = if_pos pbu_lt(0, nr) <=> 0 { pbu_write_all(w, fd_out, 18432, nr << 1) } else { 1 };
+            ok = ok * wok;
+            g = ok * pbu_lt(0, nr);
+        }
+        let c1: i64 = sys_close(fd_in);
+        let c2: i64 = sys_close(fd_out);
+        pbu_sel(ok, 0, 1) + (c1 + c2) * 0
+    } else {
+        let c0: i64 = if_pos pbu_ge(fd_in, 0) <=> 0 { sys_close(fd_in) } else { 0 };
+        1 + c0 * 0
+    };
+    return r;
+}
+
+#[strict]
+#[cap(SYS)]
+fn main() -> i64 {
+    let w: bytes = pbu_load_cmdline(pbu_alloc());
+    let argc: i64 = ld_u64(w, 8);
+    let rc: i64 = if_pos pbu_lt(argc, 3) <=> 0 {
+        2
+    } else {
+        let c0: i64 = ld_u8(w, ld_u64(w, 256 + 16));
+        if_pos pbu_eq(c0, 102) <=> 0 {
+            pbu_cmd_fnv(w)
+        } else { if_pos pbu_eq(c0, 119) * pbu_ge(argc, 4) <=> 0 {
+            pbu_cmd_widen(w)
+        } else {
+            2
+        } }
+    };
+    return sys_exit(rc);
+}
