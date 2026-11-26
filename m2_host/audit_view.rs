@@ -12,6 +12,8 @@ pub struct DecompileReport {
     pub functions_exact: usize,
     pub functions_approximate: usize,
     pub markers: Vec<String>,
+    /// Per-function `(fn_idx, is_exact, m3_fn_source)` in stream order.
+    pub functions: Vec<(u16, bool, String)>,
 }
 
 fn audit_ty_name(ty_tok: u16) -> Option<&'static str> {
@@ -103,11 +105,11 @@ fn audit_format_rhs(ins: &BinInstruction) -> Option<String> {
         0x7F03 => Some(format!("borrow_w({})", op0()?)),
         0x7F0D => Some(format!("anew({})", op0()?)),
         0x7F0E => {
-            // IGET: 2-op iget(b, i) or 3-op ld_u8/ld_u16/ld_u32/ld_u64(b, off)
+            // IGET: 2-op iget(b, i) or 3-op ld_u8/ld_u16/ld_u32/ld_u64(b, off) with width tag in ops[1]
             if ops.len() == 2 {
                 Some(format!("iget({}, {})", op0()?, op1()?))
             } else if ops.len() == 3 {
-                if let BinOperand::ImmInt(w) = ops[2] {
+                if let BinOperand::ImmInt(w) = ops[1] {
                     let name = match w {
                         -1 => "ld_u8",
                         -2 => "ld_u16",
@@ -115,7 +117,7 @@ fn audit_format_rhs(ins: &BinInstruction) -> Option<String> {
                         -8 => "ld_u64",
                         _ => return None,
                     };
-                    Some(format!("{}({}, {})", name, op0()?, op1()?))
+                    Some(format!("{}({}, {})", name, op0()?, op2()?))
                 } else {
                     None
                 }
@@ -489,32 +491,35 @@ fn audit_emit_block(
                                     }
                                 }
 
-                                // Statement-form `if_pos`/`if_neg` (preserves every write verbatim)
-                                out.push_str(&format!("{}{} {} {{\n", indent, kw, cond_s));
-                                let mut decl_then = declared.clone();
-                                audit_emit_block(
-                                    insns,
-                                    then_start,
-                                    then_end,
-                                    &mut decl_then,
-                                    depth + 1,
-                                    out,
-                                    approx,
-                                );
-                                out.push_str(&format!("{}}} else {{\n", indent));
-                                let mut decl_else = declared.clone();
-                                audit_emit_block(
-                                    insns,
-                                    else_start,
-                                    else_end,
-                                    &mut decl_else,
-                                    depth + 1,
-                                    out,
-                                    approx,
-                                );
-                                out.push_str(&format!("{}}}\n", indent));
-                                i = end_lbl_idx + 1;
-                                continue;
+                                // Statement-form `if_pos`/`if_neg` — only emit when BOTH arms are non-empty
+                                // (Omni surface grammar forbids empty branch blocks; empty-arm CFG falls back to APPROXIMATE).
+                                if then_start < then_end && else_start < else_end {
+                                    out.push_str(&format!("{}{} {} {{\n", indent, kw, cond_s));
+                                    let mut decl_then = declared.clone();
+                                    audit_emit_block(
+                                        insns,
+                                        then_start,
+                                        then_end,
+                                        &mut decl_then,
+                                        depth + 1,
+                                        out,
+                                        approx,
+                                    );
+                                    out.push_str(&format!("{}}} else {{\n", indent));
+                                    let mut decl_else = declared.clone();
+                                    audit_emit_block(
+                                        insns,
+                                        else_start,
+                                        else_end,
+                                        &mut decl_else,
+                                        depth + 1,
+                                        out,
+                                        approx,
+                                    );
+                                    out.push_str(&format!("{}}}\n", indent));
+                                    i = end_lbl_idx + 1;
+                                    continue;
+                                }
                             }
                         }
                     }
@@ -662,7 +667,7 @@ fn audit_emit_block(
 pub fn decompile_u16_stream_to_m3(stream: &[u16]) -> Result<DecompileReport, String> {
     let module = decode_omni_token_stream(stream)?;
     let stream_hash = fnv1a_64_hash(&encode_u16_stream_to_bytes(stream));
-    let mut fn_blocks: Vec<(bool, String, String)> = Vec::with_capacity(module.functions.len());
+    let mut fn_blocks: Vec<(u16, bool, String, String)> = Vec::with_capacity(module.functions.len());
     let mut functions_exact = 0usize;
     let mut functions_approximate = 0usize;
     let mut markers: Vec<String> = Vec::new();
@@ -712,8 +717,21 @@ pub fn decompile_u16_stream_to_m3(stream: &[u16]) -> Result<DecompileReport, Str
                 header.push_str(&format!("#[cap({})]\n", caps.join(", ")));
             }
         }
-        if func.fn_idx as usize != pos_idx {
-            header.push_str(&format!("#[fn_id({})]\n", func.fn_idx));
+        let n_fns = module.functions.len();
+        let expected_idx = if n_fns == 1 {
+            0
+        } else if pos_idx + 1 == n_fns {
+            0
+        } else {
+            pos_idx + 1
+        };
+        if func.fn_idx as usize != expected_idx {
+            if func.fn_idx <= 15 {
+                header.push_str(&format!("#[fn_id({})]\n", func.fn_idx));
+            } else {
+                approx = true;
+                header.push_str(&format!("// [LITERAL_OP] fn_idx={} (>15, non-positional)\n", func.fn_idx));
+            }
         }
 
         let mut param_strs = Vec::with_capacity(func.params.len());
@@ -736,7 +754,7 @@ pub fn decompile_u16_stream_to_m3(stream: &[u16]) -> Result<DecompileReport, Str
             body
         ));
         markers.push(marker.clone());
-        fn_blocks.push((approx, marker, header));
+        fn_blocks.push((func.fn_idx, !approx, marker, header));
     }
 
     let is_exact = functions_approximate == 0;
@@ -754,9 +772,11 @@ pub fn decompile_u16_stream_to_m3(stream: &[u16]) -> Result<DecompileReport, Str
         functions_exact,
         functions_approximate
     ));
-    for (_, _, block) in fn_blocks {
+    let mut functions = Vec::with_capacity(fn_blocks.len());
+    for (fid, is_fn_exact, _, block) in fn_blocks {
         m3_source.push('\n');
         m3_source.push_str(&block);
+        functions.push((fid, is_fn_exact, block));
     }
 
     Ok(DecompileReport {
@@ -765,6 +785,7 @@ pub fn decompile_u16_stream_to_m3(stream: &[u16]) -> Result<DecompileReport, Str
         functions_exact,
         functions_approximate,
         markers,
+        functions,
     })
 }
 
@@ -896,11 +917,9 @@ pub struct ProposerDiffSummary {
     pub taint_changed: bool,
     pub before_verified: bool,
     pub after_verified: bool,
-    pub ins_delta: isize,
-    pub arena_bytes_delta: i64,
-    pub buf_ops_delta: isize,
-    pub step_budget_delta: i64,
-    pub mem_budget_delta: i64,
+    pub static_ins_delta: isize,
+    pub static_arena_bytes_delta: i64,
+    pub static_buf_ops_delta: isize,
 }
 
 /// Builds a deterministic plain-language + gateable diff summary between two `.omni_bc` streams.
@@ -1025,12 +1044,9 @@ pub fn summarize_proposer_diff(
         taint_changed,
         before_verified,
         after_verified,
-        ins_delta,
-        arena_bytes_delta,
-        buf_ops_delta,
-        // Static proxy deltas for step/mem budgets when no explicit #[step_budget]/#[mem_budget] override is supplied
-        step_budget_delta: ins_delta as i64,
-        mem_budget_delta: arena_bytes_delta,
+        static_ins_delta: ins_delta,
+        static_arena_bytes_delta: arena_bytes_delta,
+        static_buf_ops_delta: buf_ops_delta,
     })
 }
 
@@ -1062,7 +1078,7 @@ impl ProposerDiffSummary {
              Functions:       added=[{}], removed=[{}], modified=[{}], unchanged={}\n\
              Capabilities:    added=[{}], removed=[{}], escalation={}\n\
              Taint Surface:   changed={}\n\
-             Budget Delta:    ins={:+}, step_budget={:+}, arena_bytes={:+}, mem_budget={:+}, buf_ops={:+}\n",
+             Budget Proxies:  static_ins={:+}, static_arena_bytes={:+}, static_buf_ops={:+} (runtime #[step_budget]/#[mem_budget] attrs not encoded in .omni_bc)\n",
             self.before_label,
             self.before_words,
             self.before_fnv1a64,
@@ -1081,11 +1097,9 @@ impl ProposerDiffSummary {
             fmt_caps(&self.caps_removed),
             self.cap_escalation,
             self.taint_changed,
-            self.ins_delta,
-            self.step_budget_delta,
-            self.arena_bytes_delta,
-            self.mem_budget_delta,
-            self.buf_ops_delta,
+            self.static_ins_delta,
+            self.static_arena_bytes_delta,
+            self.static_buf_ops_delta,
         )
     }
 
@@ -1114,11 +1128,9 @@ impl ProposerDiffSummary {
              taint_changed\t{}\n\
              verified_before\t{}\n\
              verified_after\t{}\n\
-             ins_delta\t{}\n\
-             step_budget_delta\t{}\n\
-             arena_bytes_delta\t{}\n\
-             mem_budget_delta\t{}\n\
-             buf_ops_delta\t{}\n",
+             static_ins_delta\t{}\n\
+             static_arena_bytes_delta\t{}\n\
+             static_buf_ops_delta\t{}\n",
             self.before_words,
             self.after_words,
             self.delta_words,
@@ -1135,11 +1147,9 @@ impl ProposerDiffSummary {
             self.taint_changed,
             self.before_verified,
             self.after_verified,
-            self.ins_delta,
-            self.step_budget_delta,
-            self.arena_bytes_delta,
-            self.mem_budget_delta,
-            self.buf_ops_delta,
+            self.static_ins_delta,
+            self.static_arena_bytes_delta,
+            self.static_buf_ops_delta,
         )
     }
 }
@@ -1333,7 +1343,9 @@ pub fn selftest_audit_view() -> Result<usize, String> {
         checks += 1;
     }
 
-    // 2. Round-trip / determinism on `pure/verifier_standalone.omni_bc` (the full verifier engine).
+    // 2. Round-trip & strict re-compile enforcement on `pure/verifier_standalone.omni_bc` (68 functions).
+    //    NO skip branches: EVERY function marked RECONSTRUCTED MUST genuinely compile through
+    //    `compile_omni_surface_to_u16`; any APPROXIMATE function must carry explicit LITERAL_OP markers.
     let ve_raw = std::fs::read("pure/verifier_standalone.omni_bc")
         .map_err(|e| format!("audit-view: read pure/verifier_standalone.omni_bc: {}", e))?;
     let ve_u16 = decode_bytes_to_u16_stream(&ve_raw);
@@ -1348,27 +1360,65 @@ pub fn selftest_audit_view() -> Result<usize, String> {
     {
         return Err(String::from("audit-view: verifier_engine function count mismatch"));
     }
-    if ve_rep1.is_exact {
-        // When marked exact, it must re-compile cleanly to a byte-identical stream.
-        let ve_recompiled = compile_omni_surface_to_u16(&ve_rep1.m3_source).map_err(|e| {
-            format!("audit-view: verifier_engine marked exact but failed to recompile: {}", e)
-        })?;
-        if ve_recompiled != ve_u16 {
-            return Err(format!(
-                "audit-view: verifier_engine marked exact but recompile differed ({}w vs {}w)",
-                ve_recompiled.len(),
-                ve_u16.len()
+    // Build a full module where every RECONSTRUCTED function keeps its real decompiled body
+    // and any APPROXIMATE function uses a signature-matched stub solely to satisfy cross-calls.
+    let mut ve_compile_src = String::new();
+    for (pos_idx, &(fid, is_fn_exact, ref fn_src)) in ve_rep1.functions.iter().enumerate() {
+        if is_fn_exact {
+            ve_compile_src.push_str(fn_src);
+            ve_compile_src.push('\n');
+        } else {
+            if !fn_src.contains("APPROXIMATE") || !fn_src.contains("LITERAL_OP") {
+                return Err(format!(
+                    "audit-view: verifier_engine fn_{} marked approximate without explicit markers",
+                    fid
+                ));
+            }
+            let f = &ve_mod.functions[pos_idx];
+            let mut p_strs = Vec::with_capacity(f.params.len());
+            for &(p_tok, ty_tok, tc_tok) in &f.params {
+                let p_idx = p_tok.saturating_sub(PAR_BASE);
+                let ty_s = audit_ty_name(ty_tok).unwrap_or("i64");
+                let (untr, _, _) = unpack_tc(tc_tok);
+                if untr {
+                    p_strs.push(format!("p{}: {} @untrusted", p_idx, ty_s));
+                } else {
+                    p_strs.push(format!("p{}: {}", p_idx, ty_s));
+                }
+            }
+            let ret_s = audit_ty_name(f.ret_ty_tok).unwrap_or("i64");
+            let ret_val = match f.ret_ty_tok {
+                TY_BYTES => "anew(0)",
+                TY_TRIT => "0t",
+                _ => "0",
+            };
+            ve_compile_src.push_str(&format!(
+                "fn fn_{}({}) -> {} {{ let r: {} = {}; return r; }}\n",
+                fid,
+                p_strs.join(", "),
+                ret_s,
+                ret_s,
+                ret_val
             ));
         }
-    } else if !ve_rep1.m3_source.contains("APPROXIMATE") || !ve_rep1.m3_source.contains("LITERAL_OP") {
-        return Err(String::from(
-            "audit-view: verifier_engine approximate output missing explicit APPROXIMATE/LITERAL_OP markers",
+    }
+    let ve_recompiled = compile_omni_surface_to_u16(&ve_compile_src).map_err(|e| {
+        format!(
+            "audit-view: RECONSTRUCTED functions in verifier_standalone failed to recompile: {}",
+            e
+        )
+    })?;
+    if ve_rep1.is_exact && ve_recompiled != ve_u16 {
+        return Err(format!(
+            "audit-view: verifier_standalone marked 100% exact but recompile differed ({}w vs {}w)",
+            ve_recompiled.len(),
+            ve_u16.len()
         ));
     }
     checks += 1;
 
-    // 3. B6 miscompile shape: clobbered `v0 = 0;` (`CINT 0`) inside `else` arm before `fn_0(v0, 1024 + p1)`.
-    //    The decompiled view MUST show `v0 = 0;` explicitly and NEVER hide the clobber.
+    // 3. B6 miscompile shape: clobbered `v0 = 0;` (`CINT 0`) inside `else` arm before `v0 + v2`.
+    //    The decompiled view MUST show `v0 = 0;` explicitly, NEVER hide the clobber, and recompile cleanly.
     let tc_safe = pack_tc(false, CAP_ID_PURE);
     let b6_miscompile = pack_fn_module(
         &[],
@@ -1402,12 +1452,21 @@ pub fn selftest_audit_view() -> Result<usize, String> {
         ],
     );
     let b6_rep = decompile_u16_stream_to_m3(&b6_miscompile)?;
-    if !b6_rep.m3_source.contains("v0 = 0;") || !b6_rep.m3_source.contains("v0 + v2") {
+    if !b6_rep.is_exact
+        || !b6_rep.m3_source.contains("v0 = 0;")
+        || !b6_rep.m3_source.contains("v0 + v2")
+    {
         return Err(format!(
-            "audit-view: B6 miscompile view hid the clobbered variable 'v0 = 0;'!\n{}",
+            "audit-view: B6 miscompile view hid the clobbered variable 'v0 = 0;' or was not exact!\n{}",
             b6_rep.m3_source
         ));
     }
+    let _ = compile_omni_surface_to_u16(&b6_rep.m3_source).map_err(|e| {
+        format!(
+            "audit-view: B6 decompiled M3 failed to recompile: {}\n{}",
+            e, b6_rep.m3_source
+        )
+    })?;
     checks += 1;
 
     // 4. Approximate fallback test: irreducible branch / non-surface opcode must be marked APPROXIMATE.
@@ -1470,8 +1529,8 @@ pub fn selftest_audit_view() -> Result<usize, String> {
         || !id_sum.functions_modified.is_empty()
         || id_sum.cap_escalation
         || id_sum.taint_changed
-        || id_sum.ins_delta != 0
-        || id_sum.arena_bytes_delta != 0
+        || id_sum.static_ins_delta != 0
+        || id_sum.static_arena_bytes_delta != 0
     {
         return Err(format!("audit-view: identity diff non-zero:\n{}", id_sum.render_canonical_tsv()));
     }
@@ -1491,14 +1550,14 @@ pub fn selftest_audit_view() -> Result<usize, String> {
     }
     checks += 1;
 
-    // 5e. Budget/arena delta + antisymmetry
-    if s1.arena_bytes_delta != 4096 || s1.mem_budget_delta != 4096 || !s1.hash_changed || s1.functions_modified != vec![0] {
+    // 5e. Static arena/instruction proxy deltas + antisymmetry
+    if s1.static_arena_bytes_delta != 4096 || !s1.hash_changed || s1.functions_modified != vec![0] {
         return Err(format!("audit-view: arena/budget delta wrong:\n{}", s1.render_canonical_tsv()));
     }
     let rev = summarize_proposer_diff(&arena_u16, &base_u16, "arena", "base")?;
     if rev.delta_words != -s1.delta_words
-        || rev.ins_delta != -s1.ins_delta
-        || rev.arena_bytes_delta != -s1.arena_bytes_delta
+        || rev.static_ins_delta != -s1.static_ins_delta
+        || rev.static_arena_bytes_delta != -s1.static_arena_bytes_delta
     {
         return Err(String::from("audit-view: proposer diff summary antisymmetry failed"));
     }
