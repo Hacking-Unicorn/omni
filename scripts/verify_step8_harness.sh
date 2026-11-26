@@ -46,7 +46,7 @@ else
 fi
 
 PATH="$TMP/shim:/usr/bin:/bin" bash scripts/build_pure_driver.sh "$PURE_DIR"
-for f in omnic_pure.elf audit_diff.elf audit_decompile.elf m2_lint.elf audit_view_gate.elf proposer_loop.elf core_gates.elf; do
+for f in omnic_pure.elf audit_diff.elf audit_decompile.elf m2_lint.elf audit_view_gate.elf proposer_loop.elf core_gates.elf extra_gates.elf; do
   if [ -x "$PURE_DIR/$f" ]; then
     pass "built & executable: $PURE_DIR/$f ($(wc -c < "$PURE_DIR/$f") B)"
   else
@@ -55,32 +55,28 @@ for f in omnic_pure.elf audit_diff.elf audit_decompile.elf m2_lint.elf audit_vie
 done
 
 echo "=== [2/5] Full-Text Byte-Identical Gate Differentials (cmp vs Rust ./omni) ==="
-"$PURE_BIN" audit-view > "$TMP/p_av.txt"
-"$RUST_BIN" audit-view > "$TMP/r_av.txt"
-if cmp -s "$TMP/p_av.txt" "$TMP/r_av.txt"; then
-  pass "audit-view full-text 0-byte diff vs Rust ($(cat "$TMP/p_av.txt"))"
-else
-  diff -u "$TMP/r_av.txt" "$TMP/p_av.txt" >&2 || true
-  fail "audit-view text diff vs Rust"
-fi
-
-"$PURE_BIN" proposer-loop > "$TMP/p_pl.txt"
-"$RUST_BIN" proposer-loop > "$TMP/r_pl.txt"
-if cmp -s "$TMP/p_pl.txt" "$TMP/r_pl.txt"; then
-  pass "proposer-loop full-text 0-byte diff vs Rust (10 checks, +1t/0t/-1t verdicts)"
-else
-  diff -u "$TMP/r_pl.txt" "$TMP/p_pl.txt" >&2 || true
-  fail "proposer-loop text diff vs Rust"
-fi
-
-"$PURE_BIN" p2a-syscalls > "$TMP/p_p2a.txt"
-"$RUST_BIN" p2a-syscalls > "$TMP/r_p2a.txt"
-if cmp -s "$TMP/p_p2a.txt" "$TMP/r_p2a.txt"; then
-  pass "p2a-syscalls full-text 0-byte diff vs Rust (7 checks)"
-else
-  diff -u "$TMP/r_p2a.txt" "$TMP/p_p2a.txt" >&2 || true
-  fail "p2a-syscalls text diff vs Rust"
-fi
+for gate in \
+  audit-view \
+  proposer-loop \
+  p2a-syscalls \
+  m2-frozen \
+  m2-fixed-point \
+  b2-pure-verifier \
+  m3-modular \
+  a3-macro-quarantine \
+  b4-pure-launcher \
+  p5-sys \
+  s5-refreeze
+do
+  "$PURE_BIN" "$gate" > "$TMP/p_${gate}.txt"
+  "$RUST_BIN" "$gate" > "$TMP/r_${gate}.txt"
+  if cmp -s "$TMP/p_${gate}.txt" "$TMP/r_${gate}.txt"; then
+    pass "$gate full-text 0-byte diff vs Rust ($(wc -c < "$TMP/p_${gate}.txt") B)"
+  else
+    diff -u "$TMP/r_${gate}.txt" "$TMP/p_${gate}.txt" >&2 || true
+    fail "$gate full-text diff vs Rust"
+  fi
+done
 
 echo "=== [3/5] M2 Lint Differential (Budget Rows 0-Byte Diff + 15/15 Fixtures) ==="
 for pos in spec/m2/lint/pos_clean.omni spec/m2/lint/pos_depth64.omni; do
@@ -107,14 +103,12 @@ for f in spec/m2/lint/*.omni; do
   fi
 done
 
-echo "=== [4/5] Core Pure-Omni Harness Gates & Full Pure Selftest ==="
-for gate in m2-frozen m2-fixed-point b2-pure-verifier selftest; do
-  if "$PURE_BIN" "$gate" >/dev/null; then
-    pass "omnic_pure.elf $gate PASS"
-  else
-    fail "omnic_pure.elf $gate FAIL"
-  fi
-done
+echo "=== [4/5] Pure-Omni Selftest Orchestrator ==="
+if "$PURE_BIN" selftest > "$TMP/p_st.txt" && grep -q 'PURE-HARNESS PASS' "$TMP/p_st.txt"; then
+  pass "omnic_pure.elf selftest PASS ($(tail -n 1 "$TMP/p_st.txt"))"
+else
+  fail "omnic_pure.elf selftest FAIL"
+fi
 
 echo "=== [5/5] Negative Controls (Fail-Closed) ==="
 if "$PURE_BIN" audit-view --inject-broken-decompile >/dev/null 2>&1; then

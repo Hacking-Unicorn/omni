@@ -23,7 +23,7 @@
 include "../link/elf_link.omni";
 include "sys_util.omni";
 
-// Builds `<dir_of_argv0>/<tool_name>\0` for harness tools (tid: 5=m2_lint, 6=audit_view_gate, 7=proposer_loop, 8=core_gates).
+// Builds `<dir_of_argv0>/<tool_name>\0` for harness tools (tid: 5=m2_lint, 6=audit_view_gate, 7=proposer_loop, 8=core_gates, 9=extra_gates).
 #[strict]
 fn od_tool_path_hi(b: bytes, tid: i64) -> bytes {
     let r: bytes = if_pos m2u_eq(tid, 5) <=> 0 {
@@ -34,9 +34,11 @@ fn od_tool_path_hi(b: bytes, tid: i64) -> bytes {
     } else { if_pos m2u_eq(tid, 7) <=> 0 {
         let u: bytes = iset(b, 112, 114, 111, 112, 111, 115, 101, 114, 95, 108, 111, 111, 112, 46, 101, 108);
         iset(u, 102, 0)
-    } else {
+    } else { if_pos m2u_eq(tid, 8) <=> 0 {
         iset(b, 99, 111, 114, 101, 95, 103, 97, 116, 101, 115, 46, 101, 108, 102, 0)
-    } } };
+    } else {
+        iset(b, 101, 120, 116, 114, 97, 95, 103, 97, 116, 101, 115, 46, 101, 108, 102, 0)
+    } } } };
     return r;
 }
 
@@ -474,8 +476,13 @@ fn od_classify_cmd(arena: bytes) -> i64 {
         + (m2u_eq(l, 12) * m2u_eq(c0, 112) * m2u_eq(c1, 50))
         + (m2u_eq(l, 16) * m2u_eq(c0, 98) * m2u_eq(c1, 50))
         + (m2u_eq(l, 8) * m2u_eq(c0, 115) * m2u_eq(c1, 101));
+    let is_eg: i64 = (m2u_eq(l, 10) * m2u_eq(c0, 109) * m2u_eq(c1, 51))
+        + (m2u_eq(l, 19) * m2u_eq(c0, 97) * m2u_eq(c1, 51))
+        + (m2u_eq(l, 16) * m2u_eq(c0, 98) * m2u_eq(c1, 52))
+        + (m2u_eq(l, 6) * m2u_eq(c0, 112) * m2u_eq(c1, 53))
+        + (m2u_eq(l, 11) * m2u_eq(c0, 115) * m2u_eq(c1, 53));
     let is_ver: i64 = (m2u_eq(l, 9) * m2u_eq(c0, 45) * m2u_eq(c1, 45)) + (m2u_eq(l, 2) * m2u_eq(c0, 45) * m2u_eq(c1, 86)) + (m2u_eq(l, 7) * m2u_eq(c0, 118));
-    return (is_c + is_cs) * 1 + is_ce * 2 + is_le * 3 + is_rn * 4 + is_dc * 5 + is_in * 6 + is_ad * 7 + is_ver * 8 + is_ml * 9 + is_av * 10 + is_pl * 11 + is_cg * 12;
+    return (is_c + is_cs) * 1 + is_ce * 2 + is_le * 3 + is_rn * 4 + is_dc * 5 + is_in * 6 + is_ad * 7 + is_ver * 8 + is_ml * 9 + is_av * 10 + is_pl * 11 + is_cg * 12 + is_eg * 13;
 }
 
 // Implements `compile-elf <in.omni|.omni_bc> <out.elf> [a0 a1 a2]`.
@@ -518,9 +525,11 @@ fn od_dispatch_harness(w: bytes, argc: i64, cmd: i64) -> i64 {
         sys_spawn(od_tool_path(w, 7), empty)
     } else { if_pos m2u_eq(cmd, 12) <=> 0 {
         sys_spawn(od_tool_path(w, 8), su_make_cstr(w, su_arg_off(w, 1), su_arg_len(w, 1)))
+    } else { if_pos m2u_eq(cmd, 13) <=> 0 {
+        sys_spawn(od_tool_path(w, 9), su_make_cstr(w, su_arg_off(w, 1), su_arg_len(w, 1)))
     } else {
         2
-    } } } };
+    } } } } };
     return rc;
 }
 

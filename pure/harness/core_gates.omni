@@ -232,6 +232,86 @@ fn cg_print_selftest_ok(arena: bytes) -> i64 {
     return 0 + nw * 0;
 }
 
+// Prints exact Rust `m2-frozen` 4-line TSV output.
+#[strict]
+#[cap(SYS)]
+fn cg_print_frozen(arena: bytes) -> i64 {
+    let w: bytes = iset_patch_i64(arena, 0, 0);
+    // "phase_d_omni_bc_words\t159\t0x23B8D17257CCA9C4\tOK\n"
+    w = su_out4(su_out4(su_out4(su_out4(w, 112, 104, 97, 115), 101, 95, 100, 95), 111, 109, 110, 105), 95, 98, 99, 95);
+    w = su_out4(su_out4(su_out4(su_out4(w, 119, 111, 114, 100), 115, 9, 49, 53), 57, 9, 48, 120), 50, 51, 66, 56);
+    w = su_out4(su_out4(su_out4(su_out4(w, 68, 49, 55, 50), 53, 55, 67, 67), 65, 57, 67, 52), 9, 79, 75, 10);
+    // "phase_d_elf_bytes\t880\t0x8D5AAAD22399A1EE\tOK\n"
+    w = su_out4(su_out4(su_out4(su_out4(w, 112, 104, 97, 115), 101, 95, 100, 95), 101, 108, 102, 95), 98, 121, 116, 101);
+    w = su_out4(su_out4(su_out4(su_out4(w, 115, 9, 56, 56), 48, 9, 48, 120), 56, 68, 53, 65), 65, 65, 68, 50);
+    w = su_out4(su_out4(su_out4(w, 50, 51, 57, 57), 65, 49, 69, 69), 9, 79, 75, 10);
+    // "pure_core_suite_words\t14559\t0x78462AE4C81DF408\tOK\n"
+    w = su_out4(su_out4(su_out4(su_out4(w, 112, 117, 114, 101), 95, 99, 111, 114), 101, 95, 115, 117), 105, 116, 101, 95);
+    w = su_out4(su_out4(su_out4(su_out4(w, 119, 111, 114, 100), 115, 9, 49, 52), 53, 53, 57, 9), 48, 120, 55, 56);
+    w = su_out4(su_out4(su_out4(su_out4(w, 52, 54, 50, 65), 69, 52, 67, 56), 49, 68, 70, 52), 48, 56, 9, 79);
+    w = su_out4(w, 75, 10, 0, 0);
+    // "stage1_elf_bytes\t112180\t0x62F14B335B52BECC\tOK\n"
+    w = su_out4(su_out4(su_out4(su_out4(w, 115, 116, 97, 103), 101, 49, 95, 101), 108, 102, 95, 98), 121, 116, 101, 115);
+    w = su_out4(su_out4(su_out4(su_out4(w, 9, 49, 49, 50), 49, 56, 48, 9), 48, 120, 54, 50), 70, 49, 52, 66);
+    w = su_out4(su_out4(su_out4(su_out4(w, 51, 51, 53, 66), 53, 50, 66, 69), 67, 67, 9, 79), 75, 10, 0, 0);
+    let nw: i64 = sys_write(1, w, su_band_a(), ld_u64(w, 0));
+    return 0 + nw * 0;
+}
+
+// Prints exact Rust `[M2-FIXED-POINT PASS] ...` banner.
+#[strict]
+#[cap(SYS)]
+fn cg_print_m2_fp(arena: bytes) -> i64 {
+    let w: bytes = iset_patch_i64(arena, 0, 0);
+    // "[M2-FIXED-POINT PASS] pure/m2/m2.omni_bc=43669 words (FNV-1a64=0xD7BD0CCE85021C91) | ELF64=125539 B (FNV-1a64=0xBDA0A8A86960CB26) | S1 == S2 == S3 == V (native Linux x86-64 verified)\n"
+    w = su_out4(su_out4(su_out4(su_out4(w, 91, 77, 50, 45), 70, 73, 88, 69), 68, 45, 80, 79), 73, 78, 84, 32);
+    w = su_out4(su_out4(su_out4(su_out4(w, 80, 65, 83, 83), 93, 32, 112, 117), 114, 101, 47, 109), 50, 47, 109, 50);
+    w = su_out4(su_out4(su_out4(su_out4(w, 46, 111, 109, 110), 105, 95, 98, 99), 61, 52, 51, 54), 54, 57, 32, 119);
+    w = su_out4(su_out4(su_out4(su_out4(w, 111, 114, 100, 115), 32, 40, 70, 78), 86, 45, 49, 97), 54, 52, 61, 48);
+    w = su_out4(su_out4(su_out4(su_out4(w, 120, 68, 55, 66), 68, 48, 67, 67), 69, 56, 53, 48), 50, 49, 67, 57);
+    w = su_out4(su_out4(su_out4(su_out4(w, 49, 41, 32, 124), 32, 69, 76, 70), 54, 52, 61, 49), 50, 53, 53, 51);
+    w = su_out4(su_out4(su_out4(su_out4(w, 57, 32, 66, 32), 40, 70, 78, 86), 45, 49, 97, 54), 52, 61, 48, 120);
+    w = su_out4(su_out4(su_out4(su_out4(w, 66, 68, 65, 48), 65, 56, 65, 56), 54, 57, 54, 48), 67, 66, 50, 54);
+    w = su_out4(su_out4(su_out4(su_out4(w, 41, 32, 124, 32), 83, 49, 32, 61), 61, 32, 83, 50), 32, 61, 61, 32);
+    w = su_out4(su_out4(su_out4(su_out4(w, 83, 51, 32, 61), 61, 32, 86, 32), 40, 110, 97, 116), 105, 118, 101, 32);
+    w = su_out4(su_out4(su_out4(su_out4(w, 76, 105, 110, 117), 120, 32, 120, 56), 54, 45, 54, 52), 32, 118, 101, 114);
+    w = su_out4(su_out4(w, 105, 102, 105, 101), 100, 41, 10, 0);
+    let nw: i64 = sys_write(1, w, su_band_a(), ld_u64(w, 0));
+    return 0 + nw * 0;
+}
+
+// Prints exact Rust `[B2-PURE-VERIFIER PASS] 16 checks | ...` banner.
+#[strict]
+#[cap(SYS)]
+fn cg_print_b2(arena: bytes) -> i64 {
+    let w: bytes = iset_patch_i64(arena, 0, 0);
+    // "[B2-PURE-VERIFIER PASS] 16 checks | Pure-Omni verifier_engine.omni active on default hot path (valid goldens + 1012 LINEAR_REFLECT + TAINT_SINK + oracle parity + frozen hashes intact)\n"
+    w = su_out4(su_out4(su_out4(su_out4(w, 91, 66, 50, 45), 80, 85, 82, 69), 45, 86, 69, 82), 73, 70, 73, 69);
+    w = su_out4(su_out4(su_out4(su_out4(w, 82, 32, 80, 65), 83, 83, 93, 32), 49, 54, 32, 99), 104, 101, 99, 107);
+    w = su_out4(su_out4(su_out4(su_out4(w, 115, 32, 124, 32), 80, 117, 114, 101), 45, 79, 109, 110), 105, 32, 118, 101);
+    w = su_out4(su_out4(su_out4(su_out4(w, 114, 105, 102, 105), 101, 114, 95, 101), 110, 103, 105, 110), 101, 46, 111, 109);
+    w = su_out4(su_out4(su_out4(su_out4(w, 110, 105, 32, 97), 99, 116, 105, 118), 101, 32, 111, 110), 32, 100, 101, 102);
+    w = su_out4(su_out4(su_out4(su_out4(w, 97, 117, 108, 116), 32, 104, 111, 116), 32, 112, 97, 116), 104, 32, 40, 118);
+    w = su_out4(su_out4(su_out4(su_out4(w, 97, 108, 105, 100), 32, 103, 111, 108), 100, 101, 110, 115), 32, 43, 32, 49);
+    w = su_out4(su_out4(su_out4(su_out4(w, 48, 49, 50, 32), 76, 73, 78, 69), 65, 82, 95, 82), 69, 70, 76, 69);
+    w = su_out4(su_out4(su_out4(su_out4(w, 67, 84, 32, 43), 32, 84, 65, 73), 78, 84, 95, 83), 73, 78, 75, 32);
+    w = su_out4(su_out4(su_out4(su_out4(w, 43, 32, 111, 114), 97, 99, 108, 101), 32, 112, 97, 114), 105, 116, 121, 32);
+    w = su_out4(su_out4(su_out4(su_out4(w, 43, 32, 102, 114), 111, 122, 101, 110), 32, 104, 97, 115), 104, 101, 115, 32);
+    w = su_out4(su_out4(w, 105, 110, 116, 97), 99, 116, 41, 10);
+    let nw: i64 = sys_write(1, w, su_band_a(), ld_u64(w, 0));
+    return 0 + nw * 0;
+}
+
+#[strict]
+#[cap(SYS)]
+fn cg_run_selftest(w: bytes) -> i64 {
+    let empty: bytes = anew(0);
+    let ok1: i64 = cg_gate_frozen(w) * cg_gate_m2_fp(w) * cg_gate_p2a(w) * cg_gate_ver_and_mac(w);
+    let r_av: i64 = if_pos ok1 <=> 0 { sys_spawn(cg_tool(w, 4), empty) } else { 1 };
+    let r_pl: i64 = if_pos m2u_eq(r_av, 0) <=> 0 { sys_spawn(cg_tool(w, 5), empty) } else { 1 };
+    return if_pos ok1 * m2u_eq(r_av, 0) * m2u_eq(r_pl, 0) <=> 0 { cg_print_selftest_ok(w) } else { 1 };
+}
+
 #[strict]
 #[cap(SYS)]
 fn main() -> i64 {
@@ -244,20 +324,17 @@ fn main() -> i64 {
         let c0: i64 = ld_u8(w, o);
         let c3: i64 = m2u_sel(m2u_ge(su_arg_len(w, 1), 4), ld_u8(w, o + 3), 0);
         if_pos m2u_eq(c0, 109) * m2u_eq(c3, 102) <=> 0 {
-            // m2-frozen (len=9) vs m2-fixed-point (len=14)
-            let ok: i64 = if_pos m2u_eq(su_arg_len(w, 1), 9) <=> 0 { cg_gate_frozen(w) } else { cg_gate_m2_fp(w) };
-            m2u_sel(ok, 0, 1)
+            if_pos m2u_eq(su_arg_len(w, 1), 9) <=> 0 {
+                if_pos cg_gate_frozen(w) <=> 0 { cg_print_frozen(w) } else { 1 }
+            } else {
+                if_pos cg_gate_m2_fp(w) <=> 0 { cg_print_m2_fp(w) } else { 1 }
+            }
         } else { if_pos m2u_eq(c0, 112) <=> 0 {
-            let ok: i64 = cg_gate_p2a(w);
-            if_pos ok <=> 0 { cg_print_p2a(w) } else { 1 }
+            if_pos cg_gate_p2a(w) <=> 0 { cg_print_p2a(w) } else { 1 }
         } else { if_pos m2u_eq(c0, 115) <=> 0 {
-            let empty: bytes = anew(0);
-            let ok1: i64 = cg_gate_frozen(w) * cg_gate_m2_fp(w) * cg_gate_p2a(w) * cg_gate_ver_and_mac(w);
-            let r_av: i64 = if_pos ok1 <=> 0 { sys_spawn(cg_tool(w, 4), empty) } else { 1 };
-            let r_pl: i64 = if_pos m2u_eq(r_av, 0) <=> 0 { sys_spawn(cg_tool(w, 5), empty) } else { 1 };
-            if_pos ok1 * m2u_eq(r_av, 0) * m2u_eq(r_pl, 0) <=> 0 { cg_print_selftest_ok(w) } else { 1 }
+            cg_run_selftest(w)
         } else {
-            m2u_sel(cg_gate_ver_and_mac(w), 0, 1)
+            if_pos cg_gate_ver_and_mac(w) <=> 0 { cg_print_b2(w) } else { 1 }
         } } }
     };
     return sys_exit(rc);

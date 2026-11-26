@@ -127,5 +127,6 @@ build_pure_elf "pure/harness/m2_lint.omni"         "m2_lint.elf"
 build_pure_elf "pure/harness/audit_view_gate.omni" "audit_view_gate.elf"
 build_pure_elf "pure/harness/proposer_loop.omni"   "proposer_loop.elf"
 build_pure_elf "pure/harness/core_gates.omni"      "core_gates.elf"
+build_pure_elf "pure/harness/extra_gates.omni"     "extra_gates.elf"
 
 echo "[PURE-BUILD PASS] Built Pure-Omni driver, audit, & harness toolchain in $OUT_DIR with ZERO rustc/cargo/Python."
