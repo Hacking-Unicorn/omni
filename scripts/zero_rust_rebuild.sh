@@ -3,16 +3,19 @@
 # OMNI SEED-SHRINK (PHASE C1) + PHASE 2a — LITERAL ZERO-RUST RELEASE GATE
 # `scripts/zero_rust_rebuild.sh`
 # ==============================================================================
-# Proves that with `rustc` and `cargo` completely absent from PATH:
-#   1. All committed Pure-Omni seeds (`m3.omni_bc`, `m2.omni_bc`, `m4.omni_bc`)
-#      verify bit-exact and pass every Pure-Omni self-host / fixed-point / P7 gate.
-#   2. Phase 2a Literal Zero-Rust Native Toolchain Chain runs with ZERO Rust
-#      processes in the loop: native Pure-Omni `m2.elf` rebuilds itself bit-exact
-#      (`m2.elf == m2_gen2.elf`), rebuilds `m4.elf`, `verifier.elf`, `mod_parse.elf`,
-#      `m3_standalone.elf`, and `elf_link.elf`; then native `m3.elf` + `verifier.elf`
-#      + `m4.elf` + `m2.elf` compile, verify, and execute both `weighted_diff_pure_golden.omni`
-#      and `pure/m5/zero_rust_driver.omni` (raw `0F 05` syscalls: `sys_open`/`sys_write`/
-#      `sys_read`/`sys_close`/`sys_spawn`/`sys_exit` + OOB trap) directly on Linux x86-64.
+# Two-phase rebuild proof:
+#   Phase 1 (Stage-0 host bootstrap): build `./omni`, `./omni-seed0`, and
+#     `./omni-dev-host` once with `rustc` via `bash scripts/bootstrap_stage0.sh`.
+#   Phase 2 (this script): strip `rustc` and `cargo` from PATH and prove that:
+#     1. All committed Pure-Omni seeds (`m3.omni_bc`, `m2.omni_bc`, `m4.omni_bc`)
+#        verify bit-exact and pass every Pure-Omni self-host / fixed-point / P7 gate.
+#     2. Phase 2a Literal Zero-Rust Native Toolchain Chain runs with ZERO Rust
+#        processes in the loop: native Pure-Omni `m2.elf` rebuilds itself bit-exact
+#        (`m2.elf == m2_gen2.elf`), rebuilds `m4.elf`, `verifier.elf`, `mod_parse.elf`,
+#        `m3_standalone.elf`, and `elf_link.elf`; then native `m3.elf` + `verifier.elf`
+#        + `m4.elf` + `m2.elf` compile, verify, and execute both `weighted_diff_pure_golden.omni`
+#        and `pure/m5/zero_rust_driver.omni` (raw `0F 05` syscalls: `sys_open`/`sys_write`/
+#        `sys_read`/`sys_close`/`sys_spawn`/`sys_exit` + OOB trap) directly on Linux x86-64.
 # ==============================================================================
 set -euo pipefail
 
@@ -22,6 +25,13 @@ if command -v rustc >/dev/null 2>&1 || command -v cargo >/dev/null 2>&1; then
   echo "[C1 FAIL] rustc or cargo is still reachable on PATH" >&2
   exit 1
 fi
+
+for bin in ./omni ./omni-seed0 ./omni-dev-host; do
+  if [ ! -x "$bin" ]; then
+    echo "[C1 PREREQ FAIL] Missing Stage-0 host binary '$bin'. Run 'bash scripts/bootstrap_stage0.sh' once (with rustc) before running 'scripts/zero_rust_rebuild.sh'." >&2
+    exit 1
+  fi
+done
 
 echo "[C1] Verified rustc/cargo absent from PATH ($PATH)"
 

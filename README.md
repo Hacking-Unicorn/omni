@@ -73,6 +73,8 @@ Hash-pinned native toolchain ELFs used by the default Pure-Omni path (`host_runt
 | `m4.elf` | 91,576 B | `0xFBA8272337B1BAC4` | `pure/m4/m4_standalone.omni_bc` (`pure/m4/m4.omni_bc` + 31-arg standalone entry) |
 | `verifier.elf` | 37,907 B | `0x2ECD2CE3DCB69346` | `pure/verifier_standalone.omni_bc` (15,402 words, `0xFF327F8976741D20`; `pure/verifier_engine.omni` + standalone entry) |
 
+> **Note on the two `125,539`-B `m2.elf` hashes:** `m2-fixed-point` builds `m2.elf` via the hosted S-stage route (`0xBDA0A8A86960CB26`, `S1 == S2 == S3 == V`), while the pinned native `m2.elf` above (`NATIVE_M2_ELF_FNV`, `0x0A5CD5B55707AA0D`) is the gen2 self-hosted artifact (`m2.elf` compiling its own seed with default CLI args `0, 0, 0`), reproduced bit-exact by `scripts/zero_rust_rebuild.sh` (which verifies the two-phase flow: `bash scripts/bootstrap_stage0.sh` builds the Stage-0 host binaries once with `rustc`, then `PATH=/usr/bin:/bin bash scripts/zero_rust_rebuild.sh` runs the proof with `rustc`/`cargo` stripped from `PATH`). Each artifact is verified by its own gate.
+
 ## Repository layout
 
 - `omni_rust_bootstrap.rs` — Standalone Stage-0 monolith (`rustc -O omni_rust_bootstrap.rs -o omnic`, zero warnings).
