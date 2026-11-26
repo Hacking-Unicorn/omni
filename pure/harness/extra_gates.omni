@@ -83,9 +83,9 @@ fn eg_gate_m3_modular(arena: bytes) -> i64 {
     p_el = iset(p_el, 110, 107, 46, 111, 109, 110, 105, 95, 98, 99, 0);
     let n_el: i64 = su_read_file_into(arena, p_el, su_band_b(), 250000);
     let n_m3: i64 = su_read_file_into(arena, eg_tool(arena, 0), su_band_b(), 250000);
-    let h_m3: i64 = m2u_sel(m2u_eq(n_m3, 206946), su_fnv1a64(arena, su_band_b(), n_m3), 0);
-    let want_m3: i64 = (36093 << 48) | (38712 << 32) | (29642 << 16) | 65350;
-    let ok: i64 = m2u_eq(n_mp, 84530) * m2u_eq(n_ms, 52446) * m2u_eq(n_el, 7164) * m2u_eq(h_m3, want_m3);
+    let h_m3: i64 = m2u_sel(m2u_eq(n_m3, 207015), su_fnv1a64(arena, su_band_b(), n_m3), 0);
+    let want_m3: i64 = (29591 << 48) | (42242 << 32) | (2197 << 16) | 44735;
+    let ok: i64 = m2u_eq(n_mp, 84530) * m2u_eq(n_ms, 52498) * m2u_eq(n_el, 7164) * m2u_eq(h_m3, want_m3);
     let r: i64 = if_pos ok <=> 0 {
         let w: bytes = iset_patch_i64(arena, 0, 0);
         // "[M3-MODULAR PASS] 13 checks | mod_parse (42265 w) + m3_standalone (26223 w) + elf_link (3582 w) all < 65536 w | Pure-Omni linked m3.elf (206946 B, 0x8CFD973873CAFF46) 0-word diff on all 6 pure/programs/*\n"

@@ -81,17 +81,20 @@ fn p7g_measure_once(w: bytes, path_cstr: bytes) -> bytes {
     let nw: i64 = su_write_file_from(u, sh_p, su_band_a(), ld_u64(u, 0), 493);
     let sh_bin: bytes = anew(0);
     sh_bin = iset(sh_bin, 47, 98, 105, 110, 47, 115, 104, 0);
+    let t0: i64 = sys_clock_ns();
     let rc: i64 = if_pos m2u_ge(nw, 1) <=> 0 { su_spawn_capture(sh_bin, sh_p, p7g_tmp(111), 420) } else { 1 };
+    let t1: i64 = sys_clock_ns();
+    let dt_us: i64 = (t1 - t0) / 1000;
     let nb_bc: i64 = if_pos m2u_eq(rc, 0) <=> 0 { su_read_file_into(u, bc_p, su_band_b(), 250000) } else { 0 - 1 };
     let nb_elf: i64 = if_pos m2u_ge(nb_bc, 4) <=> 0 { su_read_file_into(u, elf_p, su_band_b(), 250000) } else { 0 - 1 };
     let ok: i64 = m2u_eq(rc, 0) * m2u_ge(nb_bc, 4) * m2u_ge(nb_elf, 120);
     let fnv: i64 = if_pos ok <=> 0 { su_fnv1a64(u, su_band_b(), nb_elf) } else { 0 };
     let u2: bytes = iset_patch_i64(iset_patch_i64(u, 160, m2u_sel(ok, nb_bc >> 1, 0 - 1)), 168, m2u_sel(ok, nb_elf, 0 - 1));
-    return iset_patch_i64(u2, 176, fnv);
+    return iset_patch_i64(iset_patch_i64(u2, 176, fnv), 192, dt_us);
 }
 
 // Runs 5 sequential measurements of `path_cstr`, asserts 0-variance on `bc_words` & `elf_bytes`.
-// Stores `ok` (1/0) at `w[184]`, `bc_words` at `w[160]`, `elf_bytes` at `w[168]`, `fnv` at `w[176]`.
+// Stores `ok` (1/0) at `w[184]`, `bc_words` at `w[160]`, `elf_bytes` at `w[168]`, `fnv` at `w[176]`, `avg_us` at `w[192]`.
 #[strict]
 #[cap(SYS)]
 fn p7g_measure_5runs(w: bytes, path_cstr: bytes) -> bytes {
@@ -99,32 +102,35 @@ fn p7g_measure_5runs(w: bytes, path_cstr: bytes) -> bytes {
     let w0: i64 = ld_u64(u, 160);
     let e0: i64 = ld_u64(u, 168);
     let f0: i64 = ld_u64(u, 176);
+    let sum_us: i64 = ld_u64(u, 192);
     let ok: i64 = m2u_ge(w0, 2) * m2u_ge(e0, 120);
     let r: i64 = 1;
     while 5 - r <=> 0 {
         u = if_pos ok <=> 0 { p7g_measure_once(u, path_cstr) } else { u };
         ok = ok * m2u_eq(ld_u64(u, 160), w0) * m2u_eq(ld_u64(u, 168), e0) * m2u_eq(ld_u64(u, 176), f0);
+        sum_us = sum_us + ld_u64(u, 192);
         r = r + 1;
     }
     u = iset_patch_i64(iset_patch_i64(u, 160, w0), 168, e0);
-    return iset_patch_i64(iset_patch_i64(u, 176, f0), 184, ok);
+    return iset_patch_i64(iset_patch_i64(iset_patch_i64(u, 176, f0), 184, ok), 192, sum_us / 5);
 }
 
-// Appends a measurement row `<path>\t<bc_words>\t<elf_bytes>\t<fnv>\tvar=0\n` into Band A output cursor.
+// Appends a measurement row `<path>\t<bc_words>\t<elf_bytes>\t<fnv>\t<us>us\tvar=0\n` into Band A output cursor.
 #[strict]
-fn p7g_append_row(w: bytes, path_cstr: bytes, bw: i64, be: i64, fnv: i64) -> bytes {
+fn p7g_append_row(w: bytes, path_cstr: bytes, bw: i64, be: i64, fnv: i64, avg_us: i64) -> bytes {
     let u: bytes = p7g_out_cstr(w, path_cstr);
     u = su_out_u8(u, 9);
     u = su_out_u8(su_out_i64(u, bw), 9);
     u = su_out_u8(su_out_i64(u, be), 9);
     u = su_out_u8(su_out_hex(u, fnv, 16), 9);
+    u = su_out4(su_out_i64(u, avg_us), 117, 115, 9, 0);
     return su_out4(su_out4(u, 118, 97, 114, 61), 48, 10, 0, 0);
 }
 
 #[strict]
 #[cap(SYS)]
 fn p7g_emit_row(w: bytes, path_cstr: bytes) -> i64 {
-    let u: bytes = p7g_append_row(iset_patch_i64(w, 0, 0), path_cstr, ld_u64(w, 160), ld_u64(w, 168), ld_u64(w, 176));
+    let u: bytes = p7g_append_row(iset_patch_i64(w, 0, 0), path_cstr, ld_u64(w, 160), ld_u64(w, 168), ld_u64(w, 176), ld_u64(w, 192));
     let nw: i64 = sys_write(1, u, su_band_a(), ld_u64(u, 0));
     return 0 + nw * 0;
 }
@@ -178,18 +184,18 @@ fn p7g_cmd_measure(w: bytes, argc: i64) -> i64 {
         p4 = iset(p4, 112, 117, 114, 101, 47, 109, 53, 47, 122, 101, 114, 111, 95, 114, 117, 115);
         p4 = iset(p4, 116, 95, 100, 114, 105, 118, 101, 114, 46, 111, 109, 110, 105, 0);
         let u1: bytes = p7g_measure_5runs(w, p1);
-        let w1: i64 = ld_u64(u1, 160); let e1: i64 = ld_u64(u1, 168); let f1: i64 = ld_u64(u1, 176); let ok1: i64 = ld_u64(u1, 184);
+        let w1: i64 = ld_u64(u1, 160); let e1: i64 = ld_u64(u1, 168); let f1: i64 = ld_u64(u1, 176); let t1: i64 = ld_u64(u1, 192); let ok1: i64 = ld_u64(u1, 184);
         let u2: bytes = p7g_measure_5runs(u1, p2);
-        let w2: i64 = ld_u64(u2, 160); let e2: i64 = ld_u64(u2, 168); let f2: i64 = ld_u64(u2, 176); let ok2: i64 = ok1 * ld_u64(u2, 184);
+        let w2: i64 = ld_u64(u2, 160); let e2: i64 = ld_u64(u2, 168); let f2: i64 = ld_u64(u2, 176); let t2: i64 = ld_u64(u2, 192); let ok2: i64 = ok1 * ld_u64(u2, 184);
         let u3: bytes = p7g_measure_5runs(u2, p3);
-        let w3: i64 = ld_u64(u3, 160); let e3: i64 = ld_u64(u3, 168); let f3: i64 = ld_u64(u3, 176); let ok3: i64 = ok2 * ld_u64(u3, 184);
+        let w3: i64 = ld_u64(u3, 160); let e3: i64 = ld_u64(u3, 168); let f3: i64 = ld_u64(u3, 176); let t3: i64 = ld_u64(u3, 192); let ok3: i64 = ok2 * ld_u64(u3, 184);
         let u4: bytes = p7g_measure_5runs(u3, p4);
-        let w4: i64 = ld_u64(u4, 160); let e4: i64 = ld_u64(u4, 168); let f4: i64 = ld_u64(u4, 176); let ok4: i64 = ok3 * ld_u64(u4, 184);
+        let w4: i64 = ld_u64(u4, 160); let e4: i64 = ld_u64(u4, 168); let f4: i64 = ld_u64(u4, 176); let t4: i64 = ld_u64(u4, 192); let ok4: i64 = ok3 * ld_u64(u4, 184);
         if_pos ok4 <=> 0 {
-            let b: bytes = p7g_append_row(iset_patch_i64(u4, 0, 0), p1, w1, e1, f1);
-            b = p7g_append_row(b, p2, w2, e2, f2);
-            b = p7g_append_row(b, p3, w3, e3, f3);
-            b = p7g_append_row(b, p4, w4, e4, f4);
+            let b: bytes = p7g_append_row(iset_patch_i64(u4, 0, 0), p1, w1, e1, f1, t1);
+            b = p7g_append_row(b, p2, w2, e2, f2, t2);
+            b = p7g_append_row(b, p3, w3, e3, f3, t3);
+            b = p7g_append_row(b, p4, w4, e4, f4, t4);
             b = su_out4(su_out4(su_out4(su_out4(b, 91, 80, 55, 45), 77, 69, 65, 83), 85, 82, 69, 32), 80, 65, 83, 83);
             b = su_out4(su_out4(su_out4(su_out4(b, 93, 32, 52, 32), 116, 97, 114, 103), 101, 116, 115, 32), 124, 32, 53, 32);
             b = su_out4(su_out4(su_out4(su_out4(b, 114, 117, 110, 115), 32, 124, 32, 48), 45, 118, 97, 114), 10, 0, 0, 0);

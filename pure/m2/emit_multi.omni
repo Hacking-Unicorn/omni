@@ -1156,7 +1156,28 @@ fn m2m_emit_sys_spawn(arena: bytes, p1: i64, p2: i64, d: i64, pass: i64) -> byte
     return m2m_store_rax(w, d);
 }
 
-// Phase 2a: dispatches `0x7F73` Linux x86-64 syscall intrinsics (kind 0..5).
+// Step 11b: emits raw Linux x86-64 `sys_clock_ns()` (`kind` = 6, 0 args;
+// `clock_gettime(CLOCK_MONOTONIC=1, &ts)` syscall 228 -> `tv_sec * 1_000_000_000 + tv_nsec`).
+#[strict]
+fn m2m_emit_sys_clock(arena: bytes, d: i64) -> bytes {
+    let w: bytes = m2x_b4(arena, 72, 131, 236, 16);         // 48 83 EC 10 (sub rsp, 16)
+    w = m2a_emit_u8(w, 191);                                // BF (mov edi, 1 = CLOCK_MONOTONIC)
+    w = m2a_emit_u32(w, 1);
+    w = m2x_b3(w, 72, 137, 230);                            // 48 89 E6 (mov rsi, rsp)
+    w = m2a_emit_u8(w, 184);                                // B8 (mov eax, 228 = __NR_clock_gettime)
+    w = m2a_emit_u32(w, 228);
+    w = m2x_b4(w, 65, 83, 15, 5);                           // 41 53 0F 05 (push r11; syscall)
+    w = m2a_emit_u16(w, 23361);                             // 41 5B (pop r11)
+    w = m2x_b4(w, 72, 139, 4, 36);                          // 48 8B 04 24 (mov rax, [rsp] = tv_sec)
+    w = m2x_b3(w, 72, 105, 192);                            // 48 69 C0 (imul rax, rax, 1000000000)
+    w = m2a_emit_u32(w, 1000000000);
+    w = m2x_b4(w, 72, 3, 68, 36);                           // 48 03 44 24 08 (add rax, [rsp+8] = tv_nsec)
+    w = m2a_emit_u8(w, 8);
+    w = m2x_b4(w, 72, 131, 196, 16);                        // 48 83 C4 10 (add rsp, 16)
+    return m2m_store_rax(w, d);
+}
+
+// Phase 2a + Step 11b: dispatches `0x7F73` Linux x86-64 syscall intrinsics (kind 0..6).
 #[strict]
 fn m2m_emit_syscall(arena: bytes, arr: array, n: i64, p0: i64, p1: i64, p2: i64, p3: i64, d: i64, pass: i64) -> bytes {
     let kind: i64 = m2d_uval(p0);
@@ -1165,6 +1186,7 @@ fn m2m_emit_syscall(arena: bytes, arr: array, n: i64, p0: i64, p1: i64, p2: i64,
     let c_open: trit = m2u_eq(kind, 2) <=> 0;
     let c_ce: trit = m2u_in(kind, 3, 4) <=> 0;
     let c_sp: trit = m2u_eq(kind, 5) <=> 0;
+    let c_clk: trit = m2u_eq(kind, 6) <=> 0;
     let r1: bytes = if_pos c_rw {
         let t: bytes = m2m_load_op(arena, p2, 0);
         t = m2x_b3(t, 73, 137, 192);                        // 49 89 C0
@@ -1236,7 +1258,8 @@ fn m2m_emit_syscall(arena: bytes, arr: array, n: i64, p0: i64, p1: i64, p2: i64,
         r2
     };
     let r4: bytes = if_pos c_sp { m2m_emit_sys_spawn(r3, p1, p2, d, pass) } else { r3 };
-    return r4;
+    let r5: bytes = if_pos c_clk { m2m_emit_sys_clock(r4, d) } else { r4 };
+    return r5;
 }
 
 // Dispatches one instruction in multi-mode.

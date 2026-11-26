@@ -134,12 +134,12 @@ fn pl_stage0_guard(arena: bytes) -> i64 {
     p_jdg = iset(p_jdg, 112, 117, 114, 101, 47, 109, 55, 47, 106, 117, 100, 103, 101, 46, 111, 109);
     p_jdg = iset(p_jdg, 110, 105, 0);
     let hj: i64 = pl_hash_file(arena, p_jdg);
-    // Check pure/m2/m2.omni_bc = 0xD7BD0CCE85021C91
+    // Check pure/m2/m2.omni_bc = 0x74FB1652CC0E974B (Step 11b sys_clock_ns)
     let p_m2: bytes = anew(0);
     p_m2 = iset(p_m2, 112, 117, 114, 101, 47, 109, 50, 47, 109, 50, 46, 111, 109, 110, 105, 95);
     p_m2 = iset(p_m2, 98, 99, 0);
     let hm2: i64 = pl_hash_file(arena, p_m2);
-    let want_m2: i64 = (55229 << 48) | (3278 << 32) | (34050 << 16) | 7313;
+    let want_m2: i64 = (29947 << 48) | (5714 << 32) | (52238 << 16) | 38731;
     return m2u_eq(hv, want_v) * (1 - m2u_eq(hj, 0)) * m2u_eq(hm2, want_m2);
 }
 

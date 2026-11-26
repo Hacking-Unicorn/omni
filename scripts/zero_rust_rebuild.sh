@@ -57,11 +57,11 @@ LC_ALL=C od -An -tu1 -v pure/m5/pure_build_util.omni | LC_ALL=C awk '{for(i=1;i<
 chmod +x "$TMP/pure_build_util.elf"
 
 for spec in \
-  "bootstrap/m2.elf:125539:0x0A5CD5B55707AA0D" \
-  "bootstrap/m3.elf:206946:0x8CFD973873CAFF46" \
-  "pure/m2/m2.omni_bc:87338:0xD7BD0CCE85021C91" \
+  "bootstrap/m2.elf:126152:0xAA5F84B6AA45BB51" \
+  "bootstrap/m3.elf:207015:0x7397A5020895AEBF" \
+  "pure/m2/m2.omni_bc:87836:0x74FB1652CC0E974B" \
   "pure/m3/m3.omni_bc:132498:0x0E3052A4BE00D599" \
-  "pure/m3/m3_standalone.omni_bc:52446:0x8AA3B45FE1319A64" \
+  "pure/m3/m3_standalone.omni_bc:52498:0xD83FBCA0D2E8FA78" \
   "pure/m3/mod_parse.omni_bc:84530:0x0F581C62270F2863" \
   "pure/link/elf_link.omni_bc:7164:0x5F261D791F65ED2A" \
   "pure/m4/m4.omni_bc:56124:0x0561704B3E50EFAC" \

@@ -12,16 +12,16 @@ All committed bootstrap artifacts and their pinned byte sizes and FNV-1a64 hashe
 
 | Artifact | Size (B) | FNV-1a64 | Role |
 |---|---:|---|---|
-| `bootstrap/m2.elf` | `125,539` | `0x0A5CD5B55707AA0D` | Pure-Omni M2 x86-64 ELF64 compiler (`S1 == S2 == S3 == bootstrap/m2.elf`) |
-| `bootstrap/m3.elf` | `206,946` | `0x8CFD973873CAFF46` | Pure-Omni M3 surface `.omni` → `.omni_bc` frontend (rebuilt bit-exact via `link-elf`) |
+| `bootstrap/m2.elf` | `126,152` | `0xAA5F84B6AA45BB51` | Pure-Omni M2 x86-64 ELF64 compiler (`S1 == S2 == S3 == bootstrap/m2.elf`, incl. `sys_clock_ns`) |
+| `bootstrap/m3.elf` | `207,015` | `0x7397A5020895AEBF` | Pure-Omni M3 surface `.omni` → `.omni_bc` frontend (rebuilt bit-exact via `link-elf`) |
 
 ### Committed `.omni_bc` Bytecode Seeds (`pure/`)
 
 | Seed Artifact | Size (B) | Words | FNV-1a64 | Rebuilt Artifact |
 |---|---:|---:|---|---|
-| `pure/m2/m2.omni_bc` | `87,338` | `43,669` | `0xD7BD0CCE85021C91` | `m2.elf` (`125,539` B, `0x0A5CD5B55707AA0D`; `m2-fixed-point` hosted `0xBDA0A8A86960CB26`, `S1 == S2 == S3 == V`) |
+| `pure/m2/m2.omni_bc` | `87,836` | `43,918` | `0x74FB1652CC0E974B` | `m2.elf` (`126,152` B, `0xAA5F84B6AA45BB51`, `S1 == S2 == S3 == bootstrap/m2.elf`) |
 | `pure/m3/m3.omni_bc` | `132,498` | `66,249` | `0x0E3052A4BE00D599` | Monolithic M3 frontend fixed-point reference |
-| `pure/m3/m3_standalone.omni_bc` | `52,446` | `26,223` | `0x8AA3B45FE1319A64` | Modular M3 part 1 (linked into `m3.elf`) |
+| `pure/m3/m3_standalone.omni_bc` | `52,498` | `26,249` | `0xD83FBCA0D2E8FA78` | Modular M3 part 1 (linked into `m3.elf`) |
 | `pure/m3/mod_parse.omni_bc` | `84,530` | `42,265` | `0x0F581C62270F2863` | Modular M3 part 2 (linked into `m3.elf`) |
 | `pure/link/elf_link.omni_bc` | `7,164` | `3,582` | `0x5F261D791F65ED2A` | Pure-Omni ELF64 linker (`elf_link.elf`, `10,971` B; rebuilt bit-exact from `pure/link/elf_link.omni`) |
 | `pure/m4/m4.omni_bc` | `56,124` | `28,062` | `0x0561704B3E50EFAC` | Pure-Omni M4 VM (`90,402` B ELF64, `0xB43AFBB0DED59488`) |

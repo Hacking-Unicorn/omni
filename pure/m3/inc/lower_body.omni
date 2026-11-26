@@ -591,7 +591,7 @@ fn m3w_emit_call_done(arena: bytes, src: array, nid: i64, treg: i64, arg_base: i
     return r;
 }
 
-// Classifies Phase 2a Linux x86-64 syscall intrinsics (0=none, 1=sys_read..6=sys_spawn).
+// Classifies Phase 2a + Step 11b Linux x86-64 syscall intrinsics (0=none, 1=sys_read..6=sys_spawn, 7=sys_clock_ns).
 #[strict]
 fn m3w_sys_cls(hlow: i64) -> i64 {
     return m2u_eq(hlow, 2079304479) * 1
@@ -599,7 +599,8 @@ fn m3w_sys_cls(hlow: i64) -> i64 {
         + m2u_eq(hlow, 1176470999) * 3
         + m2u_eq(hlow, 1138020337) * 4
         + m2u_eq(hlow, 773572539) * 5
-        + m2u_eq(hlow, 504962702) * 6;
+        + m2u_eq(hlow, 504962702) * 6
+        + m2u_eq(hlow, 619781131) * 7;
 }
 
 // Emits Phase 2a syscall intrinsic `scls` (1..6) as `0x7F73 TY_I64 TC_BASE imm(kind) args...`.

@@ -50,8 +50,8 @@ verify_pin() {
 }
 
 # 2. Verify committed bootstrap binaries against bootstrap/MANIFEST.md pins.
-verify_pin "$BOOT_M2" 125539 0x0A5CD5B55707AA0D
-verify_pin "$BOOT_M3" 206946 0x8CFD973873CAFF46
+verify_pin "$BOOT_M2" 126152 0xAA5F84B6AA45BB51
+verify_pin "$BOOT_M3" 207015 0x7397A5020895AEBF
 
 # 3. Rebuild m2.elf through 3 generations (S1 == S2 == S3 == bootstrap/m2.elf).
 "$BOOT_M2" pure/m2/m2.omni_bc > "$TMP/m2_s1.elf"
@@ -63,8 +63,8 @@ chmod +x "$OUT_DIR/m2.elf"
 cmp "$BOOT_M2" "$TMP/m2_s1.elf"
 cmp "$TMP/m2_s1.elf" "$TMP/m2_s2.elf"
 cmp "$TMP/m2_s2.elf" "$OUT_DIR/m2.elf"
-verify_pin "$OUT_DIR/m2.elf" 125539 0x0A5CD5B55707AA0D
-echo "[PURE-BUILD] m2.elf fixed point S1 == S2 == S3 == bootstrap/m2.elf (125539 B, 0x0A5CD5B55707AA0D)"
+verify_pin "$OUT_DIR/m2.elf" 126152 0xAA5F84B6AA45BB51
+echo "[PURE-BUILD] m2.elf fixed point S1 == S2 == S3 == bootstrap/m2.elf (126152 B, 0xAA5F84B6AA45BB51)"
 
 # 4. Rebuild m4.elf and verifier.elf from committed .omni_bc seeds via freshly built m2.elf.
 "$OUT_DIR/m2.elf" pure/m4/m4_standalone.omni_bc > "$OUT_DIR/m4.elf"
@@ -174,7 +174,7 @@ build_pure_elf "pure/harness/p7_gates.omni"        "p7_gates.elf"
 cmp "$BOOT_M3" "$TMP/m3_rebuilt.elf"
 cp "$TMP/m3_rebuilt.elf" "$OUT_DIR/m3.elf"
 chmod +x "$OUT_DIR/m3.elf"
-verify_pin "$OUT_DIR/m3.elf" 206946 0x8CFD973873CAFF46
-echo "[PURE-BUILD] m3.elf rebuilt via Pure-Omni link-elf == bootstrap/m3.elf (206946 B, 0x8CFD973873CAFF46)"
+verify_pin "$OUT_DIR/m3.elf" 207015 0x7397A5020895AEBF
+echo "[PURE-BUILD] m3.elf rebuilt via Pure-Omni link-elf == bootstrap/m3.elf (207015 B, 0x7397A5020895AEBF)"
 
 echo "[PURE-BUILD PASS] Built complete Pure-Omni toolchain, driver, audit, & harness in $OUT_DIR with ZERO rustc/cargo/Python."

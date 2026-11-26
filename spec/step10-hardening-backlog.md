@@ -38,6 +38,7 @@ Every friction, stall, ambiguity, or tooling gap surfaced during the first live 
 - **What it blocked:**
   - **Stage 3 (5-Run Timing Measure):** Pure-Omni binaries (`proposer_loop.elf`, `p7-measure`) cannot measure `compile_us`, `emit_us`, or `vm_us` natively without shelling out to `/usr/bin/date` or an external wrapper.
 - **Remediation:** Add a `sys_clock_ns()` intrinsic (Linux x86-64 `clock_gettime(CLOCK_MONOTONIC, &ts)`, syscall 228) under `#[cap(SYS)]` (note: touches `m2.elf` — must be its own dedicated judge-reviewed PR with fixed-point proof).
+- **Resolution (Step 11b — RESOLVED):** Added `sys_clock_ns()` (`kind=6`, raw `0F 05` Linux x86-64 `clock_gettime(CLOCK_MONOTONIC)` syscall 228 under `#[cap(SYS)]`) in `pure/m2/emit_multi.omni` and `pure/m3/inc/lower_body.omni`; re-pinned `bootstrap/m2.elf` (`126,152 B`, `0xAA5F84B6AA45BB51`, `S1==S2==S3`), `bootstrap/m3.elf` (`207,015 B`, `0x7397A5020895AEBF`), `pure/m2/m2.omni_bc` (`87,836 B`, `0x74FB1652CC0E974B`), and `pure/m3/m3_standalone.omni_bc` (`52,498 B`, `0xD83FBCA0D2E8FA78`); wired native `compile_us` timing into `p7_gates.omni` and `proposer_live.omni`, retiring the Step 11 `EXTERNAL`-timing interim rule.
 
 ### 5. Stage 0 TCB deny-list guard (`pl_stage0_guard`) only hashes 3 files and has no path-allowlist enforcement
 - **Where:** `pure/harness/proposer_loop.omni:124-144`.
