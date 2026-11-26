@@ -9945,11 +9945,14 @@ pub fn explain_omni_error_code(code: &str) -> Option<String> {
     ))
 }
 
-/// CLI handler for `omni inspect <file.omni | file.omni_bc | "inline source">` and `omni disasm ...`.
+/// CLI handler for `omni inspect [--m3] <file.omni | file.omni_bc | "inline source">` and `omni disasm ...`.
 pub fn run_omni_inspect_cli(argv: &[String]) -> i32 {
     if argv.is_empty() {
-        eprintln!("usage: omni inspect <file.omni | file.omni_bc | \"source\">");
+        eprintln!("usage: omni inspect [--m3] <file.omni | file.omni_bc | \"source\">");
         return 2;
+    }
+    if argv[0] == "--m3" {
+        return run_omni_decompile_cli(&argv[1..]);
     }
     let target = &argv[0];
     if target.ends_with(".omni_bc") && std::path::Path::new(target).is_file() {
@@ -24513,6 +24516,7 @@ pub fn run_m2_foundation_selftests() -> Result<usize, String> {
         ("s4_honesty", selftest_s4_honesty),
         ("s3_perf", selftest_s3_performance),
         ("m3_modular", selftest_m3_modular),
+        ("audit_view", selftest_audit_view),
         ("s5_refreeze", selftest_s5_refreeze),
         ("s6_cleanup", selftest_s6_cleanup),
         ("b4_pure_launcher", selftest_b4_pure_launcher_count),
@@ -25133,6 +25137,19 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
                 1
             }
         },
+        "audit-view" => match selftest_audit_view() {
+            Ok(n) => {
+                println!(
+                    "[AUDIT-VIEW PASS] {} checks | M3 decompiler byte-identical round-trip on 16 goldens + verifier_engine + B6 clobber visibility + approximate fallback + proposer diff summary invariants",
+                    n
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("[AUDIT-VIEW FAIL] {}", e);
+                1
+            }
+        },
         "s3-perf" => {
             if args.get(1).map(|s| s.as_str()) == Some("--write-verifier-seed") {
                 let ve_sa_src = verifier_standalone_source();
@@ -25662,6 +25679,7 @@ pub fn selftest_m2_label_reference() -> Result<usize, String> {
 // M2-03+: host-side M2 tooling lives in m2_host/ (kept out of the monolith to avoid main-line collisions).
 include!("m2_host/lint.rs");
 include!("m2_host/decode_diff.rs");
+include!("m2_host/audit_view.rs");
 include!("host_runtime/pure_default.rs");
 include!("p4_shim/mod.rs");
 
@@ -25747,8 +25765,14 @@ fn main() {
             "harness" | "--harness" => {
                 std::process::exit(run_omni_harness_cli(&cli_args[2..]));
             }
-            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "m3-modular" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" | "p7-heal" | "p7-adapt" | "p7-learn" | "a1-pure-default" | "a2-pure-include" | "a3-macro-quarantine" | "b2-pure-verifier" | "b4-pure-launcher" | "s2-security" | "s4-honesty" | "s3-perf" | "s5-refreeze" | "s6-cleanup" | "api-stage1" | "api-stage2" | "api-stage2-emit" | "api-stage2-5" => {
+            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "m3-modular" | "audit-view" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" | "p7-heal" | "p7-adapt" | "p7-learn" | "a1-pure-default" | "a2-pure-include" | "a3-macro-quarantine" | "b2-pure-verifier" | "b4-pure-launcher" | "s2-security" | "s4-honesty" | "s3-perf" | "s5-refreeze" | "s6-cleanup" | "api-stage1" | "api-stage2" | "api-stage2-emit" | "api-stage2-5" => {
                 std::process::exit(run_m2_cli(&cli_args[1..]));
+            }
+            "decompile" | "--decompile" => {
+                std::process::exit(run_omni_decompile_cli(&cli_args[2..]));
+            }
+            "audit-diff" | "--audit-diff" => {
+                std::process::exit(run_omni_audit_diff_cli(&cli_args[2..]));
             }
             "agent-driver" | "--agent-driver" => {
                 std::process::exit(run_omni_agent_driver_cli(&cli_args[2..]));
