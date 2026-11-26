@@ -925,15 +925,17 @@ pub fn run_verifier_engine_diff_selftests() -> Result<usize, String> {
         cases.push((format!("fuzz_mut_ok_add_{i}"), s));
     }
 
-    let mut matched = 0usize;
-    for (name, stream) in &cases {
-        compare_rust_and_omni_verifier(name, stream)?;
-        matched += 1;
-    }
-    if matched != cases.len() {
+    // Warm up the OnceLock-cached verifier engine module once before fanning out.
+    let _ = omni_verifier_engine_module()?;
+    let n_cases = cases.len();
+    let results = crate::lanes::run_selftest_items_in_lanes(cases, |(name, stream)| {
+        compare_rust_and_omni_verifier(&name, &stream)?;
+        Ok(1usize)
+    })?;
+    let matched: usize = results.into_iter().sum();
+    if matched != n_cases {
         return Err(format!(
-            "verifier-diff internal count mismatch: {matched} != {}",
-            cases.len()
+            "verifier-diff internal count mismatch: {matched} != {n_cases}"
         ));
     }
     Ok(matched)
