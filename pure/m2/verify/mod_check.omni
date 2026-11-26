@@ -208,7 +208,7 @@ fn m2v_check_call_ins(w: bytes, arr: array, n: i64, caller_slot: i64, off: i64) 
 
 #[strict]
 fn m2v_ins_min_ops(op: i64) -> i64 {
-    let is_0: i64 = m2u_eq(op, 32512) + m2u_eq(op, 32525) + m2u_in(op, 32566, 32567) + m2u_eq(op, 32582) + m2u_eq(op, 32616);
+    let is_0: i64 = m2u_eq(op, 32512) + m2u_eq(op, 32525) + m2u_in(op, 32566, 32567) + m2u_eq(op, 32582) + m2u_eq(op, 32616) + m2u_eq(op, 32627);
     let is_4: i64 = m2u_eq(op, 32578) + m2u_eq(op, 32581);
     let is_3: i64 = m2u_eq(op, 32556) + m2u_eq(op, 32569);
     let is_2: i64 = m2u_in(op, 32526, 32532) + m2u_in(op, 32535, 32536) + m2u_in(op, 32542, 32544)

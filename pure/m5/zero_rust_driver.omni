@@ -1,0 +1,89 @@
+// ==============================================================================
+// pure/m5/zero_rust_driver.omni (Step 6 / Phase 2a) — Literal Zero-Rust Driver
+// ==============================================================================
+// Pure-Omni program compiled by M3 -> M2 into a standalone Linux x86-64 ELF64
+// binary calling the Linux kernel directly via M2 raw `0F 05` syscall intrinsics:
+//   - `sys_open`, `sys_write`, `sys_read`, `sys_close` (file I/O without Rust/C)
+//   - `sys_spawn` (raw fork + direct-argv execve + wait4, zero shell)
+//   - `sys_exit` (direct kernel process exit)
+// Enforced by the existing Pure-Omni & Rust verifiers (`#[cap(SYS)]` + taint-safe).
+// ==============================================================================
+
+#[strict]
+fn p2a_path_io() -> bytes {
+    // "/tmp/omni_p2a_io.bin\0" (21 bytes)
+    let b: bytes = anew(0);
+    b = iset(b, 47, 116, 109, 112, 47, 111, 109, 110, 105, 95, 112, 50, 97, 95, 105, 111);
+    b = iset(b, 46, 98, 105, 110, 0);
+    return b;
+}
+
+#[strict]
+fn p2a_path_true() -> bytes {
+    // "/bin/true\0" (10 bytes)
+    let b: bytes = anew(0);
+    b = iset(b, 47, 98, 105, 110, 47, 116, 114, 117, 101, 0);
+    return b;
+}
+
+#[strict]
+fn p2a_path_child() -> bytes {
+    // "/tmp/omni_p2a_child.elf\0" (24 bytes)
+    let b: bytes = anew(0);
+    b = iset(b, 47, 116, 109, 112, 47, 111, 109, 110, 105, 95, 112, 50, 97, 95, 99, 104);
+    b = iset(b, 105, 108, 100, 46, 101, 108, 102, 0);
+    return b;
+}
+
+#[strict]
+fn p2a_payload() -> bytes {
+    // "OMNI-P2A" (8 bytes, LE u64 = 0x4132502D494E4D4F = 4697906778079710543)
+    let b: bytes = anew(0);
+    b = iset(b, 79, 77, 78, 73, 45, 80, 50, 65);
+    return b;
+}
+
+#[strict]
+#[cap(SYS)]
+fn p2a_run_io_and_spawn(mode: i64) -> i64 {
+    let payload: bytes = p2a_payload();
+    let is_oob: i64 = sel_trit((mode - 1) <=> 0, 0, 1, 0);
+    let oob_res: i64 = if_pos is_oob <=> 0 {
+        sys_write(1, payload, 0, 16)
+    } else {
+        0
+    };
+    let is_ex: i64 = sel_trit((mode - 3) <=> 0, 0, 1, 0);
+    let ex_res: i64 = if_pos is_ex <=> 0 {
+        sys_exit(42)
+    } else {
+        0
+    };
+    let path: bytes = p2a_path_io();
+    // O_WRONLY (1) | O_CREAT (64) | O_TRUNC (512) = 577; mode 0644 = 420
+    let fd_w: i64 = sys_open(path, 577, 420);
+    let nw: i64 = sys_write(fd_w, payload, 0, 8);
+    let cw: i64 = sys_close(fd_w);
+    let fd_r: i64 = sys_open(path, 0, 0);
+    let rbuf: bytes = iset_i64(anew(0), 0);
+    let nr: i64 = sys_read(fd_r, rbuf, 0, 8);
+    let cr: i64 = sys_close(fd_r);
+    let got: i64 = ld_u64(rbuf, 0);
+    let want: i64 = ld_u64(payload, 0);
+    let match_ok: i64 = sel_trit((got - want) <=> 0, 0, 1, 0);
+    let empty_arg: bytes = anew(0);
+    let is_child: i64 = sel_trit((mode - 2) <=> 0, 0, 1, 0);
+    let child_rc: i64 = if_pos is_child <=> 0 {
+        sys_spawn(p2a_path_child(), empty_arg)
+    } else {
+        sys_spawn(p2a_path_true(), empty_arg)
+    };
+    let base: i64 = if_pos is_child <=> 0 { 2000 } else { 1000 };
+    return base * match_ok + nw + nr + child_rc + (cw + cr + oob_res + ex_res) * 0;
+}
+
+#[strict]
+#[cap(SYS)]
+fn main(mode: i64) -> i64 {
+    return p2a_run_io_and_spawn(mode);
+}

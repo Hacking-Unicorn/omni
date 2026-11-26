@@ -2169,7 +2169,7 @@ fn m3_lockstep_compile_via_omni(src: &str, strict: bool) -> Result<Result<Vec<u1
     let m3_mod = m3_lockstep_seed_module()?;
     let entry = m2_entry_of(m3_mod);
     let src_u16: Vec<u16> = src.as_bytes().iter().map(|&b| b as u16).collect();
-    let arena_bytes = 786_432usize;
+    let arena_bytes = 1_048_576usize;
     let mut vm = OmniBinaryVm::with_budgets(500_000_000, 128 * 1024 * 1024);
     let out_bytes = match vm.execute_function(
         m3_mod,
@@ -7762,8 +7762,8 @@ pub fn selftest_s4_honesty() -> Result<usize, String> {
     );
     if strict_readme {
         for &(label, needle) in &[
-            ("M3 seed hash", "0xE12D02135BCEB128"),
-            ("M2 seed hash", "0x36ADC3CEAB97B1C9"),
+            ("M3 seed hash", "0x0E3052A4BE00D599"),
+            ("M2 seed hash", "0xD7BD0CCE85021C91"),
             ("M4 seed hash", "0x0561704B3E50EFAC"),
             ("M4 ELF size", "90,402"),
             ("archived workspace", "oracle/archived-workspace/Cargo.toml"),
@@ -7784,8 +7784,8 @@ pub fn selftest_s4_honesty() -> Result<usize, String> {
     // 3. §4.2: `seed0/omni_seed0.rs` header comment must match the active SEED_M2 / SEED_M4 pins.
     let seed0_src = std::fs::read_to_string("seed0/omni_seed0.rs")
         .map_err(|e| format!("S4 read seed0/omni_seed0.rs: {}", e))?;
-    if !seed0_src.contains("65,541 words, 0xE12D02135BCEB128")
-        || !seed0_src.contains("41,855 words, 0x36ADC3CEAB97B1C9")
+    if !seed0_src.contains("66,249 words, 0x0E3052A4BE00D599")
+        || !seed0_src.contains("43,669 words, 0xD7BD0CCE85021C91")
         || !seed0_src.contains("28,062 words, 0x0561704B3E50EFAC")
     {
         return Err(String::from(
@@ -8282,6 +8282,168 @@ pub fn selftest_m3_modular() -> Result<usize, String> {
             ));
         }
     }
+
+    Ok(checks)
+}
+
+/// Step 6 (Phase 2a) Literal Zero-Rust Syscall Intrinsics hard gate (`./omni p2a-syscalls`):
+///   1. Pure-Omni M3 compiles `pure/m5/zero_rust_driver.omni` with 0-word diff vs Rust FE.
+///   2. Pure-Omni & Rust verifiers accept `zero_rust_driver.omni` (`#[cap(SYS)]`) and
+///      fail closed on negative controls: missing `#[cap(SYS)]` (`MISSING_CAP`) and
+///      `@untrusted` syscall argument (`TAINT_SINK`).
+///   3. Pure-Omni M2 lowers `0x7F73` syscall intrinsics (`sys_read`/`sys_write`/`sys_open`/
+///      `sys_close`/`sys_exit`/`sys_spawn`) to native Linux x86-64 ELF64 with 0-byte diff vs
+///      Rust M2 reference and >= 10 raw `0F 05` `syscall` instruction sites.
+///   4. On Linux x86-64: executes the M2-emitted `zero_rust_driver.elf` directly on the kernel
+///      (zero Rust/C/libc/shell) across all 4 modes:
+///        - mode 0: `sys_open`/`sys_write`/`sys_read`/`sys_close` + `sys_spawn("/bin/true")` -> `1016` & `"OMNI-P2A"`
+///        - mode 2: `sys_spawn("/tmp/omni_p2a_child.elf")` (Pure-Omni child ELF) -> `2016`
+///        - mode 1: OOB `sys_write` bounds-check trap -> exit code `1` (`T_OOB`)
+///        - mode 3: `sys_exit(42)` -> exit code `42`
+///   5. All 5 frozen FNV-1a64 hashes remain intact.
+pub fn selftest_p2a_syscall_intrinsics() -> Result<usize, String> {
+    let mut checks = 0usize;
+
+    // 1. M3 0-word diff on `pure/m5/zero_rust_driver.omni`.
+    let drv_src = std::fs::read_to_string("pure/m5/zero_rust_driver.omni")
+        .map_err(|e| format!("P2A read pure/m5/zero_rust_driver.omni: {}", e))?;
+    let drv_pure_u16 = pure_default_compile_surface_to_u16(&drv_src, true)?;
+    let drv_rust_u16 = with_lockstep_suspended(|| compile_omni_surface_strict_to_u16(&drv_src))?;
+    if drv_pure_u16 != drv_rust_u16 {
+        return Err(format!(
+            "P2A M3 0-word diff failed on zero_rust_driver.omni: pure={}w vs rust={}w",
+            drv_pure_u16.len(),
+            drv_rust_u16.len()
+        ));
+    }
+    checks += 1;
+
+    // 2a. Positive verification (Pure-Omni + Rust verifiers).
+    pure_default_verify_u16(&drv_pure_u16, true)?;
+    let drv_mod = decode_omni_token_stream(&drv_pure_u16)?;
+    for f in &drv_mod.functions {
+        let rep = verify_binary_function(f);
+        if !rep.passed {
+            return Err(format!("P2A Rust verifier rejected zero_rust_driver fn#{}: {:?}", f.fn_idx, rep.errors));
+        }
+    }
+    checks += 1;
+
+    // 2b. Negative control: missing #[cap(SYS)] must be rejected by BOTH Pure-Omni and Rust verifiers.
+    let bad_cap_src = "#[strict]\nfn main(fd: i64) -> i64 {\n    return sys_close(fd);\n}\n";
+    let bad_cap_u16 = pure_default_compile_surface_to_u16(bad_cap_src, true)?;
+    if pure_default_verify_u16(&bad_cap_u16, true).is_ok() {
+        return Err(String::from("P2A negative control failed: Pure verifier accepted sys_close without #[cap(SYS)]"));
+    }
+    let bad_cap_mod = decode_omni_token_stream(&bad_cap_u16)?;
+    if verify_binary_function(&bad_cap_mod.functions[0]).passed {
+        return Err(String::from("P2A negative control failed: Rust verifier accepted sys_close without #[cap(SYS)]"));
+    }
+    checks += 1;
+
+    // 2c. Negative control: @untrusted operand to syscall must be rejected by BOTH verifiers.
+    let bad_taint_src = "#[strict]\n#[cap(SYS)]\nfn main(fd: i64 @untrusted) -> i64 {\n    return sys_close(fd);\n}\n";
+    let bad_taint_u16 = pure_default_compile_surface_to_u16(bad_taint_src, true)?;
+    if pure_default_verify_u16(&bad_taint_u16, true).is_ok() {
+        return Err(String::from("P2A negative control failed: Pure verifier accepted @untrusted arg to sys_close"));
+    }
+    let bad_taint_mod = decode_omni_token_stream(&bad_taint_u16)?;
+    if verify_binary_function(&bad_taint_mod.functions[0]).passed {
+        return Err(String::from("P2A negative control failed: Rust verifier accepted @untrusted arg to sys_close"));
+    }
+    checks += 1;
+
+    // 3. M2 0-byte diff + raw `0F 05` syscall verification.
+    let drv_elf_pure = pure_default_compile_u16_to_elf(&drv_pure_u16, 0, 0, 0)?;
+    let drv_elf_rust = compile_pure_u16_to_x86_64_elf_multi(&drv_pure_u16, 0, 0, 0)?;
+    if drv_elf_pure != drv_elf_rust {
+        return Err(format!(
+            "P2A M2 0-byte diff failed on zero_rust_driver.omni: pure={}B vs rust={}B",
+            drv_elf_pure.len(),
+            drv_elf_rust.len()
+        ));
+    }
+    if drv_elf_pure.len() < 176 || &drv_elf_pure[0..4] != b"\x7fELF" {
+        return Err(String::from("P2A emitted driver ELF64 header invalid"));
+    }
+    let syscall_sites = drv_elf_pure[176..].windows(2).filter(|w| *w == [0x0F, 0x05]).count();
+    if syscall_sites < 10 {
+        return Err(format!("P2A expected >= 10 raw 0F 05 syscall sites, found {}", syscall_sites));
+    }
+    checks += 1;
+
+    // 4. Native Linux x86-64 live kernel execution of all 4 modes (zero Rust/C/libc/shell).
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp_drv = PrivateTempElf::new(&drv_elf_pure, "p2a_drv")?;
+        // Build Pure-Omni child ELF (/tmp/omni_p2a_child.elf) from weighted_diff_pure_golden.omni.
+        let wd_src = std::fs::read_to_string("spec/acceptance/goldens/weighted_diff_pure_golden.omni")
+            .map_err(|e| format!("P2A read weighted_diff: {}", e))?;
+        let wd_u16 = pure_default_compile_surface_to_u16(&wd_src, true)?;
+        let wd_elf = pure_default_compile_u16_to_elf(&wd_u16, 0, 0, 0)?;
+        let child_path = "/tmp/omni_p2a_child.elf";
+        std::fs::write(child_path, &wd_elf).map_err(|e| format!("P2A write child elf: {}", e))?;
+        std::fs::set_permissions(child_path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("P2A chmod child elf: {}", e))?;
+
+        // Mode 0: sys_open/write/read/close + sys_spawn("/bin/true") -> 1016 & "OMNI-P2A".
+        let out0 = std::process::Command::new(&tmp_drv.path)
+            .arg("0")
+            .output()
+            .map_err(|e| format!("P2A exec mode 0: {}", e))?;
+        if !out0.status.success() || out0.stdout.len() < 8 {
+            let _ = std::fs::remove_file(child_path);
+            return Err(format!("P2A mode 0 failed: status={:?} len={}", out0.status, out0.stdout.len()));
+        }
+        let v0 = i64::from_le_bytes(out0.stdout[out0.stdout.len() - 8..].try_into().unwrap());
+        let io_bytes = std::fs::read("/tmp/omni_p2a_io.bin").unwrap_or_default();
+        if v0 != 1016 || io_bytes != b"OMNI-P2A" {
+            let _ = std::fs::remove_file(child_path);
+            return Err(format!("P2A mode 0 mismatch: v0={} (want 1016), file={:?}", v0, io_bytes));
+        }
+
+        // Mode 2: sys_spawn("/tmp/omni_p2a_child.elf") -> Pure-Omni child ELF runs + parent returns 2016.
+        let out2 = std::process::Command::new(&tmp_drv.path)
+            .arg("2")
+            .output()
+            .map_err(|e| format!("P2A exec mode 2: {}", e))?;
+        let _ = std::fs::remove_file(child_path);
+        let _ = std::fs::remove_file("/tmp/omni_p2a_io.bin");
+        if !out2.status.success() || out2.stdout.len() < 8 {
+            return Err(format!("P2A mode 2 failed: status={:?} len={}", out2.status, out2.stdout.len()));
+        }
+        let v2 = i64::from_le_bytes(out2.stdout[out2.stdout.len() - 8..].try_into().unwrap());
+        if v2 != 2016 {
+            return Err(format!("P2A mode 2 mismatch: v2={} (want 2016)", v2));
+        }
+
+        // Mode 1: OOB sys_write bounds check -> exit 1 (T_OOB).
+        let st1 = std::process::Command::new(&tmp_drv.path)
+            .arg("1")
+            .output()
+            .map_err(|e| format!("P2A exec mode 1: {}", e))?
+            .status;
+        if st1.code() != Some(1) {
+            return Err(format!("P2A mode 1 OOB trap expected exit 1, got {:?}", st1.code()));
+        }
+
+        // Mode 3: direct sys_exit(42) -> exit 42.
+        let st3 = std::process::Command::new(&tmp_drv.path)
+            .arg("3")
+            .output()
+            .map_err(|e| format!("P2A exec mode 3: {}", e))?
+            .status;
+        drop(tmp_drv);
+        if st3.code() != Some(42) {
+            return Err(format!("P2A mode 3 sys_exit(42) expected exit 42, got {:?}", st3.code()));
+        }
+    }
+    checks += 1;
+
+    // 5. All 5 frozen FNV-1a64 hashes intact.
+    selftest_m2_frozen_hashes()?;
+    checks += 1;
 
     Ok(checks)
 }
