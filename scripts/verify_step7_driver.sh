@@ -181,23 +181,62 @@ do
   fi
 done
 
-for bc in "$BC_A" "$BC_B" pure/verifier_standalone.omni_bc; do
-  tag=$(basename "$bc" .omni_bc)
+# Full-text byte-identical decompile & inspect --m3 vs Rust ./omni on:
+#   - verifier_standalone (68 fns)
+#   - verifier_engine (67 fns)
+#   - all 16 audit-view goldens under spec/acceptance/goldens/
+"$RUST_BIN" compile pure/verifier_engine.omni "$TMP/verifier_engine.omni_bc" >/dev/null
+for pair in \
+  "pure/verifier_standalone.omni_bc:verifier_standalone" \
+  "$TMP/verifier_engine.omni_bc:verifier_engine"
+do
+  IFS=':' read -r bc tag <<< "$pair"
   "$PURE_BIN" decompile "$bc" > "$TMP/p_dc_${tag}.omni"
-  "$PURE_BIN" inspect --m3 "$bc" > "$TMP/p_ins_${tag}.omni"
-  if [ -s "$TMP/p_dc_${tag}.omni" ] && cmp -s "$TMP/p_dc_${tag}.omni" "$TMP/p_ins_${tag}.omni"; then
-    hdr=$(sed -n '2p' "$TMP/p_dc_${tag}.omni")
-    pass "decompile & inspect --m3 ($tag): identical ($(wc -l < "$TMP/p_dc_${tag}.omni") lines, $hdr)"
+  "$RUST_BIN" decompile "$bc" > "$TMP/r_dc_${tag}.omni"
+  if cmp -s "$TMP/p_dc_${tag}.omni" "$TMP/r_dc_${tag}.omni"; then
+    pass "decompile full-text 0-byte diff vs Rust ($tag, $(wc -c < "$TMP/p_dc_${tag}.omni") B)"
   else
-    fail "decompile / inspect --m3 ($tag) failed or differed"
+    diff -u "$TMP/r_dc_${tag}.omni" "$TMP/p_dc_${tag}.omni" | head -n 30 >&2 || true
+    fail "decompile full-text diff vs Rust ($tag)"
+  fi
+  "$PURE_BIN" inspect --m3 "$bc" > "$TMP/p_ins_${tag}.omni"
+  "$RUST_BIN" inspect --m3 "$bc" > "$TMP/r_ins_${tag}.omni"
+  if cmp -s "$TMP/p_ins_${tag}.omni" "$TMP/r_ins_${tag}.omni"; then
+    pass "inspect --m3 full-text 0-byte diff vs Rust ($tag, $(wc -c < "$TMP/p_ins_${tag}.omni") B)"
+  else
+    diff -u "$TMP/r_ins_${tag}.omni" "$TMP/p_ins_${tag}.omni" | head -n 30 >&2 || true
+    fail "inspect --m3 full-text diff vs Rust ($tag)"
+  fi
+done
+
+for g in \
+  seed0_risk seed4_consensus seed6_clamp custom_non_seed_alu \
+  iabs_golden idiv_zero shl_65 sel_mix \
+  br_pos_golden br_neg_arith_golden nested_branch_golden match_trit_golden \
+  branch_loop_golden byte_buf_golden decision_hook_golden arena_lifecycle_golden
+do
+  src="spec/acceptance/goldens/${g}.omni"
+  if ! "$RUST_BIN" compile "$src" "$TMP/g_${g}.omni_bc" >/dev/null 2>&1; then
+    "$RUST_BIN" compile --rust "$src" "$TMP/g_${g}.omni_bc" >/dev/null
+  fi
+  "$PURE_BIN" decompile "$TMP/g_${g}.omni_bc" > "$TMP/p_dc_${g}.omni"
+  "$RUST_BIN" decompile "$TMP/g_${g}.omni_bc" > "$TMP/r_dc_${g}.omni"
+  "$PURE_BIN" inspect --m3 "$TMP/g_${g}.omni_bc" > "$TMP/p_ins_${g}.omni"
+  "$RUST_BIN" inspect --m3 "$TMP/g_${g}.omni_bc" > "$TMP/r_ins_${g}.omni"
+  if cmp -s "$TMP/p_dc_${g}.omni" "$TMP/r_dc_${g}.omni" && cmp -s "$TMP/p_ins_${g}.omni" "$TMP/r_ins_${g}.omni"; then
+    pass "decompile & inspect --m3 full-text 0-byte diff vs Rust (golden: $g)"
+  else
+    diff -u "$TMP/r_dc_${g}.omni" "$TMP/p_dc_${g}.omni" | head -n 20 >&2 || true
+    fail "decompile / inspect --m3 diff vs Rust (golden: $g)"
   fi
 done
 
 "$PURE_BIN" decompile pure/programs/pack5_decision_controller.omni > "$TMP/p_dc_src.omni"
-if cmp -s "$TMP/p_dc_src.omni" "$TMP/p_dc_p_pure_programs_pack5_decision_controller_omni.omni"; then
-  pass "decompile .omni source matches decompile .omni_bc (0-byte diff)"
+"$RUST_BIN" decompile "$BC_A" > "$TMP/r_dc_pack5.omni"
+if cmp -s "$TMP/p_dc_src.omni" "$TMP/r_dc_pack5.omni"; then
+  pass "decompile .omni source matches Rust decompile .omni_bc (0-byte diff)"
 else
-  fail "decompile .omni source differed from .omni_bc"
+  fail "decompile .omni source differed from Rust decompile .omni_bc"
 fi
 
 echo "=== [8/8] Negative Controls (fail-closed) ==="
