@@ -92,38 +92,35 @@ chmod +x "$P2A_TMP/verifier_gen2.elf"
 "$P2A_TMP/m2_gen2.elf" pure/m3/mod_parse.omni_bc > "$P2A_TMP/mod_parse_gen2.elf"
 "$P2A_TMP/m2_gen2.elf" pure/m3/m3_standalone.omni_bc > "$P2A_TMP/m3_standalone_gen2.elf"
 
-# 2. Verify exact byte sizes & FNV-1a64 pins of zero-Rust rebuilt native toolchain ELFs.
-python3 - "$P2A_TMP" <<'PY'
-import sys, os
-tmp = sys.argv[1]
-def fnv1a64(b):
-    h = 0xcbf29ce484222325
-    for x in b:
-        h = ((h ^ x) * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
-    return h
-checks = [
-    ("m2_gen2.elf", 125539, 0x0A5CD5B55707AA0D),
-    ("m4_gen2.elf", 91576, 0xFBA8272337B1BAC4),
-    ("verifier_gen2.elf", 37907, 0x2ECD2CE3DCB69346),
-]
-for name, want_len, want_fnv in checks:
-    d = open(os.path.join(tmp, name), "rb").read()
-    got_fnv = fnv1a64(d)
-    assert len(d) == want_len and got_fnv == want_fnv, f"{name}: got {len(d)} B / 0x{got_fnv:016X}, want {want_len} B / 0x{want_fnv:016X}"
-    print(f"[P2A] zero-Rust rebuilt {name}: {len(d)} B (0x{got_fnv:016X}) OK")
-PY
+# 2. Build zero-include Pure-Omni build utility (`pure/m5/pure_build_util.omni`) via gen2 toolchain
+#    and verify exact byte sizes & FNV-1a64 pins of zero-Rust rebuilt native toolchain ELFs (ZERO Python!).
+LC_ALL=C od -An -tu1 -v pure/m5/pure_build_util.omni | LC_ALL=C awk '{for(i=1;i<=NF;i++) printf "%c%c", $i, 0}' > "$P2A_TMP/pbu.u16"
+"$M3_ELF" "$P2A_TMP/pbu.u16" 1 > "$P2A_TMP/pbu.omni_bc"
+PBU_VER_ERRS=$("$P2A_TMP/verifier_gen2.elf" "$P2A_TMP/pbu.omni_bc" | od -An -tu2 -N 2 | tr -d ' \n')
+if [ "${PBU_VER_ERRS:-1}" -ne 0 ]; then
+  echo "[P2A FAIL] verifier_gen2.elf rejected pure/m5/pure_build_util.omni with ${PBU_VER_ERRS} error(s)" >&2
+  exit 1
+fi
+"$P2A_TMP/m2_gen2.elf" "$P2A_TMP/pbu.omni_bc" > "$P2A_TMP/pure_build_util.elf"
+chmod +x "$P2A_TMP/pure_build_util.elf"
 
-# 3. Compile + verify + VM-run + native-compile + native-run weighted_diff_pure_golden.omni (ZERO Rust!).
-python3 - "$P2A_TMP" <<'PY'
-import sys, os
-tmp = sys.argv[1]
-for src, out in [
-    ("spec/acceptance/goldens/weighted_diff_pure_golden.omni", "wd.u16"),
-    ("pure/m5/zero_rust_driver.omni", "drv.u16"),
-]:
-    b = open(src, "rb").read()
-    open(os.path.join(tmp, out), "wb").write(b"".join(bytes([x, 0]) for x in b))
-PY
+for spec in \
+  "m2_gen2.elf:125539:0x0A5CD5B55707AA0D" \
+  "m4_gen2.elf:91576:0xFBA8272337B1BAC4" \
+  "verifier_gen2.elf:37907:0x2ECD2CE3DCB69346"
+do
+  IFS=':' read -r name want_len want_fnv <<< "$spec"
+  read -r got_len got_fnv < <("$P2A_TMP/pure_build_util.elf" fnv "$P2A_TMP/$name")
+  if [ "$got_len" != "$want_len" ] || [ "$got_fnv" != "$want_fnv" ]; then
+    echo "[P2A FAIL] ${name}: got ${got_len} B / ${got_fnv}, want ${want_len} B / ${want_fnv}" >&2
+    exit 1
+  fi
+  echo "[P2A] zero-Rust rebuilt ${name}: ${got_len} B (${got_fnv}) OK"
+done
+
+# 3. Compile + verify + VM-run + native-compile + native-run weighted_diff_pure_golden.omni (ZERO Rust, ZERO Python!).
+"$P2A_TMP/pure_build_util.elf" widen spec/acceptance/goldens/weighted_diff_pure_golden.omni "$P2A_TMP/wd.u16"
+"$P2A_TMP/pure_build_util.elf" widen pure/m5/zero_rust_driver.omni "$P2A_TMP/drv.u16"
 
 "$M3_ELF" "$P2A_TMP/wd.u16" 1 > "$P2A_TMP/wd.omni_bc"
 "$P2A_TMP/verifier_gen2.elf" "$P2A_TMP/wd.omni_bc" > "$P2A_TMP/wd_ver.bin"
