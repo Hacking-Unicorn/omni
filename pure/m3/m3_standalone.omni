@@ -70,9 +70,14 @@ include "pure/m3/inc/lower_body.omni";
 #[strict]
 fn m3_standalone_entry(src: array, strict_arg: i64, a1: i64, a2: i64) -> bytes {
     let w: bytes = anew(0);
+    // Size arena dynamically (min 160 KiB, max 768 KiB) and unroll 8x (64 B/iter) to cut startup overhead.
+    let need_q: i64 = 20480 + (slen(src) * 3);
+    let nq: i64 = m2u_sel(m2u_lt(need_q, 98304), need_q, 98304);
+    let blocks: i64 = (nq + 7) >> 3;
     let i: i64 = 0;
-    while 98304 - i <=> 0 {
-        w = iset_i64(w, 0);
+    while blocks - i <=> 0 {
+        w = iset_i64(w, 0); w = iset_i64(w, 0); w = iset_i64(w, 0); w = iset_i64(w, 0);
+        w = iset_i64(w, 0); w = iset_i64(w, 0); w = iset_i64(w, 0); w = iset_i64(w, 0);
         i = i + 1;
     }
     w = m3_compile_all_into(w, src, strict_arg);

@@ -49,13 +49,14 @@ fn m3c_is_op1(c: i64) -> i64 {
     return a + b;
 }
 
-// Q1: raw substring scan for `#[strict]` (35,91,115,116,114,105,99,116,93).
+// Q1: raw substring scan for `#[strict]` (35,91,115,116,114,105,99,116,93), early exit on hit.
 #[strict]
 fn m3l_has_strict_attr(src: array, n: i64) -> i64 {
     let found: i64 = 0;
     let i: i64 = 0;
     let lim: i64 = n - 8;
-    while lim - i <=> 0 {
+    let g: i64 = m2u_lt(i, lim);
+    while g <=> 0 {
         let is_h: trit = m2u_eq(iget(src, i), 35) <=> 0;
         let hit: i64 = if_pos is_h {
             let m0: i64 = m2u_eq(iget(src, i + 1), 91) * m2u_eq(iget(src, i + 2), 115) * m2u_eq(iget(src, i + 3), 116);
@@ -67,6 +68,7 @@ fn m3l_has_strict_attr(src: array, n: i64) -> i64 {
         };
         found = found | hit;
         i = i + 1;
+        g = m2u_lt(i, lim) * (1 - found);
     }
     return found;
 }
@@ -77,26 +79,28 @@ fn m3l_skip_ws(arena: bytes, src: array, n: i64) -> bytes {
     let i: i64 = ld_u64(arena, 0);
     let line: i64 = ld_u64(arena, 16);
     let col: i64 = ld_u64(arena, 24);
-    let going: i64 = 1;
+    let going: i64 = m2u_lt(i, n);
     while going <=> 0 {
-        let have: i64 = m2u_lt(i, n);
-        let c: i64 = m2u_tok(src, n, i);
-        let c1: i64 = m2u_tok(src, n, i + 1);
-        let is_nl: i64 = have * m2u_eq(c, 10);
-        let is_ws: i64 = have * m3c_is_ws(c);
-        let is_sl: i64 = have * m2u_lt(i + 1, n) * m2u_eq(c, 47) * m2u_eq(c1, 47);
-        let is_hc: i64 = have * m2u_eq(c, 35) * (1 - m2u_lt(i + 1, n) * m2u_eq(c1, 91));
-        let is_cmt: trit = (is_sl + is_hc) <=> 0;
+        let c: i64 = iget(src, i);
+        let is_sp: i64 = m2u_eq(c, 32);
+        let is_nl: i64 = m2u_eq(c, 10);
+        let is_ws: i64 = is_sp + m2u_eq(c, 9) + m2u_eq(c, 13) + m2u_eq(c, 12);
         let adv: i64 = is_nl + is_ws;
+        let maybe_c: i64 = (1 - adv) * (m2u_eq(c, 47) + m2u_eq(c, 35));
+        let is_cmt: i64 = if_pos maybe_c <=> 0 {
+            let h1: i64 = m2u_lt(i + 1, n);
+            let c1: i64 = m2u_sel(h1, iget(src, (i + 1) * h1), 0);
+            m2u_eq(c, 47) * h1 * m2u_eq(c1, 47) + m2u_eq(c, 35) * (1 - h1 * m2u_eq(c1, 91))
+        } else { 0 };
         i = i + adv;
         line = line + is_nl;
         col = m2u_sel(is_nl, 1, col + is_ws);
-        let cmt_end: i64 = if_pos is_cmt {
+        let cmt_end: i64 = if_pos is_cmt <=> 0 {
             let j: i64 = i;
-            let cg: i64 = m2u_lt(j, n) * (1 - m2u_eq(m2u_tok(src, n, j), 10));
+            let cg: i64 = m2u_lt(j, n) * (1 - m2u_eq(iget(src, j), 10));
             while cg <=> 0 {
                 j = j + 1;
-                cg = m2u_lt(j, n) * (1 - m2u_eq(m2u_tok(src, n, j), 10));
+                cg = m2u_lt(j, n) * (1 - m2u_eq(iget(src, j * m2u_lt(j, n)), 10));
             }
             j
         } else {
@@ -104,7 +108,7 @@ fn m3l_skip_ws(arena: bytes, src: array, n: i64) -> bytes {
         };
         col = col + (cmt_end - i);
         i = cmt_end;
-        going = adv + is_sl + is_hc;
+        going = (adv + is_cmt) * m2u_lt(i, n);
     }
     let w: bytes = iset_patch_i64(arena, 0, i);
     w = iset_patch_i64(w, 16, line);
@@ -212,20 +216,22 @@ fn m3l_check_legacy_trit(src: array, n: i64, start: i64, len: i64) -> i64 {
 // Lexes an identifier or legacy TRIT_POS/TRIT_ZERO/TRIT_NEG (AMBIGUOUS_GRAMMAR in strict mode).
 #[strict]
 fn m3l_lex_ident(arena: bytes, src: array, n: i64) -> bytes {
-    let i: i64 = ld_u64(arena, 0);
+    let start: i64 = ld_u64(arena, 0);
     let line: i64 = ld_u64(arena, 16);
     let scol: i64 = ld_u64(arena, 24);
     let strict: i64 = ld_u64(arena, 32);
-    let col: i64 = scol;
-    let start: i64 = i;
-    let g: i64 = m2u_lt(i, n) * m3c_is_alnum(m2u_tok(src, n, i));
+    let i: i64 = start + 1;
+    let g: i64 = m2u_lt(i, n);
     while g <=> 0 {
-        i = i + 1;
-        col = col + 1;
-        g = m2u_lt(i, n) * m3c_is_alnum(m2u_tok(src, n, i));
+        let c: i64 = iget(src, i);
+        let ok_c: i64 = m3c_is_alnum(c);
+        i = i + ok_c;
+        g = ok_c * m2u_lt(i, n);
     }
     let len: i64 = i - start;
-    let lt: i64 = m3l_check_legacy_trit(src, n, start, len);
+    let col: i64 = scol + len;
+    let maybe_lt: i64 = (m2u_eq(len, 8) + m2u_eq(len, 9)) * m2u_eq(iget(src, start), 84);
+    let lt: i64 = if_pos maybe_lt <=> 0 { m3l_check_legacy_trit(src, n, start, len) } else { 0 };
     let is_lt: trit = lt <=> 0;
     let r: bytes = if_pos is_lt {
         let is_st: trit = strict <=> 0;
@@ -292,42 +298,53 @@ fn m3l_lex_punct(arena: bytes, src: array, n: i64) -> bytes {
     return r;
 }
 
+// Dispatches non-identifier tokens at cursor `i` (split from `m3l_lex_one` to stay <= 12 labels).
+#[strict]
+fn m3l_lex_non_id(arena: bytes, src: array, n: i64, i: i64, line: i64, col: i64, c0: i64) -> bytes {
+    let d0: i64 = m3c_is_digit(c0);
+    let h0: i64 = m2u_eq(c0, 35);
+    let q0: i64 = m2u_eq(c0, 34);
+    let at0: i64 = m2u_eq(c0, 64);
+    let is_0t: i64 = if_pos (m2u_eq(c0, 48) * m2u_ge(n, i + 2)) <=> 0 {
+        let c1: i64 = iget(src, i + 1);
+        let h2: i64 = m2u_lt(i + 2, n);
+        let c2: i64 = m2u_sel(h2, iget(src, (i + 2) * h2), 0);
+        m2u_eq(c1, 116) * (1 - h2 * m3c_is_alnum(c2))
+    } else { 0 };
+    let dig_f: i64 = d0 * (1 - is_0t);
+    let r1: bytes = if_pos h0 <=> 0 {
+        let w: bytes = m3a_emit_tok(arena, 1, 0, line, col, 35);
+        w = iset_patch_i64(w, 0, i + 1);
+        iset_patch_i64(w, 24, col + 1)
+    } else { arena };
+    let r2: bytes = if_pos q0 <=> 0 { m3l_lex_string(r1, src, n) } else { r1 };
+    let r3: bytes = if_pos at0 <=> 0 { m3l_lex_at_ident(r2, src, n) } else { r2 };
+    let r4: bytes = if_pos dig_f <=> 0 { m3l_lex_int(r3, src, n) } else { r3 };
+    let oth: i64 = 1 - h0 - q0 - at0 - dig_f;
+    return if_pos oth <=> 0 { m3l_lex_punct(r4, src, n) } else { r4 };
+}
+
 // Dispatches one token at cursor `i` (after whitespace/comments have been skipped).
 #[strict]
 fn m3l_lex_one(arena: bytes, src: array, n: i64) -> bytes {
     let i: i64 = ld_u64(arena, 0);
     let line: i64 = ld_u64(arena, 16);
     let col: i64 = ld_u64(arena, 24);
-    let c0: i64 = m2u_tok(src, n, i);
-    let c1: i64 = m2u_tok(src, n, i + 1);
-    let c2: i64 = m2u_tok(src, n, i + 2);
-    let is_hash: trit = m2u_eq(c0, 35) <=> 0;
-    let is_str: trit = m2u_eq(c0, 34) <=> 0;
-    let is_at: trit = m2u_eq(c0, 64) <=> 0;
-    let is_0t: i64 = m2u_ge(n, i + 2) * m2u_eq(c0, 48) * m2u_eq(c1, 116) * (1 - m2u_lt(i + 2, n) * m3c_is_alnum(c2));
-    let is_dig: trit = (m3c_is_digit(c0) * (1 - is_0t)) <=> 0;
-    let is_id: trit = m3c_is_alpha(c0) <=> 0;
-    let is_other: trit = (1 - m2u_eq(c0, 35) - m2u_eq(c0, 34) - m2u_eq(c0, 64) - m3c_is_digit(c0) * (1 - is_0t) - m3c_is_alpha(c0)) <=> 0;
-    let r1: bytes = if_pos is_hash {
-        let w: bytes = m3a_emit_tok(arena, 1, 0, line, col, 35);
-        w = iset_patch_i64(w, 0, i + 1);
-        iset_patch_i64(w, 24, col + 1)
+    let c0: i64 = iget(src, i);
+    let a0: i64 = m3c_is_alpha(c0);
+    let r: bytes = if_pos a0 <=> 0 {
+        m3l_lex_ident(arena, src, n)
     } else {
-        arena
+        m3l_lex_non_id(arena, src, n, i, line, col, c0)
     };
-    let r2: bytes = if_pos is_str { m3l_lex_string(r1, src, n) } else { r1 };
-    let r3: bytes = if_pos is_at { m3l_lex_at_ident(r2, src, n) } else { r2 };
-    let r4: bytes = if_pos is_dig { m3l_lex_int(r3, src, n) } else { r3 };
-    let r5: bytes = if_pos is_id { m3l_lex_ident(r4, src, n) } else { r4 };
-    let r6: bytes = if_pos is_other { m3l_lex_punct(r5, src, n) } else { r5 };
-    return r6;
+    return r;
 }
 
 // Top-level Pass L (in-place): lexes the entire source buffer into m3l_out() without slicing.
 #[strict]
 fn m3_lex_into(arena: bytes, src: array, strict_arg: i64) -> bytes {
     let n: i64 = slen(src);
-    let eff_strict: i64 = strict_arg | m3l_has_strict_attr(src, n);
+    let eff_strict: i64 = if_pos strict_arg <=> 0 { 1 } else { m3l_has_strict_attr(src, n) };
     let w: bytes = m3a_init(arena, n, eff_strict);
     let going: i64 = 1;
     while going <=> 0 {
