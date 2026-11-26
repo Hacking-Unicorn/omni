@@ -1,4 +1,4 @@
-name: Omni CI (Monolith, Fuzz Smoke & Zero-Rust Release Gate)
+name: Omni CI (Zero-Rust Pure-Omni Clean-Room Gate)
 
 on:
   push:
@@ -10,135 +10,40 @@ permissions:
   contents: read
 
 jobs:
-  verify:
+  zero-rust-clean-room:
+    name: Zero-Rust Clean-Room Rebuild & Pure-Omni Harness Gate
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Install Rust pinned toolchain (1.100.0)
-        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
-        with:
-          toolchain: "1.100.0"
-
-      - name: Run standalone monolith selftest (fixed-point + M2/M3/P4/P5/S1-S6 gates + 5-backend diff + pure-omni-diff + acceptance-diff + harness)
+      - name: Verify zero Rust/Cargo files in tree and no rustc/cargo on PATH
         run: |
-          rustc -O omni_rust_bootstrap.rs -o omni
-          ./omni --help
-          ./omni fixed-point
-          ./omni pure-bootstrap
-          ./omni m2-lint
-          ./omni m2-elf
-          ./omni m2-lock > /tmp/m2_lock_check.tsv && diff -u spec/m2/single_mode_lock.tsv /tmp/m2_lock_check.tsv
-          ./omni m2-compile
-          ./omni m2-multi
-          ./omni m2-multi-pure
-          ./omni m2-wasm-multi
-          ./omni m2-verify
-          ./omni m2-fixed-point
-          ./omni m3-gate
-          ./omni m3-lex
-          ./omni m3-skim
-          ./omni m3-expr
-          ./omni m3-stmt
-          ./omni m3-lower
-          ./omni m3-lockstep
-          ./omni m3-4backend
-          ./omni m3-fixed-point
-          ./omni p4-vm
-          ./omni p4-shim
-          ./omni p4-wasm
-          ./omni compile-surface --rust spec/acceptance/goldens/seed6_clamp.omni /tmp/seed6_clamp.omni_bc
-          ./omni p4-exec /tmp/seed6_clamp.omni_bc 150 10 90 --trace
-          ./omni compile spec/acceptance/goldens/judge_better_golden.omni /tmp/judge_better.omni_bc
-          ./omni p4-exec /tmp/judge_better.omni_bc 100 80 5 --trace
-          ./omni p5-sys
-          ./omni p5-selfhost
-          ./omni p7-measure
-          ./omni p7-canary
-          ./omni p7-heal
-          ./omni p7-adapt
-          ./omni p7-learn
-          ./omni a1-pure-default
-          ./omni a2-pure-include
-          ./omni a3-macro-quarantine
-          ./omni b2-pure-verifier
-          ./omni b4-pure-launcher
-          ./omni s2-security
-          ./omni s3-perf
-          ./omni s4-honesty
-          ./omni s5-refreeze
-          ./omni s6-cleanup
-          ./omni api-stage1
-          ./omni api-stage2
-          ./omni api-stage2-emit
-          ./omni api-stage2-5
-          ./omni backend-diff --suite
-          ./omni selftest
-          ./omni pure-omni-diff
-          ./omni acceptance-diff
-          ./omni harness --spec
-          ./omni harness --version-check
-          ./omni agent-driver --list-strategies
-          ./omni agent-driver --strict "fn main(a: int) -> trit { let d = a - 10; let g = egate(d); return g; }" 25
+          export PATH="/usr/bin:/bin"
+          echo "PATH=$PATH"
+          ! command -v rustc
+          ! command -v cargo
+          test "$(find . -path ./.git -prune -o \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \) -print | wc -l)" -eq 0
 
-  fuzz-smoke:
-    name: Bytecode Mutation Fuzz & Security Gate (Audit §1.2 / §2 / §6.3)
+      - name: Run mandatory Zero-Rust Clean-Room Rebuild & Fixed-Point Gate
+        run: |
+          PATH="/usr/bin:/bin" bash scripts/zero_rust_rebuild.sh
+
+      - name: Run Pure-Omni Driver Verification Suite (Step 7)
+        run: |
+          PATH="/usr/bin:/bin" bash scripts/verify_step7_driver.sh
+
+      - name: Run Pure-Omni Harness Verification Suite (Step 8)
+        run: |
+          PATH="/usr/bin:/bin" bash scripts/verify_step8_harness.sh
+
+  external-verifier:
+    name: Independent External Verifier Trace Check (C2 — Python 3, zero Rust/Omni)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Install Rust pinned toolchain (1.100.0)
-        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
-        with:
-          toolchain: "1.100.0"
-
-      - name: Run 256-mutant .omni_bc verifier/VM fuzzer + native m2.elf crash corpus + strict OOB/PT_GNU_STACK gates
-        run: |
-          rustc -O omni_rust_bootstrap.rs -o omni
-          ./omni b2-pure-verifier
-          ./omni s2-security
-          ./omni s5-refreeze
-          # Audit L2 + Round-3 L-B: every command exits 1 with a structured error (never a
-          # rc=101 panic) on a missing input file.
-          lb_fail=0
-          while IFS= read -r lb_cmd; do
-            set +e
-            ./omni $lb_cmd >/dev/null 2>/tmp/fuzz_lb.err
-            rc=$?
-            set -e
-            if [ "$rc" -ne 1 ] || ! grep -q 'FAIL\]' /tmp/fuzz_lb.err; then
-              echo "::error::L-B '$lb_cmd' exited rc=$rc (want 1 + structured [... FAIL] error)"; cat /tmp/fuzz_lb.err; lb_fail=1
-            fi
-          done <<'LB_CMDS'
-          compile-elf /tmp/nonexistent_fuzz_l2.omni /tmp/fuzz_l2.elf
-          compile /tmp/nonexistent_fuzz_lb.omni /tmp/fuzz_lb.omni_bc
-          compile --rust /tmp/nonexistent_fuzz_lb.omni /tmp/fuzz_lb.omni_bc
-          compile-wasm /tmp/nonexistent_fuzz_lb.omni /tmp/fuzz_lb.wasm
-          compile-wasm /tmp/nonexistent_fuzz_lb.omni_bc /tmp/fuzz_lb.wasm
-          surface-to-asm /tmp/nonexistent_fuzz_lb.omni
-          run --rust /tmp/nonexistent_fuzz_lb.omni
-          run --rust /tmp/nonexistent_fuzz_lb.omni_bc
-          LB_CMDS
-          test "$lb_fail" -eq 0
-
-  pure-default-no-rustc:
-    name: Zero-Rust Release Gate & Independent Verifier (Seed-Shrink A4/B4/C1/C2)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Independent External Verifier Trace Check (C2 — Python 3, zero Rust/Omni)
+      - name: Run independent verifier trace checker
         run: |
           python3 scripts/external_verifier_check.py
-
-      - name: Build Stage-0 seed & runner binaries once (before stripping rustc/cargo from PATH)
-        run: |
-          rustc -O --edition 2021 omni_rust_bootstrap.rs -o ./omni
-          rustc -O --edition 2021 seed0/omni_seed0.rs -o ./omni-seed0
-          rustc -O --edition 2021 omni_dev_host.rs -o ./omni-dev-host
-
-      - name: Run mandatory Zero-Rust Fixed-Point Release Gate (C1 — rustc/cargo absent from PATH)
-        run: |
-          bash scripts/zero_rust_rebuild.sh

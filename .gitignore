@@ -1,6 +1,7 @@
-# Rust / Cargo build outputs
+# Build outputs
 target/
 **/target/
+build/
 
 # Compiled binaries and artifacts
 *.exe
@@ -8,6 +9,7 @@ target/
 *.pdb
 *.bin
 *.elf
+!bootstrap/*.elf
 *.wasm
 *.omni_bc
 *.omni_holo
