@@ -24517,6 +24517,7 @@ pub fn run_m2_foundation_selftests() -> Result<usize, String> {
         ("s3_perf", selftest_s3_performance),
         ("m3_modular", selftest_m3_modular),
         ("audit_view", selftest_audit_view),
+        ("proposer_loop", selftest_proposer_loop),
         ("s5_refreeze", selftest_s5_refreeze),
         ("s6_cleanup", selftest_s6_cleanup),
         ("b4_pure_launcher", selftest_b4_pure_launcher_count),
@@ -25150,6 +25151,19 @@ pub fn run_m2_cli(args: &[String]) -> i32 {
                 1
             }
         },
+        "proposer-loop" => match selftest_proposer_loop() {
+            Ok(n) => {
+                println!(
+                    "[PROPOSER-LOOP PASS] {} checks | Stage 0 scope/deny-list + Stage 1 CEGIS gradient + Stage 2 canary + Stage 3 5-run 0-var + Stage 4 judge/heal/learn (+1t ADOPT / 0t HOLD / -1t REJECT) + Step 4 audit view + flywheel/auto Git SHA-256 store & GC",
+                    n
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("[PROPOSER-LOOP FAIL] {}", e);
+                1
+            }
+        },
         "s3-perf" => {
             if args.get(1).map(|s| s.as_str()) == Some("--write-verifier-seed") {
                 let ve_sa_src = verifier_standalone_source();
@@ -25680,6 +25694,7 @@ pub fn selftest_m2_label_reference() -> Result<usize, String> {
 include!("m2_host/lint.rs");
 include!("m2_host/decode_diff.rs");
 include!("m2_host/audit_view.rs");
+include!("m2_host/proposer_loop.rs");
 include!("host_runtime/pure_default.rs");
 include!("p4_shim/mod.rs");
 
@@ -25765,7 +25780,7 @@ fn main() {
             "harness" | "--harness" => {
                 std::process::exit(run_omni_harness_cli(&cli_args[2..]));
             }
-            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "m3-modular" | "audit-view" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" | "p7-heal" | "p7-adapt" | "p7-learn" | "a1-pure-default" | "a2-pure-include" | "a3-macro-quarantine" | "b2-pure-verifier" | "b4-pure-launcher" | "s2-security" | "s4-honesty" | "s3-perf" | "s5-refreeze" | "s6-cleanup" | "api-stage1" | "api-stage2" | "api-stage2-emit" | "api-stage2-5" => {
+            "m2-frozen" | "m2-lock" | "m2-census" | "m2-labels" | "m2-lint" | "m2-decode" | "m2-elf" | "m2-compile" | "m2-multi" | "m2-multi-pure" | "m2-fixed-point" | "m2-wasm-multi" | "m2-verify" | "m3-lex" | "m3-skim" | "m3-expr" | "m3-stmt" | "m3-lower" | "m3-lockstep" | "m3-4backend" | "m3-fixed-point" | "m3-modular" | "audit-view" | "proposer-loop" | "p4-vm" | "p4-exec" | "p4-shim" | "p4-wasm" | "p5-sys" | "p5-selfhost" | "p7-measure" | "p7-canary" | "p7-heal" | "p7-adapt" | "p7-learn" | "a1-pure-default" | "a2-pure-include" | "a3-macro-quarantine" | "b2-pure-verifier" | "b4-pure-launcher" | "s2-security" | "s4-honesty" | "s3-perf" | "s5-refreeze" | "s6-cleanup" | "api-stage1" | "api-stage2" | "api-stage2-emit" | "api-stage2-5" => {
                 std::process::exit(run_m2_cli(&cli_args[1..]));
             }
             "decompile" | "--decompile" => {
@@ -25773,6 +25788,9 @@ fn main() {
             }
             "audit-diff" | "--audit-diff" => {
                 std::process::exit(run_omni_audit_diff_cli(&cli_args[2..]));
+            }
+            "propose-run" | "--propose-run" => {
+                std::process::exit(run_omni_propose_run_cli(&cli_args[2..]));
             }
             "agent-driver" | "--agent-driver" => {
                 std::process::exit(run_omni_agent_driver_cli(&cli_args[2..]));
