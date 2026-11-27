@@ -456,6 +456,9 @@ fn parse_operand_raw(stream: bytes, pos: i64, nwords: i64) -> i64 {
     let i32_hi: i64 = load_u16(stream, pos + 1) * is_i32 * need_i32;
     let i32_lo: i64 = load_u16(stream, pos + 2) * is_i32 * need_i32;
     let i32_val: i64 = ((i32_hi << 16) | i32_lo) & 65535;
+    let i16_lbl_ok: i64 = is_i16 * need_i16 * in_range(i16_val, 0, 4079);
+    let i32_lbl_ok: i64 = is_i32 * need_i32 * is_eq(i32_hi, 0) * in_range(i32_lo, 0, 4079);
+    let imm_fl: i64 = 8 + (i16_lbl_ok + i32_lbl_ok) * 16;
     let imm_ok: i64 = is_i16 * need_i16 + is_i32 * need_i32;
     let imm_pos: i64 = is_i16 * (pos + 2) + is_i32 * (pos + 3);
     let imm_tok: i64 = is_i16 * i16_val + is_i32 * i32_val;
@@ -464,8 +467,8 @@ fn parse_operand_raw(stream: bytes, pos: i64, nwords: i64) -> i64 {
     let sym_fl: i64 = 8 + is_fn * 64;
     let known_fixed: i64 = have * (is_simple + imm_ok + sym_ok);
     let fixed: i64 = is_simple * pack_op(pos + 1, simple_flags, simple_tok)
-        + is_i16 * need_i16 * pack_op(imm_pos, 8, imm_tok)
-        + is_i32 * need_i32 * pack_op(imm_pos, 8, imm_tok)
+        + is_i16 * need_i16 * pack_op(imm_pos, imm_fl, imm_tok)
+        + is_i32 * need_i32 * pack_op(imm_pos, imm_fl, imm_tok)
         + sym_ok * pack_op(pos + 2, sym_fl, sym_val);
     let c_eng: trit = is_eng <=> 0;
     let eng_p: i64 = if_pos c_eng {
@@ -650,7 +653,7 @@ fn record_labels_from_ops(ws: bytes, is_label_op: i64) -> bytes {
     let out: bytes = if_pos c {
         let p: i64 = ws_get(w, 384);
         let fl: i64 = op_flags(p);
-        let is_lab: i64 = is_gt(fl & 2, 0) + is_gt(fl & 8, 0);
+        let is_lab: i64 = is_gt(fl & 2, 0) + is_gt(fl & 16, 0);
         let lid: i64 = op_tok(p);
         let w2: bytes = if_pos is_lab <=> 0 {
             set_label(w, lid)
@@ -676,7 +679,7 @@ fn check_branch_labels(ws: bytes, op: i64, off: i64) -> bytes {
     let is_lbl_def: i64 = is_eq(op, 32576);
     let lbl_p0: i64 = ws_get(w, 384) * is_gt(nops, 0);
     let lbl_fl: i64 = op_flags(lbl_p0);
-    let lbl_ok: i64 = is_gt(nops, 0) * is_gt((lbl_fl & 2) + (lbl_fl & 8), 0);
+    let lbl_ok: i64 = is_gt(nops, 0) * is_gt((lbl_fl & 2) + (lbl_fl & 16), 0);
     w = append_err_if(w, is_lbl_def * (1 - lbl_ok), 2009, off);
     let start: i64 = is_jmp * 0 + (1 - is_jmp) * 1;
     let count: i64 = nops - start;
@@ -687,7 +690,7 @@ fn check_branch_labels(ws: bytes, op: i64, off: i64) -> bytes {
     while go <=> 0 {
         let p: i64 = ws_get(w, 384 + i);
         let fl: i64 = op_flags(p);
-        let can: i64 = is_gt(fl & 2, 0) + is_gt(fl & 8, 0);
+        let can: i64 = is_gt(fl & 2, 0) + is_gt(fl & 16, 0);
         let lid: i64 = op_tok(p);
         let ok: i64 = can * has_label(w, lid);
         w = append_err_if(w, 1 - ok, 2009, off);
