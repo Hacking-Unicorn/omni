@@ -379,6 +379,60 @@ else
   fail "Step 16 Family F1 permanent regression check FAIL"
 fi
 
+# Step 16 Part B3b: Permanent negative controls for LABEL / branch label-operand corner (60 -> 63)
+splice_kv_label() {
+  local out="$1" ins_bytes="$2"
+  dd if="$TMP/s15_kv.bc" of="$out" bs=1 count=424 2>/dev/null
+  printf '\x0e\x00' | dd of="$out" bs=1 seek=306 count=2 conv=notrunc 2>/dev/null
+  printf '%b' "$ins_bytes" >> "$out"
+  dd if="$TMP/s15_kv.bc" bs=1 skip=424 2>/dev/null >> "$out"
+}
+
+splice_kv_label "$TMP/s16_lbl_ok.bc" '\x40\x7f\xf4\x7e\xe4\x7e'
+splice_kv_label "$TMP/s16_lbl_trit.bc" '\x40\x7f\xe9\x7e\xe4\x7e'
+splice_kv_label "$TMP/s16_lbl_sch.bc" '\x40\x7f\xeb\x7e\x00\x00\xe4\x7e'
+"$PURE_DIR/verifier.elf" "$TMP/s16_lbl_ok.bc" > "$TMP/s16_lbl_ok.ver"
+"$PURE_DIR/verifier.elf" "$TMP/s16_lbl_trit.bc" > "$TMP/s16_lbl_trit.ver"
+"$PURE_DIR/verifier.elf" "$TMP/s16_lbl_sch.bc" > "$TMP/s16_lbl_sch.ver"
+if ! od -An -tu8 "$TMP/s16_lbl_ok.ver" | grep -qw '2009' \
+   && od -An -tu8 "$TMP/s16_lbl_trit.ver" | grep -qw '2009' \
+   && od -An -tu8 "$TMP/s16_lbl_sch.ver" | grep -qw '2009' \
+   && "$TMP/s16_kv_orig.elf" >/dev/null 2>&1; then
+  pass "Step 16 Part B3b LABEL non-IMM flag-8 negative control PASS (LABEL 0x7EF4 accepted; TRIT_POS 0x7EE9 & SCHEMA_REF 0x7EEB rejected with err 2009)"
+else
+  fail "Step 16 Part B3b LABEL non-IMM flag-8 negative control FAIL"
+fi
+
+splice_kv_label "$TMP/s16_lbl_4079.bc" '\x40\x7f\xe5\x7e\xef\x0f\xe4\x7e'
+splice_kv_label "$TMP/s16_lbl_4080.bc" '\x40\x7f\xe5\x7e\xf0\x0f\xe4\x7e'
+splice_kv_label "$TMP/s16_lbl_4081.bc" '\x40\x7f\xe5\x7e\xf1\x0f\xe4\x7e'
+splice_kv_label "$TMP/s16_lbl_neg1.bc" '\x40\x7f\xe5\x7e\xff\xff\xe4\x7e'
+splice_kv_label "$TMP/s16_lbl_i32.bc" '\x40\x7f\xe6\x7e\x00\x00\xf0\x0f\xe4\x7e'
+"$PURE_DIR/verifier.elf" "$TMP/s16_lbl_4079.bc" > "$TMP/s16_lbl_4079.ver"
+"$PURE_DIR/verifier.elf" "$TMP/s16_lbl_4080.bc" > "$TMP/s16_lbl_4080.ver"
+"$PURE_DIR/verifier.elf" "$TMP/s16_lbl_4081.bc" > "$TMP/s16_lbl_4081.ver"
+"$PURE_DIR/verifier.elf" "$TMP/s16_lbl_neg1.bc" > "$TMP/s16_lbl_neg1.ver"
+"$PURE_DIR/verifier.elf" "$TMP/s16_lbl_i32.bc" > "$TMP/s16_lbl_i32.ver"
+if ! od -An -tu8 "$TMP/s16_lbl_4079.ver" | grep -qw '2009' \
+   && od -An -tu8 "$TMP/s16_lbl_4080.ver" | grep -qw '2009' \
+   && od -An -tu8 "$TMP/s16_lbl_4081.ver" | grep -qw '2009' \
+   && od -An -tu8 "$TMP/s16_lbl_neg1.ver" | grep -qw '2009' \
+   && od -An -tu8 "$TMP/s16_lbl_i32.ver" | grep -qw '2009'; then
+  pass "Step 16 Part B3b LABEL IMM boundary negative control PASS (IMM 4079 accepted; 4080/4081/-1/i32 rejected with err 2009)"
+else
+  fail "Step 16 Part B3b LABEL IMM boundary negative control FAIL"
+fi
+
+cp "$TMP/s15_kv.bc" "$TMP/s16_br_trit.bc"
+printf '\xe9\x7e' | dd of="$TMP/s16_br_trit.bc" bs=1 seek=378 count=2 conv=notrunc 2>/dev/null
+printf '\xf0\x7e' | dd of="$TMP/s16_br_trit.bc" bs=1 seek=426 count=2 conv=notrunc 2>/dev/null
+"$PURE_DIR/verifier.elf" "$TMP/s16_br_trit.bc" > "$TMP/s16_br_trit.ver"
+if od -An -tu8 "$TMP/s16_br_trit.ver" | grep -qw '2009'; then
+  pass "Step 16 Part B3b branch-target flag-8 negative control PASS (JMP TRIT_POS -> LABEL L0 rejected with err 2009)"
+else
+  fail "Step 16 Part B3b branch-target flag-8 negative control FAIL"
+fi
+
 echo "=============================================================================="
 echo "[STEP8 SUMMARY] PASS=$PASS FAIL=$FAIL"
 echo "=============================================================================="
