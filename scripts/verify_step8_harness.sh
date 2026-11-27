@@ -363,6 +363,22 @@ else
   fail "Step 16 Family F3 LABEL-operand permanent regression check FAIL"
 fi
 
+# Step 16 Part B3: Permanent negative control for Family F1 (kv_ledger_service word 179 dest-ful slot -> 0x7F5A/0x7F5B/0x7F5C all rejected with err 3001; Find #2 fully closed)
+F1_OK=1
+for f1_hex in 5a 5b 5c; do
+  cp "$TMP/s15_kv.bc" "$TMP/s16_kv_7f${f1_hex}.bc"
+  printf "\\x${f1_hex}\\x7f" | dd of="$TMP/s16_kv_7f${f1_hex}.bc" bs=1 seek=358 count=2 conv=notrunc 2>/dev/null
+  "$PURE_DIR/verifier.elf" "$TMP/s16_kv_7f${f1_hex}.bc" > "$TMP/s16_kv_7f${f1_hex}.ver"
+  if ! od -An -tu8 "$TMP/s16_kv_7f${f1_hex}.ver" | grep -qw '3001'; then
+    F1_OK=0
+  fi
+done
+if [ "$F1_OK" -eq 1 ] && ! od -An -tu8 "$TMP/s15_kv_orig.ver" | grep -qw '3001' && "$TMP/s16_kv_orig.elf" >/dev/null 2>&1; then
+  pass "Step 16 Family F1 permanent regression check PASS (verifier.elf rejects kv_ledger word 179 dest-ful 0x7F5A/0x7F5B/0x7F5C with err 3001; orig runs cleanly; Find #2 closed)"
+else
+  fail "Step 16 Family F1 permanent regression check FAIL"
+fi
+
 echo "=============================================================================="
 echo "[STEP8 SUMMARY] PASS=$PASS FAIL=$FAIL"
 echo "=============================================================================="

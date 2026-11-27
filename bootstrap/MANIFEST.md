@@ -18,6 +18,8 @@ As of Step 9 (Complete Rust Removal), the Omni repository contains **zero Rust s
 > **Step 16 Part B1 Judge Change (Family F4 — `FN_HDR fn_id`):** `pure/verifier_standalone.omni_bc` (`31,048 B` / `0x430CC3C933918F64` → `31,168 B` / `0x2AF95DB4A6628007`) and `verifier.elf` (`38,193 B` / `0x23E3D55383B3333B` → `38,365 B` / `0x035987D581B3F315`) were intentionally re-pinned in Step 16 Part B1 after adding `in_range(fn_idx, 0, 1023)` validation (matching `pure/m2/verify/mod_check.omni::m2v_record_fn`) at both `FN_HDR fn_id` read sites in `pure/verifier_engine.omni` (`prescan_module_fns` and `omni_verify_module_with_mode`), rejecting out-of-range / token-band `fn_id` words (such as F4's `0x7EFB`) with existing error code `3006`. No other pin or frozen hash moved.
 >
 > **Step 16 Part B2 Judge Change (Family F3 — Dest-Shape & `LABEL` Operand):** `pure/verifier_standalone.omni_bc` (`31,168 B` / `0x2AF95DB4A6628007` → `31,526 B` / `0x485D1C5C2D0A69C6`) and `verifier.elf` (`38,365 B` / `0x035987D581B3F315` → `38,895 B` / `0xB60283901F089BE9`) were intentionally re-pinned in Step 16 Part B2 after tightening `pure/verifier_engine.omni` to (1) reject dest-requiring opcodes emitted in destless slots (`op_has_dest(op) * (1 - is_dest)`) in `verify_ins_body` with existing error code `2012`, and (2) require `LABEL (0x7F40)` operand 0 to be a label/imm operand (`(fl & 2) + (fl & 8) > 0`) in `check_branch_labels` with existing error code `2009`. No other pin or frozen hash moved.
+>
+> **Step 16 Part B3 Judge Change (Family F1 — Unassigned Sanitizer Ops `0x7F5A`–`0x7F5C`):** `pure/verifier_standalone.omni_bc` (`31,526 B` / `0x485D1C5C2D0A69C6` → `31,564 B` / `0x061DACCE78F5ADDB`) and `verifier.elf` (`38,895 B` / `0xB60283901F089BE9` → `38,943 B` / `0x1D4E0C270335720E`) were intentionally re-pinned in Step 16 Part B3 after excluding unassigned opcodes `0x7F5A`–`0x7F5C` (`32602`–`32604`) from `pure/verifier_engine.omni::op_is_known` (rejected with existing error code `3001`), fully closing Find #2 (both F1 and F3 components). No other pin or frozen hash moved.
 
 ## 2. Committed `.omni_bc` Bytecode Seeds (`pure/`)
 
@@ -30,7 +32,7 @@ As of Step 9 (Complete Rust Removal), the Omni repository contains **zero Rust s
 | `pure/link/elf_link.omni_bc` | `7,164` | `3,582` | `0x5F261D791F65ED2A` | Pure-Omni multi-module ELF64 linker (`elf_link.elf`, `10,971` B; also rebuilt bit-exact from `pure/link/elf_link.omni`) |
 | `pure/m4/m4.omni_bc` | `56,124` | `28,062` | `0x0561704B3E50EFAC` | Pure-Omni M4 VM (`90,402` B ELF64, `0xB43AFBB0DED59488`) |
 | `pure/m4/m4_standalone.omni_bc` | `57,330` | `28,665` | `0x6F86B759214A2765` | Standalone native `m4.elf` (`91,576` B, `0xFBA8272337B1BAC4`) |
-| `pure/verifier_standalone.omni_bc` | `31,526` | `15,763` | `0x485D1C5C2D0A69C6` | Standalone native `verifier.elf` (`38,895` B, `0xB60283901F089BE9`) |
+| `pure/verifier_standalone.omni_bc` | `31,564` | `15,782` | `0x061DACCE78F5ADDB` | Standalone native `verifier.elf` (`38,943` B, `0x1D4E0C270335720E`) |
 
 ## 3. Rebuilt Toolchain & Harness ELFs (`build/pure-bin/`)
 
@@ -38,7 +40,7 @@ Produced from scratch by `bash scripts/build_pure_driver.sh build/pure-bin` (wit
 
 1. `pure_build_util.elf` — built from `pure/m5/pure_build_util.omni` via `bootstrap/m3.elf` + `bootstrap/m2.elf` (provides FNV-1a64 hashing and UTF-16LE widening without Python).
 2. `m2.elf` — rebuilt from `pure/m2/m2.omni_bc` through 3 generations (`S1 == S2 == S3 == bootstrap/m2.elf`, `126,152` B, `0xAA5F84B6AA45BB51`); `m2-fixed-point` additionally verifies `S1 == S2 == S3 == V` against the same pin (`126,152` B, `0xAA5F84B6AA45BB51`).
-3. `verifier.elf` (`38,895` B, `0xB60283901F089BE9`) and `m4.elf` (`91,576` B, `0xFBA8272337B1BAC4`) — rebuilt from their `.omni_bc` seeds using freshly built `m2.elf`.
+3. `verifier.elf` (`38,943` B, `0x1D4E0C270335720E`) and `m4.elf` (`91,576` B, `0xFBA8272337B1BAC4`) — rebuilt from their `.omni_bc` seeds using freshly built `m2.elf`.
 4. `audit_diff.elf`, `audit_decompile.elf`, `omnic_pure.elf`, `m2_lint.elf`, `audit_view_gate.elf`, `proposer_loop.elf`, `core_gates.elf`, `extra_gates.elf` — compiled from `.omni` sources via `m3.elf` + `verifier.elf` + `m2.elf`.
 5. `m3.elf` (`207,015` B, `0x7397A5020895AEBF`) — rebuilt via `omnic_pure.elf link-elf pure/m3/m3_standalone.omni_bc pure/m3/mod_parse.omni_bc` and verified bit-identical (`cmp`) to `bootstrap/m3.elf`.
 6. `omnic_pure.elf` self-compile fixed point — `omnic_pure.elf` compiles `pure/driver/omnic_driver.omni` to `omnic_pure_gen2.elf` and verifies `0`-byte diff (`58,184` B).
