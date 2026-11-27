@@ -432,11 +432,11 @@ let p1: i64 = dc_ins_op1(w,idx);
 let is_bin: i64 = m2u_in(op,32528,32532) + m2u_in(op,32542,32544) + m2u_in(op,32546,32551) + m2u_eq(op,32557);
 let is_1: i64 = m2u_in(op,32513,32515) + m2u_eq(op,32518)
 + m2u_eq(op,32525) + m2u_eq(op,32534) + m2u_eq(op,32545) + m2u_eq(op,32552)
-+ m2u_eq(op,32560) + m2u_eq(op,32565) + m2u_eq(op,32592) + m2u_in(op,32597,32601)
++ m2u_eq(op,32560) + m2u_eq(op,32565) + m2u_eq(op,32592) + m2u_in(op,32598,32599) + m2u_eq(op,32601)
 + m2u_eq(op,32605) + m2u_eq(op,32612) + m2u_eq(op,32616) + m2u_eq(op,32621) + m2u_eq(op,32624);
 let is_const: i64 = m2u_eq(op,32521) * m2u_eq(nops,1) * m2u_in(dc_u16(w,p0),32485,32490);
 let is_2: i64 = is_bin + m2u_eq(op,32535) + m2u_eq(op,32536) + m2u_in(op,32553,32555)
-+ m2u_eq(op,32561) + m2u_eq(op,32564) + m2u_eq(op,32593) + m2u_eq(op,32613)
++ m2u_eq(op,32561) + m2u_eq(op,32564) + m2u_eq(op,32613)
 + m2u_eq(op,32619) + m2u_eq(op,32622) + m2u_eq(op,32623);
 let is_3: i64 = m2u_eq(op,32556) + m2u_eq(op,32575);
 let is_4: i64 = m2u_eq(op,32581);
