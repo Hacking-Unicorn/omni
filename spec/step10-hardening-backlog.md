@@ -62,3 +62,13 @@ Every friction, stall, ambiguity, or tooling gap surfaced during the first live 
 - **What it blocked:** When running `./build/pure-bin/omnic_pure.elf selftest > /tmp/out.txt`, the child `proposer_loop.elf` writes 242 bytes at file offset 0 and `core_gates.elf` subsequently writes `[PURE-HARNESS PASS] ...` overwriting the first 61 bytes, producing garbled output (`...proposer\nage 1 CEGIS gradient...`). Also affects clean log capture for evidence trails.
 - **Remediation:** Ensure `core_gates.elf` captures or suppresses child stdout cleanly (or uses `O_APPEND` / separate capture file) before emitting its final `[PURE-HARNESS PASS]` summary line.
 - **Resolution (Step 11 — RESOLVED):** Updated `pure/harness/core_gates.omni::cg_run_selftest` to capture `audit_view_gate.elf` and `proposer_loop.elf` stdout into separate temp files and emit the combined 3-line summary in a single `sys_write(1, ...)`; verified clean redirected output in `scripts/verify_step8_harness.sh`.
+
+---
+
+## P1 — Operational Findings Surfaced in Step 12
+
+### 8. Out-of-tree `--candidate` files with relative `include "../..."` directives fail Stage 1/3 compilation (`cand=-1/-1`)
+- **Where:** `pure/harness/proposer_live.omni` (`propose-run --target <repo-path> --candidate <tmp-path>`) + `pure/driver/omnic_driver.omni` (`od_compile_omni` / `od_read_include`).
+- **What it blocked (Step 12 Cycles 1 & 2):** Any target module that contains relative `include "../..."` directives (such as `pure/audit/decompile.omni` and `pure/audit/diff_summary.omni`) fails to compile when its candidate file is staged outside the target's directory (e.g., `/tmp/.../cand.omni`), because `od_compile_omni` resolves relative includes against the candidate file's directory rather than `--target`'s directory. Both Step 12 cycles failed closed as `-1t REJECT` (`cand=-1/-1`, `learn_delta=-3`, `heal_action=1`), triggering the 2-consecutive-non-ADOPT stop condition.
+- **Remediation:** Either pass an explicit `--include-base <dir>` (derived from `--target`'s parent directory) from `proposer_live.omni` to `omnic_pure.elf compile` / `p7-measure`, or stage the candidate temporarily inside the target's directory (or an ephemeral worktree) during Stage 3 measurement and clean up unconditionally on exit.
+- **Status:** **OPEN** (surfaced in Step 12; intentionally not patched mid-batch per Standing Rule 4).

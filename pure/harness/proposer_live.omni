@@ -209,9 +209,13 @@ fn plv_git_adopt_commit(w: bytes, repo_cstr: bytes, tgt_cstr: bytes, cand_cstr: 
     u = plv_out_cstr(su_out4(su_out4(u, 116, 32, 45, 67), 32, 34, 0, 0), repo_cstr);
     u = su_out4(su_out4(su_out4(su_out4(u, 34, 32, 114, 101), 118, 45, 112, 97), 114, 115, 101, 32), 45, 45, 97, 98);
     u = su_out4(su_out4(su_out4(su_out4(u, 98, 114, 101, 118), 45, 114, 101, 102), 32, 72, 69, 65), 68, 41, 10, 103);
-    // "git -C \"<repo>\" checkout -B flywheel/auto\ncp \"<cand>\" \"<repo>/<tgt>\"\n"
+    // "git -C \"<repo>\" checkout flywheel/auto 2>/dev/null || git -C \"<repo>\" checkout -b flywheel/auto\ncp \"<cand>\" \"<repo>/<tgt>\"\n"
     u = plv_out_cstr(su_out4(su_out4(u, 105, 116, 32, 45), 67, 32, 34, 0), repo_cstr);
-    u = su_out4(su_out4(su_out4(su_out4(u, 34, 32, 99, 104), 101, 99, 107, 111), 117, 116, 32, 45), 66, 32, 102, 108);
+    u = su_out4(su_out4(su_out4(su_out4(u, 34, 32, 99, 104), 101, 99, 107, 111), 117, 116, 32, 102), 108, 121, 119, 104);
+    u = su_out4(su_out4(su_out4(su_out4(u, 101, 101, 108, 47), 97, 117, 116, 111), 32, 50, 62, 47), 100, 101, 118, 47);
+    u = su_out4(su_out4(su_out4(su_out4(u, 110, 117, 108, 108), 32, 124, 124, 32), 103, 105, 116, 32), 45, 67, 32, 34);
+    u = plv_out_cstr(u, repo_cstr);
+    u = su_out4(su_out4(su_out4(su_out4(u, 34, 32, 99, 104), 101, 99, 107, 111), 117, 116, 32, 45), 98, 32, 102, 108);
     u = su_out4(su_out4(su_out4(su_out4(u, 121, 119, 104, 101), 101, 108, 47, 97), 117, 116, 111, 10), 99, 112, 32, 34);
     u = plv_out_cstr(u, cand_cstr);
     u = plv_out_cstr(su_out4(u, 34, 32, 34, 0), repo_cstr);

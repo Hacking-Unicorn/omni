@@ -94,10 +94,10 @@ fn jc_update_heal(path_cstr: bytes, err_code: i64, attempt: i64, hash_lo32: i64)
     return act + nw * 0;
 }
 
-// Formats and writes `verdict=<+1t ADOPT|0t HOLD|-1t REJECT> | learn_updates=<N> | heal_action=<A>\n`.
+// Formats and writes `verdict=<+1t ADOPT|0t HOLD|-1t REJECT> | learn_delta=<D> | learn_updates=<N> | heal_action=<A>\n`.
 #[strict]
 #[cap(SYS)]
-fn jc_print_verdict(arena: bytes, v_i64: i64, learn_upd: i64, heal_act: i64) -> i64 {
+fn jc_print_verdict(arena: bytes, v_i64: i64, learn_delta: i64, learn_upd: i64, heal_act: i64) -> i64 {
     let w: bytes = iset_patch_i64(arena, 0, 0);
     // "verdict="
     w = su_out4(su_out4(w, 118, 101, 114, 100), 105, 99, 116, 61);
@@ -108,6 +108,9 @@ fn jc_print_verdict(arena: bytes, v_i64: i64, learn_upd: i64, heal_act: i64) -> 
     } else {
         su_out4(su_out4(su_out4(w, 45, 49, 116, 32), 82, 69, 74, 69), 67, 84, 0, 0)
     } };
+    // " | learn_delta="
+    w = su_out4(su_out4(su_out4(su_out4(w, 32, 124, 32, 108), 101, 97, 114, 110), 95, 100, 101, 108), 116, 97, 61, 0);
+    w = su_out_signed_i64(w, learn_delta);
     // " | learn_updates="
     w = su_out4(su_out4(su_out4(su_out4(w, 32, 124, 32, 108), 101, 97, 114, 110), 95, 117, 112, 100), 97, 116, 101, 115);
     w = su_out_i64(su_out_u8(w, 61), learn_upd);
@@ -160,7 +163,8 @@ fn main() -> i64 {
             let heal_act: i64 = if_pos has_heal <=> 0 {
                 jc_update_heal(su_make_cstr(u8, l8_off, l8_len), err_code, attempt, (cand_w ^ cand_elf) & 2147483647)
             } else { p7_heal_decide(err_code, attempt, 3, 1) };
-            jc_print_verdict(u8, v_i64, learn_upd, heal_act)
+            let learn_delta: i64 = m2u_sel(has_learn, m2u_sel(m2u_eq(v_i64, 1), 2, m2u_sel(m2u_eq(v_i64, 0), 0, 0 - 3)), 0);
+            jc_print_verdict(u8, v_i64, learn_delta, learn_upd, heal_act)
         }
     };
     return sys_exit(rc);
