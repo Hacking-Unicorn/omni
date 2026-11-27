@@ -72,9 +72,11 @@ fn cg_tmp(tag: i64) -> bytes {
 #[strict]
 #[cap(SYS)]
 fn cg_check_pin(arena: bytes, p: bytes, want_sz: i64, want_h: i64) -> i64 {
-    let nb: i64 = su_read_file_into(arena, p, su_band_b(), 250000);
-    let h: i64 = m2u_sel(m2u_eq(nb, want_sz), su_fnv1a64(arena, su_band_b(), nb), 0);
-    return m2u_eq(nb, want_sz) * m2u_eq(h, want_h);
+    let bb: i64 = su_band_b();
+    let nb: i64 = su_read_file_into(arena, p, bb, 250000);
+    let sz_ok: i64 = m2u_eq(nb, want_sz);
+    let h: i64 = m2u_sel(sz_ok, su_fnv1a64(arena, bb, nb), 0);
+    return sz_ok * m2u_eq(h, want_h);
 }
 
 // Gate 1: m2-frozen (all frozen seed & native ELF pins intact).
@@ -129,14 +131,16 @@ fn cg_gate_p2a(arena: bytes) -> i64 {
     let drv_src: bytes = anew(0);
     drv_src = iset(drv_src, 112, 117, 114, 101, 47, 109, 53, 47, 122, 101, 114, 111, 95, 114, 117, 115);
     drv_src = iset(drv_src, 116, 95, 100, 114, 105, 118, 101, 114, 46, 111, 109, 110, 105, 0);
-    let nb: i64 = su_read_file_into(arena, drv_src, su_band_a(), 16000);
+    let ba: i64 = su_band_a();
+    let bb: i64 = su_band_b();
+    let nb: i64 = su_read_file_into(arena, drv_src, ba, 16000);
     let w: bytes = arena;
     let i: i64 = 0;
-    while nb - i <=> 0 { w = st_u16(w, su_band_b() + (i << 1), ld_u8(w, su_band_a() + i)); i = i + 1; }
+    while nb - i <=> 0 { w = st_u16(w, bb + (i << 1), ld_u8(w, ba + i)); i = i + 1; }
     let u16_p: bytes = cg_tmp(117);
     let bc_p: bytes = cg_tmp(98);
     let elf_p: bytes = cg_tmp(101);
-    let nw: i64 = su_write_file_from(w, u16_p, su_band_b(), nb << 1, 420);
+    let nw: i64 = su_write_file_from(w, u16_p, bb, nb << 1, 420);
     let rc_m3: i64 = if_pos m2u_ge(nw, 0) <=> 0 { su_spawn_capture(cg_tool(w, 0), u16_p, bc_p, 420) } else { 1 };
     let rc_v: i64 = if_pos m2u_eq(rc_m3, 0) <=> 0 { su_spawn_capture(cg_tool(w, 2), bc_p, cg_tmp(118), 420) } else { 1 };
     let vn: i64 = su_read_file_into(w, cg_tmp(118), 1536, 64);
@@ -165,13 +169,15 @@ fn cg_gate_ver_and_mac(arena: bytes) -> i64 {
     wd_p = iset(wd_p, 103, 111, 108, 100, 101, 110, 115, 47, 119, 101, 105, 103, 104, 116, 101, 100);
     wd_p = iset(wd_p, 95, 100, 105, 102, 102, 95, 112, 117, 114, 101, 95, 103, 111, 108, 100, 101);
     wd_p = iset(wd_p, 110, 46, 111, 109, 110, 105, 0);
-    let nb: i64 = su_read_file_into(arena, wd_p, su_band_a(), 16000);
+    let ba: i64 = su_band_a();
+    let bb: i64 = su_band_b();
+    let nb: i64 = su_read_file_into(arena, wd_p, ba, 16000);
     let w: bytes = arena;
     let i: i64 = 0;
-    while nb - i <=> 0 { w = st_u16(w, su_band_b() + (i << 1), ld_u8(w, su_band_a() + i)); i = i + 1; }
+    while nb - i <=> 0 { w = st_u16(w, bb + (i << 1), ld_u8(w, ba + i)); i = i + 1; }
     let u16_p: bytes = cg_tmp(119);
     let bc_p: bytes = cg_tmp(120);
-    let nw: i64 = su_write_file_from(w, u16_p, su_band_b(), nb << 1, 420);
+    let nw: i64 = su_write_file_from(w, u16_p, bb, nb << 1, 420);
     let rc_m3: i64 = if_pos m2u_ge(nw, 0) <=> 0 { su_spawn_capture(cg_tool(w, 0), u16_p, bc_p, 420) } else { 1 };
     let rc_v: i64 = if_pos m2u_eq(rc_m3, 0) <=> 0 { su_spawn_capture(cg_tool(w, 2), bc_p, cg_tmp(121), 420) } else { 1 };
     let vn: i64 = su_read_file_into(w, cg_tmp(121), 1536, 64);
