@@ -348,7 +348,6 @@ let w: bytes = dc_try_if(arena,i,end,depth);
 w = if_pos m2u_eq(ld_u64(w,176),0) <=> 0 { dc_try_match_trit(w,i,end,depth) } else { w };
 w = if_pos m2u_eq(ld_u64(w,176),0) <=> 0 { dc_try_dowhile(w,i,end,depth) } else { w };
 let r: bytes = if_pos ld_u64(w,176) <=> 0 {
-let ni: i64 = ld_u64(w,184);
 w
 } else {
 let u: bytes = dc_emit_single(w,i,depth);
@@ -447,9 +446,10 @@ let w: bytes = su_out_u8(su_out_i64(su_out4(su_out4(arena,102,110,32,102),110,95
 let pk: i64 = 0;
 while pcnt - pk <=> 0 {
 w = if_pos m2u_lt(0,pk) <=> 0 { su_out4(w,44,32,0,0) } else { w };
-let pt: i64 = dc_u16(w,pos + 3 + pk * 3);
-let pty: i64 = dc_u16(w,pos + 3 + pk * 3 + 1);
-let ptc: i64 = dc_u16(w,pos + 3 + pk * 3 + 2);
+let pbase: i64 = pos + 3 + pk * 3;
+let pt: i64 = dc_u16(w,pbase);
+let pty: i64 = dc_u16(w,pbase + 1);
+let ptc: i64 = dc_u16(w,pbase + 2);
 let untr: i64 = ((ptc - 32704) >> 5) & 1;
 w = dc_emit_ty(su_out4(su_out_i64(su_out_u8(w,112),pt - 32448),58,32,0,0),pty);
 w = if_pos untr <=> 0 {
