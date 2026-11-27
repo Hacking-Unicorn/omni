@@ -12,21 +12,21 @@ All committed bootstrap artifacts and their pinned byte sizes and FNV-1a64 hashe
 
 | Artifact | Size (B) | FNV-1a64 | Role |
 |---|---:|---|---|
-| `bootstrap/m2.elf` | `126,152` | `0xAA5F84B6AA45BB51` | Pure-Omni M2 x86-64 ELF64 compiler (`S1 == S2 == S3 == bootstrap/m2.elf`, incl. `sys_clock_ns`) |
+| `bootstrap/m2.elf` | `126,032` | `0x1F040D79AE834D14` | Pure-Omni M2 x86-64 ELF64 compiler (`S1 == S2 == S3 == bootstrap/m2.elf`, incl. `sys_clock_ns`) |
 | `bootstrap/m3.elf` | `207,015` | `0x7397A5020895AEBF` | Pure-Omni M3 surface `.omni` → `.omni_bc` frontend (rebuilt bit-exact via `link-elf`) |
 
 ### Committed `.omni_bc` Bytecode Seeds (`pure/`)
 
 | Seed Artifact | Size (B) | Words | FNV-1a64 | Rebuilt Artifact |
 |---|---:|---:|---|---|
-| `pure/m2/m2.omni_bc` | `87,836` | `43,918` | `0x74FB1652CC0E974B` | `m2.elf` (`126,152` B, `0xAA5F84B6AA45BB51`, `S1 == S2 == S3 == bootstrap/m2.elf`) |
+| `pure/m2/m2.omni_bc` | `87,802` | `43,901` | `0xFD2F8B389C2AAEA1` | `m2.elf` (`126,032` B, `0x1F040D79AE834D14`, `S1 == S2 == S3 == bootstrap/m2.elf`) |
 | `pure/m3/m3.omni_bc` | `132,498` | `66,249` | `0x0E3052A4BE00D599` | Monolithic M3 frontend fixed-point reference |
 | `pure/m3/m3_standalone.omni_bc` | `52,498` | `26,249` | `0xD83FBCA0D2E8FA78` | Modular M3 part 1 (linked into `m3.elf`) |
 | `pure/m3/mod_parse.omni_bc` | `84,530` | `42,265` | `0x0F581C62270F2863` | Modular M3 part 2 (linked into `m3.elf`) |
 | `pure/link/elf_link.omni_bc` | `7,164` | `3,582` | `0x5F261D791F65ED2A` | Pure-Omni ELF64 linker (`elf_link.elf`, `10,971` B; rebuilt bit-exact from `pure/link/elf_link.omni`) |
 | `pure/m4/m4.omni_bc` | `56,124` | `28,062` | `0x0561704B3E50EFAC` | Pure-Omni M4 VM (`90,402` B ELF64, `0xB43AFBB0DED59488`) |
 | `pure/m4/m4_standalone.omni_bc` | `57,330` | `28,665` | `0x6F86B759214A2765` | Standalone native `m4.elf` (`91,576` B, `0xFBA8272337B1BAC4`) |
-| `pure/verifier_standalone.omni_bc` | `32,760` | `16,380` | `0x676886F908AD2887` | Standalone native `verifier.elf` (`40,562` B, `0xB3A9FFC5328CAFE4`) |
+| `pure/verifier_standalone.omni_bc` | `32,760` | `16,380` | `0xD3482994AFC37D25` | Standalone native `verifier.elf` (`40,562` B, `0x965E0FA56E7B6046`) |
 
 > **Judge / Pin Discipline:** After Step 9, the frozen regression hashes and `bootstrap/MANIFEST.md` are the sole cryptographic anchors. Every hash/pin change is a judge change: its own PR with from-scratch derivation and fixed-point proof, never auto-merged and never proposer-initiated.
 

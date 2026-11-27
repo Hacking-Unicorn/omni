@@ -603,6 +603,45 @@ else
   fail "Step 16 Part B6 (F6-D) non-canonical alias honesty control FAIL"
 fi
 
+# Check 74: Step 16 Part B7 (Option 2, 0x7F51 scat) — rejected by both verifier.elf (3001) and m2.elf (seed0 w22 0x7F10->0x7F51)
+cp "$TMP/s16_f2_s0_orig.bc" "$TMP/s16_b7_7f51.bc"
+printf '\x51\x7f' | dd of="$TMP/s16_b7_7f51.bc" bs=1 seek=44 count=2 conv=notrunc 2>/dev/null
+"$PURE_DIR/verifier.elf" "$TMP/s16_b7_7f51.bc" > "$TMP/s16_b7_7f51.ver"
+if od -An -tu8 -w8 "$TMP/s16_b7_7f51.ver" | grep -qw '3001' \
+   && ! "$PURE_DIR/m2.elf" "$TMP/s16_b7_7f51.bc" >/dev/null 2>&1 \
+   && ! od -An -tu8 -w8 "$TMP/s16_f2_s0_orig.ver" | grep -qw '3001' \
+   && "$PURE_DIR/m2.elf" "$TMP/s16_f2_s0_orig.bc" >/dev/null; then
+  pass "Step 16 Part B7 (0x7F51 scat) reserved-op negative control PASS (rejected 3001 by verifier.elf & rejected by m2.elf; orig accepted)"
+else
+  fail "Step 16 Part B7 (0x7F51 scat) reserved-op negative control FAIL"
+fi
+
+# Check 75: Step 16 Part B7 (Option 2, 0x7F55 s2i) — rejected by both verifier.elf (3001) and m2.elf (seed0 w37 0x7F09->0x7F55)
+cp "$TMP/s16_f2_s0_orig.bc" "$TMP/s16_b7_7f55.bc"
+printf '\x55\x7f' | dd of="$TMP/s16_b7_7f55.bc" bs=1 seek=74 count=2 conv=notrunc 2>/dev/null
+"$PURE_DIR/verifier.elf" "$TMP/s16_b7_7f55.bc" > "$TMP/s16_b7_7f55.ver"
+if od -An -tu8 -w8 "$TMP/s16_b7_7f55.ver" | grep -qw '3001' \
+   && ! "$PURE_DIR/m2.elf" "$TMP/s16_b7_7f55.bc" >/dev/null 2>&1 \
+   && "$PURE_DIR/m2.elf" "$TMP/s16_f2_s0_orig.bc" >/dev/null; then
+  pass "Step 16 Part B7 (0x7F55 s2i) reserved-op negative control PASS (rejected 3001 by verifier.elf & rejected by m2.elf; orig accepted)"
+else
+  fail "Step 16 Part B7 (0x7F55 s2i) reserved-op negative control FAIL"
+fi
+
+# Check 76: Step 16 Part B7 (Option 2, 0x7F58 san_dom) — accepted by verifier.elf & m2.elf, stamped APPROXIMATE by audit_decompile.elf (seed4 w25 0x7F28->0x7F58)
+cp "$TMP/s16_s4_orig.bc" "$TMP/s16_b7_7f58.bc"
+printf '\x58\x7f' | dd of="$TMP/s16_b7_7f58.bc" bs=1 seek=50 count=2 conv=notrunc 2>/dev/null
+"$PURE_DIR/verifier.elf" "$TMP/s16_b7_7f58.bc" > "$TMP/s16_b7_7f58.ver"
+"$PURE_DIR/audit_decompile.elf" "$TMP/s16_b7_7f58.bc" > "$TMP/s16_b7_7f58.dec.omni"
+if ! od -An -tu8 -w8 "$TMP/s16_b7_7f58.ver" | grep -qw '3001' \
+   && "$PURE_DIR/m2.elf" "$TMP/s16_b7_7f58.bc" >/dev/null \
+   && grep -q '^// Status: APPROXIMATE' "$TMP/s16_b7_7f58.dec.omni" \
+   && grep -q '^// Status: RECONSTRUCTED (exact)' "$TMP/s16_s4_orig.dec.omni"; then
+  pass "Step 16 Part B7 (0x7F58 san_dom) M2-lowered/decompiler-honesty control PASS (accepted by verifier & m2, stamped APPROXIMATE; orig RECONSTRUCTED)"
+else
+  fail "Step 16 Part B7 (0x7F58 san_dom) M2-lowered/decompiler-honesty control FAIL"
+fi
+
 echo "=============================================================================="
 echo "[STEP8 SUMMARY] PASS=$PASS FAIL=$FAIL"
 echo "=============================================================================="
