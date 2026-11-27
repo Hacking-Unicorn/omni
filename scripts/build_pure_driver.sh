@@ -74,8 +74,8 @@ echo "[PURE-BUILD] m4.elf rebuilt (91576 B, 0xFBA8272337B1BAC4)"
 
 "$OUT_DIR/m2.elf" pure/verifier_standalone.omni_bc > "$OUT_DIR/verifier.elf"
 chmod +x "$OUT_DIR/verifier.elf"
-verify_pin "$OUT_DIR/verifier.elf" 39223 0x5CCDC9F0C0897E0B
-echo "[PURE-BUILD] verifier.elf rebuilt (39223 B, 0x5CCDC9F0C0897E0B)"
+verify_pin "$OUT_DIR/verifier.elf" 39407 0x01F8692886A0F9E0
+echo "[PURE-BUILD] verifier.elf rebuilt (39407 B, 0x01F8692886A0F9E0)"
 
 cp "$BOOT_M3" "$OUT_DIR/m3.elf"
 chmod +x "$OUT_DIR/m3.elf"

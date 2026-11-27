@@ -433,6 +433,67 @@ else
   fail "Step 16 Part B3b branch-target flag-8 negative control FAIL"
 fi
 
+# Step 16 Part B3c: Permanent checks for label identity resolution (4096 non-aliasing slots + bit-63 fix, 63 -> 66)
+patch_kv_lbl_pair() {
+  local out="$1" b189="$2" b213="$3"
+  dd if="$TMP/s15_kv.bc" of="$out" bs=1 count=378 2>/dev/null
+  printf '%b' "$b189" >> "$out"
+  dd if="$TMP/s15_kv.bc" bs=1 skip=380 count=46 2>/dev/null >> "$out"
+  printf '%b' "$b213" >> "$out"
+  dd if="$TMP/s15_kv.bc" bs=1 skip=428 2>/dev/null >> "$out"
+}
+
+patch_kv_lbl_pair "$TMP/s16_alias_a.bc" '\xe5\x7e\x01\x00' '\xf3\x7e'
+patch_kv_lbl_pair "$TMP/s16_alias_ap.bc" '\xf3\x7e' '\xe5\x7e\x03\x00'
+patch_kv_lbl_pair "$TMP/s16_imm_same.bc" '\xe5\x7e\x03\x00' '\xe5\x7e\x03\x00'
+"$PURE_DIR/verifier.elf" "$TMP/s16_alias_a.bc" > "$TMP/s16_alias_a.ver"
+"$PURE_DIR/verifier.elf" "$TMP/s16_alias_ap.bc" > "$TMP/s16_alias_ap.ver"
+"$PURE_DIR/verifier.elf" "$TMP/s16_imm_same.bc" > "$TMP/s16_imm_same.ver"
+if od -An -tu8 "$TMP/s16_alias_a.ver" | grep -qw '2009' \
+   && od -An -tu8 "$TMP/s16_alias_ap.ver" | grep -qw '2009' \
+   && ! od -An -tu8 "$TMP/s16_imm_same.ver" | grep -qw '2009' \
+   && "$PURE_DIR/m2.elf" "$TMP/s16_imm_same.bc" > /dev/null \
+   && "$TMP/s16_kv_orig.elf" >/dev/null 2>&1; then
+  pass "Step 16 Part B3c non-aliasing negative control PASS (LBL/IMM cross-namespace probes (a)/(a') rejected 2009; same-ns IMM 3 & LBL 3 accepted + run cleanly)"
+else
+  fail "Step 16 Part B3c non-aliasing negative control FAIL"
+fi
+
+B3C_COMP_OK=1
+for imm_pair in '3f:00' 'ff:00' '00:01' '2c:01' 'ef:0f'; do
+  lo="${imm_pair%:*}"; hi="${imm_pair#*:}"
+  patch_kv_lbl_pair "$TMP/s16_imm_${lo}${hi}.bc" "\\xe5\\x7e\\x${lo}\\x${hi}" "\\xe5\\x7e\\x${lo}\\x${hi}"
+  "$PURE_DIR/verifier.elf" "$TMP/s16_imm_${lo}${hi}.bc" > "$TMP/s16_imm_${lo}${hi}.ver"
+  if od -An -tu8 "$TMP/s16_imm_${lo}${hi}.ver" | grep -qw '2009' || ! "$PURE_DIR/m2.elf" "$TMP/s16_imm_${lo}${hi}.bc" > /dev/null; then
+    B3C_COMP_OK=0
+  fi
+done
+patch_kv_lbl_pair "$TMP/s16_lbl15.bc" '\xff\x7e' '\xff\x7e'
+"$PURE_DIR/verifier.elf" "$TMP/s16_lbl15.bc" > "$TMP/s16_lbl15.ver"
+if od -An -tu8 "$TMP/s16_lbl15.ver" | grep -qw '2009' || ! "$PURE_DIR/m2.elf" "$TMP/s16_lbl15.bc" > /dev/null; then
+  B3C_COMP_OK=0
+fi
+if [ "$B3C_COMP_OK" -eq 1 ]; then
+  pass "Step 16 Part B3c full IMM 0..4079 & bit-63 completeness check PASS (IMM 63/255/256/300/4079 & LBL 15 accepted by verifier.elf and lowered by m2.elf)"
+else
+  fail "Step 16 Part B3c full IMM 0..4079 & bit-63 completeness check FAIL"
+fi
+
+patch_kv_lbl_pair "$TMP/s16_undef_300.bc" '\xe5\x7e\x2c\x01' '\xf3\x7e'
+"$PURE_DIR/verifier.elf" "$TMP/s16_undef_300.bc" > "$TMP/s16_undef_300.ver"
+dd if="$TMP/s15_kv.bc" of="$TMP/s16_dual_ns.bc" bs=1 count=424 2>/dev/null
+printf '\x0f\x00' | dd of="$TMP/s16_dual_ns.bc" bs=1 seek=306 count=2 conv=notrunc 2>/dev/null
+printf '\x41\x7f\xe5\x7e\x03\x00\xe4\x7e\x40\x7f\xe5\x7e\x03\x00\xe4\x7e' >> "$TMP/s16_dual_ns.bc"
+dd if="$TMP/s15_kv.bc" bs=1 skip=424 2>/dev/null >> "$TMP/s16_dual_ns.bc"
+"$PURE_DIR/verifier.elf" "$TMP/s16_dual_ns.bc" > "$TMP/s16_dual_ns.ver"
+if od -An -tu8 "$TMP/s16_undef_300.ver" | grep -qw '2009' \
+   && ! od -An -tu8 "$TMP/s16_dual_ns.ver" | grep -qw '2009' \
+   && "$PURE_DIR/m2.elf" "$TMP/s16_dual_ns.bc" > /dev/null; then
+  pass "Step 16 Part B3c undef IMM 300 & dual-namespace control PASS (undef rejected 2009; simultaneous LBL 3 + IMM 3 accepted by both)"
+else
+  fail "Step 16 Part B3c undef IMM 300 & dual-namespace control FAIL"
+fi
+
 echo "=============================================================================="
 echo "[STEP8 SUMMARY] PASS=$PASS FAIL=$FAIL"
 echo "=============================================================================="

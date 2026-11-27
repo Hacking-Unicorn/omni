@@ -29,7 +29,9 @@
 //   14 nops, 15 ins_off,
 //   32..255 register slots (224),
 //   256..383 error pairs (up to 64),
-//   384..447 operand packs (up to 64).
+//   384..447 operand packs (up to 64),
+//   448..959 module fn table,
+//   960..1023 label bitset (64 words = 4096 slots: 0..4079 IMM, 4080..4095 LBL).
 // ==============================================================================
 
 #[strict]
@@ -362,20 +364,31 @@ fn op_is_destless(op: i64) -> i64 {
 
 
 #[strict]
+fn op_label_slot(p: i64) -> i64 {
+    let fl: i64 = op_flags(p);
+    let is_lbl: i64 = is_gt(fl & 2, 0);
+    let is_imm: i64 = is_gt(fl & 16, 0);
+    let tok: i64 = op_tok(p);
+    let lbl_slot: i64 = 4080 + tok;
+    let r: i64 = is_lbl * lbl_slot + is_imm * tok + (1 - is_lbl - is_imm) * (0 - 1);
+    return r;
+}
+
+#[strict]
 fn has_label(ws: bytes, lid: i64) -> i64 {
-    let in_rng: i64 = in_range(lid, 0, 255);
-    let w: i64 = 4 + label_bit_word(lid);
+    let in_rng: i64 = in_range(lid, 0, 4095);
+    let w: i64 = 960 + label_bit_word(lid) * in_rng;
     let bits: i64 = ws_get(ws, w);
     let m: i64 = label_bit_mask(lid);
-    let hit: i64 = is_gt(bits & m, 0);
+    let hit: i64 = 1 - is_eq(bits & m, 0);
     let r: i64 = in_rng * hit;
     return r;
 }
 
 #[strict]
 fn set_label(ws: bytes, lid: i64) -> bytes {
-    let in_rng: i64 = in_range(lid, 0, 255);
-    let w: i64 = 4 + label_bit_word(lid) * in_rng;
+    let in_rng: i64 = in_range(lid, 0, 4095);
+    let w: i64 = 960 + label_bit_word(lid) * in_rng;
     let bits: i64 = ws_get(ws, w);
     let m: i64 = label_bit_mask(lid);
     let nxt: i64 = bits | (m * in_rng);
@@ -582,6 +595,13 @@ fn clear_labels_and_regs(ws: bytes) -> bytes {
         i = i + 1;
         more = 224 - i <=> 0;
     } more;
+    let j: i64 = 0;
+    let more_l: trit = 64 <=> 0;
+    do_while {
+        w = ws_set(w, 960 + j, 0);
+        j = j + 1;
+        more_l = 64 - j <=> 0;
+    } more_l;
     return w;
 }
 
@@ -652,11 +672,10 @@ fn record_labels_from_ops(ws: bytes, is_label_op: i64) -> bytes {
     let c: trit = do_it <=> 0;
     let out: bytes = if_pos c {
         let p: i64 = ws_get(w, 384);
-        let fl: i64 = op_flags(p);
-        let is_lab: i64 = is_gt(fl & 2, 0) + is_gt(fl & 16, 0);
-        let lid: i64 = op_tok(p);
+        let slot: i64 = op_label_slot(p);
+        let is_lab: i64 = is_ge(slot, 0);
         let w2: bytes = if_pos is_lab <=> 0 {
-            set_label(w, lid)
+            set_label(w, slot)
         } else {
             w
         };
@@ -678,8 +697,7 @@ fn check_branch_labels(ws: bytes, op: i64, off: i64) -> bytes {
     let nops: i64 = ws_get(w, 14);
     let is_lbl_def: i64 = is_eq(op, 32576);
     let lbl_p0: i64 = ws_get(w, 384) * is_gt(nops, 0);
-    let lbl_fl: i64 = op_flags(lbl_p0);
-    let lbl_ok: i64 = is_gt(nops, 0) * is_gt((lbl_fl & 2) + (lbl_fl & 16), 0);
+    let lbl_ok: i64 = is_gt(nops, 0) * is_ge(op_label_slot(lbl_p0), 0);
     w = append_err_if(w, is_lbl_def * (1 - lbl_ok), 2009, off);
     let start: i64 = is_jmp * 0 + (1 - is_jmp) * 1;
     let count: i64 = nops - start;
@@ -689,10 +707,8 @@ fn check_branch_labels(ws: bytes, op: i64, off: i64) -> bytes {
     let go: i64 = is_br * (1 - missing) * is_gt(count, 0);
     while go <=> 0 {
         let p: i64 = ws_get(w, 384 + i);
-        let fl: i64 = op_flags(p);
-        let can: i64 = is_gt(fl & 2, 0) + is_gt(fl & 16, 0);
-        let lid: i64 = op_tok(p);
-        let ok: i64 = can * has_label(w, lid);
+        let slot: i64 = op_label_slot(p);
+        let ok: i64 = is_ge(slot, 0) * has_label(w, slot);
         w = append_err_if(w, 1 - ok, 2009, off);
         i = i + 1;
         go = is_gt(nops, i);
