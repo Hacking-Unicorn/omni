@@ -1,0 +1,624 @@
+// ==============================================================================
+// pure/harness/fuzz_gates.omni (Step 14) — Deterministic Mutation-Fuzz Harness
+// ==============================================================================
+// Attacks verifier soundness, decompiler round-trip + honesty, and judge
+// integrity across a fixed corpus using a deterministic seeded PRNG (zero clock,
+// zero environment input).
+//
+// Committed PRNG seeds:
+//   SEED_INIT = 31337421 (0x01DE2B4D)
+//   LCG_MUL   = 1664525
+//   LCG_INC   = 1013904223
+//
+// Usage:
+//   fuzz_gates.elf                (reduced fixed panel: 301 mutants, 43/class)
+//   fuzz_gates.elf --campaign     (full campaign panel: 2800 mutants, 400/class)
+//   fuzz_gates.elf --no-judge     (skip Property 3 judge check, for sub-check)
+//
+// Summary line:
+//   [FUZZ PASS] <gen> mutants | <acc> accepted | <rej> rejected | soundness=0 roundtrip=0 judge=0
+//   [FUZZ FAIL] <gen> mutants | <acc> accepted | <rej> rejected | soundness=<s> roundtrip=<r> judge=<j>
+// ==============================================================================
+
+include "../m2/util.omni";
+include "../driver/sys_util.omni";
+
+// Arena state slots (offsets 32..255):
+//   32  : rng_state
+//   40  : total_gen
+//   48  : total_acc
+//   56  : total_rej
+//   64  : find_soundness
+//   72  : find_roundtrip
+//   80  : find_judge
+//   88  : per_class_target (43 for reduced, 400 for campaign)
+//   96  : stop_on_find (1)
+//   104 : run_judge (1)
+//   112 : per-class gen[0..6]  at 112 + c*8  (7 * 8 = 56 B -> 112..167)
+//   168 : per-class acc[0..6]  at 168 + c*8  (7 * 8 = 56 B -> 168..223)
+//   224 : per-class rej[0..6]  at 224 + c*8  (7 * 8 = 56 B -> 224..279)
+//   288 : first_find_op
+//   296 : first_find_item
+//   304 : first_find_site
+//   312 : first_find_seed
+//   320 : first_find_kind (1=soundness_lint, 2=soundness_exec, 3=roundtrip, 4=honesty, 5=judge)
+
+// tid: 0=omnic_pure.elf, 1=verifier.elf, 2=m2.elf, 3=m2_lint.elf, 4=audit_decompile.elf
+#[strict]
+fn fg_tool(arena: bytes, tid: i64) -> bytes {
+    let a0_off: i64 = su_arg_off(arena, 0);
+    let a0_len: i64 = su_arg_len(arena, 0);
+    let slash: i64 = 0 - 1;
+    let i: i64 = 0;
+    while a0_len - i <=> 0 {
+        slash = m2u_sel(m2u_eq(ld_u8(arena, a0_off + i), 47), i, slash);
+        i = i + 1;
+    }
+    let b: bytes = anew(0);
+    let k: i64 = 0;
+    let pfx: i64 = m2u_sel(m2u_ge(slash, 0), slash + 1, 0);
+    while pfx - k <=> 0 { b = iset(b, ld_u8(arena, a0_off + k)); k = k + 1; }
+    let r: bytes = if_pos m2u_eq(tid, 0) <=> 0 {
+        iset(b, 111, 109, 110, 105, 99, 95, 112, 117, 114, 101, 46, 101, 108, 102, 0)
+    } else { if_pos m2u_eq(tid, 1) <=> 0 {
+        iset(b, 118, 101, 114, 105, 102, 105, 101, 114, 46, 101, 108, 102, 0)
+    } else { if_pos m2u_eq(tid, 2) <=> 0 {
+        iset(b, 109, 50, 46, 101, 108, 102, 0)
+    } else { if_pos m2u_eq(tid, 3) <=> 0 {
+        iset(b, 109, 50, 95, 108, 105, 110, 116, 46, 101, 108, 102, 0)
+    } else {
+        let u: bytes = iset(b, 97, 117, 100, 105, 116, 95, 100, 101, 99, 111, 109, 112, 105, 108, 101, 46);
+        iset(u, 101, 108, 102, 0)
+    } } } };
+    return r;
+}
+
+#[strict]
+fn fg_tmp(tag: i64) -> bytes {
+    let p: bytes = anew(0);
+    p = iset(p, 47, 116, 109, 112, 47, 111, 109, 110, 105, 95, 102, 103, 95);
+    return iset(p, tag, 0);
+}
+
+#[strict]
+fn fg_out_cstr(w: bytes, s: bytes) -> bytes {
+    let u: bytes = w;
+    let n: i64 = slen(s) - 1;
+    let i: i64 = 0;
+    while n - i <=> 0 { u = su_out_u8(u, ld_u8(s, i)); i = i + 1; }
+    return u;
+}
+
+// Deterministic 31-bit PRNG step (committed constants: SEED_INIT=31337421, MUL=1664525, INC=1013904223).
+#[strict]
+fn fg_rng_step(s: i64) -> i64 {
+    let x: i64 = s ^ ((s >> 13) & 2147483647);
+    return (x * 1664525 + 1013904223) & 2147483647;
+}
+
+// Constant-divisor-free modulo `x0 mod n` for `n >= 1` (avoids dynamic IMOD in M2 strict mode).
+#[strict]
+fn fg_mod(x0: i64, n: i64) -> i64 {
+    let x: i64 = x0 & 32767;
+    let d: i64 = m2u_sel(m2u_ge(n, 1), n, 1);
+    let g: i64 = m2u_ge(x, d);
+    while g <=> 0 { x = x - d; g = m2u_ge(x, d); }
+    return x;
+}
+
+// Corpus paths (idx 0..7):
+//   0: spec/acceptance/goldens/seed0_risk.omni
+//   1: spec/acceptance/goldens/seed4_consensus.omni
+//   2: spec/acceptance/goldens/seed6_clamp.omni
+//   3: pure/programs/kv_ledger_service.omni
+//   4: pure/programs/pack5_decision_controller.omni
+//   5: pure/programs/compiler_self_audit.omni
+//   6: pure/m5/zero_rust_driver.omni
+//   7: pure/verifier_standalone.omni_bc
+#[strict]
+fn fg_corpus_hi(idx: i64) -> bytes {
+    let b: bytes = anew(0);
+    let r: bytes = if_pos m2u_eq(idx, 4) <=> 0 {
+        let u: bytes = iset(b, 112, 117, 114, 101, 47, 112, 114, 111, 103, 114, 97, 109, 115, 47, 112, 97);
+        u = iset(u, 99, 107, 53, 95, 100, 101, 99, 105, 115, 105, 111, 110, 95, 99, 111, 110);
+        iset(u, 116, 114, 111, 108, 108, 101, 114, 46, 111, 109, 110, 105, 0)
+    } else { if_pos m2u_eq(idx, 5) <=> 0 {
+        let u: bytes = iset(b, 112, 117, 114, 101, 47, 112, 114, 111, 103, 114, 97, 109, 115, 47, 99, 111);
+        u = iset(u, 109, 112, 105, 108, 101, 114, 95, 115, 101, 108, 102, 95, 97, 117, 100, 105);
+        iset(u, 116, 46, 111, 109, 110, 105, 0)
+    } else { if_pos m2u_eq(idx, 6) <=> 0 {
+        let u: bytes = iset(b, 112, 117, 114, 101, 47, 109, 53, 47, 122, 101, 114, 111, 95, 114, 117, 115);
+        iset(u, 116, 95, 100, 114, 105, 118, 101, 114, 46, 111, 109, 110, 105, 0)
+    } else {
+        let u: bytes = iset(b, 112, 117, 114, 101, 47, 118, 101, 114, 105, 102, 105, 101, 114, 95, 115, 116);
+        u = iset(u, 97, 110, 100, 97, 108, 111, 110, 101, 46, 111, 109, 110, 105, 95, 98, 99);
+        iset(u, 0)
+    } } };
+    return r;
+}
+
+#[strict]
+fn fg_corpus_path(idx: i64) -> bytes {
+    let b: bytes = anew(0);
+    let r: bytes = if_pos m2u_eq(idx, 0) <=> 0 {
+        let u: bytes = iset(b, 115, 112, 101, 99, 47, 97, 99, 99, 101, 112, 116, 97, 110, 99, 101, 47);
+        u = iset(u, 103, 111, 108, 100, 101, 110, 115, 47, 115, 101, 101, 100, 48, 95, 114, 105);
+        iset(u, 115, 107, 46, 111, 109, 110, 105, 0)
+    } else { if_pos m2u_eq(idx, 1) <=> 0 {
+        let u: bytes = iset(b, 115, 112, 101, 99, 47, 97, 99, 99, 101, 112, 116, 97, 110, 99, 101, 47);
+        u = iset(u, 103, 111, 108, 100, 101, 110, 115, 47, 115, 101, 101, 100, 52, 95, 99, 111);
+        iset(u, 110, 115, 101, 110, 115, 117, 115, 46, 111, 109, 110, 105, 0)
+    } else { if_pos m2u_eq(idx, 2) <=> 0 {
+        let u: bytes = iset(b, 115, 112, 101, 99, 47, 97, 99, 99, 101, 112, 116, 97, 110, 99, 101, 47);
+        u = iset(u, 103, 111, 108, 100, 101, 110, 115, 47, 115, 101, 101, 100, 54, 95, 99, 108);
+        iset(u, 97, 109, 112, 46, 111, 109, 110, 105, 0)
+    } else { if_pos m2u_eq(idx, 3) <=> 0 {
+        let u: bytes = iset(b, 112, 117, 114, 101, 47, 112, 114, 111, 103, 114, 97, 109, 115, 47, 107, 118);
+        u = iset(u, 95, 108, 101, 100, 103, 101, 114, 95, 115, 101, 114, 118, 105, 99, 101, 46);
+        iset(u, 111, 109, 110, 105, 0)
+    } else {
+        fg_corpus_hi(idx)
+    } } } };
+    return r;
+}
+
+// Compiles `src_cstr` -> `out_bc_cstr` via `omnic_pure.elf compile`. Returns 0 on success.
+#[strict]
+#[cap(SYS)]
+fn fg_compile_file(w: bytes, src_cstr: bytes, out_bc: bytes) -> i64 {
+    let sh_p: bytes = fg_tmp(115);
+    let omnic: bytes = fg_tool(w, 0);
+    let u: bytes = fg_out_cstr(iset_patch_i64(w, 0, 0), omnic);
+    u = fg_out_cstr(su_out4(su_out4(su_out4(u, 32, 99, 111, 109), 112, 105, 108, 101), 32, 34, 0, 0), src_cstr);
+    u = fg_out_cstr(su_out4(u, 34, 32, 34, 0), out_bc);
+    u = su_out4(u, 34, 10, 0, 0);
+    let nw: i64 = su_write_file_from(u, sh_p, su_band_a(), ld_u64(u, 0), 493);
+    let sh_bin: bytes = anew(0);
+    sh_bin = iset(sh_bin, 47, 98, 105, 110, 47, 115, 104, 0);
+    return if_pos m2u_ge(nw, 1) <=> 0 { su_spawn_capture(sh_bin, sh_p, fg_tmp(111), 420) } else { 1 };
+}
+
+// Runs `verifier.elf` on `bc_cstr`. Returns 1 if ACCEPTED (passed==1 && err_count==0), else 0.
+#[strict]
+#[cap(SYS)]
+fn fg_verify_bc(w: bytes, bc_cstr: bytes) -> i64 {
+    let ver_out: bytes = fg_tmp(118);
+    let rc: i64 = su_spawn_capture(fg_tool(w, 1), bc_cstr, ver_out, 420);
+    let vn: i64 = if_pos m2u_eq(rc, 0) <=> 0 { su_read_file_into(w, ver_out, 1536, 64) } else { 0 };
+    return m2u_eq(rc, 0) * m2u_ge(vn, 48) * m2u_eq(ld_u64(w, 1536), 0) * m2u_eq(ld_u64(w, 1536 + 24), 1) * m2u_eq(ld_u64(w, 1536 + 40), 0);
+}
+
+// Checks whether `w[off..off+len]` contains 4-byte pattern `(c0,c1,c2,c3)`.
+#[strict]
+fn fg_has4(w: bytes, off: i64, len: i64, c0: i64, c1: i64, c2: i64, c3: i64) -> i64 {
+    let found: i64 = 0;
+    let i: i64 = 0;
+    let lim: i64 = len - 3;
+    let g: i64 = m2u_lt(0, lim);
+    while g <=> 0 {
+        let p: i64 = off + i;
+        let hit: i64 = m2u_eq(ld_u8(w, p), c0) * m2u_eq(ld_u8(w, p + 1), c1)
+            * m2u_eq(ld_u8(w, p + 2), c2) * m2u_eq(ld_u8(w, p + 3), c3);
+        found = found | hit;
+        i = i + 1;
+        g = (1 - found) * m2u_lt(i, lim);
+    }
+    return found;
+}
+
+// Property 2: Decompiler round-trip + honesty check on an ACCEPTED `.omni_bc` at `bc_cstr` (`orig_nb` bytes).
+// Returns: 0 = PASS, 3 = ROUND-TRIP find, 4 = HONESTY find.
+#[strict]
+#[cap(SYS)]
+fn fg_check_decompile(w: bytes, bc_cstr: bytes, orig_nb: i64) -> i64 {
+    let dec_p: bytes = fg_tmp(100);
+    let rc_d: i64 = su_spawn_capture(fg_tool(w, 4), bc_cstr, dec_p, 420);
+    let nd: i64 = if_pos m2u_eq(rc_d, 0) <=> 0 { su_read_file_into(w, dec_p, su_band_b(), 180000) } else { 0 };
+    let r: i64 = if_pos m2u_eq(rc_d, 0) * m2u_ge(nd, 32) <=> 0 {
+        let bb: i64 = su_band_b();
+        let has_lit: i64 = fg_has4(w, bb, nd, 76, 73, 84, 69); // "LITE" (LITERAL_OP)
+        let has_app: i64 = fg_has4(w, bb, nd, 65, 80, 80, 82); // "APPR" (APPROXIMATE)
+        // Check first 160 bytes for "Status: RECONSTRUCTED" ("s: R")
+        let hdr_len: i64 = m2u_sel(m2u_lt(nd, 160), nd, 160);
+        let hdr_rec: i64 = fg_has4(w, bb, hdr_len, 115, 58, 32, 82);
+        // Honesty violation: header claims RECONSTRUCTED while body contains LITERAL_OP or APPROXIMATE
+        if_pos hdr_rec * (has_lit + has_app) <=> 0 {
+            4
+        } else { if_pos hdr_rec <=> 0 {
+            // Fully RECONSTRUCTED -> must recompile byte-identically!
+            let rec_bc: bytes = fg_tmp(114);
+            let rc_r: i64 = fg_compile_file(w, dec_p, rec_bc);
+            if_pos m2u_eq(rc_r, 0) <=> 0 {
+                let n1: i64 = su_read_file_into(w, bc_cstr, su_band_b(), 100000);
+                let n2: i64 = su_read_file_into(w, rec_bc, su_band_b() + 100000, 100000);
+                let eq: i64 = m2u_eq(n1, orig_nb) * m2u_eq(n1, n2) * su_eq_bytes(w, su_band_b(), n1, su_band_b() + 100000, n2);
+                m2u_sel(eq, 0, 3)
+            } else { 3 }
+        } else { 0 } }
+    } else { 0 };
+    return r;
+}
+
+// Scans Band B u16 words from `idx` up to `lim` for first word in `[lo, hi]`. Returns index or `idx`.
+#[strict]
+fn fg_scan_range(w: bytes, idx: i64, lim: i64, lo: i64, hi: i64) -> i64 {
+    let bb: i64 = su_band_b();
+    let p: i64 = idx;
+    let g: i64 = m2u_lt(p, lim) * (1 - m2u_in(ld_u16(w, bb + (p << 1)), lo, hi));
+    while g <=> 0 {
+        p = p + 1;
+        g = m2u_lt(p, lim) * (1 - m2u_in(ld_u16(w, bb + (p << 1)), lo, hi));
+    }
+    return m2u_sel(m2u_lt(p, lim), p, idx);
+}
+
+// Op 5a/5b: Single-word deletion or duplication at non-header `idx`.
+#[strict]
+fn fg_mut_op5_del(w0: bytes, nb: i64, idx: i64) -> bytes {
+    let bb: i64 = su_band_b();
+    let nw: i64 = nb >> 1;
+    let w: bytes = w0;
+    let k: i64 = idx;
+    while (nw - 1) - k <=> 0 {
+        w = st_u16(w, bb + (k << 1), ld_u16(w, bb + ((k + 1) << 1)));
+        k = k + 1;
+    }
+    return iset_patch_i64(iset_patch_i64(w, 328, nb - 2), 304, idx);
+}
+
+#[strict]
+fn fg_mut_op5_dup(w0: bytes, nb: i64, idx: i64) -> bytes {
+    let bb: i64 = su_band_b();
+    let nw: i64 = nb >> 1;
+    let w: bytes = w0;
+    let k: i64 = nw;
+    while k - idx <=> 0 {
+        w = st_u16(w, bb + (k << 1), ld_u16(w, bb + ((k - 1) << 1)));
+        k = k - 1;
+    }
+    return iset_patch_i64(iset_patch_i64(w, 328, nb + 2), 304, idx);
+}
+
+#[strict]
+fn fg_mut_op5(w0: bytes, nb: i64, idx: i64, do_del: i64) -> bytes {
+    return if_pos do_del <=> 0 { fg_mut_op5_del(w0, nb, idx) } else { fg_mut_op5_dup(w0, nb, idx) };
+}
+
+// Applies bytecode mutation `op_cls` (0..4 => Ops 1..5) to Band B (`nb` bytes, `nwords = nb >> 1`).
+// Writes mutated byte length into `w[328]` and `site` into `w[304]`.
+#[strict]
+fn fg_mutate_bc(w0: bytes, nb: i64, op_cls: i64, rng: i64) -> bytes {
+    let bb: i64 = su_band_b();
+    let nw: i64 = nb >> 1;
+    let site_lim: i64 = m2u_sel(m2u_ge(nw, 18), nw - 17, 1);
+    let idx: i64 = 16 + fg_mod(rng, site_lim);
+    let r: bytes = if_pos m2u_eq(op_cls, 0) <=> 0 {
+        let tgt: i64 = fg_scan_range(w0, idx, nw - 1, 32512, 32639);
+        let new_op: i64 = 32512 + ((rng >> 4) % 96);
+        iset_patch_i64(iset_patch_i64(st_u16(w0, bb + (tgt << 1), new_op), 304, tgt), 328, nb)
+    } else { if_pos m2u_eq(op_cls, 1) <=> 0 {
+        let tgt: i64 = fg_scan_range(w0, idx, nw - 1, 32256, 32479);
+        let v: i64 = ld_u16(w0, bb + (tgt << 1));
+        let delta: i64 = m2u_sel(rng & 1, 1, 0 - 1);
+        iset_patch_i64(iset_patch_i64(st_u16(w0, bb + (tgt << 1), (v + delta) & 65535), 304, tgt), 328, nb)
+    } else { if_pos m2u_eq(op_cls, 2) <=> 0 {
+        let tgt: i64 = fg_scan_range(w0, idx, nw - 1, 32496, 32511);
+        let new_l: i64 = 32496 + ((rng >> 3) & 15);
+        iset_patch_i64(iset_patch_i64(st_u16(w0, bb + (tgt << 1), new_l), 304, tgt), 328, nb)
+    } else { if_pos m2u_eq(op_cls, 3) <=> 0 {
+        let p: i64 = fg_scan_range(w0, idx, nw - 2, 32485, 32486);
+        let tgt: i64 = m2u_sel(m2u_in(ld_u16(w0, bb + (p << 1)), 32485, 32486), p + 1, idx);
+        let v: i64 = ld_u16(w0, bb + (tgt << 1));
+        let nv: i64 = m2u_sel(rng & 2, (0 - v) & 65535, (v + m2u_sel(rng & 1, 1, 0 - 1)) & 65535);
+        iset_patch_i64(iset_patch_i64(st_u16(w0, bb + (tgt << 1), nv), 304, tgt), 328, nb)
+    } else {
+        fg_mut_op5(w0, nb, idx, rng & 1)
+    } } } };
+    return r;
+}
+
+// Op 6: Source comparison-operator / arithmetic-direction swap in Band B.
+#[strict]
+fn fg_mut_op6(w0: bytes, nb: i64, start: i64) -> bytes {
+    let bb: i64 = su_band_b();
+    let p: i64 = start;
+    let lim: i64 = nb - 4;
+    let found: i64 = 0;
+    let g: i64 = m2u_lt(p, lim);
+    let u: bytes = w0;
+    while g <=> 0 {
+        let c0: i64 = ld_u8(u, bb + p);
+        let c1: i64 = ld_u8(u, bb + p + 1);
+        let c2: i64 = ld_u8(u, bb + p + 2);
+        let is_sp_add: i64 = m2u_eq(c0, 32) * m2u_eq(c1, 43) * m2u_eq(c2, 32);
+        let is_sp_sub: i64 = m2u_eq(c0, 32) * m2u_eq(c1, 45) * m2u_eq(c2, 32);
+        let is_cmp: i64 = m2u_eq(c0, 60) * m2u_eq(c1, 61) * m2u_eq(c2, 62);
+        let hit: i64 = is_sp_add + is_sp_sub + is_cmp;
+        u = if_pos is_sp_add <=> 0 { su_st_u8(u, bb + p + 1, 45) }
+            else { if_pos is_sp_sub <=> 0 { su_st_u8(u, bb + p + 1, 43) }
+            else { if_pos is_cmp * m2u_eq(ld_u8(u, bb + p + 4), 48) <=> 0 { su_st_u8(u, bb + p + 4, 49) } else { u } } };
+        found = m2u_sel(hit, 1, found);
+        p = p + 1;
+        g = (1 - found) * m2u_lt(p, lim);
+    }
+    return iset_patch_i64(u, 304, p);
+}
+
+// Op 7: Source integer literal ±1 in Band B.
+#[strict]
+fn fg_mut_op7(w0: bytes, nb: i64, start: i64) -> bytes {
+    let bb: i64 = su_band_b();
+    let p: i64 = start;
+    let lim: i64 = nb - 2;
+    let found: i64 = 0;
+    let g: i64 = m2u_lt(p, lim);
+    let u: bytes = w0;
+    while g <=> 0 {
+        let prev: i64 = ld_u8(u, bb + p);
+        let ch: i64 = ld_u8(u, bb + p + 1);
+        let ok_prev: i64 = m2u_eq(prev, 32) + m2u_eq(prev, 40) + m2u_eq(prev, 44);
+        let ok_dig: i64 = m2u_in(ch, 48, 57);
+        let hit: i64 = ok_prev * ok_dig;
+        let nd: i64 = m2u_sel(m2u_eq(ch, 57), 56, ch + 1);
+        u = if_pos hit <=> 0 { su_st_u8(u, bb + p + 1, nd) } else { u };
+        found = m2u_sel(hit, 1, found);
+        p = p + 1;
+        g = (1 - found) * m2u_lt(p, lim);
+    }
+    return iset_patch_i64(u, 304, p);
+}
+
+// Applies source-level mutation `op_cls` (5=Op 6 cmp-swap, 6=Op 7 int literal ±1) to Band B (`nb` bytes).
+#[strict]
+fn fg_mutate_src(w0: bytes, nb: i64, op_cls: i64, rng: i64) -> bytes {
+    let start: i64 = fg_mod(rng, m2u_sel(m2u_ge(nb, 16), nb - 8, 1));
+    let r: bytes = if_pos m2u_eq(op_cls, 5) <=> 0 { fg_mut_op6(w0, nb, start) } else { fg_mut_op7(w0, nb, start) };
+    return iset_patch_i64(r, 328, nb);
+}
+
+// Records a find in arena if none recorded yet.
+#[strict]
+fn fg_rec_find(w: bytes, slot: i64, kind: i64, op_num: i64, cidx: i64, rng: i64) -> bytes {
+    let u: bytes = iset_patch_i64(w, slot, ld_u64(w, slot) + 1);
+    return if_pos m2u_eq(ld_u64(u, 320), 0) <=> 0 {
+        let u1: bytes = iset_patch_i64(iset_patch_i64(u, 288, op_num), 296, cidx);
+        iset_patch_i64(iset_patch_i64(u1, 312, rng), 320, kind)
+    } else { u };
+}
+
+// Property 1b: Lowering soundness check via `m2.elf` on an ACCEPTED mutant `.omni_bc`.
+// If `verifier.elf` ACCEPTED the mutant, `m2.elf` must be able to lower it (non-empty ELF, rc=0);
+// an illegal/unassigned opcode accepted by `verifier.elf` but rejected by `m2.elf` is a soundness find!
+#[strict]
+#[cap(SYS)]
+fn fg_check_m2_lower(w: bytes, bc_cstr: bytes) -> i64 {
+    let elf_p: bytes = fg_tmp(101);
+    let rc: i64 = su_spawn_capture(fg_tool(w, 2), bc_cstr, elf_p, 420);
+    let nb: i64 = if_pos m2u_eq(rc, 0) <=> 0 { su_read_file_into(w, elf_p, su_band_b(), 250000) } else { 0 };
+    return m2u_sel(m2u_eq(rc, 0) * m2u_ge(nb, 120), 0, 1);
+}
+
+// Runs one bytecode mutant (op_cls 0..4) against `base_bc_cstr` (`base_nb` bytes, corpus `cidx`).
+#[strict]
+#[cap(SYS)]
+fn fg_run_bc_mutant(w0: bytes, cidx: i64, op_cls: i64, base_bc: bytes, base_nb: i64) -> bytes {
+    let rng: i64 = fg_rng_step(ld_u64(w0, 32));
+    let w: bytes = iset_patch_i64(w0, 32, rng);
+    let nr: i64 = su_read_file_into(w, base_bc, su_band_b(), 200000);
+    w = fg_mutate_bc(w, nr, op_cls, rng);
+    let m_nb: i64 = ld_u64(w, 328);
+    let m_bc: bytes = fg_tmp(109);
+    let nw: i64 = su_write_file_from(w, m_bc, su_band_b(), m_nb, 420);
+    let acc: i64 = if_pos m2u_eq(nw, m_nb) <=> 0 { fg_verify_bc(w, m_bc) } else { 0 };
+    w = iset_patch_i64(w, 40, ld_u64(w, 40) + 1);
+    w = iset_patch_i64(w, 112 + (op_cls << 3), ld_u64(w, 112 + (op_cls << 3)) + 1);
+    let r: bytes = if_pos acc <=> 0 {
+        let u: bytes = iset_patch_i64(w, 48, ld_u64(w, 48) + 1);
+        u = iset_patch_i64(u, 168 + (op_cls << 3), ld_u64(u, 168 + (op_cls << 3)) + 1);
+        let lower_fail: i64 = fg_check_m2_lower(u, m_bc);
+        if_pos lower_fail <=> 0 {
+            fg_rec_find(u, 64, 1, op_cls + 1, cidx, rng)
+        } else {
+            let dec_res: i64 = fg_check_decompile(u, m_bc, m_nb);
+            if_pos m2u_ge(dec_res, 1) <=> 0 { fg_rec_find(u, 72, dec_res, op_cls + 1, cidx, rng) } else { u }
+        }
+    } else {
+        let u: bytes = iset_patch_i64(w, 56, ld_u64(w, 56) + 1);
+        iset_patch_i64(u, 224 + (op_cls << 3), ld_u64(u, 224 + (op_cls << 3)) + 1)
+    };
+    return r;
+}
+
+// Runs one source-level mutant (op_cls 5..6) against `src_path` (corpus `cidx`).
+#[strict]
+#[cap(SYS)]
+fn fg_run_src_mutant(w0: bytes, cidx: i64, op_cls: i64, src_path: bytes) -> bytes {
+    let rng: i64 = fg_rng_step(ld_u64(w0, 32));
+    let w: bytes = iset_patch_i64(w0, 32, rng);
+    let nr: i64 = su_read_file_into(w, src_path, su_band_b(), 120000);
+    w = fg_mutate_src(w, nr, op_cls, rng);
+    let m_src: bytes = fg_tmp(120);
+    let m_bc: bytes = fg_tmp(109);
+    let nw: i64 = su_write_file_from(w, m_src, su_band_b(), nr, 420);
+    let rc_c: i64 = if_pos m2u_eq(nw, nr) <=> 0 { fg_compile_file(w, m_src, m_bc) } else { 1 };
+    let acc: i64 = if_pos m2u_eq(rc_c, 0) <=> 0 { fg_verify_bc(w, m_bc) } else { 0 };
+    w = iset_patch_i64(w, 40, ld_u64(w, 40) + 1);
+    w = iset_patch_i64(w, 112 + (op_cls << 3), ld_u64(w, 112 + (op_cls << 3)) + 1);
+    let r: bytes = if_pos acc <=> 0 {
+        let u: bytes = iset_patch_i64(w, 48, ld_u64(w, 48) + 1);
+        u = iset_patch_i64(u, 168 + (op_cls << 3), ld_u64(u, 168 + (op_cls << 3)) + 1);
+        let m_nb: i64 = su_read_file_into(u, m_bc, su_band_b(), 200000);
+        let dec_res: i64 = fg_check_decompile(u, m_bc, m_nb);
+        if_pos m2u_ge(dec_res, 1) <=> 0 { fg_rec_find(u, 72, dec_res, op_cls + 1, cidx, rng) } else { u }
+    } else {
+        let u: bytes = iset_patch_i64(w, 56, ld_u64(w, 56) + 1);
+        iset_patch_i64(u, 224 + (op_cls << 3), ld_u64(u, 224 + (op_cls << 3)) + 1)
+    };
+    return r;
+}
+
+// Property 3: Judge integrity — runs a behavior-diverging mutant of `tgt_path` through `propose-run --dry-run`.
+// Expects `gates_ok=0` and non-ADOPT. Returns 1 if JUDGE find (gates_ok==1 or +1t ADOPT), else 0.
+#[strict]
+#[cap(SYS)]
+fn fg_check_judge_mutant(w: bytes, tgt_path: bytes, cand_path: bytes) -> i64 {
+    let sh_p: bytes = fg_tmp(115);
+    let out_p: bytes = fg_tmp(106);
+    let omnic: bytes = fg_tool(w, 0);
+    let u: bytes = fg_out_cstr(iset_patch_i64(w, 0, 0), omnic);
+    // "<omnic> propose-run --target \"<tgt>\" --candidate \"<cand>\" --dry-run\n"
+    u = su_out4(su_out4(su_out4(su_out4(u, 32, 112, 114, 111), 112, 111, 115, 101), 45, 114, 117, 110), 32, 45, 45, 116);
+    u = fg_out_cstr(su_out4(su_out4(u, 97, 114, 103, 101), 116, 32, 34, 0), tgt_path);
+    u = su_out4(su_out4(su_out4(su_out4(u, 34, 32, 45, 45), 99, 97, 110, 100), 105, 100, 97, 116), 101, 32, 34, 0);
+    u = fg_out_cstr(u, cand_path);
+    u = su_out4(su_out4(su_out4(u, 34, 32, 45, 45), 100, 114, 121, 45), 114, 117, 110, 10);
+    let nw: i64 = su_write_file_from(u, sh_p, su_band_a(), ld_u64(u, 0), 493);
+    let sh_bin: bytes = anew(0);
+    sh_bin = iset(sh_bin, 47, 98, 105, 110, 47, 115, 104, 0);
+    let rc: i64 = if_pos m2u_ge(nw, 1) <=> 0 { su_spawn_capture(sh_bin, sh_p, out_p, 420) } else { 1 };
+    // Read /tmp/omni_plv_j first byte: '1' (49) means gates_ok=1!
+    let jreq: bytes = anew(0);
+    jreq = iset(jreq, 47, 116, 109, 112, 47, 111, 109, 110, 105, 95, 112, 108, 118, 95, 106, 0);
+    let nj: i64 = su_read_file_into(u, jreq, 1536, 16);
+    let gates_1: i64 = m2u_ge(nj, 1) * m2u_eq(ld_u8(u, 1536), 49);
+    let no: i64 = su_read_file_into(u, out_p, su_band_b(), 512);
+    let is_adopt: i64 = fg_has4(u, su_band_b(), no, 43, 49, 116, 32); // "+1t "
+    return m2u_lt(0, gates_1 + is_adopt + rc * 0);
+}
+
+// Prints the exact required summary line and per-class counts.
+#[strict]
+#[cap(SYS)]
+fn fg_emit_report(w: bytes) -> i64 {
+    let fs: i64 = ld_u64(w, 64);
+    let fr: i64 = ld_u64(w, 72);
+    let fj: i64 = ld_u64(w, 80);
+    let any_find: i64 = m2u_lt(0, fs + fr + fj);
+    let u: bytes = iset_patch_i64(w, 0, 0);
+    // "[FUZZ PASS] " or "[FUZZ FAIL] "
+    u = su_out4(su_out4(u, 91, 70, 85, 90), 90, 32, 0, 0);
+    u = if_pos any_find <=> 0 { su_out4(u, 70, 65, 73, 76) } else { su_out4(u, 80, 65, 83, 83) };
+    u = su_out_i64(su_out4(u, 93, 32, 0, 0), ld_u64(w, 40));
+    u = su_out4(su_out4(su_out4(u, 32, 109, 117, 116), 97, 110, 116, 115), 32, 124, 32, 0);
+    u = su_out_i64(u, ld_u64(w, 48));
+    u = su_out4(su_out4(su_out4(u, 32, 97, 99, 99), 101, 112, 116, 101), 100, 32, 124, 32);
+    u = su_out_i64(u, ld_u64(w, 56));
+    u = su_out4(su_out4(su_out4(u, 32, 114, 101, 106), 101, 99, 116, 101), 100, 32, 124, 32);
+    u = su_out_i64(su_out4(su_out4(su_out4(u, 115, 111, 117, 110), 100, 110, 101, 115), 115, 61, 0, 0), fs);
+    u = su_out_i64(su_out4(su_out4(su_out4(u, 32, 114, 111, 117), 110, 100, 116, 114), 105, 112, 61, 0), fr);
+    u = su_out_i64(su_out4(su_out4(u, 32, 106, 117, 100), 103, 101, 61, 0), fj);
+    u = su_out_u8(u, 10);
+    // Emit per-class counts: "op=<1..7> gen=<g> acc=<a> rej=<r>\n"
+    let c: i64 = 0;
+    while 7 - c <=> 0 {
+        u = su_out_i64(su_out4(u, 111, 112, 61, 0), c + 1);
+        u = su_out_i64(su_out4(su_out_u8(u, 32), 103, 101, 110, 61), ld_u64(w, 112 + (c << 3)));
+        u = su_out_i64(su_out4(su_out_u8(u, 32), 97, 99, 99, 61), ld_u64(w, 168 + (c << 3)));
+        u = su_out_u8(su_out_i64(su_out4(su_out_u8(u, 32), 114, 101, 106, 61), ld_u64(w, 224 + (c << 3))), 10);
+        c = c + 1;
+    }
+    // If any find occurred, emit first-find record: "[FUZZ FIND] kind=<k> op=<o> item=<i> site=<s> seed=<r>\n"
+    u = if_pos any_find <=> 0 {
+        let f: bytes = su_out4(su_out4(su_out4(u, 91, 70, 85, 90), 90, 32, 70, 73), 78, 68, 93, 32);
+        f = su_out_i64(su_out4(su_out_u8(f, 107), 105, 110, 100, 61), ld_u64(w, 320));
+        f = su_out_i64(su_out4(f, 32, 111, 112, 61), ld_u64(w, 288));
+        f = su_out_i64(su_out4(su_out4(f, 32, 105, 116, 101), 109, 61, 0, 0), ld_u64(w, 296));
+        f = su_out_i64(su_out4(su_out4(f, 32, 115, 105, 116), 101, 61, 0, 0), ld_u64(w, 304));
+        su_out_u8(su_out_i64(su_out4(su_out4(f, 32, 115, 101, 101), 100, 61, 0, 0), ld_u64(w, 312)), 10)
+    } else { u };
+    let nw: i64 = sys_write(1, u, su_band_a(), ld_u64(u, 0));
+    return m2u_sel(any_find, 1, 0) + nw * 0;
+}
+
+#[strict]
+#[cap(SYS)]
+fn fg_run_bc_classes(w0: bytes, per_cls: i64) -> bytes {
+    let w: bytes = w0;
+    let cls: i64 = 0;
+    let stopped: i64 = 0;
+    while (5 - cls) * (1 - stopped) <=> 0 {
+        let k: i64 = 0;
+        while (per_cls - k) * (1 - stopped) <=> 0 {
+            let cidx: i64 = (k + cls) & 7;
+            let bc_p: bytes = if_pos m2u_eq(cidx, 7) <=> 0 { fg_corpus_path(7) } else { fg_tmp(48 + cidx) };
+            let b_nb: i64 = su_read_file_into(w, bc_p, su_band_b(), 200000);
+            w = fg_run_bc_mutant(w, cidx, cls, bc_p, b_nb);
+            stopped = m2u_lt(0, ld_u64(w, 64) + ld_u64(w, 72));
+            k = k + 1;
+        }
+        cls = cls + 1;
+    }
+    return w;
+}
+
+#[strict]
+#[cap(SYS)]
+fn fg_run_src_classes(w0: bytes, src_lim: i64) -> bytes {
+    let w: bytes = w0;
+    let cls: i64 = 5;
+    let stopped: i64 = m2u_lt(0, ld_u64(w, 64) + ld_u64(w, 72));
+    while (7 - cls) * (1 - stopped) <=> 0 {
+        let k: i64 = 0;
+        while (src_lim - k) * (1 - stopped) <=> 0 {
+            let cidx: i64 = fg_mod(k + cls, 7);
+            w = fg_run_src_mutant(w, cidx, cls, fg_corpus_path(cidx));
+            stopped = m2u_lt(0, ld_u64(w, 64) + ld_u64(w, 72));
+            k = k + 1;
+        }
+        cls = cls + 1;
+    }
+    return w;
+}
+
+#[strict]
+#[cap(SYS)]
+fn fg_run_judge_panel(w0: bytes, no_judge: i64) -> bytes {
+    let w: bytes = w0;
+    let stopped: i64 = m2u_lt(0, ld_u64(w, 64) + ld_u64(w, 72));
+    let j: i64 = 0;
+    let jg: i64 = (1 - stopped) * (1 - no_judge);
+    while (12 - j) * jg <=> 0 {
+        let cidx: i64 = 3 + (j & 3);
+        let rng: i64 = fg_rng_step(ld_u64(w, 32));
+        w = iset_patch_i64(w, 32, rng);
+        let tgt: bytes = fg_corpus_path(cidx);
+        let nr: i64 = su_read_file_into(w, tgt, su_band_b(), 120000);
+        w = fg_mutate_src(w, nr, 6, rng);
+        let cand: bytes = fg_tmp(121);
+        let nw: i64 = su_write_file_from(w, cand, su_band_b(), nr, 420);
+        let jf: i64 = if_pos m2u_eq(nw, nr) <=> 0 { fg_check_judge_mutant(w, tgt, cand) } else { 0 };
+        w = if_pos jf <=> 0 { fg_rec_find(w, 80, 5, 7, cidx, rng) } else { w };
+        jg = jg * (1 - jf);
+        j = j + 1;
+    }
+    return w;
+}
+
+#[strict]
+#[cap(SYS)]
+fn main() -> i64 {
+    let w: bytes = su_load_cmdline(su_alloc_arena());
+    let argc: i64 = su_argc(w);
+    let is_camp: i64 = if_pos m2u_ge(argc, 2) <=> 0 {
+        m2u_eq(su_arg_len(w, 1), 10) * m2u_eq(ld_u8(w, su_arg_off(w, 1) + 2), 99)
+    } else { 0 };
+    let no_judge: i64 = if_pos m2u_ge(argc, 2) <=> 0 {
+        m2u_eq(su_arg_len(w, 1), 10) * m2u_eq(ld_u8(w, su_arg_off(w, 1) + 2), 110)
+    } else { 0 };
+    let per_cls: i64 = m2u_sel(is_camp, 500, 48);
+    let src_lim: i64 = m2u_sel(is_camp, 150, 30);
+    w = iset_patch_i64(w, 32, 31337421);
+    w = iset_patch_i64(iset_patch_i64(iset_patch_i64(w, 40, 0), 48, 0), 56, 0);
+    w = iset_patch_i64(iset_patch_i64(iset_patch_i64(w, 64, 0), 72, 0), 80, 0);
+    w = iset_patch_i64(w, 320, 0);
+    let ci: i64 = 0;
+    while 7 - ci <=> 0 {
+        let rc_c: i64 = fg_compile_file(w, fg_corpus_path(ci), fg_tmp(48 + ci));
+        w = if_pos m2u_eq(rc_c, 0) <=> 0 { w } else { iset_patch_i64(w, 64, ld_u64(w, 64) + 1) };
+        ci = ci + 1;
+    }
+    w = fg_run_bc_classes(w, per_cls);
+    w = fg_run_src_classes(w, src_lim);
+    w = fg_run_judge_panel(w, no_judge);
+    return sys_exit(fg_emit_report(w));
+}
