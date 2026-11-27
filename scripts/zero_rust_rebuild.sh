@@ -12,7 +12,7 @@
 #        - `m2.elf`: S1 == S2 == S3 == bootstrap/m2.elf (125,539 B, 0x0A5CD5B55707AA0D)
 #        - `m3.elf`: link-elf rebuild == bootstrap/m3.elf (206,946 B, 0x8CFD973873CAFF46)
 #        - `m4.elf`: 91,576 B, 0xFBA8272337B1BAC4
-#        - `verifier.elf`: 37,907 B, 0x2ECD2CE3DCB69346
+#        - `verifier.elf`: 38,193 B, 0x23E3D55383B3333B
 #        - `omnic_pure.elf`: self-compile fixed point (gen1 == gen2, 0-byte diff)
 #        - `pure/link/elf_link.omni` -> `pure/link/elf_link.omni_bc` (0-byte diff)
 #   3. Every committed `.omni_bc` seed matches its `bootstrap/MANIFEST.md` pin.
@@ -66,7 +66,7 @@ for spec in \
   "pure/link/elf_link.omni_bc:7164:0x5F261D791F65ED2A" \
   "pure/m4/m4.omni_bc:56124:0x0561704B3E50EFAC" \
   "pure/m4/m4_standalone.omni_bc:57330:0x6F86B759214A2765" \
-  "pure/verifier_standalone.omni_bc:30804:0xFF327F8976741D20"
+  "pure/verifier_standalone.omni_bc:31048:0x430CC3C933918F64"
 do
   IFS=':' read -r path want_len want_fnv <<< "$spec"
   read -r got_len got_fnv < <("$TMP/pure_build_util.elf" fnv "$path")

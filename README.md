@@ -26,7 +26,7 @@ All committed bootstrap artifacts and their pinned byte sizes and FNV-1a64 hashe
 | `pure/link/elf_link.omni_bc` | `7,164` | `3,582` | `0x5F261D791F65ED2A` | Pure-Omni ELF64 linker (`elf_link.elf`, `10,971` B; rebuilt bit-exact from `pure/link/elf_link.omni`) |
 | `pure/m4/m4.omni_bc` | `56,124` | `28,062` | `0x0561704B3E50EFAC` | Pure-Omni M4 VM (`90,402` B ELF64, `0xB43AFBB0DED59488`) |
 | `pure/m4/m4_standalone.omni_bc` | `57,330` | `28,665` | `0x6F86B759214A2765` | Standalone native `m4.elf` (`91,576` B, `0xFBA8272337B1BAC4`) |
-| `pure/verifier_standalone.omni_bc` | `30,804` | `15,402` | `0xFF327F8976741D20` | Standalone native `verifier.elf` (`37,907` B, `0x2ECD2CE3DCB69346`) |
+| `pure/verifier_standalone.omni_bc` | `31,048` | `15,524` | `0x430CC3C933918F64` | Standalone native `verifier.elf` (`38,193` B, `0x23E3D55383B3333B`) |
 
 > **Judge / Pin Discipline:** After Step 9, the frozen regression hashes and `bootstrap/MANIFEST.md` are the sole cryptographic anchors. Every hash/pin change is a judge change: its own PR with from-scratch derivation and fixed-point proof, never auto-merged and never proposer-initiated.
 

@@ -11,7 +11,9 @@ As of Step 9 (Complete Rust Removal), the Omni repository contains **zero Rust s
 | `bootstrap/m2.elf` | `126,152` | `0xAA5F84B6AA45BB51` | Pure-Omni M2 x86-64 ELF64 compiler (built from `pure/m2/m2.omni_bc`, includes Step 11b `sys_clock_ns`, self-hosts `S1 == S2 == S3`) |
 | `bootstrap/m3.elf` | `207,015` | `0x7397A5020895AEBF` | Pure-Omni M3 surface `.omni` → `.omni_bc` frontend (linked from `m3_standalone.omni_bc` + `mod_parse.omni_bc` via `elf_link.omni_bc`, includes Step 11b `sys_clock_ns`) |
 
-> **Step 11b Judge Change:** `bootstrap/m2.elf`, `bootstrap/m3.elf`, `pure/m2/m2.omni_bc`, and `pure/m3/m3_standalone.omni_bc` were intentionally re-pinned in Step 11b to add the Linux x86-64 `sys_clock_ns()` intrinsic (`clock_gettime(CLOCK_MONOTONIC)`, syscall 228, `#[cap(SYS)]`). All 5 frozen hashes, `m4.elf` (`91,576 B`, `0xFBA8272337B1BAC4`), `verifier.elf` (`37,907 B`, `0x2ECD2CE3DCB69346`), `mod_parse.omni_bc`, and `elf_link.omni_bc` are unchanged.
+> **Step 11b Judge Change:** `bootstrap/m2.elf`, `bootstrap/m3.elf`, `pure/m2/m2.omni_bc`, and `pure/m3/m3_standalone.omni_bc` were intentionally re-pinned in Step 11b to add the Linux x86-64 `sys_clock_ns()` intrinsic (`clock_gettime(CLOCK_MONOTONIC)`, syscall 228, `#[cap(SYS)]`). All 5 frozen hashes, `m4.elf` (`91,576 B`, `0xFBA8272337B1BAC4`), `mod_parse.omni_bc`, and `elf_link.omni_bc` are unchanged.
+>
+> **Step 15 Judge Change (Fuzz Find #1):** `pure/verifier_standalone.omni_bc` (`30,804 B` / `0xFF327F8976741D20` → `31,048 B` / `0x430CC3C933918F64`) and `verifier.elf` (`37,907 B` / `0x2ECD2CE3DCB69346` → `38,193 B` / `0x23E3D55383B3333B`) were intentionally re-pinned in Step 15 after tightening `pure/verifier_engine.omni::op_is_known` to reject all 18 unassigned opcode holes in `0x7F00..=0x7F7F` (including Find #1's `0x7F5F`) with existing error code `3001`. No other pin or frozen hash moved.
 
 ## 2. Committed `.omni_bc` Bytecode Seeds (`pure/`)
 
@@ -24,7 +26,7 @@ As of Step 9 (Complete Rust Removal), the Omni repository contains **zero Rust s
 | `pure/link/elf_link.omni_bc` | `7,164` | `3,582` | `0x5F261D791F65ED2A` | Pure-Omni multi-module ELF64 linker (`elf_link.elf`, `10,971` B; also rebuilt bit-exact from `pure/link/elf_link.omni`) |
 | `pure/m4/m4.omni_bc` | `56,124` | `28,062` | `0x0561704B3E50EFAC` | Pure-Omni M4 VM (`90,402` B ELF64, `0xB43AFBB0DED59488`) |
 | `pure/m4/m4_standalone.omni_bc` | `57,330` | `28,665` | `0x6F86B759214A2765` | Standalone native `m4.elf` (`91,576` B, `0xFBA8272337B1BAC4`) |
-| `pure/verifier_standalone.omni_bc` | `30,804` | `15,402` | `0xFF327F8976741D20` | Standalone native `verifier.elf` (`37,907` B, `0x2ECD2CE3DCB69346`) |
+| `pure/verifier_standalone.omni_bc` | `31,048` | `15,524` | `0x430CC3C933918F64` | Standalone native `verifier.elf` (`38,193` B, `0x23E3D55383B3333B`) |
 
 ## 3. Rebuilt Toolchain & Harness ELFs (`build/pure-bin/`)
 
@@ -32,7 +34,7 @@ Produced from scratch by `bash scripts/build_pure_driver.sh build/pure-bin` (wit
 
 1. `pure_build_util.elf` — built from `pure/m5/pure_build_util.omni` via `bootstrap/m3.elf` + `bootstrap/m2.elf` (provides FNV-1a64 hashing and UTF-16LE widening without Python).
 2. `m2.elf` — rebuilt from `pure/m2/m2.omni_bc` through 3 generations (`S1 == S2 == S3 == bootstrap/m2.elf`, `126,152` B, `0xAA5F84B6AA45BB51`); `m2-fixed-point` additionally verifies `S1 == S2 == S3 == V` against the same pin (`126,152` B, `0xAA5F84B6AA45BB51`).
-3. `verifier.elf` (`37,907` B, `0x2ECD2CE3DCB69346`) and `m4.elf` (`91,576` B, `0xFBA8272337B1BAC4`) — rebuilt from their `.omni_bc` seeds using freshly built `m2.elf`.
+3. `verifier.elf` (`38,193` B, `0x23E3D55383B3333B`) and `m4.elf` (`91,576` B, `0xFBA8272337B1BAC4`) — rebuilt from their `.omni_bc` seeds using freshly built `m2.elf`.
 4. `audit_diff.elf`, `audit_decompile.elf`, `omnic_pure.elf`, `m2_lint.elf`, `audit_view_gate.elf`, `proposer_loop.elf`, `core_gates.elf`, `extra_gates.elf` — compiled from `.omni` sources via `m3.elf` + `verifier.elf` + `m2.elf`.
 5. `m3.elf` (`207,015` B, `0x7397A5020895AEBF`) — rebuilt via `omnic_pure.elf link-elf pure/m3/m3_standalone.omni_bc pure/m3/mod_parse.omni_bc` and verified bit-identical (`cmp`) to `bootstrap/m3.elf`.
 6. `omnic_pure.elf` self-compile fixed point — `omnic_pure.elf` compiles `pure/driver/omnic_driver.omni` to `omnic_pure_gen2.elf` and verifies `0`-byte diff (`58,184` B).

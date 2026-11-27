@@ -305,13 +305,26 @@ else
   fail "Step 14 fuzz_gates.elf non-deterministic output (rc1=$FZ1_RC rc2=$FZ2_RC)"
 fi
 
-if [ "$FZ1_RC" -ne 0 ] && grep -q '^\[FUZZ FAIL\]' "$TMP/fuzz1.txt" && grep -q '^\[FUZZ FIND\] kind=1 op=1 item=3 site=179 seed=46528505' "$TMP/fuzz1.txt"; then
-  pass "Step 14 fuzz_gates.elf fail-closed soundness find reproduced (item=3 site=179 0x7F28->0x7F5F, filed in spec/step14-fuzz-evidence.md)"
+if [ "$FZ1_RC" -ne 0 ] && grep -q '^\[FUZZ FAIL\]' "$TMP/fuzz1.txt" && grep -q '^\[FUZZ FIND\] kind=1 op=1 item=1 site=30 seed=1367066037' "$TMP/fuzz1.txt"; then
+  pass "Step 14/15 fuzz_gates.elf fail-closed Find #2 reproduced (item=1 site=30 0x7F4A->0x7F5B, filed in spec/step15-fix-evidence.md)"
 elif [ "$FZ1_RC" -eq 0 ] && grep -q '^\[FUZZ PASS\].*soundness=0 roundtrip=0 judge=0' "$TMP/fuzz1.txt"; then
-  pass "Step 14 fuzz_gates.elf reduced panel PASS (0 finds)"
+  pass "Step 14/15 fuzz_gates.elf reduced panel PASS (0 finds)"
 else
   cat "$TMP/fuzz1.txt" >&2 || true
-  fail "Step 14 fuzz_gates.elf unexpected output (rc=$FZ1_RC)"
+  fail "Step 14/15 fuzz_gates.elf unexpected output (rc=$FZ1_RC)"
+fi
+
+# Step 15: Permanent negative control for Find #1 (kv_ledger_service word 179: 0x7F28 -> 0x7F5F rejected with err 3001)
+"$PURE_BIN" compile pure/programs/kv_ledger_service.omni "$TMP/s15_kv.bc"
+cp "$TMP/s15_kv.bc" "$TMP/s15_kv_f1.bc"
+printf '\x5f\x7f' | dd of="$TMP/s15_kv_f1.bc" bs=1 seek=358 count=2 conv=notrunc 2>/dev/null
+"$PURE_DIR/verifier.elf" "$TMP/s15_kv.bc" > "$TMP/s15_kv_orig.ver"
+"$PURE_DIR/verifier.elf" "$TMP/s15_kv_f1.bc" > "$TMP/s15_kv_f1.ver"
+if ! od -An -tu8 "$TMP/s15_kv_orig.ver" | grep -qw '3001' \
+   && od -An -tu8 "$TMP/s15_kv_f1.ver" | grep -qw '3001'; then
+  pass "Step 15 Find #1 permanent regression check PASS (verifier.elf accepts orig kv_ledger_service, rejects 0x7F5F with err 3001)"
+else
+  fail "Step 15 Find #1 permanent regression check FAIL"
 fi
 
 echo "=============================================================================="
