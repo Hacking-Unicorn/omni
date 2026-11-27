@@ -11,8 +11,8 @@
 //   LCG_INC   = 1013904223
 //
 // Usage:
-//   fuzz_gates.elf                (reduced fixed panel: 301 mutants, 43/class)
-//   fuzz_gates.elf --campaign     (full campaign panel: 2800 mutants, 400/class)
+//   fuzz_gates.elf                (reduced fixed panel: 300 mutants = 48x5 bc + 30x2 src)
+//   fuzz_gates.elf --campaign     (full campaign panel: 2800 mutants = 500x5 bc + 150x2 src)
 //   fuzz_gates.elf --no-judge     (skip Property 3 judge check, for sub-check)
 //
 // Summary line:
@@ -178,14 +178,29 @@ fn fg_compile_file(w: bytes, src_cstr: bytes, out_bc: bytes) -> i64 {
     return if_pos m2u_ge(nw, 1) <=> 0 { su_spawn_capture(sh_bin, sh_p, fg_tmp(111), 420) } else { 1 };
 }
 
-// Runs `verifier.elf` on `bc_cstr`. Returns 1 if ACCEPTED (passed==1 && err_count==0), else 0.
+// Runs `verifier.elf` on `bc_cstr`. Returns 1 if ACCEPTED (status==0 && nfns>=1 && EVERY fn has passed==1 && err_count==0), else 0.
 #[strict]
 #[cap(SYS)]
 fn fg_verify_bc(w: bytes, bc_cstr: bytes) -> i64 {
     let ver_out: bytes = fg_tmp(118);
     let rc: i64 = su_spawn_capture(fg_tool(w, 1), bc_cstr, ver_out, 420);
-    let vn: i64 = if_pos m2u_eq(rc, 0) <=> 0 { su_read_file_into(w, ver_out, 1536, 64) } else { 0 };
-    return m2u_eq(rc, 0) * m2u_ge(vn, 48) * m2u_eq(ld_u64(w, 1536), 0) * m2u_eq(ld_u64(w, 1536 + 24), 1) * m2u_eq(ld_u64(w, 1536 + 40), 0);
+    let vn: i64 = if_pos m2u_eq(rc, 0) <=> 0 { su_read_file_into(w, ver_out, 1536, 4096) } else { 0 };
+    let st: i64 = m2u_sel(m2u_ge(vn, 24), ld_u64(w, 1536), 1);
+    let nfns: i64 = m2u_sel(m2u_ge(vn, 24), ld_u64(w, 1536 + 16), 0);
+    let ok: i64 = m2u_eq(rc, 0) * m2u_eq(st, 0) * m2u_ge(nfns, 1);
+    let pos: i64 = 24;
+    let fi: i64 = 0;
+    let g: i64 = ok * m2u_lt(fi, nfns);
+    while g <=> 0 {
+        let has_hdr: i64 = m2u_ge(vn, pos + 24);
+        let passed: i64 = m2u_sel(has_hdr, ld_u64(w, 1536 + pos + 8), 0);
+        let ecnt: i64 = m2u_sel(has_hdr, ld_u64(w, 1536 + pos + 16), 1);
+        ok = ok * has_hdr * m2u_eq(passed, 1) * m2u_eq(ecnt, 0);
+        pos = pos + 24 + (ecnt << 4);
+        fi = fi + 1;
+        g = ok * m2u_lt(fi, nfns);
+    }
+    return ok;
 }
 
 // Checks whether `w[off..off+len]` contains 4-byte pattern `(c0,c1,c2,c3)`.

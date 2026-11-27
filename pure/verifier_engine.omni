@@ -170,7 +170,11 @@ fn unpack_cap(tc: i64) -> i64 {
 
 #[strict]
 fn op_is_known(op: i64) -> i64 {
-    let r: i64 = in_range(op, 32512, 32639);
+    let in_blk: i64 = in_range(op, 32512, 32639);
+    let hole: i64 = is_eq(op, 32519) + in_range(op, 32522, 32524)
+        + in_range(op, 32570, 32574) + in_range(op, 32587, 32590)
+        + in_range(op, 32594, 32596) + in_range(op, 32606, 32607);
+    let r: i64 = in_blk * is_eq(hole, 0);
     return r;
 }
 
