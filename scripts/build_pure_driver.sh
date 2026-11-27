@@ -167,6 +167,7 @@ build_pure_elf "pure/harness/core_gates.omni"      "core_gates.elf"
 build_pure_elf "pure/harness/extra_gates.omni"     "extra_gates.elf"
 build_pure_elf "pure/m7/judge_cli.omni"            "judge_cli.elf"
 build_pure_elf "pure/harness/p7_gates.omni"        "p7_gates.elf"
+build_pure_elf "pure/harness/fuzz_gates.omni"      "fuzz_gates.elf"
 
 # 5. Rebuild m3.elf from modular seeds via freshly built omnic_pure.elf link-elf
 #    and verify bit-exact parity with bootstrap/m3.elf!

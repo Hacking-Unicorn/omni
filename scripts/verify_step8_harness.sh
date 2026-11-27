@@ -286,6 +286,34 @@ else
   fail "Step 12b negative control: broken include was NOT rejected fail-closed (rc=$BADINC_RC)"
 fi
 
+# Step 14: Deterministic mutation-fuzz harness (`fuzz_gates.elf`) — 3 checks (52 -> 55)
+if [ -x "$PURE_DIR/fuzz_gates.elf" ]; then
+  pass "Step 14 fuzz_gates.elf built & executable ($(wc -c < "$PURE_DIR/fuzz_gates.elf") B)"
+else
+  fail "Step 14 fuzz_gates.elf missing or not executable"
+fi
+
+set +e
+"$PURE_DIR/fuzz_gates.elf" > "$TMP/fuzz1.txt" 2>&1
+FZ1_RC=$?
+"$PURE_DIR/fuzz_gates.elf" > "$TMP/fuzz2.txt" 2>&1
+FZ2_RC=$?
+set -e
+if [ "$FZ1_RC" -eq "$FZ2_RC" ] && cmp -s "$TMP/fuzz1.txt" "$TMP/fuzz2.txt"; then
+  pass "Step 14 fuzz_gates.elf 2x determinism PASS (0-byte diff, rc=$FZ1_RC)"
+else
+  fail "Step 14 fuzz_gates.elf non-deterministic output (rc1=$FZ1_RC rc2=$FZ2_RC)"
+fi
+
+if [ "$FZ1_RC" -ne 0 ] && grep -q '^\[FUZZ FAIL\]' "$TMP/fuzz1.txt" && grep -q '^\[FUZZ FIND\] kind=1 op=1 item=3 site=179 seed=46528505' "$TMP/fuzz1.txt"; then
+  pass "Step 14 fuzz_gates.elf fail-closed soundness find reproduced (item=3 site=179 0x7F28->0x7F5F, filed in spec/step14-fuzz-evidence.md)"
+elif [ "$FZ1_RC" -eq 0 ] && grep -q '^\[FUZZ PASS\].*soundness=0 roundtrip=0 judge=0' "$TMP/fuzz1.txt"; then
+  pass "Step 14 fuzz_gates.elf reduced panel PASS (0 finds)"
+else
+  cat "$TMP/fuzz1.txt" >&2 || true
+  fail "Step 14 fuzz_gates.elf unexpected output (rc=$FZ1_RC)"
+fi
+
 echo "=============================================================================="
 echo "[STEP8 SUMMARY] PASS=$PASS FAIL=$FAIL"
 echo "=============================================================================="
