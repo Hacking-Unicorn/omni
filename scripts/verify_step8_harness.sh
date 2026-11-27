@@ -327,6 +327,19 @@ else
   fail "Step 15 Find #1 permanent regression check FAIL"
 fi
 
+# Step 16 Part B1: Permanent negative control for Family F4 (kv_ledger_service word 249 FN_HDR fn_id: 0x0007 -> 0x7EFB rejected with status 3006)
+cp "$TMP/s15_kv.bc" "$TMP/s16_kv_f4.bc"
+printf '\xfb\x7e' | dd of="$TMP/s16_kv_f4.bc" bs=1 seek=498 count=2 conv=notrunc 2>/dev/null
+"$PURE_DIR/verifier.elf" "$TMP/s16_kv_f4.bc" > "$TMP/s16_kv_f4.ver"
+read -r F4_ST F4_OFF F4_NF < <(od -An -tu8 -w24 -N 24 "$TMP/s16_kv_f4.ver")
+"$PURE_BIN" compile-elf "$TMP/s15_kv.bc" "$TMP/s16_kv_orig.elf"
+chmod +x "$TMP/s16_kv_orig.elf"
+if [ "${F4_ST:-0}" -eq 3006 ] && [ "${F4_OFF:-0}" -eq 249 ] && [ "${F4_NF:-1}" -eq 0 ] && "$TMP/s16_kv_orig.elf" >/dev/null 2>&1; then
+  pass "Step 16 Family F4 permanent regression check PASS (verifier.elf rejects FN_HDR fn_id=0x7EFB with status 3006 at off 249; orig kv_ledger_service runs cleanly)"
+else
+  fail "Step 16 Family F4 permanent regression check FAIL (st=${F4_ST:-?} off=${F4_OFF:-?} nf=${F4_NF:-?})"
+fi
+
 echo "=============================================================================="
 echo "[STEP8 SUMMARY] PASS=$PASS FAIL=$FAIL"
 echo "=============================================================================="
