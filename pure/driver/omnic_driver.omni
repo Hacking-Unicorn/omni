@@ -120,6 +120,9 @@ fn od_read_include(w: bytes, src_off: i64, ps: i64, pe: i64, base_off: i64, base
         pb = iset(pb, ld_u8(w, base_off + bi));
         bi = bi + 1;
     }
+    let last_idx: i64 = m2u_sel(m2u_ge(base_len, 1), base_off + base_len - 1, 0);
+    let need_slash: i64 = m2u_ge(base_len, 1) * (1 - m2u_eq(ld_u8(w, last_idx), 47));
+    pb = if_pos need_slash <=> 0 { iset(pb, 47) } else { pb };
     let pi: i64 = ps;
     while pe - pi <=> 0 {
         pb = iset(pb, ld_u8(w, src_off + pi));
@@ -233,9 +236,11 @@ fn od_run_m3_and_verify(w2: bytes, n2: i64, out_bc_cstr: bytes) -> i64 {
 }
 
 // Compiles `.omni` file at `in_off..in_len` -> `out_bc_cstr` via native `m3.elf` + `verifier.elf`.
+// When `ib_len >= 1`, relative `include`s resolve against `arena[ib_off..ib_off+ib_len]`;
+// otherwise they resolve against the source file's own parent directory.
 #[strict]
 #[cap(SYS)]
-fn od_compile_omni(arena: bytes, in_off: i64, in_len: i64, out_bc_cstr: bytes) -> i64 {
+fn od_compile_omni_base(arena: bytes, in_off: i64, in_len: i64, out_bc_cstr: bytes, ib_off: i64, ib_len: i64) -> i64 {
     let in_cstr: bytes = su_make_cstr(arena, in_off, in_len);
     let nb: i64 = su_read_file_into(arena, in_cstr, su_band_b(), 120000);
     let r: i64 = if_pos m2u_lt(nb, 0) <=> 0 {
@@ -247,8 +252,10 @@ fn od_compile_omni(arena: bytes, in_off: i64, in_len: i64, out_bc_cstr: bytes) -
             slash = m2u_sel(m2u_eq(ld_u8(arena, in_off + si), 47), si, slash);
             si = si + 1;
         }
-        let base_len: i64 = m2u_sel(m2u_ge(slash, 0), slash + 1, 0);
-        let w1: bytes = od_expand_includes_pass(arena, su_band_b(), nb, in_off, base_len);
+        let use_ib: i64 = m2u_ge(ib_len, 1);
+        let base_off: i64 = m2u_sel(use_ib, ib_off, in_off);
+        let base_len: i64 = m2u_sel(use_ib, ib_len, m2u_sel(m2u_ge(slash, 0), slash + 1, 0));
+        let w1: bytes = od_expand_includes_pass(arena, su_band_b(), nb, base_off, base_len);
         let e1: i64 = ld_u64(w1, 24);
         let n1: i64 = ld_u64(w1, 0);
         let ci: i64 = 0;
@@ -256,7 +263,7 @@ fn od_compile_omni(arena: bytes, in_off: i64, in_len: i64, out_bc_cstr: bytes) -
             w1 = su_st_u8(w1, su_band_b() + ci, ld_u8(w1, su_band_a() + ci));
             ci = ci + 1;
         }
-        let w2: bytes = od_expand_includes_pass(w1, su_band_b(), n1, in_off, base_len);
+        let w2: bytes = od_expand_includes_pass(w1, su_band_b(), n1, base_off, base_len);
         let e2: i64 = ld_u64(w2, 24);
         let n2: i64 = ld_u64(w2, 0);
         let has_mac: i64 = od_has_macro(w2, su_band_a(), n2);
@@ -267,6 +274,12 @@ fn od_compile_omni(arena: bytes, in_off: i64, in_len: i64, out_bc_cstr: bytes) -
         }
     };
     return r;
+}
+
+#[strict]
+#[cap(SYS)]
+fn od_compile_omni(arena: bytes, in_off: i64, in_len: i64, out_bc_cstr: bytes) -> i64 {
+    return od_compile_omni_base(arena, in_off, in_len, out_bc_cstr, 0, 0);
 }
 
 // Compiles `.omni_bc` -> native ELF64 via `m2.elf` and optionally patches default CLI args `[a0, a1, a2]`.
@@ -609,7 +622,15 @@ fn main() -> i64 {
         if_pos m2u_eq(cmd, 1) <=> 0 {
             if_pos m2u_lt(argc, 4) <=> 0 { 2 } else {
                 let out_c: bytes = su_make_cstr(w, su_arg_off(w, 3), su_arg_len(w, 3));
-                od_compile_omni(w, su_arg_off(w, 2), su_arg_len(w, 2), out_c)
+                let has_ib: i64 = if_pos m2u_ge(argc, 6) <=> 0 {
+                    let fo: i64 = su_arg_off(w, 4);
+                    let fl: i64 = su_arg_len(w, 4);
+                    m2u_eq(fl, 14) * m2u_eq(ld_u8(w, fo), 45) * m2u_eq(ld_u8(w, fo + 1), 45)
+                        * m2u_eq(ld_u8(w, fo + 2), 105) * m2u_eq(ld_u8(w, fo + 13), 101)
+                } else { 0 };
+                let ib_off: i64 = if_pos has_ib <=> 0 { su_arg_off(w, 5) } else { 0 };
+                let ib_len: i64 = if_pos has_ib <=> 0 { su_arg_len(w, 5) } else { 0 };
+                od_compile_omni_base(w, su_arg_off(w, 2), su_arg_len(w, 2), out_c, ib_off, ib_len)
             }
         } else { if_pos m2u_eq(cmd, 2) <=> 0 {
             od_cmd_compile_elf(w, argc)
