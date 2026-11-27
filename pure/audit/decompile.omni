@@ -42,13 +42,12 @@ let w: bytes = iset_patch_i64(dc_emit_indent(arena,depth),72,1);
 w = su_out4(su_out4(su_out4(su_out4(w,47,47,32,91),76,73,84,69),82,65,76,95),79,80,32,64);
 w = su_out4(su_out_hex(w,dc_ins_woff(w,idx),4),93,32,79,80);
 w = if_pos m2u_eq(op,32578) <=> 0 {
-su_out4(su_out4(su_out4(w,95,55,70,52),50,95,66,82),95,84,82,73)
+su_out_u8(su_out4(su_out4(su_out4(w,95,55,70,52),50,95,66,82),95,84,82,73),84)
 } else { if_pos m2u_eq(op,32579) <=> 0 {
 su_out4(su_out4(su_out4(w,95,55,70,52),51,95,66,82),95,80,79,83)
 } else {
 su_out4(su_out4(su_out4(w,95,55,70,52),52,95,66,82),95,78,69,71)
 } };
-w = if_pos m2u_eq(op,32578) <=> 0 { su_out_u8(w,84) } else { w };
 return su_out_u8(dc_emit_op_args(su_out_u8(w,32),idx,0,0),10);
 }
 #[strict]
@@ -106,8 +105,9 @@ let bop: i64 = dc_ins_op(w,br);
 let is_br: i64 = (m2u_eq(bop,32579) + m2u_eq(bop,32580)) * m2u_ge(dc_ins_nops(w,br),2);
 let lt: i64 = m2u_sel(is_br,dc_label_id(w,br,1),0 - 1);
 let tli: i64 = m2u_sel(m2u_ge(lt,0),dc_find_label(w,br + 1,end,lt),0 - 1);
-let jmp_ok: i64 = m2u_ge(tli,br + 2) * m2u_eq(dc_ins_op(w,m2u_sel(m2u_ge(tli,1),tli - 1,0)),32577)
-* m2u_eq(dc_label_id(w,m2u_sel(m2u_ge(tli,1),tli - 1,0),0),l_outer);
+let jidx: i64 = m2u_sel(m2u_ge(tli,1),tli - 1,0);
+let jmp_ok: i64 = m2u_ge(tli,br + 2) * m2u_eq(dc_ins_op(w,jidx),32577)
+* m2u_eq(dc_label_id(w,jidx,0),l_outer);
 let sz_ok: i64 = jmp_ok * m2u_eq(br + 2,tli - 1) * m2u_eq(tli + 2,end);
 let ie: i64 = m2u_sel(sz_ok,br + 1,0);
 let it: i64 = m2u_sel(sz_ok,tli + 1,0);
