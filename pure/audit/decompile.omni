@@ -84,10 +84,10 @@ su_out4(su_out_i64(u,dc_label_id(u,idx,0)),59,10,0,0)
 } else { if_pos m2u_eq(op,32577) <=> 0 {
 let u: bytes = su_out4(su_out_u8(dc_emit_indent(w,depth),103),111,116,111,32);
 su_out4(su_out_i64(u,dc_label_id(u,idx,0)),59,10,0,0)
-} else { if_pos m2u_eq(op,32517) * m2u_ge(nops,1) <=> 0 {
+} else { if_pos m2u_eq(op,32517) * m2u_eq(nops,1) <=> 0 {
 let u: bytes = su_out_u8(su_out4(dc_emit_indent(w,depth),100,114,111,112),40);
 su_out4(dc_emit_op(u,dc_ins_op0(u,idx)),41,59,10,0)
-} else { if_pos m2u_eq(op,32586) <=> 0 {
+} else { if_pos m2u_eq(op,32586) * (1 - m2u_lt(1,nops)) <=> 0 {
 let u: bytes = su_out4(su_out4(dc_emit_indent(w,depth),114,101,116,117),114,110,0,0);
 if_pos m2u_ge(nops,1) <=> 0 { su_out4(dc_emit_op(su_out_u8(u,32),dc_ins_op0(u,idx)),59,10,0,0) }
 else { su_out4(u,59,10,0,0) }

@@ -167,7 +167,7 @@ let r: bytes = if_pos m2u_eq(t,32490) <=> 0 { dc_emit_eng(w,pos) }
 else { if_pos m2u_eq(t,32491) <=> 0 { su_out_i64(su_out4(su_out4(w,64,115,99,104),101,109,97,95),dc_u16(w,pos + 1)) }
 else { if_pos m2u_eq(t,32492) <=> 0 { su_out_i64(su_out4(w,102,110,95,0),dc_u16(w,pos + 1)) }
 else { if_pos m2u_eq(t,32493) <=> 0 { su_out_i64(su_out4(su_out4(w,64,115,107,105),108,108,95,0),dc_u16(w,pos + 1)) }
-else { if_pos m2u_in(t,32496,32511) <=> 0 { su_out_i64(w,t - 32496) }
+else { if_pos m2u_in(t,32496,32511) <=> 0 { su_out_i64(iset_patch_i64(w,72,1),t - 32496) }
 else { su_out_hex(w,t,4) } } } } };
 return r;
 }
@@ -414,16 +414,27 @@ else { w } } } } } };
 return r;
 }
 #[strict]
+fn dc_op_fixed_ty(op: i64) -> i64 {
+let is_i64: i64 = m2u_in(op,32514,32515) + m2u_eq(op,32526) + m2u_in(op,32528,32536)
++ m2u_in(op,32542,32547) + m2u_eq(op,32564) + m2u_eq(op,32592) + m2u_in(op,32612,32624);
+let is_trit: i64 = m2u_in(op,32548,32557) + m2u_eq(op,32565) + m2u_eq(op,32575);
+let is_bytes: i64 = m2u_eq(op,32525) + m2u_eq(op,32527) + m2u_eq(op,32560);
+let is_tvec: i64 = m2u_eq(op,32561);
+let is_arena: i64 = m2u_eq(op,32513);
+return is_i64 * 32641 + is_trit * 32643 + is_bytes * 32646 + is_tvec * 32647 + is_arena * 32650;
+}
+#[strict]
 fn dc_can_rhs(w: bytes,idx: i64) -> i64 {
 let op: i64 = dc_ins_op(w,idx);
 let nops: i64 = dc_ins_nops(w,idx);
 let p0: i64 = dc_ins_op0(w,idx);
 let p1: i64 = dc_ins_op1(w,idx);
 let is_bin: i64 = m2u_in(op,32528,32532) + m2u_in(op,32542,32544) + m2u_in(op,32546,32551) + m2u_eq(op,32557);
-let is_1: i64 = m2u_in(op,32513,32515) + m2u_eq(op,32518) + m2u_eq(op,32520) + m2u_eq(op,32521)
-+ m2u_eq(op,32525) + m2u_eq(op,32533) + m2u_eq(op,32534) + m2u_eq(op,32545) + m2u_eq(op,32552)
+let is_1: i64 = m2u_in(op,32513,32515) + m2u_eq(op,32518)
++ m2u_eq(op,32525) + m2u_eq(op,32534) + m2u_eq(op,32545) + m2u_eq(op,32552)
 + m2u_eq(op,32560) + m2u_eq(op,32565) + m2u_eq(op,32592) + m2u_in(op,32597,32601)
 + m2u_eq(op,32605) + m2u_eq(op,32612) + m2u_eq(op,32616) + m2u_eq(op,32621) + m2u_eq(op,32624);
+let is_const: i64 = m2u_eq(op,32521) * m2u_eq(nops,1) * m2u_in(dc_u16(w,p0),32485,32490);
 let is_2: i64 = is_bin + m2u_eq(op,32535) + m2u_eq(op,32536) + m2u_in(op,32553,32555)
 + m2u_eq(op,32561) + m2u_eq(op,32564) + m2u_eq(op,32593) + m2u_eq(op,32613)
 + m2u_eq(op,32619) + m2u_eq(op,32622) + m2u_eq(op,32623);
@@ -435,7 +446,9 @@ let ig_w: i64 = m2u_sel(dc_is_imm(w,p1),dc_imm_val(w,p1),0);
 let ig_ok3: i64 = m2u_eq(nops,3) * dc_is_imm(w,p1)
 * (m2u_eq(ig_w,0 - 1) + m2u_eq(ig_w,0 - 2) + m2u_eq(ig_w,0 - 4) + m2u_eq(ig_w,0 - 8));
 let is_iget: i64 = m2u_eq(op,32526) * (m2u_eq(nops,2) + ig_ok3);
-let ok: i64 = (is_1 * m2u_ge(nops,1)) + (is_2 * m2u_ge(nops,2)) + (is_3 * m2u_ge(nops,3))
-+ (is_4 * m2u_ge(nops,4)) + is_call + is_iset + is_iget;
-return m2u_lt(0,ok);
+let ok: i64 = (is_1 * m2u_eq(nops,1)) + (is_2 * m2u_eq(nops,2)) + (is_3 * m2u_eq(nops,3))
++ (is_4 * m2u_eq(nops,4)) + is_const + is_call + is_iset + is_iget;
+let want_ty: i64 = dc_op_fixed_ty(op);
+let ty_ok: i64 = m2u_eq(want_ty,0) + m2u_eq(dc_ins_ty(w,idx),want_ty);
+return m2u_lt(0,ok) * m2u_lt(0,ty_ok);
 }

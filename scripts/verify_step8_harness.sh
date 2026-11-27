@@ -305,8 +305,8 @@ else
   fail "Step 14 fuzz_gates.elf non-deterministic output (rc1=$FZ1_RC rc2=$FZ2_RC)"
 fi
 
-if [ "$FZ1_RC" -ne 0 ] && grep -q '^\[FUZZ FAIL\]' "$TMP/fuzz1.txt" && grep -q '^\[FUZZ FIND\] kind=3 op=1 item=1 site=17 seed=977037651' "$TMP/fuzz1.txt"; then
-  pass "Step 14/16 fuzz_gates.elf fail-closed first find reproduced (kind=3 op=1 item=1 site=17 seed=977037651; Find #2 fully closed — F3 component PR #62, F1 component PR #63)"
+if [ "$FZ1_RC" -ne 0 ] && grep -q '^\[FUZZ FAIL\].*soundness=0 roundtrip=0 judge=1' "$TMP/fuzz1.txt" && grep -q '^\[FUZZ FIND\] kind=5 op=7 item=3 site=1091 seed=1910166380' "$TMP/fuzz1.txt"; then
+  pass "Step 14/16 fuzz_gates.elf fail-closed first find reproduced (soundness=0 roundtrip=0 judge=1; kind=5 op=7 item=3 site=1091 seed=1910166380 — Family F7)"
 elif [ "$FZ1_RC" -eq 0 ] && grep -q '^\[FUZZ PASS\].*soundness=0 roundtrip=0 judge=0' "$TMP/fuzz1.txt"; then
   pass "Step 14/16 fuzz_gates.elf reduced panel PASS (0 finds)"
 else
@@ -544,6 +544,63 @@ if ! od -An -tu8 -w8 "$TMP/s16_f2_kv_orig.ver" | grep -qw '3001' \
   pass "Step 16 Part B5 (F2) unlowered-op & final-RET negative control PASS (kv w79 0x7F45->0x7F19 rejected 3001; seed0 w49 0x7F4A->0x7F46 rejected 2012; origs accepted & run cleanly)"
 else
   fail "Step 16 Part B5 (F2) unlowered-op & final-RET negative control FAIL"
+fi
+
+# Check 70: Step 16 Part B6 (F6-A) — inline LBL token as value operand (seed4 w28 0x7E00->0x7EFD) stamped APPROXIMATE
+cp "$TMP/s16_s4_orig.bc" "$TMP/s16_f6a_mut.bc"
+printf '\xfd\x7e' | dd of="$TMP/s16_f6a_mut.bc" bs=1 seek=56 count=2 conv=notrunc 2>/dev/null
+"$PURE_DIR/audit_decompile.elf" "$TMP/s16_s4_orig.bc" > "$TMP/s16_s4_orig.dec.omni"
+"$PURE_DIR/audit_decompile.elf" "$TMP/s16_f6a_mut.bc" > "$TMP/s16_f6a_mut.dec.omni"
+"$PURE_DIR/omnic_pure.elf" compile "$TMP/s16_s4_orig.dec.omni" "$TMP/s16_s4_orig.rec.bc"
+if grep -q '^// Status: RECONSTRUCTED (exact)' "$TMP/s16_s4_orig.dec.omni" \
+   && cmp -s "$TMP/s16_s4_orig.bc" "$TMP/s16_s4_orig.rec.bc" \
+   && grep -q '^// Status: APPROXIMATE' "$TMP/s16_f6a_mut.dec.omni"; then
+  pass "Step 16 Part B6 (F6-A) inline-LBL value operand honesty control PASS (seed4 w28 0x7E00->0x7EFD stamped APPROXIMATE; orig RECONSTRUCTED byte-exact)"
+else
+  fail "Step 16 Part B6 (F6-A) inline-LBL value operand honesty control FAIL"
+fi
+
+# Check 71: Step 16 Part B6 (F6-B) — excess operands beyond canonical arity (seed4 RET v1 dup & seed6 w24 0x7F17->0x7F16 iabs) stamped APPROXIMATE
+dd if="$TMP/s16_s4_orig.bc" of="$TMP/s16_f6b_dup.bc" bs=1 count=64 2>/dev/null
+printf '\x01\x7e' >> "$TMP/s16_f6b_dup.bc"
+dd if="$TMP/s16_s4_orig.bc" bs=1 skip=64 2>/dev/null >> "$TMP/s16_f6b_dup.bc"
+cp "$TMP/s16_s6_orig.bc" "$TMP/s16_f6b_op4.bc"
+printf '\x16\x7f' | dd of="$TMP/s16_f6b_op4.bc" bs=1 seek=48 count=2 conv=notrunc 2>/dev/null
+"$PURE_DIR/audit_decompile.elf" "$TMP/s16_f6b_dup.bc" > "$TMP/s16_f6b_dup.dec.omni"
+"$PURE_DIR/audit_decompile.elf" "$TMP/s16_f6b_op4.bc" > "$TMP/s16_f6b_op4.dec.omni"
+"$PURE_DIR/audit_decompile.elf" "$TMP/s16_s6_orig.bc" > "$TMP/s16_s6_orig.dec.omni"
+if grep -q '^// Status: APPROXIMATE' "$TMP/s16_f6b_dup.dec.omni" \
+   && grep -q '^// Status: APPROXIMATE' "$TMP/s16_f6b_op4.dec.omni" \
+   && grep -q '^// Status: RECONSTRUCTED (exact)' "$TMP/s16_s6_orig.dec.omni"; then
+  pass "Step 16 Part B6 (F6-B) excess-operand honesty control PASS (RET dup & iabs nops=2 stamped APPROXIMATE; orig RECONSTRUCTED)"
+else
+  fail "Step 16 Part B6 (F6-B) excess-operand honesty control FAIL"
+fi
+
+# Check 72: Step 16 Part B6 (F6-C) — destination ty mismatch (seed4 w18 0x7F83->0x7F84 tmaj->str) stamped APPROXIMATE
+cp "$TMP/s16_s4_orig.bc" "$TMP/s16_f6c_mut.bc"
+printf '\x84\x7f' | dd of="$TMP/s16_f6c_mut.bc" bs=1 seek=36 count=2 conv=notrunc 2>/dev/null
+"$PURE_DIR/audit_decompile.elf" "$TMP/s16_f6c_mut.bc" > "$TMP/s16_f6c_mut.dec.omni"
+if grep -q '^// Status: APPROXIMATE' "$TMP/s16_f6c_mut.dec.omni" \
+   && grep -q '^// Status: RECONSTRUCTED (exact)' "$TMP/s16_s4_orig.dec.omni"; then
+  pass "Step 16 Part B6 (F6-C) dest-type mismatch honesty control PASS (seed4 w18 0x7F83->0x7F84 stamped APPROXIMATE; orig RECONSTRUCTED)"
+else
+  fail "Step 16 Part B6 (F6-C) dest-type mismatch honesty control FAIL"
+fi
+
+# Check 73: Step 16 Part B6 (F6-D) — non-canonical op aliases (seed4 w25 0x7F28->0x7F09 reg-CONST & w17 0x7F2C->0x7F15 INEG) stamped APPROXIMATE
+cp "$TMP/s16_s4_orig.bc" "$TMP/s16_f6d_const.bc"
+printf '\x09\x7f' | dd of="$TMP/s16_f6d_const.bc" bs=1 seek=50 count=2 conv=notrunc 2>/dev/null
+cp "$TMP/s16_s4_orig.bc" "$TMP/s16_f6d_ineg.bc"
+printf '\x15\x7f' | dd of="$TMP/s16_f6d_ineg.bc" bs=1 seek=34 count=2 conv=notrunc 2>/dev/null
+"$PURE_DIR/audit_decompile.elf" "$TMP/s16_f6d_const.bc" > "$TMP/s16_f6d_const.dec.omni"
+"$PURE_DIR/audit_decompile.elf" "$TMP/s16_f6d_ineg.bc" > "$TMP/s16_f6d_ineg.dec.omni"
+if grep -q '^// Status: APPROXIMATE' "$TMP/s16_f6d_const.dec.omni" \
+   && grep -q '^// Status: APPROXIMATE' "$TMP/s16_f6d_ineg.dec.omni" \
+   && grep -q '^// Status: RECONSTRUCTED (exact)' "$TMP/s16_s4_orig.dec.omni"; then
+  pass "Step 16 Part B6 (F6-D) non-canonical alias honesty control PASS (CONST-with-reg & INEG stamped APPROXIMATE; orig RECONSTRUCTED)"
+else
+  fail "Step 16 Part B6 (F6-D) non-canonical alias honesty control FAIL"
 fi
 
 echo "=============================================================================="
