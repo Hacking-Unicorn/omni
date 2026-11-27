@@ -78,9 +78,9 @@ fi
 
 echo "=== [4/8] Pure-Omni compile-elf ==="
 for pair in \
-  "pure/m2/m2.omni_bc:m2:126032" \
+  "pure/m2/m2.omni_bc:m2:125660" \
   "pure/m4/m4.omni_bc:m4:90402" \
-  "pure/verifier_standalone.omni_bc:verifier:40562"
+  "pure/verifier_standalone.omni_bc:verifier:77189"
 do
   IFS=':' read -r bc name exp_sz <<< "$pair"
   "$PURE_BIN" compile-elf "$bc" "$TMP/p_${name}.elf"

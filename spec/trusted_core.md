@@ -22,7 +22,7 @@ Everything outside this core—including `omni-agent-driver` repair heuristics, 
 2. **Lemma 2 — Multi-Arena Linear Conservation:**
    - Every function accepted by `verify_binary_function` that allocates $k \ge 1$ linear arenas (`arena(N)`) must release all $k$ arenas after releasing any active borrows (`borrow_r` / `borrow_w`), terminating with `vm.allocated_bytes == 0`. Partial drops are rejected with `error[LINEAR_LEAK]`.
 3. **Lemma 3 — Capability Monotonicity Across `OMNI_ISA_TABLE`:**
-   - For every opcode `op_tok` in `0x7F00..=0x7F7F` where `spec.req_cap_mask != 0` (25 capability-gated opcodes), a function with `cap_mask == 0` containing `op_tok` is unconditionally rejected with `error[MISSING_CAP]`.
+   - For every opcode `op_tok` in `0x7F00..=0x7F7F` where `spec.req_cap_mask != 0` (24 capability-gated opcodes), a function with `cap_mask == 0` containing `op_tok` is unconditionally rejected with `error[MISSING_CAP]`.
 4. **Lemma 4 — Hot-Path AOT Observational Equivalence on 64-Bit Boundaries:**
    - For any single-function pure numeric/ternary module accepted by `is_module_aot_hot_path`, execution via `x86-64`/Wasm AOT and `OmniBinaryVm` produces identical results across boundary inputs `(0, 0)`, `(42, 0)` (totalized division/modulo by zero), `(i64::MIN, -1)` (wrapping overflow), `(i64::MAX, 1)`, and `(-99, 7)`.
 5. **Lemma 5 — Module & Hygienic Macro Transparency:**

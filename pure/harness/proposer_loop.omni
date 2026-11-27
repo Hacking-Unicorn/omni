@@ -122,24 +122,24 @@ fn pl_hash_file(arena: bytes, p: bytes) -> i64 {
 #[strict]
 #[cap(SYS)]
 fn pl_stage0_guard(arena: bytes) -> i64 {
-    // Check verifier_standalone.omni_bc = 16380w (32760 B), FNV-1a64 = 0xD3482994AFC37D25 (Step 16 Part B7 reserve 0x7F51/0x7F55)
+    // Check verifier_standalone.omni_bc = 23634w (47268 B), FNV-1a64 = 0x7E82A2FFC55AEE56 (Addons Item 1 PR 1 op_is_known)
     let p_ver: bytes = anew(0);
     p_ver = iset(p_ver, 112, 117, 114, 101, 47, 118, 101, 114, 105, 102, 105, 101, 114, 95, 115, 116);
     p_ver = iset(p_ver, 97, 110, 100, 97, 108, 111, 110, 101, 46, 111, 109, 110, 105, 95, 98, 99);
     p_ver = iset(p_ver, 0);
     let hv: i64 = pl_hash_file(arena, p_ver);
-    let want_v: i64 = (54088 << 48) | (10644 << 32) | (44995 << 16) | 32037;
+    let want_v: i64 = (32386 << 48) | (41727 << 32) | (50522 << 16) | 61014;
     // Check pure/m7/judge.omni exists and is readable (deny-listed)
     let p_jdg: bytes = anew(0);
     p_jdg = iset(p_jdg, 112, 117, 114, 101, 47, 109, 55, 47, 106, 117, 100, 103, 101, 46, 111, 109);
     p_jdg = iset(p_jdg, 110, 105, 0);
     let hj: i64 = pl_hash_file(arena, p_jdg);
-    // Check pure/m2/m2.omni_bc = 0xFD2F8B389C2AAEA1 (Step 16 Part B7 reserve 0x7F51/0x7F55)
+    // Check pure/m2/m2.omni_bc = 0x3DCC8546CE5B0D57 (Addons Item 1 PR 1 table.omni acceptance)
     let p_m2: bytes = anew(0);
     p_m2 = iset(p_m2, 112, 117, 114, 101, 47, 109, 50, 47, 109, 50, 46, 111, 109, 110, 105, 95);
     p_m2 = iset(p_m2, 98, 99, 0);
     let hm2: i64 = pl_hash_file(arena, p_m2);
-    let want_m2: i64 = (64815 << 48) | (35640 << 32) | (39978 << 16) | 44705;
+    let want_m2: i64 = (15820 << 48) | (34118 << 32) | (52827 << 16) | 3415;
     return m2u_eq(hv, want_v) * (1 - m2u_eq(hj, 0)) * m2u_eq(hm2, want_m2);
 }
 

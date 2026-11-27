@@ -207,8 +207,11 @@ fn m2v_check_call_ins(w: bytes, arr: array, n: i64, caller_slot: i64, off: i64) 
 }
 
 #[strict]
-fn m2v_ins_min_ops(op: i64) -> i64 {
-    let is_0: i64 = m2u_eq(op, 32512) + m2u_eq(op, 32525) + m2u_in(op, 32566, 32567) + m2u_eq(op, 32582) + m2u_eq(op, 32616) + m2u_eq(op, 32627);
+fn m2v_ins_min_ops(w: bytes, op: i64) -> i64 {
+    let idx: i64 = isa_op_index(op);
+    let in_blk: i64 = m2u_ge(idx, 0);
+    let safe_idx: i64 = m2u_sel(in_blk, idx, 0);
+    let known: i64 = in_blk * isa_op_flag(w, m2l_isa_tbl(), safe_idx, 5);
     let is_4: i64 = m2u_eq(op, 32578) + m2u_eq(op, 32581);
     let is_3: i64 = m2u_eq(op, 32556) + m2u_eq(op, 32569);
     let is_2: i64 = m2u_in(op, 32526, 32532) + m2u_in(op, 32535, 32536) + m2u_in(op, 32542, 32544)
@@ -220,7 +223,6 @@ fn m2v_ins_min_ops(op: i64) -> i64 {
         + m2u_in(op, 32575, 32577) + m2u_eq(op, 32584) + m2u_eq(op, 32586) + m2u_eq(op, 32592)
         + m2u_in(op, 32598, 32601) + m2u_eq(op, 32605) + m2u_in(op, 32611, 32615)
         + m2u_eq(op, 32617) + m2u_in(op, 32619, 32624) + m2u_eq(op, 32630) + m2u_in(op, 32637, 32638);
-    let known: i64 = is_0 + is_1 + is_2 + is_3 + is_4;
     let need: i64 = is_1 * 1 + is_2 * 2 + is_3 * 3 + is_4 * 4;
     return m2u_sel(known, need, 0 - 1);
 }
@@ -229,7 +231,7 @@ fn m2v_ins_min_ops(op: i64) -> i64 {
 fn m2v_step_ins(w: bytes, arr: array, n: i64, fslot: i64, cur: i64) -> bytes {
     let op: i64 = m2d_ins_op(arr, n, cur);
     let nops: i64 = m2d_ins_nops(arr, n, cur);
-    let min_ops: i64 = m2v_ins_min_ops(op);
+    let min_ops: i64 = m2v_ins_min_ops(w, op);
     let bad_op: i64 = m2u_lt(min_ops, 0) + m2u_lt(nops, min_ops);
     let w0: bytes = if_pos bad_op <=> 0 {
         m2v_set_err(w, 1, cur)
