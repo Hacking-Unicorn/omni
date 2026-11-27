@@ -12,7 +12,8 @@
 //
 // Usage:
 //   fuzz_gates.elf                (reduced fixed panel: 300 mutants = 48x5 bc + 30x2 src)
-//   fuzz_gates.elf --campaign     (full campaign panel: 2800 mutants = 500x5 bc + 150x2 src)
+//   fuzz_gates.elf --campaign     (full campaign panel: 2800 mutants = 500x5 bc + 150x2 src, stop-on-find)
+//   fuzz_gates.elf --campaign-all (full 2800-mutant collect-all enumeration + 12-mutant judge panel)
 //   fuzz_gates.elf --no-judge     (skip Property 3 judge check, for sub-check)
 //
 // Summary line:
@@ -181,20 +182,21 @@ fn fg_compile_file(w: bytes, src_cstr: bytes, out_bc: bytes) -> i64 {
 // Runs `verifier.elf` on `bc_cstr`. Returns 1 if ACCEPTED (status==0 && nfns>=1 && EVERY fn has passed==1 && err_count==0), else 0.
 #[strict]
 #[cap(SYS)]
-fn fg_verify_bc(w: bytes, bc_cstr: bytes) -> i64 {
-    let ver_out: bytes = fg_tmp(118);
-    let rc: i64 = su_spawn_capture(fg_tool(w, 1), bc_cstr, ver_out, 420);
-    let vn: i64 = if_pos m2u_eq(rc, 0) <=> 0 { su_read_file_into(w, ver_out, 1536, 4096) } else { 0 };
-    let st: i64 = m2u_sel(m2u_ge(vn, 24), ld_u64(w, 1536), 1);
-    let nfns: i64 = m2u_sel(m2u_ge(vn, 24), ld_u64(w, 1536 + 16), 0);
+fn fg_verify_bc(w: bytes, ver_elf: bytes, bc_cstr: bytes, ver_out: bytes) -> i64 {
+    let rc: i64 = su_spawn_capture(ver_elf, bc_cstr, ver_out, 420);
+    let vb: i64 = su_band_b() + 200000;
+    let vn: i64 = if_pos m2u_eq(rc, 0) <=> 0 { su_read_file_into(w, ver_out, vb, 32768) } else { 0 };
+    let st: i64 = m2u_sel(m2u_ge(vn, 24), ld_u64(w, vb), 1);
+    let nfns: i64 = m2u_sel(m2u_ge(vn, 24), ld_u64(w, vb + 16), 0);
     let ok: i64 = m2u_eq(rc, 0) * m2u_eq(st, 0) * m2u_ge(nfns, 1);
     let pos: i64 = 24;
     let fi: i64 = 0;
     let g: i64 = ok * m2u_lt(fi, nfns);
     while g <=> 0 {
         let has_hdr: i64 = m2u_ge(vn, pos + 24);
-        let passed: i64 = m2u_sel(has_hdr, ld_u64(w, 1536 + pos + 8), 0);
-        let ecnt: i64 = m2u_sel(has_hdr, ld_u64(w, 1536 + pos + 16), 1);
+        let safe_p: i64 = m2u_sel(has_hdr, vb + pos, vb);
+        let passed: i64 = m2u_sel(has_hdr, ld_u64(w, safe_p + 8), 0);
+        let ecnt: i64 = m2u_sel(has_hdr, ld_u64(w, safe_p + 16), 1);
         ok = ok * has_hdr * m2u_eq(passed, 1) * m2u_eq(ecnt, 0);
         pos = pos + 24 + (ecnt << 4);
         fi = fi + 1;
@@ -300,7 +302,7 @@ fn fg_mut_op5(w0: bytes, nb: i64, idx: i64, do_del: i64) -> bytes {
 }
 
 // Applies bytecode mutation `op_cls` (0..4 => Ops 1..5) to Band B (`nb` bytes, `nwords = nb >> 1`).
-// Writes mutated byte length into `w[328]` and `site` into `w[304]`.
+// Writes mutated byte length into `w[328]`, `site` into `w[304]`, `orig_w` into `w[336]`, `mut_w` into `w[344]`.
 #[strict]
 fn fg_mutate_bc(w0: bytes, nb: i64, op_cls: i64, rng: i64) -> bytes {
     let bb: i64 = su_band_b();
@@ -309,25 +311,34 @@ fn fg_mutate_bc(w0: bytes, nb: i64, op_cls: i64, rng: i64) -> bytes {
     let idx: i64 = 16 + fg_mod(rng, site_lim);
     let r: bytes = if_pos m2u_eq(op_cls, 0) <=> 0 {
         let tgt: i64 = fg_scan_range(w0, idx, nw - 1, 32512, 32639);
+        let ov: i64 = ld_u16(w0, bb + (tgt << 1));
         let new_op: i64 = 32512 + ((rng >> 4) % 96);
-        iset_patch_i64(iset_patch_i64(st_u16(w0, bb + (tgt << 1), new_op), 304, tgt), 328, nb)
+        let u: bytes = iset_patch_i64(iset_patch_i64(st_u16(w0, bb + (tgt << 1), new_op), 336, ov), 344, new_op);
+        iset_patch_i64(iset_patch_i64(u, 304, tgt), 328, nb)
     } else { if_pos m2u_eq(op_cls, 1) <=> 0 {
         let tgt: i64 = fg_scan_range(w0, idx, nw - 1, 32256, 32479);
         let v: i64 = ld_u16(w0, bb + (tgt << 1));
         let delta: i64 = m2u_sel(rng & 1, 1, 0 - 1);
-        iset_patch_i64(iset_patch_i64(st_u16(w0, bb + (tgt << 1), (v + delta) & 65535), 304, tgt), 328, nb)
+        let nv: i64 = (v + delta) & 65535;
+        let u: bytes = iset_patch_i64(iset_patch_i64(st_u16(w0, bb + (tgt << 1), nv), 336, v), 344, nv);
+        iset_patch_i64(iset_patch_i64(u, 304, tgt), 328, nb)
     } else { if_pos m2u_eq(op_cls, 2) <=> 0 {
         let tgt: i64 = fg_scan_range(w0, idx, nw - 1, 32496, 32511);
+        let ov: i64 = ld_u16(w0, bb + (tgt << 1));
         let new_l: i64 = 32496 + ((rng >> 3) & 15);
-        iset_patch_i64(iset_patch_i64(st_u16(w0, bb + (tgt << 1), new_l), 304, tgt), 328, nb)
+        let u: bytes = iset_patch_i64(iset_patch_i64(st_u16(w0, bb + (tgt << 1), new_l), 336, ov), 344, new_l);
+        iset_patch_i64(iset_patch_i64(u, 304, tgt), 328, nb)
     } else { if_pos m2u_eq(op_cls, 3) <=> 0 {
         let p: i64 = fg_scan_range(w0, idx, nw - 2, 32485, 32486);
         let tgt: i64 = m2u_sel(m2u_in(ld_u16(w0, bb + (p << 1)), 32485, 32486), p + 1, idx);
         let v: i64 = ld_u16(w0, bb + (tgt << 1));
         let nv: i64 = m2u_sel(rng & 2, (0 - v) & 65535, (v + m2u_sel(rng & 1, 1, 0 - 1)) & 65535);
-        iset_patch_i64(iset_patch_i64(st_u16(w0, bb + (tgt << 1), nv), 304, tgt), 328, nb)
+        let u: bytes = iset_patch_i64(iset_patch_i64(st_u16(w0, bb + (tgt << 1), nv), 336, v), 344, nv);
+        iset_patch_i64(iset_patch_i64(u, 304, tgt), 328, nb)
     } else {
-        fg_mut_op5(w0, nb, idx, rng & 1)
+        let ov: i64 = ld_u16(w0, bb + (idx << 1));
+        let do_del: i64 = rng & 1;
+        iset_patch_i64(iset_patch_i64(fg_mut_op5(w0, nb, idx, do_del), 336, ov), 344, m2u_sel(do_del, 65535, ov))
     } } } };
     return r;
 }
@@ -391,13 +402,33 @@ fn fg_mutate_src(w0: bytes, nb: i64, op_cls: i64, rng: i64) -> bytes {
     return iset_patch_i64(r, 328, nb);
 }
 
-// Records a find in arena if none recorded yet.
+// Emits one structured find line to stdout in collect-all mode (`w[96] == 1`).
 #[strict]
+#[cap(SYS)]
+fn fg_log_find(w: bytes, kind: i64, op_num: i64, cidx: i64, rng: i64) -> i64 {
+    let f: bytes = iset_patch_i64(w, 0, 0);
+    f = su_out4(su_out4(su_out4(f, 91, 70, 85, 90), 90, 32, 70, 73), 78, 68, 93, 32);
+    f = su_out_i64(su_out4(su_out_u8(f, 107), 105, 110, 100, 61), kind);
+    f = su_out_i64(su_out4(f, 32, 111, 112, 61), op_num);
+    f = su_out_i64(su_out4(su_out4(f, 32, 105, 116, 101), 109, 61, 0, 0), cidx);
+    f = su_out_i64(su_out4(su_out4(f, 32, 115, 105, 116), 101, 61, 0, 0), ld_u64(w, 304));
+    f = su_out_i64(su_out4(su_out4(f, 32, 115, 101, 101), 100, 61, 0, 0), rng);
+    f = su_out_hex(su_out4(su_out4(f, 32, 111, 114, 105), 103, 61, 0, 0), ld_u64(w, 336), 4);
+    f = su_out_hex(su_out4(su_out4(f, 32, 109, 117, 116), 61, 0, 0, 0), ld_u64(w, 344), 4);
+    f = su_out_u8(f, 10);
+    let nw: i64 = sys_write(1, f, su_band_a(), ld_u64(f, 0));
+    return 0 + nw * 0;
+}
+
+// Records a find in arena; in collect-all mode (`w[96]==1`), also logs every find line immediately.
+#[strict]
+#[cap(SYS)]
 fn fg_rec_find(w: bytes, slot: i64, kind: i64, op_num: i64, cidx: i64, rng: i64) -> bytes {
     let u: bytes = iset_patch_i64(w, slot, ld_u64(w, slot) + 1);
+    let lg: i64 = if_pos ld_u64(u, 96) <=> 0 { fg_log_find(u, kind, op_num, cidx, rng) } else { 0 };
     return if_pos m2u_eq(ld_u64(u, 320), 0) <=> 0 {
         let u1: bytes = iset_patch_i64(iset_patch_i64(u, 288, op_num), 296, cidx);
-        iset_patch_i64(iset_patch_i64(u1, 312, rng), 320, kind)
+        iset_patch_i64(iset_patch_i64(u1, 312, rng + lg * 0), 320, kind)
     } else { u };
 }
 
@@ -416,15 +447,14 @@ fn fg_check_m2_lower(w: bytes, bc_cstr: bytes) -> i64 {
 // Runs one bytecode mutant (op_cls 0..4) against `base_bc_cstr` (`base_nb` bytes, corpus `cidx`).
 #[strict]
 #[cap(SYS)]
-fn fg_run_bc_mutant(w0: bytes, cidx: i64, op_cls: i64, base_bc: bytes, base_nb: i64) -> bytes {
+fn fg_run_bc_mutant(w0: bytes, cidx: i64, op_cls: i64, base_bc: bytes, ver_elf: bytes, m_bc: bytes, ver_out: bytes) -> bytes {
     let rng: i64 = fg_rng_step(ld_u64(w0, 32));
     let w: bytes = iset_patch_i64(w0, 32, rng);
     let nr: i64 = su_read_file_into(w, base_bc, su_band_b(), 200000);
     w = fg_mutate_bc(w, nr, op_cls, rng);
     let m_nb: i64 = ld_u64(w, 328);
-    let m_bc: bytes = fg_tmp(109);
     let nw: i64 = su_write_file_from(w, m_bc, su_band_b(), m_nb, 420);
-    let acc: i64 = if_pos m2u_eq(nw, m_nb) <=> 0 { fg_verify_bc(w, m_bc) } else { 0 };
+    let acc: i64 = if_pos m2u_eq(nw, m_nb) <=> 0 { fg_verify_bc(w, ver_elf, m_bc, ver_out) } else { 0 };
     w = iset_patch_i64(w, 40, ld_u64(w, 40) + 1);
     w = iset_patch_i64(w, 112 + (op_cls << 3), ld_u64(w, 112 + (op_cls << 3)) + 1);
     let r: bytes = if_pos acc <=> 0 {
@@ -447,16 +477,14 @@ fn fg_run_bc_mutant(w0: bytes, cidx: i64, op_cls: i64, base_bc: bytes, base_nb: 
 // Runs one source-level mutant (op_cls 5..6) against `src_path` (corpus `cidx`).
 #[strict]
 #[cap(SYS)]
-fn fg_run_src_mutant(w0: bytes, cidx: i64, op_cls: i64, src_path: bytes) -> bytes {
+fn fg_run_src_mutant(w0: bytes, cidx: i64, op_cls: i64, src_path: bytes, ver_elf: bytes, m_src: bytes, m_bc: bytes, ver_out: bytes) -> bytes {
     let rng: i64 = fg_rng_step(ld_u64(w0, 32));
     let w: bytes = iset_patch_i64(w0, 32, rng);
     let nr: i64 = su_read_file_into(w, src_path, su_band_b(), 120000);
     w = fg_mutate_src(w, nr, op_cls, rng);
-    let m_src: bytes = fg_tmp(120);
-    let m_bc: bytes = fg_tmp(109);
     let nw: i64 = su_write_file_from(w, m_src, su_band_b(), nr, 420);
     let rc_c: i64 = if_pos m2u_eq(nw, nr) <=> 0 { fg_compile_file(w, m_src, m_bc) } else { 1 };
-    let acc: i64 = if_pos m2u_eq(rc_c, 0) <=> 0 { fg_verify_bc(w, m_bc) } else { 0 };
+    let acc: i64 = if_pos m2u_eq(rc_c, 0) <=> 0 { fg_verify_bc(w, ver_elf, m_bc, ver_out) } else { 0 };
     w = iset_patch_i64(w, 40, ld_u64(w, 40) + 1);
     w = iset_patch_i64(w, 112 + (op_cls << 3), ld_u64(w, 112 + (op_cls << 3)) + 1);
     let r: bytes = if_pos acc <=> 0 {
@@ -532,8 +560,8 @@ fn fg_emit_report(w: bytes) -> i64 {
         u = su_out_u8(su_out_i64(su_out4(su_out_u8(u, 32), 114, 101, 106, 61), ld_u64(w, 224 + (c << 3))), 10);
         c = c + 1;
     }
-    // If any find occurred, emit first-find record: "[FUZZ FIND] kind=<k> op=<o> item=<i> site=<s> seed=<r>\n"
-    u = if_pos any_find <=> 0 {
+    // If any find occurred and NOT collect-all mode, emit first-find record
+    u = if_pos any_find * (1 - ld_u64(w, 96)) <=> 0 {
         let f: bytes = su_out4(su_out4(su_out4(u, 91, 70, 85, 90), 90, 32, 70, 73), 78, 68, 93, 32);
         f = su_out_i64(su_out4(su_out_u8(f, 107), 105, 110, 100, 61), ld_u64(w, 320));
         f = su_out_i64(su_out4(f, 32, 111, 112, 61), ld_u64(w, 288));
@@ -546,19 +574,41 @@ fn fg_emit_report(w: bytes) -> i64 {
 }
 
 #[strict]
+fn fg_pick4(i: i64, a: bytes, b: bytes, c: bytes, d: bytes) -> bytes {
+    return if_pos m2u_eq(i, 0) <=> 0 { a }
+        else { if_pos m2u_eq(i, 1) <=> 0 { b }
+        else { if_pos m2u_eq(i, 2) <=> 0 { c } else { d } } };
+}
+
+#[strict]
 #[cap(SYS)]
 fn fg_run_bc_classes(w0: bytes, per_cls: i64) -> bytes {
     let w: bytes = w0;
+    let ver_elf: bytes = fg_tool(w, 1);
+    let m_bc: bytes = fg_tmp(109);
+    let ver_out: bytes = fg_tmp(118);
+    let bc0: bytes = fg_tmp(48);
+    let bc1: bytes = fg_tmp(49);
+    let bc2: bytes = fg_tmp(50);
+    let bc3: bytes = fg_tmp(51);
+    let bc4: bytes = fg_tmp(52);
+    let bc5: bytes = fg_tmp(53);
+    let bc6: bytes = fg_tmp(54);
+    let bc7: bytes = fg_corpus_path(7);
+    let stop_en: i64 = 1 - ld_u64(w, 96);
     let cls: i64 = 0;
     let stopped: i64 = 0;
     while (5 - cls) * (1 - stopped) <=> 0 {
         let k: i64 = 0;
         while (per_cls - k) * (1 - stopped) <=> 0 {
             let cidx: i64 = (k + cls) & 7;
-            let bc_p: bytes = if_pos m2u_eq(cidx, 7) <=> 0 { fg_corpus_path(7) } else { fg_tmp(48 + cidx) };
-            let b_nb: i64 = su_read_file_into(w, bc_p, su_band_b(), 200000);
-            w = fg_run_bc_mutant(w, cidx, cls, bc_p, b_nb);
-            stopped = m2u_lt(0, ld_u64(w, 64) + ld_u64(w, 72));
+            let bc_p: bytes = if_pos m2u_lt(cidx, 4) <=> 0 {
+                fg_pick4(cidx, bc0, bc1, bc2, bc3)
+            } else {
+                fg_pick4(cidx - 4, bc4, bc5, bc6, bc7)
+            };
+            w = fg_run_bc_mutant(w, cidx, cls, bc_p, ver_elf, m_bc, ver_out);
+            stopped = stop_en * m2u_lt(0, ld_u64(w, 64) + ld_u64(w, 72));
             k = k + 1;
         }
         cls = cls + 1;
@@ -570,14 +620,31 @@ fn fg_run_bc_classes(w0: bytes, per_cls: i64) -> bytes {
 #[cap(SYS)]
 fn fg_run_src_classes(w0: bytes, src_lim: i64) -> bytes {
     let w: bytes = w0;
+    let ver_elf: bytes = fg_tool(w, 1);
+    let m_src: bytes = fg_tmp(120);
+    let m_bc: bytes = fg_tmp(109);
+    let ver_out: bytes = fg_tmp(118);
+    let s0: bytes = fg_corpus_path(0);
+    let s1: bytes = fg_corpus_path(1);
+    let s2: bytes = fg_corpus_path(2);
+    let s3: bytes = fg_corpus_path(3);
+    let s4: bytes = fg_corpus_path(4);
+    let s5: bytes = fg_corpus_path(5);
+    let s6: bytes = fg_corpus_path(6);
+    let stop_en: i64 = 1 - ld_u64(w, 96);
     let cls: i64 = 5;
-    let stopped: i64 = m2u_lt(0, ld_u64(w, 64) + ld_u64(w, 72));
+    let stopped: i64 = stop_en * m2u_lt(0, ld_u64(w, 64) + ld_u64(w, 72));
     while (7 - cls) * (1 - stopped) <=> 0 {
         let k: i64 = 0;
         while (src_lim - k) * (1 - stopped) <=> 0 {
             let cidx: i64 = fg_mod(k + cls, 7);
-            w = fg_run_src_mutant(w, cidx, cls, fg_corpus_path(cidx));
-            stopped = m2u_lt(0, ld_u64(w, 64) + ld_u64(w, 72));
+            let src_p: bytes = if_pos m2u_lt(cidx, 4) <=> 0 {
+                fg_pick4(cidx, s0, s1, s2, s3)
+            } else {
+                fg_pick4(cidx - 4, s4, s5, s6, s6)
+            };
+            w = fg_run_src_mutant(w, cidx, cls, src_p, ver_elf, m_src, m_bc, ver_out);
+            stopped = stop_en * m2u_lt(0, ld_u64(w, 64) + ld_u64(w, 72));
             k = k + 1;
         }
         cls = cls + 1;
@@ -587,9 +654,24 @@ fn fg_run_src_classes(w0: bytes, src_lim: i64) -> bytes {
 
 #[strict]
 #[cap(SYS)]
+fn fg_log_judge(w: bytes, j: i64, cidx: i64, rng: i64, jf: i64) -> i64 {
+    let f: bytes = iset_patch_i64(w, 0, 0);
+    f = su_out4(su_out4(su_out4(f, 91, 70, 85, 90), 90, 32, 74, 85), 68, 71, 69, 93);
+    f = su_out_i64(su_out4(su_out_u8(f, 32), 105, 100, 120, 61), j);
+    f = su_out_i64(su_out4(su_out4(f, 32, 105, 116, 101), 109, 61, 0, 0), cidx);
+    f = su_out_i64(su_out4(su_out4(f, 32, 115, 101, 101), 100, 61, 0, 0), rng);
+    f = su_out_u8(su_out_i64(su_out4(su_out4(f, 32, 102, 105, 110), 100, 61, 0, 0), jf), 10);
+    let nw: i64 = sys_write(1, f, su_band_a(), ld_u64(f, 0));
+    return 0 + nw * 0;
+}
+
+#[strict]
+#[cap(SYS)]
 fn fg_run_judge_panel(w0: bytes, no_judge: i64) -> bytes {
     let w: bytes = w0;
-    let stopped: i64 = m2u_lt(0, ld_u64(w, 64) + ld_u64(w, 72));
+    let is_all: i64 = ld_u64(w, 96);
+    let stop_en: i64 = 1 - is_all;
+    let stopped: i64 = stop_en * m2u_lt(0, ld_u64(w, 64) + ld_u64(w, 72));
     let j: i64 = 0;
     let jg: i64 = (1 - stopped) * (1 - no_judge);
     while (12 - j) * jg <=> 0 {
@@ -602,8 +684,9 @@ fn fg_run_judge_panel(w0: bytes, no_judge: i64) -> bytes {
         let cand: bytes = fg_tmp(121);
         let nw: i64 = su_write_file_from(w, cand, su_band_b(), nr, 420);
         let jf: i64 = if_pos m2u_eq(nw, nr) <=> 0 { fg_check_judge_mutant(w, tgt, cand) } else { 0 };
-        w = if_pos jf <=> 0 { fg_rec_find(w, 80, 5, 7, cidx, rng) } else { w };
-        jg = jg * (1 - jf);
+        let lj: i64 = if_pos is_all <=> 0 { fg_log_judge(w, j, cidx, rng, jf) } else { 0 };
+        w = if_pos jf <=> 0 { fg_rec_find(w, 80, 5, 7, cidx, rng + lj * 0) } else { w };
+        jg = jg * (1 - stop_en * jf);
         j = j + 1;
     }
     return w;
@@ -614,7 +697,10 @@ fn fg_run_judge_panel(w0: bytes, no_judge: i64) -> bytes {
 fn main() -> i64 {
     let w: bytes = su_load_cmdline(su_alloc_arena());
     let argc: i64 = su_argc(w);
-    let is_camp: i64 = if_pos m2u_ge(argc, 2) <=> 0 {
+    let is_camp_all: i64 = if_pos m2u_ge(argc, 2) <=> 0 {
+        m2u_eq(su_arg_len(w, 1), 14) * m2u_eq(ld_u8(w, su_arg_off(w, 1) + 2), 99) * m2u_eq(ld_u8(w, su_arg_off(w, 1) + 11), 97)
+    } else { 0 };
+    let is_camp: i64 = is_camp_all + if_pos m2u_ge(argc, 2) <=> 0 {
         m2u_eq(su_arg_len(w, 1), 10) * m2u_eq(ld_u8(w, su_arg_off(w, 1) + 2), 99)
     } else { 0 };
     let no_judge: i64 = if_pos m2u_ge(argc, 2) <=> 0 {
@@ -622,10 +708,10 @@ fn main() -> i64 {
     } else { 0 };
     let per_cls: i64 = m2u_sel(is_camp, 500, 48);
     let src_lim: i64 = m2u_sel(is_camp, 150, 30);
-    w = iset_patch_i64(w, 32, 31337421);
+    w = iset_patch_i64(iset_patch_i64(w, 32, 31337421), 96, is_camp_all);
     w = iset_patch_i64(iset_patch_i64(iset_patch_i64(w, 40, 0), 48, 0), 56, 0);
     w = iset_patch_i64(iset_patch_i64(iset_patch_i64(w, 64, 0), 72, 0), 80, 0);
-    w = iset_patch_i64(w, 320, 0);
+    w = iset_patch_i64(iset_patch_i64(iset_patch_i64(w, 320, 0), 336, 0), 344, 0);
     let ci: i64 = 0;
     while 7 - ci <=> 0 {
         let rc_c: i64 = fg_compile_file(w, fg_corpus_path(ci), fg_tmp(48 + ci));
