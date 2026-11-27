@@ -3,7 +3,7 @@
 // ==============================================================================
 // Ports the 5 PORT-NOW suites identified in `spec/harness-accounting.md` (29 checks)
 // with FULL-TEXT BYTE-IDENTICAL output vs Rust `./omni <gate>`:
-//   - m3-modular          (13 checks): mod_parse (42265w) + m3_standalone (26223w) +
+//   - m3-modular          (13 checks): mod_parse (42265w) + m3_standalone (26249w) +
 //                                      elf_link (3582w) < 65536w + link-elf -> 206,946 B m3.elf
 //   - a3-macro-quarantine ( 4 checks): macro rejected fail-closed + weighted_diff_pure_golden -> 100
 //   - b4-pure-launcher    ( 5 checks): pure/m5/launcher.omni zero-shim 237 B ELF64 verified
@@ -65,7 +65,7 @@ fn eg_check_gnu_stack(arena: bytes, elf_p: bytes) -> i64 {
     return is_elf * found;
 }
 
-// Gate: m3-modular (13 checks): verifies mod_parse (42265w), m3_standalone (26223w), elf_link (3582w) < 65536w
+// Gate: m3-modular (13 checks): verifies mod_parse (42265w), m3_standalone (26249w), elf_link (3582w) < 65536w
 // and sibling `m3.elf` == 206,946 B (FNV-1a64=0x8CFD973873CAFF46).
 #[strict]
 #[cap(SYS)]
@@ -88,18 +88,18 @@ fn eg_gate_m3_modular(arena: bytes) -> i64 {
     let ok: i64 = m2u_eq(n_mp, 84530) * m2u_eq(n_ms, 52498) * m2u_eq(n_el, 7164) * m2u_eq(h_m3, want_m3);
     let r: i64 = if_pos ok <=> 0 {
         let w: bytes = iset_patch_i64(arena, 0, 0);
-        // "[M3-MODULAR PASS] 13 checks | mod_parse (42265 w) + m3_standalone (26223 w) + elf_link (3582 w) all < 65536 w | Pure-Omni linked m3.elf (206946 B, 0x8CFD973873CAFF46) 0-word diff on all 6 pure/programs/*\n"
+        // "[M3-MODULAR PASS] 13 checks | mod_parse (42265 w) + m3_standalone (26249 w) + elf_link (3582 w) all < 65536 w | Pure-Omni linked m3.elf (207015 B, 0x7397A5020895AEBF) 0-word diff on all 6 pure/programs/*\n"
         w = su_out4(su_out4(su_out4(su_out4(w, 91, 77, 51, 45), 77, 79, 68, 85), 76, 65, 82, 32), 80, 65, 83, 83);
         w = su_out4(su_out4(su_out4(su_out4(w, 93, 32, 49, 51), 32, 99, 104, 101), 99, 107, 115, 32), 124, 32, 109, 111);
         w = su_out4(su_out4(su_out4(su_out4(w, 100, 95, 112, 97), 114, 115, 101, 32), 40, 52, 50, 50), 54, 53, 32, 119);
         w = su_out4(su_out4(su_out4(su_out4(w, 41, 32, 43, 32), 109, 51, 95, 115), 116, 97, 110, 100), 97, 108, 111, 110);
-        w = su_out4(su_out4(su_out4(su_out4(w, 101, 32, 40, 50), 54, 50, 50, 51), 32, 119, 41, 32), 43, 32, 101, 108);
+        w = su_out4(su_out4(su_out4(su_out4(w, 101, 32, 40, 50), 54, 50, 52, 57), 32, 119, 41, 32), 43, 32, 101, 108);
         w = su_out4(su_out4(su_out4(su_out4(w, 102, 95, 108, 105), 110, 107, 32, 40), 51, 53, 56, 50), 32, 119, 41, 32);
         w = su_out4(su_out4(su_out4(su_out4(w, 97, 108, 108, 32), 60, 32, 54, 53), 53, 51, 54, 32), 119, 32, 124, 32);
         w = su_out4(su_out4(su_out4(su_out4(w, 80, 117, 114, 101), 45, 79, 109, 110), 105, 32, 108, 105), 110, 107, 101, 100);
-        w = su_out4(su_out4(su_out4(su_out4(w, 32, 109, 51, 46), 101, 108, 102, 32), 40, 50, 48, 54), 57, 52, 54, 32);
-        w = su_out4(su_out4(su_out4(su_out4(w, 66, 44, 32, 48), 120, 56, 67, 70), 68, 57, 55, 51), 56, 55, 51, 67);
-        w = su_out4(su_out4(su_out4(su_out4(w, 65, 70, 70, 52), 54, 41, 32, 48), 45, 119, 111, 114), 100, 32, 100, 105);
+        w = su_out4(su_out4(su_out4(su_out4(w, 32, 109, 51, 46), 101, 108, 102, 32), 40, 50, 48, 55), 48, 49, 53, 32);
+        w = su_out4(su_out4(su_out4(su_out4(w, 66, 44, 32, 48), 120, 55, 51, 57), 55, 65, 53, 48), 50, 48, 56, 57);
+        w = su_out4(su_out4(su_out4(su_out4(w, 53, 65, 69, 66), 70, 41, 32, 48), 45, 119, 111, 114), 100, 32, 100, 105);
         w = su_out4(su_out4(su_out4(su_out4(w, 102, 102, 32, 111), 110, 32, 97, 108), 108, 32, 54, 32), 112, 117, 114, 101);
         w = su_out4(su_out4(su_out4(w, 47, 112, 114, 111), 103, 114, 97, 109), 115, 47, 42, 10);
         let nw: i64 = sys_write(1, w, su_band_a(), ld_u64(w, 0));

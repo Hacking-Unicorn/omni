@@ -31,11 +31,11 @@ As of Step 9 (Complete Rust Removal), the Omni repository contains **zero Rust s
 Produced from scratch by `bash scripts/build_pure_driver.sh build/pure-bin` (with `PATH=/usr/bin:/bin`, zero `rustc`, zero `cargo`, zero `python3`):
 
 1. `pure_build_util.elf` — built from `pure/m5/pure_build_util.omni` via `bootstrap/m3.elf` + `bootstrap/m2.elf` (provides FNV-1a64 hashing and UTF-16LE widening without Python).
-2. `m2.elf` — rebuilt from `pure/m2/m2.omni_bc` through 3 generations (`S1 == S2 == S3 == bootstrap/m2.elf`, `125,539` B, `0x0A5CD5B55707AA0D`); `m2-fixed-point` additionally verifies hosted `S1 == S2 == S3 == V` (`125,539` B, `0xBDA0A8A86960CB26`).
+2. `m2.elf` — rebuilt from `pure/m2/m2.omni_bc` through 3 generations (`S1 == S2 == S3 == bootstrap/m2.elf`, `126,152` B, `0xAA5F84B6AA45BB51`); `m2-fixed-point` additionally verifies `S1 == S2 == S3 == V` against the same pin (`126,152` B, `0xAA5F84B6AA45BB51`).
 3. `verifier.elf` (`37,907` B, `0x2ECD2CE3DCB69346`) and `m4.elf` (`91,576` B, `0xFBA8272337B1BAC4`) — rebuilt from their `.omni_bc` seeds using freshly built `m2.elf`.
 4. `audit_diff.elf`, `audit_decompile.elf`, `omnic_pure.elf`, `m2_lint.elf`, `audit_view_gate.elf`, `proposer_loop.elf`, `core_gates.elf`, `extra_gates.elf` — compiled from `.omni` sources via `m3.elf` + `verifier.elf` + `m2.elf`.
-5. `m3.elf` (`206,946` B, `0x8CFD973873CAFF46`) — rebuilt via `omnic_pure.elf link-elf pure/m3/m3_standalone.omni_bc pure/m3/mod_parse.omni_bc` and verified bit-identical (`cmp`) to `bootstrap/m3.elf`.
-6. `omnic_pure.elf` self-compile fixed point — `omnic_pure.elf` compiles `pure/driver/omnic_driver.omni` to `omnic_pure_gen2.elf` and verifies `0`-byte diff (`54,923` B).
+5. `m3.elf` (`207,015` B, `0x7397A5020895AEBF`) — rebuilt via `omnic_pure.elf link-elf pure/m3/m3_standalone.omni_bc pure/m3/mod_parse.omni_bc` and verified bit-identical (`cmp`) to `bootstrap/m3.elf`.
+6. `omnic_pure.elf` self-compile fixed point — `omnic_pure.elf` compiles `pure/driver/omnic_driver.omni` to `omnic_pure_gen2.elf` and verifies `0`-byte diff (`58,184` B).
 
 ## 4. Exact From-Scratch Clean-Room Procedure (Linux x86-64)
 

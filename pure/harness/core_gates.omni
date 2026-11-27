@@ -3,8 +3,8 @@
 // ==============================================================================
 // Pure-Omni port of the core `m2_host/decode_diff.rs` gates:
 //   - m2-frozen          : verifies all 5 frozen hashes & native ELF pins
-//   - m2-fixed-point     : S1 == S2 == m2.elf (125,539 B, 0x0A5CD5B55707AA0D)
-//   - m3-modular         : link-elf -> 206,946 B m3.elf (0x8CFD973873CAFF46) + pure/programs/*
+//   - m2-fixed-point     : S1 == S2 == m2.elf (126,152 B, 0xAA5F84B6AA45BB51)
+//   - m3-modular         : link-elf -> 207,015 B m3.elf (0x7397A5020895AEBF) + pure/programs/*
 //   - p2a-syscalls       : live Linux kernel 0F 05 syscalls (modes 0/1/2/3) + cap/taint negs
 //   - a3-macro-quarantine: macro rejected fail-closed + weighted_diff_pure_golden -> 100
 //   - b2-pure-verifier   : verifier.elf on valid goldens + negative verifier controls
@@ -105,7 +105,7 @@ fn cg_gate_frozen(arena: bytes) -> i64 {
     return ok1 * ok2 * ok3 * ok4;
 }
 
-// Gate 2: m2-fixed-point (S1 == S2 == m2.elf: 125,539 B, 0x0A5CD5B55707AA0D).
+// Gate 2: m2-fixed-point (S1 == S2 == m2.elf: 126,152 B, 0xAA5F84B6AA45BB51).
 #[strict]
 #[cap(SYS)]
 fn cg_gate_m2_fp(arena: bytes) -> i64 {
@@ -258,20 +258,20 @@ fn cg_print_frozen(arena: bytes) -> i64 {
     return 0 + nw * 0;
 }
 
-// Prints exact Rust `[M2-FIXED-POINT PASS] ...` banner.
+// Prints the `[M2-FIXED-POINT PASS] ...` banner (values = current pins, Step 11b).
 #[strict]
 #[cap(SYS)]
 fn cg_print_m2_fp(arena: bytes) -> i64 {
     let w: bytes = iset_patch_i64(arena, 0, 0);
-    // "[M2-FIXED-POINT PASS] pure/m2/m2.omni_bc=43669 words (FNV-1a64=0xD7BD0CCE85021C91) | ELF64=125539 B (FNV-1a64=0xBDA0A8A86960CB26) | S1 == S2 == S3 == V (native Linux x86-64 verified)\n"
+    // "[M2-FIXED-POINT PASS] pure/m2/m2.omni_bc=43918 words (FNV-1a64=0x74FB1652CC0E974B) | ELF64=126152 B (FNV-1a64=0xAA5F84B6AA45BB51) | S1 == S2 == S3 == V (native Linux x86-64 verified)\n"
     w = su_out4(su_out4(su_out4(su_out4(w, 91, 77, 50, 45), 70, 73, 88, 69), 68, 45, 80, 79), 73, 78, 84, 32);
     w = su_out4(su_out4(su_out4(su_out4(w, 80, 65, 83, 83), 93, 32, 112, 117), 114, 101, 47, 109), 50, 47, 109, 50);
-    w = su_out4(su_out4(su_out4(su_out4(w, 46, 111, 109, 110), 105, 95, 98, 99), 61, 52, 51, 54), 54, 57, 32, 119);
+    w = su_out4(su_out4(su_out4(su_out4(w, 46, 111, 109, 110), 105, 95, 98, 99), 61, 52, 51, 57), 49, 56, 32, 119);
     w = su_out4(su_out4(su_out4(su_out4(w, 111, 114, 100, 115), 32, 40, 70, 78), 86, 45, 49, 97), 54, 52, 61, 48);
-    w = su_out4(su_out4(su_out4(su_out4(w, 120, 68, 55, 66), 68, 48, 67, 67), 69, 56, 53, 48), 50, 49, 67, 57);
-    w = su_out4(su_out4(su_out4(su_out4(w, 49, 41, 32, 124), 32, 69, 76, 70), 54, 52, 61, 49), 50, 53, 53, 51);
-    w = su_out4(su_out4(su_out4(su_out4(w, 57, 32, 66, 32), 40, 70, 78, 86), 45, 49, 97, 54), 52, 61, 48, 120);
-    w = su_out4(su_out4(su_out4(su_out4(w, 66, 68, 65, 48), 65, 56, 65, 56), 54, 57, 54, 48), 67, 66, 50, 54);
+    w = su_out4(su_out4(su_out4(su_out4(w, 120, 55, 52, 70), 66, 49, 54, 53), 50, 67, 67, 48), 69, 57, 55, 52);
+    w = su_out4(su_out4(su_out4(su_out4(w, 66, 41, 32, 124), 32, 69, 76, 70), 54, 52, 61, 49), 50, 54, 49, 53);
+    w = su_out4(su_out4(su_out4(su_out4(w, 50, 32, 66, 32), 40, 70, 78, 86), 45, 49, 97, 54), 52, 61, 48, 120);
+    w = su_out4(su_out4(su_out4(su_out4(w, 65, 65, 53, 70), 56, 52, 66, 54), 65, 65, 52, 53), 66, 66, 53, 49);
     w = su_out4(su_out4(su_out4(su_out4(w, 41, 32, 124, 32), 83, 49, 32, 61), 61, 32, 83, 50), 32, 61, 61, 32);
     w = su_out4(su_out4(su_out4(su_out4(w, 83, 51, 32, 61), 61, 32, 86, 32), 40, 110, 97, 116), 105, 118, 101, 32);
     w = su_out4(su_out4(su_out4(su_out4(w, 76, 105, 110, 117), 120, 32, 120, 56), 54, 45, 54, 52), 32, 118, 101, 114);
