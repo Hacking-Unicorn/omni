@@ -97,11 +97,12 @@ fn od_has_macro(arena: bytes, off: i64, len: i64) -> i64 {
     let i: i64 = 0;
     let at_sol: i64 = 1;
     while len - i <=> 0 {
-        let ch: i64 = ld_u8(arena, off + i);
+        let p: i64 = off + i;
+        let ch: i64 = ld_u8(arena, p);
         let hit: i64 = at_sol * m2u_ge(len, i + 6)
-            * m2u_eq(ch, 109) * m2u_eq(ld_u8(arena, off + i + 1), 97)
-            * m2u_eq(ld_u8(arena, off + i + 2), 99) * m2u_eq(ld_u8(arena, off + i + 3), 114)
-            * m2u_eq(ld_u8(arena, off + i + 4), 111) * m2u_eq(ld_u8(arena, off + i + 5), 32);
+            * m2u_eq(ch, 109) * m2u_eq(ld_u8(arena, p + 1), 97)
+            * m2u_eq(ld_u8(arena, p + 2), 99) * m2u_eq(ld_u8(arena, p + 3), 114)
+            * m2u_eq(ld_u8(arena, p + 4), 111) * m2u_eq(ld_u8(arena, p + 5), 32);
         found = found | hit;
         at_sol = m2u_eq(ch, 10) + at_sol * (m2u_eq(ch, 32) + m2u_eq(ch, 9));
         i = i + 1;
@@ -178,12 +179,13 @@ fn od_expand_includes_pass(arena: bytes, src_off: i64, src_len: i64, base_off: i
         let le: i64 = od_line_end(w, src_off, pos, src_len);
         pos = le;
         let p: i64 = od_skip_ws(w, src_off, ls, le);
+        let sp: i64 = src_off + p;
         let is_inc: i64 = m2u_ge(le, p + 10)
-            * m2u_eq(ld_u8(w, src_off + p), 105) * m2u_eq(ld_u8(w, src_off + p + 1), 110)
-            * m2u_eq(ld_u8(w, src_off + p + 2), 99) * m2u_eq(ld_u8(w, src_off + p + 3), 108)
-            * m2u_eq(ld_u8(w, src_off + p + 4), 117) * m2u_eq(ld_u8(w, src_off + p + 5), 100)
-            * m2u_eq(ld_u8(w, src_off + p + 6), 101) * m2u_eq(ld_u8(w, src_off + p + 7), 32)
-            * m2u_eq(ld_u8(w, src_off + p + 8), 34);
+            * m2u_eq(ld_u8(w, sp), 105) * m2u_eq(ld_u8(w, sp + 1), 110)
+            * m2u_eq(ld_u8(w, sp + 2), 99) * m2u_eq(ld_u8(w, sp + 3), 108)
+            * m2u_eq(ld_u8(w, sp + 4), 117) * m2u_eq(ld_u8(w, sp + 5), 100)
+            * m2u_eq(ld_u8(w, sp + 6), 101) * m2u_eq(ld_u8(w, sp + 7), 32)
+            * m2u_eq(ld_u8(w, sp + 8), 34);
         w = if_pos is_inc <=> 0 {
             let ps: i64 = p + 9;
             let pe: i64 = ps;
@@ -205,9 +207,11 @@ fn od_expand_includes_pass(arena: bytes, src_off: i64, src_len: i64, base_off: i
 #[cap(SYS)]
 fn od_run_m3_and_verify(w2: bytes, n2: i64, out_bc_cstr: bytes) -> i64 {
     let w: bytes = w2;
+    let ba: i64 = su_band_a();
+    let bb: i64 = su_band_b();
     let ui: i64 = 0;
     while n2 - ui <=> 0 {
-        w = st_u16(w, su_band_b() + (ui << 1), ld_u8(w, su_band_a() + ui));
+        w = st_u16(w, bb + (ui << 1), ld_u8(w, ba + ui));
         ui = ui + 1;
     }
     let u16_p: bytes = anew(0);
