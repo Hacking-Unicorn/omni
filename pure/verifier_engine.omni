@@ -1189,6 +1189,7 @@ fn prescan_module_fns(stream: bytes, ws: bytes, nwords: i64) -> bytes {
             let have: i64 = is_ge(nwords, pos + 2);
             w = set_decode_err_if(w, 1 - have, pos);
             let fn_idx: i64 = load_u16(stream, pos);
+            w = set_decode_err_if(w, 1 - in_range(fn_idx, 0, 1023), pos);
             let p_cnt: i64 = load_u16(stream, pos + 1);
             let sig: i64 = pos + 2 + p_cnt * 3 + 3;
             w = set_decode_err_if(w, 1 - is_ge(nwords, sig), pos);
@@ -1265,6 +1266,7 @@ fn omni_verify_module_with_mode(stream: bytes, api_mode: i64) -> bytes {
             let have: i64 = is_ge(nwords, pos + 2);
             ws = set_decode_err_if(ws, 1 - have, pos);
             let fn_idx: i64 = load_u16(stream, pos);
+            ws = set_decode_err_if(ws, 1 - in_range(fn_idx, 0, 1023), pos);
             let p_cnt: i64 = load_u16(stream, pos + 1);
             let sig: i64 = pos + 2 + p_cnt * 3 + 3;
             ws = set_decode_err_if(ws, 1 - is_ge(nwords, sig), pos);

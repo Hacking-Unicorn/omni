@@ -122,13 +122,13 @@ fn pl_hash_file(arena: bytes, p: bytes) -> i64 {
 #[strict]
 #[cap(SYS)]
 fn pl_stage0_guard(arena: bytes) -> i64 {
-    // Check verifier_standalone.omni_bc = 15524w (31048 B), FNV-1a64 = 0x430CC3C933918F64 (Step 15)
+    // Check verifier_standalone.omni_bc = 15584w (31168 B), FNV-1a64 = 0x2AF95DB4A6628007 (Step 16 Part B1 Family F4)
     let p_ver: bytes = anew(0);
     p_ver = iset(p_ver, 112, 117, 114, 101, 47, 118, 101, 114, 105, 102, 105, 101, 114, 95, 115, 116);
     p_ver = iset(p_ver, 97, 110, 100, 97, 108, 111, 110, 101, 46, 111, 109, 110, 105, 95, 98, 99);
     p_ver = iset(p_ver, 0);
     let hv: i64 = pl_hash_file(arena, p_ver);
-    let want_v: i64 = (17164 << 48) | (50121 << 32) | (13201 << 16) | 36708;
+    let want_v: i64 = (11001 << 48) | (23988 << 32) | (42594 << 16) | 32775;
     // Check pure/m7/judge.omni exists and is readable (deny-listed)
     let p_jdg: bytes = anew(0);
     p_jdg = iset(p_jdg, 112, 117, 114, 101, 47, 109, 55, 47, 106, 117, 100, 103, 101, 46, 111, 109);
