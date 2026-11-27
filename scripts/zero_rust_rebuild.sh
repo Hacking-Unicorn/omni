@@ -57,16 +57,16 @@ LC_ALL=C od -An -tu1 -v pure/m5/pure_build_util.omni | LC_ALL=C awk '{for(i=1;i<
 chmod +x "$TMP/pure_build_util.elf"
 
 for spec in \
-  "bootstrap/m2.elf:125660:0x3A4A285C58CFA93E" \
+  "bootstrap/m2.elf:124248:0xAEDE11CB00E7EFDF" \
   "bootstrap/m3.elf:207015:0x7397A5020895AEBF" \
-  "pure/m2/m2.omni_bc:87686:0x3DCC8546CE5B0D57" \
+  "pure/m2/m2.omni_bc:86576:0xE649625E08054C94" \
   "pure/m3/m3.omni_bc:132498:0x0E3052A4BE00D599" \
   "pure/m3/m3_standalone.omni_bc:52498:0xD83FBCA0D2E8FA78" \
   "pure/m3/mod_parse.omni_bc:84530:0x0F581C62270F2863" \
   "pure/link/elf_link.omni_bc:7164:0x5F261D791F65ED2A" \
   "pure/m4/m4.omni_bc:56124:0x0561704B3E50EFAC" \
   "pure/m4/m4_standalone.omni_bc:57330:0x6F86B759214A2765" \
-  "pure/verifier_standalone.omni_bc:47268:0x7E82A2FFC55AEE56"
+  "pure/verifier_standalone.omni_bc:45714:0xD4F684144C0D81F8"
 do
   IFS=':' read -r path want_len want_fnv <<< "$spec"
   read -r got_len got_fnv < <("$TMP/pure_build_util.elf" fnv "$path")

@@ -3,7 +3,7 @@
 // ==============================================================================
 // Pure-Omni port of the core `m2_host/decode_diff.rs` gates:
 //   - m2-frozen          : verifies all 5 frozen hashes & native ELF pins
-//   - m2-fixed-point     : S1 == S2 == m2.elf (125,660 B, 0x3A4A285C58CFA93E)
+//   - m2-fixed-point     : S1 == S2 == m2.elf (124,248 B, 0xAEDE11CB00E7EFDF)
 //   - m3-modular         : link-elf -> 207,015 B m3.elf (0x7397A5020895AEBF) + pure/programs/*
 //   - p2a-syscalls       : live Linux kernel 0F 05 syscalls (modes 0/1/2/3) + cap/taint negs
 //   - a3-macro-quarantine: macro rejected fail-closed + weighted_diff_pure_golden -> 100
@@ -81,11 +81,11 @@ fn cg_check_pin(arena: bytes, p: bytes, want_sz: i64, want_h: i64) -> i64 {
 #[strict]
 #[cap(SYS)]
 fn cg_gate_frozen(arena: bytes) -> i64 {
-    // pure/m2/m2.omni_bc: 87686 B (43843w), 0x3DCC8546CE5B0D57 (Addons Item 1 PR 1 table.omni acceptance)
+    // pure/m2/m2.omni_bc: 86576 B (43288w), 0xE649625E08054C94 (Addons Item 1 PR 2 min_ops/dest derivation)
     let p_m2: bytes = anew(0);
     p_m2 = iset(p_m2, 112, 117, 114, 101, 47, 109, 50, 47, 109, 50, 46, 111, 109, 110, 105, 95);
     p_m2 = iset(p_m2, 98, 99, 0);
-    let ok1: i64 = cg_check_pin(arena, p_m2, 87686, (15820 << 48) | (34118 << 32) | (52827 << 16) | 3415);
+    let ok1: i64 = cg_check_pin(arena, p_m2, 86576, (58953 << 48) | (25182 << 32) | (2053 << 16) | 19604);
     // pure/m3/m3.omni_bc: 132498 B (66249w), 0x0E3052A4BE00D599
     let p_m3: bytes = anew(0);
     p_m3 = iset(p_m3, 112, 117, 114, 101, 47, 109, 51, 47, 109, 51, 46, 111, 109, 110, 105, 95);
@@ -96,16 +96,16 @@ fn cg_gate_frozen(arena: bytes) -> i64 {
     p_m4 = iset(p_m4, 112, 117, 114, 101, 47, 109, 52, 47, 109, 52, 46, 111, 109, 110, 105, 95);
     p_m4 = iset(p_m4, 98, 99, 0);
     let ok3: i64 = cg_check_pin(arena, p_m4, 56124, (1377 << 48) | (28747 << 32) | (15952 << 16) | 61356);
-    // pure/verifier_standalone.omni_bc: 47268 B (23634w), 0x7E82A2FFC55AEE56 (Addons Item 1 PR 1 op_is_known)
+    // pure/verifier_standalone.omni_bc: 45714 B (22857w), 0xD4F684144C0D81F8 (Addons Item 1 PR 2 min_ops/dest derivation)
     let p_v: bytes = anew(0);
     p_v = iset(p_v, 112, 117, 114, 101, 47, 118, 101, 114, 105, 102, 105, 101, 114, 95, 115, 116);
     p_v = iset(p_v, 97, 110, 100, 97, 108, 111, 110, 101, 46, 111, 109, 110, 105, 95, 98, 99);
     p_v = iset(p_v, 0);
-    let ok4: i64 = cg_check_pin(arena, p_v, 47268, (32386 << 48) | (41727 << 32) | (50522 << 16) | 61014);
+    let ok4: i64 = cg_check_pin(arena, p_v, 45714, (54518 << 48) | (33812 << 32) | (19469 << 16) | 33272);
     return ok1 * ok2 * ok3 * ok4;
 }
 
-// Gate 2: m2-fixed-point (S1 == S2 == m2.elf: 125,660 B, 0x3A4A285C58CFA93E).
+// Gate 2: m2-fixed-point (S1 == S2 == m2.elf: 124,248 B, 0xAEDE11CB00E7EFDF).
 #[strict]
 #[cap(SYS)]
 fn cg_gate_m2_fp(arena: bytes) -> i64 {
@@ -116,9 +116,9 @@ fn cg_gate_m2_fp(arena: bytes) -> i64 {
     let s2: bytes = cg_tmp(66);
     let rc1: i64 = su_spawn_capture(cg_tool(arena, 1), p_m2, s1, 493);
     let rc2: i64 = if_pos m2u_eq(rc1, 0) <=> 0 { su_spawn_capture(s1, p_m2, s2, 493) } else { 1 };
-    let want_h: i64 = (14922 << 48) | (10332 << 32) | (22735 << 16) | 43326;
-    let ok1: i64 = m2u_eq(rc1, 0) * cg_check_pin(arena, s1, 125660, want_h);
-    let ok2: i64 = m2u_eq(rc2, 0) * cg_check_pin(arena, s2, 125660, want_h);
+    let want_h: i64 = (44766 << 48) | (4555 << 32) | (231 << 16) | 61407;
+    let ok1: i64 = m2u_eq(rc1, 0) * cg_check_pin(arena, s1, 124248, want_h);
+    let ok2: i64 = m2u_eq(rc2, 0) * cg_check_pin(arena, s2, 124248, want_h);
     return ok1 * ok2;
 }
 
@@ -263,7 +263,7 @@ fn cg_print_frozen(arena: bytes) -> i64 {
 #[cap(SYS)]
 fn cg_print_m2_fp(arena: bytes) -> i64 {
     let w: bytes = iset_patch_i64(arena, 0, 0);
-    // "[M2-FIXED-POINT PASS] pure/m2/m2.omni_bc=43843 words (FNV-1a64=0x3DCC8546CE5B0D57) | ELF64=125660 B (FNV-1a64=0x3A4A285C58CFA93E) | S1 == S2 == S3 == V (native Linux x86-64 verified)\n"
+    // "[M2-FIXED-POINT PASS] pure/m2/m2.omni_bc=43288 words (FNV-1a64=0xE649625E08054C94) | ELF64=124248 B (FNV-1a64=0xAEDE11CB00E7EFDF) | S1 == S2 == S3 == V (native Linux x86-64 verified)\n"
     w = su_out4(su_out4(su_out4(su_out4(w, 91, 77, 50, 45), 70, 73, 88, 69), 68, 45, 80, 79), 73, 78, 84, 32);
     w = su_out4(su_out4(su_out4(su_out4(w, 80, 65, 83, 83), 93, 32, 112, 117), 114, 101, 47, 109), 50, 47, 109, 50);
     w = su_out4(su_out4(su_out4(su_out4(w, 46, 111, 109, 110), 105, 95, 98, 99), 61, 52, 51, 56), 52, 51, 32, 119);

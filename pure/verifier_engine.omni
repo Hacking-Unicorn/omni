@@ -184,31 +184,25 @@ fn op_is_known(ws: bytes, op: i64) -> i64 {
     return r;
 }
 
-// Reconciled per-opcode minimum operand count table (ported from pure/m2/verify/mod_check.omni::m2v_ins_min_ops
-// and reconciled with omni_rust_bootstrap.rs VM BAD_ARITY: 0x7F42 BR_TRIT = 4, 0x7F43/0x7F44 BR_POS/BR_NEG = 2,
-// plus 0x7F19..=0x7F1D float ops = 2).
+// Per-opcode minimum operand count, derived from pure/isa/table.omni byte +5
+// (isa_op_min_ops), gated by the ACCEPTED bit (Addons Item 1 PR 2; spec R2).
 #[strict]
-fn op_min_ops(op: i64) -> i64 {
-    let is_4: i64 = is_eq(op, 32578) + is_eq(op, 32581);
-    let is_3: i64 = is_eq(op, 32556) + is_eq(op, 32569);
-    let is_2: i64 = in_range(op, 32526, 32532) + in_range(op, 32535, 32544)
-        + in_range(op, 32546, 32551) + in_range(op, 32553, 32555) + in_range(op, 32557, 32559)
-        + is_eq(op, 32561) + is_eq(op, 32564) + in_range(op, 32579, 32580) + is_eq(op, 32593)
-        + is_eq(op, 32618) + is_eq(op, 32639);
-    let is_1: i64 = in_range(op, 32513, 32518) + in_range(op, 32520, 32521) + in_range(op, 32533, 32534)
-        + is_eq(op, 32545) + is_eq(op, 32552) + is_eq(op, 32560) + is_eq(op, 32565)
-        + in_range(op, 32575, 32577) + is_eq(op, 32584) + is_eq(op, 32586) + is_eq(op, 32592)
-        + in_range(op, 32597, 32601) + is_eq(op, 32605) + in_range(op, 32611, 32615)
-        + is_eq(op, 32617) + in_range(op, 32619, 32624) + is_eq(op, 32630) + in_range(op, 32637, 32638);
-    let need: i64 = is_1 * 1 + is_2 * 2 + is_3 * 3 + is_4 * 4;
-    return need;
+fn op_min_ops(ws: bytes, op: i64) -> i64 {
+    let idx: i64 = isa_op_index(op);
+    let ok: i64 = is_ge(idx, 0);
+    let safe_idx: i64 = ok * idx;
+    let known: i64 = ok * isa_op_flag(ws, 65536, safe_idx, 5);
+    let r: i64 = known * isa_op_min_ops(ws, 65536, safe_idx);
+    return r;
 }
 
 #[strict]
 fn op_has_dest(ws: bytes, op: i64) -> i64 {
-    let known: i64 = op_is_known(ws, op);
-    let destless: i64 = op_is_destless(op);
-    let r: i64 = known * (1 - destless);
+    let idx: i64 = isa_op_index(op);
+    let ok: i64 = is_ge(idx, 0);
+    let safe_idx: i64 = ok * idx;
+    let f: i64 = isa_op_flags(ws, 65536, safe_idx);
+    let r: i64 = ok * (f & 1) * ((f >> 5) & 1);
     return r;
 }
 
@@ -344,24 +338,6 @@ fn op_is_sanitizer(op: i64) -> i64 {
     acc = acc + is_eq(op, 32603) * 1;
     acc = acc + is_eq(op, 32604) * 1;
     acc = acc + is_eq(op, 32624) * 1;
-    return acc;
-}
-
-#[strict]
-fn op_is_destless(op: i64) -> i64 {
-    let acc: i64 = 0;
-    acc = acc + is_eq(op, 32512) * 1;
-    acc = acc + is_eq(op, 32517) * 1;
-    acc = acc + is_eq(op, 32576) * 1;
-    acc = acc + is_eq(op, 32577) * 1;
-    acc = acc + is_eq(op, 32578) * 1;
-    acc = acc + is_eq(op, 32579) * 1;
-    acc = acc + is_eq(op, 32580) * 1;
-    acc = acc + is_eq(op, 32582) * 1;
-    acc = acc + is_eq(op, 32583) * 1;
-    acc = acc + is_eq(op, 32585) * 1;
-    acc = acc + is_eq(op, 32586) * 1;
-    acc = acc + is_eq(op, 32591) * 1;
     return acc;
 }
 
@@ -997,7 +973,7 @@ fn verify_ins_body(stream: bytes, ws: bytes, ins_start: i64, ins_cnt: i64, cap: 
             w
         };
         let skip: i64 = (1 - known) + is_drop + is_ret;
-        let min_ops: i64 = op_min_ops(op);
+        let min_ops: i64 = op_min_ops(w, op);
         let nops_cur: i64 = ws_get(w, 14);
         let bad_op_ar: i64 = known * (1 - is_eq(op, 32584)) * is_lt(nops_cur, min_ops);
         w = append_err_if(w, bad_op_ar, 2012, ins_off);
