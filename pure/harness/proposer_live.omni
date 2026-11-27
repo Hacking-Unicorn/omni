@@ -156,11 +156,32 @@ fn plv_out_cstr(w: bytes, s: bytes) -> bytes {
     return u;
 }
 
+// Extracts parent directory (including trailing '/') from a NUL-terminated path, or "\0" if none.
+#[strict]
+fn plv_parent_dir(p: bytes) -> bytes {
+    let n: i64 = slen(p) - 1;
+    let slash: i64 = 0 - 1;
+    let i: i64 = 0;
+    while n - i <=> 0 {
+        slash = m2u_sel(m2u_eq(ld_u8(p, i), 47), i, slash);
+        i = i + 1;
+    }
+    let out: bytes = anew(0);
+    let pfx: i64 = m2u_sel(m2u_ge(slash, 0), slash + 1, 0);
+    let k: i64 = 0;
+    while pfx - k <=> 0 {
+        out = iset(out, ld_u8(p, k));
+        k = k + 1;
+    }
+    return iset(out, 0);
+}
+
 // Runs `omnic_pure.elf compile` + `compile-elf` via `/bin/sh` 5 sequential times, checking 0-variance.
+// When `ib_cstr` is non-empty (`slen > 1`), passes `--include-base "<ib_cstr>"` to `compile`.
 // Writes `bc_words` -> `w[160]`, `elf_bytes` -> `w[168]`, `ok` -> `w[176]`, and leaves final `.omni_bc` at `out_bc_tag`.
 #[strict]
 #[cap(SYS)]
-fn plv_measure_5(w: bytes, src_cstr: bytes, out_bc_tag: i64) -> bytes {
+fn plv_measure_5(w: bytes, src_cstr: bytes, ib_cstr: bytes, out_bc_tag: i64) -> bytes {
     let sh_p: bytes = plv_tmp(115);
     let bc_p: bytes = plv_tmp(out_bc_tag);
     let elf_p: bytes = plv_tmp(101);
@@ -168,7 +189,12 @@ fn plv_measure_5(w: bytes, src_cstr: bytes, out_bc_tag: i64) -> bytes {
     let u: bytes = plv_out_cstr(iset_patch_i64(w, 0, 0), omnic);
     u = plv_out_cstr(su_out4(su_out4(su_out4(u, 32, 99, 111, 109), 112, 105, 108, 101), 32, 34, 0, 0), src_cstr);
     u = su_out4(su_out4(su_out4(su_out4(u, 34, 32, 47, 116), 109, 112, 47, 111), 109, 110, 105, 95), 112, 108, 118, 95);
-    u = plv_out_cstr(su_out4(su_out4(u, out_bc_tag, 32, 38, 38), 32, 0, 0, 0), omnic);
+    u = su_out_u8(u, out_bc_tag);
+    u = if_pos m2u_ge(slen(ib_cstr), 2) <=> 0 {
+        let u1: bytes = su_out4(su_out4(su_out4(su_out4(u, 32, 45, 45, 105), 110, 99, 108, 117), 100, 101, 45, 98), 97, 115, 101, 32);
+        su_out_u8(plv_out_cstr(su_out_u8(u1, 34), ib_cstr), 34)
+    } else { u };
+    u = plv_out_cstr(su_out4(u, 32, 38, 38, 32), omnic);
     u = su_out4(su_out4(su_out4(u, 32, 99, 111, 109), 112, 105, 108, 101), 45, 101, 108, 102);
     u = su_out4(su_out4(su_out4(su_out4(u, 32, 47, 116, 109), 112, 47, 111, 109), 110, 105, 95, 112), 108, 118, 95, out_bc_tag);
     u = su_out4(su_out4(su_out4(su_out4(u, 32, 47, 116, 109), 112, 47, 111, 109), 110, 105, 95, 112), 108, 118, 95, 101);
@@ -393,12 +419,14 @@ fn plv_run_cycle(u: bytes) -> i64 {
         if_pos m2u_eq(rc_can, 0) <=> 0 {
             let tgt_src: bytes = plv_resolve_tgt(u, r_off, r_len, t_off, t_len);
             let cand_c: bytes = su_make_cstr(u, c_off, c_len);
-            let mb: bytes = plv_measure_5(u, tgt_src, 65);
+            let empty_ib: bytes = iset(anew(0), 0);
+            let inc_base: bytes = plv_parent_dir(tgt_src);
+            let mb: bytes = plv_measure_5(u, tgt_src, empty_ib, 65);
             let bw: i64 = ld_u64(mb, 160);
             let be: i64 = ld_u64(mb, 168);
             let ok_b: i64 = ld_u64(mb, 176);
             let b_us: i64 = ld_u64(mb, 200);
-            let mc: bytes = iset_patch_i64(plv_measure_5(mb, cand_c, 66), 208, b_us);
+            let mc: bytes = iset_patch_i64(plv_measure_5(mb, cand_c, inc_base, 66), 208, b_us);
             let cw: i64 = ld_u64(mc, 160);
             let ce: i64 = ld_u64(mc, 168);
             let ok_c: i64 = ld_u64(mc, 176);

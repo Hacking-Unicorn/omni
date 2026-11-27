@@ -242,6 +242,50 @@ else
   pass "Step 11b negative control: sys_clock_ns() without #[cap(SYS)] rejected fail-closed"
 fi
 
+# Step 12b: Out-of-tree --candidate include-base resolution (Part B: 3 checks)
+cp pure/audit/decompile.omni "$TMP/decomp_same.omni"
+if "$PURE_BIN" propose-run --target pure/audit/decompile.omni --candidate "$TMP/decomp_same.omni" --dry-run > "$TMP/inc_same.txt" 2>&1 \
+   && grep -q '^\[PROPOSE-RUN LIVE\]' "$TMP/inc_same.txt" \
+   && ! grep -q 'cand=-1/-1' "$TMP/inc_same.txt" \
+   && grep -q '^verdict=0t HOLD' "$TMP/inc_same.txt"; then
+  BPAIR=$(sed -n 's/.*base=\([0-9]*\/[0-9]*\).*/\1/p' "$TMP/inc_same.txt")
+  CPAIR=$(sed -n 's/.*cand=\([0-9]*\/[0-9]*\).*/\1/p' "$TMP/inc_same.txt")
+  if [ -n "$BPAIR" ] && [ "$BPAIR" = "$CPAIR" ]; then
+    pass "Step 12b included-module dry-run PASS (out-of-tree copy base=cand=$BPAIR, 0t HOLD)"
+  else
+    cat "$TMP/inc_same.txt" >&2 || true
+    fail "Step 12b included-module dry-run mismatch (base=$BPAIR cand=$CPAIR)"
+  fi
+else
+  cat "$TMP/inc_same.txt" >&2 || true
+  fail "Step 12b included-module dry-run FAIL"
+fi
+
+sed '0,/return r;/s/return r;/let _s12b_t: i64 = 0; return r;/' pure/audit/decompile.omni > "$TMP/decomp_mod.omni"
+set +e
+"$PURE_BIN" propose-run --target pure/audit/decompile.omni --candidate "$TMP/decomp_mod.omni" --dry-run > "$TMP/inc_mod.txt" 2>&1
+set -e
+if grep -q '^\[PROPOSE-RUN LIVE\]' "$TMP/inc_mod.txt" \
+   && grep -qE 'cand=[1-9][0-9]*/[1-9][0-9]*' "$TMP/inc_mod.txt" \
+   && grep -q '^verdict=' "$TMP/inc_mod.txt"; then
+  pass "Step 12b included-module real diff merits verdict PASS ($(grep '^verdict=' "$TMP/inc_mod.txt"))"
+else
+  cat "$TMP/inc_mod.txt" >&2 || true
+  fail "Step 12b included-module real diff merits verdict FAIL"
+fi
+
+sed 's|include "../m2/util.omni";|include "../m2/nonexistent_step12b_999.omni";|' pure/audit/decompile.omni > "$TMP/decomp_badinc.omni"
+set +e
+"$PURE_BIN" propose-run --target pure/audit/decompile.omni --candidate "$TMP/decomp_badinc.omni" --dry-run > "$TMP/inc_bad.txt" 2>&1
+BADINC_RC=$?
+set -e
+if [ "$BADINC_RC" -ne 0 ] && grep -q 'cand=-1/-1' "$TMP/inc_bad.txt" && grep -q '^verdict=-1t REJECT' "$TMP/inc_bad.txt"; then
+  pass "Step 12b negative control: broken include in out-of-tree candidate rejected fail-closed (cand=-1/-1, -1t REJECT)"
+else
+  cat "$TMP/inc_bad.txt" >&2 || true
+  fail "Step 12b negative control: broken include was NOT rejected fail-closed (rc=$BADINC_RC)"
+fi
+
 echo "=============================================================================="
 echo "[STEP8 SUMMARY] PASS=$PASS FAIL=$FAIL"
 echo "=============================================================================="
