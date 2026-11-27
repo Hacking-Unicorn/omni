@@ -66,7 +66,7 @@ for spec in \
   "pure/link/elf_link.omni_bc:7164:0x5F261D791F65ED2A" \
   "pure/m4/m4.omni_bc:56124:0x0561704B3E50EFAC" \
   "pure/m4/m4_standalone.omni_bc:57330:0x6F86B759214A2765" \
-  "pure/verifier_standalone.omni_bc:31744:0x00B2D6710B6D00D0"
+  "pure/verifier_standalone.omni_bc:31958:0xE99BF4CBF1455275"
 do
   IFS=':' read -r path want_len want_fnv <<< "$spec"
   read -r got_len got_fnv < <("$TMP/pure_build_util.elf" fnv "$path")
