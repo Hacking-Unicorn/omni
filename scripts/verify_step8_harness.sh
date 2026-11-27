@@ -522,6 +522,30 @@ else
   fail "Step 16 Part B4 (F5b) void return type on dest op negative control FAIL"
 fi
 
+# Check 69: Step 16 Part B5 (Family F2) — unlowered op (kv_ledger w79 0x7F45->0x7F19) & final-RET rule (seed0_risk w49 0x7F4A->0x7F46)
+"$PURE_DIR/omnic_pure.elf" compile pure/programs/kv_ledger_service.omni "$TMP/s16_f2_kv_orig.bc"
+cp "$TMP/s16_f2_kv_orig.bc" "$TMP/s16_f2_kv_mut.bc"
+printf '\x19\x7f' | dd of="$TMP/s16_f2_kv_mut.bc" bs=1 seek=158 count=2 conv=notrunc 2>/dev/null
+"$PURE_DIR/verifier.elf" "$TMP/s16_f2_kv_orig.bc" > "$TMP/s16_f2_kv_orig.ver"
+"$PURE_DIR/verifier.elf" "$TMP/s16_f2_kv_mut.bc" > "$TMP/s16_f2_kv_mut.ver"
+"$PURE_DIR/omnic_pure.elf" compile spec/acceptance/goldens/seed0_risk.omni "$TMP/s16_f2_s0_orig.bc"
+cp "$TMP/s16_f2_s0_orig.bc" "$TMP/s16_f2_s0_mut.bc"
+printf '\x46\x7f' | dd of="$TMP/s16_f2_s0_mut.bc" bs=1 seek=98 count=2 conv=notrunc 2>/dev/null
+"$PURE_DIR/verifier.elf" "$TMP/s16_f2_s0_orig.bc" > "$TMP/s16_f2_s0_orig.ver"
+"$PURE_DIR/verifier.elf" "$TMP/s16_f2_s0_mut.bc" > "$TMP/s16_f2_s0_mut.ver"
+if ! od -An -tu8 -w8 "$TMP/s16_f2_kv_orig.ver" | grep -qw '3001' \
+   && od -An -tu8 -w8 "$TMP/s16_f2_kv_mut.ver" | grep -qw '3001' \
+   && "$PURE_DIR/m2.elf" "$TMP/s16_f2_kv_orig.bc" > "$TMP/s16_f2_kv_orig.elf" \
+   && chmod +x "$TMP/s16_f2_kv_orig.elf" \
+   && "$TMP/s16_f2_kv_orig.elf" >/dev/null 2>&1 \
+   && ! od -An -tu8 -w8 "$TMP/s16_f2_s0_orig.ver" | grep -qw '2012' \
+   && od -An -tu8 -w8 "$TMP/s16_f2_s0_mut.ver" | grep -qw '2012' \
+   && "$PURE_DIR/m2.elf" "$TMP/s16_f2_s0_orig.bc" > "$TMP/s16_f2_s0_orig.elf"; then
+  pass "Step 16 Part B5 (F2) unlowered-op & final-RET negative control PASS (kv w79 0x7F45->0x7F19 rejected 3001; seed0 w49 0x7F4A->0x7F46 rejected 2012; origs accepted & run cleanly)"
+else
+  fail "Step 16 Part B5 (F2) unlowered-op & final-RET negative control FAIL"
+fi
+
 echo "=============================================================================="
 echo "[STEP8 SUMMARY] PASS=$PASS FAIL=$FAIL"
 echo "=============================================================================="

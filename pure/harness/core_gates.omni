@@ -96,12 +96,12 @@ fn cg_gate_frozen(arena: bytes) -> i64 {
     p_m4 = iset(p_m4, 112, 117, 114, 101, 47, 109, 52, 47, 109, 52, 46, 111, 109, 110, 105, 95);
     p_m4 = iset(p_m4, 98, 99, 0);
     let ok3: i64 = cg_check_pin(arena, p_m4, 56124, (1377 << 48) | (28747 << 32) | (15952 << 16) | 61356);
-    // pure/verifier_standalone.omni_bc: 32286 B (16143w), 0xEA324F363AC8D90E (Step 16 Part B4 F5 undef-ret & void-dest)
+    // pure/verifier_standalone.omni_bc: 32760 B (16380w), 0x676886F908AD2887 (Step 16 Part B5 F2 m2v ops & final-RET)
     let p_v: bytes = anew(0);
     p_v = iset(p_v, 112, 117, 114, 101, 47, 118, 101, 114, 105, 102, 105, 101, 114, 95, 115, 116);
     p_v = iset(p_v, 97, 110, 100, 97, 108, 111, 110, 101, 46, 111, 109, 110, 105, 95, 98, 99);
     p_v = iset(p_v, 0);
-    let ok4: i64 = cg_check_pin(arena, p_v, 32286, (59954 << 48) | (20278 << 32) | (15048 << 16) | 55566);
+    let ok4: i64 = cg_check_pin(arena, p_v, 32760, (26472 << 48) | (34553 << 32) | (2221 << 16) | 10375);
     return ok1 * ok2 * ok3 * ok4;
 }
 
