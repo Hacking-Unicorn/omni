@@ -769,6 +769,9 @@ fn handle_ret(ws: bytes, off: i64) -> bytes {
     let slot: i64 = token_to_slot(tok);
     let valid: i64 = is_slot * is_ge(slot, 0);
     let pack: i64 = get_reg(w, slot);
+    let rst: i64 = sl_state(pack);
+    let bad_ret: i64 = is_eq(rst, 0) + is_eq(rst, 3) + is_eq(rst, 4) + is_eq(rst, 5);
+    w = append_err_if(w, valid * bad_ret, 1005, off);
     let taint: i64 = sl_taint(pack) * valid;
     w = append_err_if(w, taint, 1001, off);
     let moved: i64 = slot_pack(4, sl_k(pack), sl_taint(pack), sl_heap(pack), sl_parent(pack));
@@ -964,6 +967,7 @@ fn verify_ins_body(stream: bytes, ws: bytes, ins_start: i64, ins_cnt: i64, cap: 
         w = set_decode_err_if(w, 1 - is_ge(nwords, pos + need), pos);
         let dest: i64 = is_dest * first;
         let op: i64 = is_dest * load_u16(stream, pos + 1) + (1 - is_dest) * first;
+        let ty: i64 = is_dest * load_u16(stream, pos + 2) + (1 - is_dest) * 32640;
         let tc: i64 = is_dest * load_u16(stream, pos + 3) + (1 - is_dest) * 32704;
         pos = pos + need;
         w = ws_set(w, 0, pos);
@@ -994,6 +998,8 @@ fn verify_ins_body(stream: bytes, ws: bytes, ins_start: i64, ins_cnt: i64, cap: 
         w = append_err_if(w, missing_dest, 2012, ins_off);
         w = check_branch_labels(w, op, ins_off);
         let do_dest: i64 = known * (1 - skip) * op_has_dest(op) * is_dest;
+        let void_dest: i64 = do_dest * is_eq(ty, 32640);
+        w = append_err_if(w, void_dest, 2012, ins_off);
         let cdest: trit = do_dest <=> 0;
         w = if_pos cdest {
             handle_dest(w, op, dest, tc, cap, ins_off)

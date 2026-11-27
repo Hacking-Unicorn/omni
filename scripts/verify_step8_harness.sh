@@ -494,6 +494,34 @@ else
   fail "Step 16 Part B3c undef IMM 300 & dual-namespace control FAIL"
 fi
 
+# Check 67: Step 16 Part B4 (Family F5a) — undefined register in RET (seed4_consensus w31: 0x7E01 -> 0x7E02)
+"$PURE_DIR/omnic_pure.elf" compile spec/acceptance/goldens/seed4_consensus.omni "$TMP/s16_s4_orig.bc"
+cp "$TMP/s16_s4_orig.bc" "$TMP/s16_s4_mut.bc"
+printf '\x02\x7e' | dd of="$TMP/s16_s4_mut.bc" bs=1 seek=62 count=2 conv=notrunc 2>/dev/null
+"$PURE_DIR/verifier.elf" "$TMP/s16_s4_orig.bc" > "$TMP/s16_s4_orig.ver"
+"$PURE_DIR/verifier.elf" "$TMP/s16_s4_mut.bc" > "$TMP/s16_s4_mut.ver"
+if ! od -An -tu8 -w8 "$TMP/s16_s4_orig.ver" | grep -qw '1005' \
+   && od -An -tu8 -w8 "$TMP/s16_s4_mut.ver" | grep -qw '1005' \
+   && "$PURE_DIR/m2.elf" "$TMP/s16_s4_orig.bc" > "$TMP/s16_s4_orig.elf"; then
+  pass "Step 16 Part B4 (F5a) undefined register in RET negative control PASS (w31 0x7E01->0x7E02 rejected 1005; orig accepted & lowered)"
+else
+  fail "Step 16 Part B4 (F5a) undefined register in RET negative control FAIL"
+fi
+
+# Check 68: Step 16 Part B4 (Family F5b) — void (0x7F80) return type on value-producing dest op (seed6_clamp w25: 0x7F81 -> 0x7F80)
+"$PURE_DIR/omnic_pure.elf" compile spec/acceptance/goldens/seed6_clamp.omni "$TMP/s16_s6_orig.bc"
+cp "$TMP/s16_s6_orig.bc" "$TMP/s16_s6_mut.bc"
+printf '\x80\x7f' | dd of="$TMP/s16_s6_mut.bc" bs=1 seek=50 count=2 conv=notrunc 2>/dev/null
+"$PURE_DIR/verifier.elf" "$TMP/s16_s6_orig.bc" > "$TMP/s16_s6_orig.ver"
+"$PURE_DIR/verifier.elf" "$TMP/s16_s6_mut.bc" > "$TMP/s16_s6_mut.ver"
+if ! od -An -tu8 -w8 "$TMP/s16_s6_orig.ver" | grep -qw '2012' \
+   && od -An -tu8 -w8 "$TMP/s16_s6_mut.ver" | grep -qw '2012' \
+   && "$PURE_DIR/m2.elf" "$TMP/s16_s6_orig.bc" > "$TMP/s16_s6_orig.elf"; then
+  pass "Step 16 Part B4 (F5b) void return type on dest op negative control PASS (w25 0x7F81->0x7F80 rejected 2012; orig accepted & lowered)"
+else
+  fail "Step 16 Part B4 (F5b) void return type on dest op negative control FAIL"
+fi
+
 echo "=============================================================================="
 echo "[STEP8 SUMMARY] PASS=$PASS FAIL=$FAIL"
 echo "=============================================================================="
