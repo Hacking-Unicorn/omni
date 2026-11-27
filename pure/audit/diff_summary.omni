@@ -91,7 +91,8 @@ fn ad_scan_module(arena: bytes, base: i64, nwords: i64, tbl_off: i64, stat_off: 
         let tot_ar: i64 = 0;
         let tot_buf: i64 = 0;
         let cap_u: i64 = 0;
-        let g: i64 = m2u_lt(pos, nwords - 1);
+        let lim: i64 = nwords - 1;
+        let g: i64 = m2u_lt(pos, lim);
         while g <=> 0 {
             let tag: i64 = ad_u16(w, base, pos);
             let is_end: i64 = m2u_eq(tag, 32495);
@@ -153,7 +154,7 @@ fn ad_scan_module(arena: bytes, base: i64, nwords: i64, tbl_off: i64, stat_off: 
                 let sch_n: i64 = m2u_sel(is_sch, ad_u16(w, base, pos + 2), 0);
                 pos = m2u_sel(is_end, nwords, m2u_sel(is_sch, pos + 3 + sch_n * 2, m2u_sel(is_exp, pos + 5, pos + 1)));
             };
-            g = (1 - is_end) * m2u_lt(pos, nwords - 1) * m2u_lt(fcnt, 512);
+            g = (1 - is_end) * m2u_lt(pos, lim) * m2u_lt(fcnt, 512);
         }
         w = iset_patch_i64(w, stat_off, fcnt);
         w = iset_patch_i64(w, stat_off + 8, tot_ins);
@@ -197,7 +198,7 @@ fn ad_emit_cap_lo(u: bytes, bit: i64) -> bytes {
 #[strict]
 fn ad_emit_cap_hi(u: bytes, bit: i64) -> bytes {
     let t5: bytes = if_pos m2u_eq(bit, 5) <=> 0 { su_out4(su_out4(u, 86, 73, 83, 73), 79, 78, 0, 0) } else { u };
-    let t6: bytes = if_pos m2u_eq(bit, 6) <=> 0 { su_out4(su_out4(t5, 65, 85, 68, 73), 79, 0, 0, 0) } else { t5 };
+    let t6: bytes = if_pos m2u_eq(bit, 6) <=> 0 { su_out_u8(su_out4(t5, 65, 85, 68, 73), 79) } else { t5 };
     let t7: bytes = if_pos m2u_eq(bit, 7) <=> 0 { su_out4(t6, 65, 85, 84, 72) } else { t6 };
     let t8: bytes = if_pos m2u_eq(bit, 8) <=> 0 { su_out4(t7, 70, 83, 0, 0) } else { t7 };
     return if_pos m2u_eq(bit, 9) <=> 0 { su_out4(t8, 83, 89, 83, 0) } else { t8 };
