@@ -174,9 +174,12 @@ fn unpack_cap(tc: i64) -> i64 {
 fn op_is_known(op: i64) -> i64 {
     let in_blk: i64 = in_range(op, 32512, 32639);
     let hole: i64 = is_eq(op, 32519) + in_range(op, 32522, 32524)
-        + in_range(op, 32570, 32574) + in_range(op, 32587, 32590)
+        + in_range(op, 32537, 32541) + in_range(op, 32562, 32563)
+        + is_eq(op, 32568) + in_range(op, 32570, 32574)
+        + is_eq(op, 32583) + is_eq(op, 32585) + in_range(op, 32587, 32591)
         + in_range(op, 32594, 32596) + in_range(op, 32602, 32604)
-        + in_range(op, 32606, 32607);
+        + in_range(op, 32606, 32610) + in_range(op, 32625, 32626)
+        + in_range(op, 32628, 32629) + in_range(op, 32631, 32636);
     let r: i64 = in_blk * is_eq(hole, 0);
     return r;
 }
@@ -955,6 +958,8 @@ fn verify_ins_body(stream: bytes, ws: bytes, ins_start: i64, ins_cnt: i64, cap: 
     let nwords: i64 = ws_get(w, 1);
     let pos: i64 = ins_start;
     let left: i64 = ins_cnt;
+    let last_op: i64 = 0;
+    let last_off: i64 = 0;
     let go: i64 = left * (1 - is_eq(ws_get(w, 10), 3006));
     while go <=> 0 {
         let have: i64 = is_gt(nwords, pos);
@@ -967,6 +972,8 @@ fn verify_ins_body(stream: bytes, ws: bytes, ins_start: i64, ins_cnt: i64, cap: 
         w = set_decode_err_if(w, 1 - is_ge(nwords, pos + need), pos);
         let dest: i64 = is_dest * first;
         let op: i64 = is_dest * load_u16(stream, pos + 1) + (1 - is_dest) * first;
+        last_op = op;
+        last_off = ins_off;
         let ty: i64 = is_dest * load_u16(stream, pos + 2) + (1 - is_dest) * 32640;
         let tc: i64 = is_dest * load_u16(stream, pos + 3) + (1 - is_dest) * 32704;
         pos = pos + need;
@@ -1010,6 +1017,8 @@ fn verify_ins_body(stream: bytes, ws: bytes, ins_start: i64, ins_cnt: i64, cap: 
         left = left - 1;
         go = left * (1 - is_eq(ws_get(w, 10), 3006));
     }
+    let no_ret: i64 = (1 - is_eq(ws_get(w, 10), 3006)) * (1 - is_eq(last_op, 32586));
+    w = append_err_if(w, no_ret, 2012, last_off);
     return w;
 }
 
