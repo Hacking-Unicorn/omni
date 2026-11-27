@@ -237,14 +237,16 @@ fn av_check_verifier_standalone(arena: bytes) -> i64 {
     let dc2: bytes = av_tmp(102);
     let rc1: i64 = su_spawn_capture(av_tool(arena, 2), vs_p, dc1, 420);
     let rc2: i64 = su_spawn_capture(av_tool(arena, 2), vs_p, dc2, 420);
-    let n1: i64 = su_read_file_into(arena, dc1, su_band_a(), 120000);
-    let n2: i64 = su_read_file_into(arena, dc2, su_band_a() + 125000, 120000);
+    let ba: i64 = su_band_a();
+    let ba2: i64 = ba + 125000;
+    let n1: i64 = su_read_file_into(arena, dc1, ba, 120000);
+    let n2: i64 = su_read_file_into(arena, dc2, ba2, 120000);
     let det: i64 = m2u_eq(rc1, 0) * m2u_eq(rc2, 0) * m2u_ge(n1, 50000)
-        * su_eq_bytes(arena, su_band_a(), n1, su_band_a() + 125000, n2);
+        * su_eq_bytes(arena, ba, n1, ba2, n2);
     // Must contain RECONSTRUCTED ("RECO"), APPROXIMATE ("APPR"), and LITERAL_OP ("LITE")
-    let has_m: i64 = av_has4(arena, su_band_a(), n1, 82, 69, 67, 79)
-        * av_has4(arena, su_band_a(), n1, 65, 80, 80, 82)
-        * av_has4(arena, su_band_a(), n1, 76, 73, 84, 69);
+    let has_m: i64 = av_has4(arena, ba, n1, 82, 69, 67, 79)
+        * av_has4(arena, ba, n1, 65, 80, 80, 82)
+        * av_has4(arena, ba, n1, 76, 73, 84, 69);
     return det * has_m;
 }
 
@@ -292,11 +294,11 @@ fn av_check_b6(arena: bytes) -> i64 {
     let nw: i64 = su_write_file_from(w, b6_bc, b, 152, 420);
     let dc_p: bytes = av_tmp(104);
     let rc: i64 = if_pos m2u_eq(nw, 152) <=> 0 { su_spawn_capture(av_tool(w, 2), b6_bc, dc_p, 420) } else { 1 };
-    let nd: i64 = su_read_file_into(w, dc_p, su_band_a(), 32000);
+    let nd: i64 = su_read_file_into(w, dc_p, b, 32000);
     // Must show "v0 = 0;" ("= 0;") and "v0 + v2" ("+ v2") and recompile cleanly!
-    let vis: i64 = m2u_eq(rc, 0) * av_has4(w, su_band_a(), nd, 61, 32, 48, 59)
-        * av_has4(w, su_band_a(), nd, 43, 32, 118, 50);
-    let nb_rec: i64 = if_pos vis <=> 0 { av_compile_buf(w, su_band_a(), nd, av_tmp(105)) } else { 0 - 1 };
+    let vis: i64 = m2u_eq(rc, 0) * av_has4(w, b, nd, 61, 32, 48, 59)
+        * av_has4(w, b, nd, 43, 32, 118, 50);
+    let nb_rec: i64 = if_pos vis <=> 0 { av_compile_buf(w, b, nd, av_tmp(105)) } else { 0 - 1 };
     return vis * m2u_ge(nb_rec, 4);
 }
 
