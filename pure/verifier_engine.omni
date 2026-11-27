@@ -31,8 +31,12 @@
 //   256..383 error pairs (up to 64),
 //   384..447 operand packs (up to 64),
 //   448..959 module fn table,
-//   960..1023 label bitset (64 words = 4096 slots: 0..4079 IMM, 4080..4095 LBL).
+//   960..1023 label bitset (64 words = 4096 slots: 0..4079 IMM, 4080..4095 LBL),
+//   1024..8191 result output words (bytes 8192..65535),
+//   bytes 65536..67855 (2320 B): once-per-module cached `pure/isa/table.omni` blob.
 // ==============================================================================
+
+include "isa/table.omni";
 
 #[strict]
 fn is_eq(a: i64, b: i64) -> i64 {
@@ -171,16 +175,12 @@ fn unpack_cap(tc: i64) -> i64 {
 }
 
 #[strict]
-fn op_is_known(op: i64) -> i64 {
-    let in_blk: i64 = in_range(op, 32512, 32639);
-    let hole: i64 = is_eq(op, 32519) + in_range(op, 32522, 32524)
-        + in_range(op, 32537, 32541) + in_range(op, 32562, 32563)
-        + is_eq(op, 32568) + in_range(op, 32570, 32574)
-        + is_eq(op, 32583) + is_eq(op, 32585) + in_range(op, 32587, 32591)
-        + in_range(op, 32593, 32597) + in_range(op, 32602, 32604)
-        + in_range(op, 32606, 32610) + in_range(op, 32625, 32626)
-        + in_range(op, 32628, 32629) + in_range(op, 32631, 32636);
-    let r: i64 = in_blk * is_eq(hole, 0);
+#[strict]
+fn op_is_known(ws: bytes, op: i64) -> i64 {
+    let idx: i64 = isa_op_index(op);
+    let ok: i64 = is_ge(idx, 0);
+    let safe_idx: i64 = ok * idx;
+    let r: i64 = ok * isa_op_flag(ws, 65536, safe_idx, 5);
     return r;
 }
 
@@ -205,8 +205,8 @@ fn op_min_ops(op: i64) -> i64 {
 }
 
 #[strict]
-fn op_has_dest(op: i64) -> i64 {
-    let known: i64 = op_is_known(op);
+fn op_has_dest(ws: bytes, op: i64) -> i64 {
+    let known: i64 = op_is_known(ws, op);
     let destless: i64 = op_is_destless(op);
     let r: i64 = known * (1 - destless);
     return r;
@@ -980,7 +980,7 @@ fn verify_ins_body(stream: bytes, ws: bytes, ins_start: i64, ins_cnt: i64, cap: 
         w = ws_set(w, 0, pos);
         w = collect_ops(stream, w);
         pos = ws_get(w, 0);
-        let known: i64 = op_is_known(op);
+        let known: i64 = op_is_known(w, op);
         w = append_err_if(w, 1 - known, 3001, ins_off);
         let is_drop: i64 = known * is_eq(op, 32517);
         let is_ret: i64 = known * is_eq(op, 32586);
@@ -1001,10 +1001,10 @@ fn verify_ins_body(stream: bytes, ws: bytes, ins_start: i64, ins_cnt: i64, cap: 
         let nops_cur: i64 = ws_get(w, 14);
         let bad_op_ar: i64 = known * (1 - is_eq(op, 32584)) * is_lt(nops_cur, min_ops);
         w = append_err_if(w, bad_op_ar, 2012, ins_off);
-        let missing_dest: i64 = known * (1 - skip) * op_has_dest(op) * (1 - is_dest);
+        let missing_dest: i64 = known * (1 - skip) * op_has_dest(w, op) * (1 - is_dest);
         w = append_err_if(w, missing_dest, 2012, ins_off);
         w = check_branch_labels(w, op, ins_off);
-        let do_dest: i64 = known * (1 - skip) * op_has_dest(op) * is_dest;
+        let do_dest: i64 = known * (1 - skip) * op_has_dest(w, op) * is_dest;
         let void_dest: i64 = do_dest * is_eq(ty, 32640);
         w = append_err_if(w, void_dest, 2012, ins_off);
         let cdest: trit = do_dest <=> 0;
@@ -1262,7 +1262,7 @@ fn prescan_module_fns(stream: bytes, ws: bytes, nwords: i64) -> bytes {
 fn omni_verify_module_with_mode(stream: bytes, api_mode: i64) -> bytes {
     let nbytes: i64 = slen(stream);
     let nwords: i64 = nbytes / 2;
-    let ws: bytes = init_zero_buf(8192);
+    let ws: bytes = isa_tbl_append(init_zero_buf(8192));
     ws = ws_set(ws, 1, nwords);
     ws = ws_set(ws, 19, api_mode);
     ws = ws_set(ws, 21, 3);

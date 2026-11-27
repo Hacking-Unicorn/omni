@@ -14,10 +14,11 @@
 fn m2_standalone_entry(arr: array, arg0: i64, arg1: i64, arg2: i64) -> bytes {
     let w: bytes = anew(0);
     let i: i64 = 0;
-    while 65536 - i <=> 0 {
+    while 66048 - i <=> 0 {
         w = iset_i64(w, 0);
         i = i + 1;
     }
+    w = isa_tbl_append(w);
     w = m2_verify_module_into(w, arr);
     let verr: i64 = ld_u32(w, m2v_state() + 8);
     let ok: i64 = m2u_eq(verr, 0);

@@ -3,7 +3,7 @@
 // ==============================================================================
 // Pure-Omni port of the core `m2_host/decode_diff.rs` gates:
 //   - m2-frozen          : verifies all 5 frozen hashes & native ELF pins
-//   - m2-fixed-point     : S1 == S2 == m2.elf (126,032 B, 0x1F040D79AE834D14)
+//   - m2-fixed-point     : S1 == S2 == m2.elf (125,660 B, 0x3A4A285C58CFA93E)
 //   - m3-modular         : link-elf -> 207,015 B m3.elf (0x7397A5020895AEBF) + pure/programs/*
 //   - p2a-syscalls       : live Linux kernel 0F 05 syscalls (modes 0/1/2/3) + cap/taint negs
 //   - a3-macro-quarantine: macro rejected fail-closed + weighted_diff_pure_golden -> 100
@@ -81,11 +81,11 @@ fn cg_check_pin(arena: bytes, p: bytes, want_sz: i64, want_h: i64) -> i64 {
 #[strict]
 #[cap(SYS)]
 fn cg_gate_frozen(arena: bytes) -> i64 {
-    // pure/m2/m2.omni_bc: 87802 B (43901w), 0xFD2F8B389C2AAEA1 (Step 16 Part B7 reserve 0x7F51/0x7F55)
+    // pure/m2/m2.omni_bc: 87686 B (43843w), 0x3DCC8546CE5B0D57 (Addons Item 1 PR 1 table.omni acceptance)
     let p_m2: bytes = anew(0);
     p_m2 = iset(p_m2, 112, 117, 114, 101, 47, 109, 50, 47, 109, 50, 46, 111, 109, 110, 105, 95);
     p_m2 = iset(p_m2, 98, 99, 0);
-    let ok1: i64 = cg_check_pin(arena, p_m2, 87802, (64815 << 48) | (35640 << 32) | (39978 << 16) | 44705);
+    let ok1: i64 = cg_check_pin(arena, p_m2, 87686, (15820 << 48) | (34118 << 32) | (52827 << 16) | 3415);
     // pure/m3/m3.omni_bc: 132498 B (66249w), 0x0E3052A4BE00D599
     let p_m3: bytes = anew(0);
     p_m3 = iset(p_m3, 112, 117, 114, 101, 47, 109, 51, 47, 109, 51, 46, 111, 109, 110, 105, 95);
@@ -96,16 +96,16 @@ fn cg_gate_frozen(arena: bytes) -> i64 {
     p_m4 = iset(p_m4, 112, 117, 114, 101, 47, 109, 52, 47, 109, 52, 46, 111, 109, 110, 105, 95);
     p_m4 = iset(p_m4, 98, 99, 0);
     let ok3: i64 = cg_check_pin(arena, p_m4, 56124, (1377 << 48) | (28747 << 32) | (15952 << 16) | 61356);
-    // pure/verifier_standalone.omni_bc: 32760 B (16380w), 0xD3482994AFC37D25 (Step 16 Part B7 reserve 0x7F51/0x7F55)
+    // pure/verifier_standalone.omni_bc: 47268 B (23634w), 0x7E82A2FFC55AEE56 (Addons Item 1 PR 1 op_is_known)
     let p_v: bytes = anew(0);
     p_v = iset(p_v, 112, 117, 114, 101, 47, 118, 101, 114, 105, 102, 105, 101, 114, 95, 115, 116);
     p_v = iset(p_v, 97, 110, 100, 97, 108, 111, 110, 101, 46, 111, 109, 110, 105, 95, 98, 99);
     p_v = iset(p_v, 0);
-    let ok4: i64 = cg_check_pin(arena, p_v, 32760, (54088 << 48) | (10644 << 32) | (44995 << 16) | 32037);
+    let ok4: i64 = cg_check_pin(arena, p_v, 47268, (32386 << 48) | (41727 << 32) | (50522 << 16) | 61014);
     return ok1 * ok2 * ok3 * ok4;
 }
 
-// Gate 2: m2-fixed-point (S1 == S2 == m2.elf: 126,032 B, 0x1F040D79AE834D14).
+// Gate 2: m2-fixed-point (S1 == S2 == m2.elf: 125,660 B, 0x3A4A285C58CFA93E).
 #[strict]
 #[cap(SYS)]
 fn cg_gate_m2_fp(arena: bytes) -> i64 {
@@ -116,9 +116,9 @@ fn cg_gate_m2_fp(arena: bytes) -> i64 {
     let s2: bytes = cg_tmp(66);
     let rc1: i64 = su_spawn_capture(cg_tool(arena, 1), p_m2, s1, 493);
     let rc2: i64 = if_pos m2u_eq(rc1, 0) <=> 0 { su_spawn_capture(s1, p_m2, s2, 493) } else { 1 };
-    let want_h: i64 = (7940 << 48) | (3449 << 32) | (44675 << 16) | 19732;
-    let ok1: i64 = m2u_eq(rc1, 0) * cg_check_pin(arena, s1, 126032, want_h);
-    let ok2: i64 = m2u_eq(rc2, 0) * cg_check_pin(arena, s2, 126032, want_h);
+    let want_h: i64 = (14922 << 48) | (10332 << 32) | (22735 << 16) | 43326;
+    let ok1: i64 = m2u_eq(rc1, 0) * cg_check_pin(arena, s1, 125660, want_h);
+    let ok2: i64 = m2u_eq(rc2, 0) * cg_check_pin(arena, s2, 125660, want_h);
     return ok1 * ok2;
 }
 
@@ -258,20 +258,20 @@ fn cg_print_frozen(arena: bytes) -> i64 {
     return 0 + nw * 0;
 }
 
-// Prints the `[M2-FIXED-POINT PASS] ...` banner (values = current pins, Step 16 Part B7).
+// Prints the `[M2-FIXED-POINT PASS] ...` banner (values = current pins, Addons Item 1 PR 1).
 #[strict]
 #[cap(SYS)]
 fn cg_print_m2_fp(arena: bytes) -> i64 {
     let w: bytes = iset_patch_i64(arena, 0, 0);
-    // "[M2-FIXED-POINT PASS] pure/m2/m2.omni_bc=43901 words (FNV-1a64=0xFD2F8B389C2AAEA1) | ELF64=126032 B (FNV-1a64=0x1F040D79AE834D14) | S1 == S2 == S3 == V (native Linux x86-64 verified)\n"
+    // "[M2-FIXED-POINT PASS] pure/m2/m2.omni_bc=43843 words (FNV-1a64=0x3DCC8546CE5B0D57) | ELF64=125660 B (FNV-1a64=0x3A4A285C58CFA93E) | S1 == S2 == S3 == V (native Linux x86-64 verified)\n"
     w = su_out4(su_out4(su_out4(su_out4(w, 91, 77, 50, 45), 70, 73, 88, 69), 68, 45, 80, 79), 73, 78, 84, 32);
     w = su_out4(su_out4(su_out4(su_out4(w, 80, 65, 83, 83), 93, 32, 112, 117), 114, 101, 47, 109), 50, 47, 109, 50);
-    w = su_out4(su_out4(su_out4(su_out4(w, 46, 111, 109, 110), 105, 95, 98, 99), 61, 52, 51, 57), 48, 49, 32, 119);
+    w = su_out4(su_out4(su_out4(su_out4(w, 46, 111, 109, 110), 105, 95, 98, 99), 61, 52, 51, 56), 52, 51, 32, 119);
     w = su_out4(su_out4(su_out4(su_out4(w, 111, 114, 100, 115), 32, 40, 70, 78), 86, 45, 49, 97), 54, 52, 61, 48);
-    w = su_out4(su_out4(su_out4(su_out4(w, 120, 70, 68, 50), 70, 56, 66, 51), 56, 57, 67, 50), 65, 65, 69, 65);
-    w = su_out4(su_out4(su_out4(su_out4(w, 49, 41, 32, 124), 32, 69, 76, 70), 54, 52, 61, 49), 50, 54, 48, 51);
-    w = su_out4(su_out4(su_out4(su_out4(w, 50, 32, 66, 32), 40, 70, 78, 86), 45, 49, 97, 54), 52, 61, 48, 120);
-    w = su_out4(su_out4(su_out4(su_out4(w, 49, 70, 48, 52), 48, 68, 55, 57), 65, 69, 56, 51), 52, 68, 49, 52);
+    w = su_out4(su_out4(su_out4(su_out4(w, 120, 51, 68, 67), 67, 56, 53, 52), 54, 67, 69, 53), 66, 48, 68, 53);
+    w = su_out4(su_out4(su_out4(su_out4(w, 55, 41, 32, 124), 32, 69, 76, 70), 54, 52, 61, 49), 50, 53, 54, 54);
+    w = su_out4(su_out4(su_out4(su_out4(w, 48, 32, 66, 32), 40, 70, 78, 86), 45, 49, 97, 54), 52, 61, 48, 120);
+    w = su_out4(su_out4(su_out4(su_out4(w, 51, 65, 52, 65), 50, 56, 53, 67), 53, 56, 67, 70), 65, 57, 51, 69);
     w = su_out4(su_out4(su_out4(su_out4(w, 41, 32, 124, 32), 83, 49, 32, 61), 61, 32, 83, 50), 32, 61, 61, 32);
     w = su_out4(su_out4(su_out4(su_out4(w, 83, 51, 32, 61), 61, 32, 86, 32), 40, 110, 97, 116), 105, 118, 101, 32);
     w = su_out4(su_out4(su_out4(su_out4(w, 76, 105, 110, 117), 120, 32, 120, 56), 54, 45, 54, 52), 32, 118, 101, 114);
