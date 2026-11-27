@@ -48,15 +48,17 @@ fn eg_tool(arena: bytes, tid: i64) -> bytes {
 #[strict]
 #[cap(SYS)]
 fn eg_check_gnu_stack(arena: bytes, elf_p: bytes) -> i64 {
-    let nb: i64 = su_read_file_into(arena, elf_p, su_band_b(), 250000);
-    let is_elf: i64 = m2u_ge(nb, 176) * m2u_eq(ld_u32(arena, su_band_b()), 1179403647);
-    let phoff: i64 = m2u_sel(is_elf, ld_u64(arena, su_band_b() + 32), 0);
-    let phent: i64 = m2u_sel(is_elf, ld_u16(arena, su_band_b() + 54), 56);
-    let phnum: i64 = m2u_sel(is_elf, ld_u16(arena, su_band_b() + 56), 0);
+    let bb: i64 = su_band_b();
+    let nb: i64 = su_read_file_into(arena, elf_p, bb, 250000);
+    let is_elf: i64 = m2u_ge(nb, 176) * m2u_eq(ld_u32(arena, bb), 1179403647);
+    let phoff: i64 = m2u_sel(is_elf, ld_u64(arena, bb + 32), 0);
+    let phent: i64 = m2u_sel(is_elf, ld_u16(arena, bb + 54), 56);
+    let phnum: i64 = m2u_sel(is_elf, ld_u16(arena, bb + 56), 0);
+    let pbase: i64 = bb + phoff;
     let found: i64 = 0;
     let i: i64 = 0;
     while phnum - i <=> 0 {
-        let po: i64 = su_band_b() + phoff + i * phent;
+        let po: i64 = pbase + i * phent;
         let pt: i64 = ld_u32(arena, po);
         let pf: i64 = ld_u32(arena, po + 4);
         found = found | (m2u_eq(pt, 1685382481) * m2u_eq(pf, 6));
