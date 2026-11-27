@@ -305,13 +305,13 @@ else
   fail "Step 14 fuzz_gates.elf non-deterministic output (rc1=$FZ1_RC rc2=$FZ2_RC)"
 fi
 
-if [ "$FZ1_RC" -ne 0 ] && grep -q '^\[FUZZ FAIL\]' "$TMP/fuzz1.txt" && grep -q '^\[FUZZ FIND\] kind=1 op=1 item=1 site=30 seed=1367066037' "$TMP/fuzz1.txt"; then
-  pass "Step 14/15 fuzz_gates.elf fail-closed Find #2 reproduced (item=1 site=30 0x7F4A->0x7F5B, filed in spec/step15-fix-evidence.md)"
+if [ "$FZ1_RC" -ne 0 ] && grep -q '^\[FUZZ FAIL\]' "$TMP/fuzz1.txt" && grep -q '^\[FUZZ FIND\] kind=3 op=1 item=1 site=17 seed=977037651' "$TMP/fuzz1.txt"; then
+  pass "Step 14/16 fuzz_gates.elf fail-closed first find reproduced (kind=3 op=1 item=1 site=17 seed=977037651; Find #2 F3 component closed, F1 0x7F5B still open)"
 elif [ "$FZ1_RC" -eq 0 ] && grep -q '^\[FUZZ PASS\].*soundness=0 roundtrip=0 judge=0' "$TMP/fuzz1.txt"; then
-  pass "Step 14/15 fuzz_gates.elf reduced panel PASS (0 finds)"
+  pass "Step 14/16 fuzz_gates.elf reduced panel PASS (0 finds)"
 else
   cat "$TMP/fuzz1.txt" >&2 || true
-  fail "Step 14/15 fuzz_gates.elf unexpected output (rc=$FZ1_RC)"
+  fail "Step 14/16 fuzz_gates.elf unexpected output (rc=$FZ1_RC)"
 fi
 
 # Step 15: Permanent negative control for Find #1 (kv_ledger_service word 179: 0x7F28 -> 0x7F5F rejected with err 3001)
@@ -338,6 +338,29 @@ if [ "${F4_ST:-0}" -eq 3006 ] && [ "${F4_OFF:-0}" -eq 249 ] && [ "${F4_NF:-1}" -
   pass "Step 16 Family F4 permanent regression check PASS (verifier.elf rejects FN_HDR fn_id=0x7EFB with status 3006 at off 249; orig kv_ledger_service runs cleanly)"
 else
   fail "Step 16 Family F4 permanent regression check FAIL (st=${F4_ST:-?} off=${F4_OFF:-?} nf=${F4_NF:-?})"
+fi
+
+# Step 16 Part B2: Permanent negative controls for Family F3 (seed6_clamp word 30: dest-shape 0x7F4A->0x7F3F err 2012; LABEL-operand 0x7F4A->0x7F40 err 2009)
+"$PURE_BIN" compile spec/acceptance/goldens/seed6_clamp.omni "$TMP/s16_s6.bc"
+"$PURE_DIR/verifier.elf" "$TMP/s16_s6.bc" > "$TMP/s16_s6_orig.ver"
+cp "$TMP/s16_s6.bc" "$TMP/s16_s6_dest.bc"
+printf '\x3f\x7f' | dd of="$TMP/s16_s6_dest.bc" bs=1 seek=60 count=2 conv=notrunc 2>/dev/null
+"$PURE_DIR/verifier.elf" "$TMP/s16_s6_dest.bc" > "$TMP/s16_s6_dest.ver"
+if ! od -An -tu8 "$TMP/s16_s6_orig.ver" | grep -qw '2012' \
+   && od -An -tu8 "$TMP/s16_s6_dest.ver" | grep -qw '2012'; then
+  pass "Step 16 Family F3 dest-shape permanent regression check PASS (verifier.elf accepts orig seed6_clamp, rejects word 30 0x7F4A->0x7F3F with err 2012)"
+else
+  fail "Step 16 Family F3 dest-shape permanent regression check FAIL"
+fi
+
+cp "$TMP/s16_s6.bc" "$TMP/s16_s6_lbl.bc"
+printf '\x40\x7f' | dd of="$TMP/s16_s6_lbl.bc" bs=1 seek=60 count=2 conv=notrunc 2>/dev/null
+"$PURE_DIR/verifier.elf" "$TMP/s16_s6_lbl.bc" > "$TMP/s16_s6_lbl.ver"
+if ! od -An -tu8 "$TMP/s16_s6_orig.ver" | grep -qw '2009' \
+   && od -An -tu8 "$TMP/s16_s6_lbl.ver" | grep -qw '2009'; then
+  pass "Step 16 Family F3 LABEL-operand permanent regression check PASS (verifier.elf accepts orig seed6_clamp, rejects word 30 0x7F4A->0x7F40 with err 2009)"
+else
+  fail "Step 16 Family F3 LABEL-operand permanent regression check FAIL"
 fi
 
 echo "=============================================================================="
