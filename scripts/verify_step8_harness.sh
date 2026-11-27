@@ -306,7 +306,7 @@ else
 fi
 
 if [ "$FZ1_RC" -ne 0 ] && grep -q '^\[FUZZ FAIL\]' "$TMP/fuzz1.txt" && grep -q '^\[FUZZ FIND\] kind=3 op=1 item=1 site=17 seed=977037651' "$TMP/fuzz1.txt"; then
-  pass "Step 14/16 fuzz_gates.elf fail-closed first find reproduced (kind=3 op=1 item=1 site=17 seed=977037651; Find #2 F3 component closed, F1 0x7F5B still open)"
+  pass "Step 14/16 fuzz_gates.elf fail-closed first find reproduced (kind=3 op=1 item=1 site=17 seed=977037651; Find #2 fully closed — F3 component PR #62, F1 component PR #63)"
 elif [ "$FZ1_RC" -eq 0 ] && grep -q '^\[FUZZ PASS\].*soundness=0 roundtrip=0 judge=0' "$TMP/fuzz1.txt"; then
   pass "Step 14/16 fuzz_gates.elf reduced panel PASS (0 finds)"
 else
