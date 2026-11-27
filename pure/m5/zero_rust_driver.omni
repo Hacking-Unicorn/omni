@@ -78,7 +78,7 @@ fn p2a_run_io_and_spawn(mode: i64) -> i64 {
     } else {
         sys_spawn(p2a_path_true(), empty_arg)
     };
-    let base: i64 = if_pos is_child <=> 0 { 2000 } else { 1000 };
+    let base: i64 = 1000 + is_child * 1000;
     return base * match_ok + nw + nr + child_rc + (cw + cr + oob_res + ex_res) * 0;
 }
 

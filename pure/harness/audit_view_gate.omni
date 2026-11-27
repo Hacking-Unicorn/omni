@@ -103,8 +103,9 @@ fn av_has4(arena: bytes, off: i64, len: i64, c0: i64, c1: i64, c2: i64, c3: i64)
     let lim: i64 = len - 3;
     let g: i64 = m2u_lt(0, lim);
     while g <=> 0 {
-        let hit: i64 = m2u_eq(ld_u8(arena, off + i), c0) * m2u_eq(ld_u8(arena, off + i + 1), c1)
-            * m2u_eq(ld_u8(arena, off + i + 2), c2) * m2u_eq(ld_u8(arena, off + i + 3), c3);
+        let p: i64 = off + i;
+        let hit: i64 = m2u_eq(ld_u8(arena, p), c0) * m2u_eq(ld_u8(arena, p + 1), c1)
+            * m2u_eq(ld_u8(arena, p + 2), c2) * m2u_eq(ld_u8(arena, p + 3), c3);
         found = found | hit;
         i = i + 1;
         g = (1 - found) * m2u_lt(i, lim);
@@ -120,12 +121,14 @@ fn av_has4(arena: bytes, off: i64, len: i64, c0: i64, c1: i64, c2: i64, c3: i64)
 #[strict]
 #[cap(SYS)]
 fn av_roundtrip_file(arena: bytes, path_cstr: bytes, corrupt: i64) -> i64 {
-    let nsrc: i64 = su_read_file_into(arena, path_cstr, su_band_a(), 32000);
+    let ba: i64 = su_band_a();
+    let ba2: i64 = ba + 65536;
+    let nsrc: i64 = su_read_file_into(arena, path_cstr, ba, 32000);
     let r: i64 = if_pos m2u_lt(nsrc, 4) <=> 0 {
         0
     } else {
         let orig_bc: bytes = av_tmp(97);
-        let nb1: i64 = av_compile_buf(arena, su_band_a(), nsrc, orig_bc);
+        let nb1: i64 = av_compile_buf(arena, ba, nsrc, orig_bc);
         if_pos m2u_lt(nb1, 4) <=> 0 {
             0
         } else {
@@ -133,24 +136,24 @@ fn av_roundtrip_file(arena: bytes, path_cstr: bytes, corrupt: i64) -> i64 {
             let dc2: bytes = av_tmp(99);
             let rc1: i64 = su_spawn_capture(av_tool(arena, 2), orig_bc, dc1, 420);
             let rc2: i64 = su_spawn_capture(av_tool(arena, 2), orig_bc, dc2, 420);
-            let nd1: i64 = su_read_file_into(arena, dc1, su_band_a(), 64000);
-            let nd2: i64 = su_read_file_into(arena, dc2, su_band_a() + 65536, 64000);
+            let nd1: i64 = su_read_file_into(arena, dc1, ba, 64000);
+            let nd2: i64 = su_read_file_into(arena, dc2, ba2, 64000);
             let det: i64 = m2u_eq(rc1, 0) * m2u_eq(rc2, 0) * m2u_lt(0, nd1)
-                * su_eq_bytes(arena, su_band_a(), nd1, su_band_a() + 65536, nd2);
-            let has_rec: i64 = av_has4(arena, su_band_a(), nd1, 82, 69, 67, 79);
+                * su_eq_bytes(arena, ba, nd1, ba2, nd2);
+            let has_rec: i64 = av_has4(arena, ba, nd1, 82, 69, 67, 79);
             if_pos det * has_rec <=> 0 {
                 let w: bytes = if_pos corrupt <=> 0 {
                     // Corrupt `return` -> `???` inside decompiled body so recompile MUST fail
-                    su_st_u8(su_st_u8(arena, su_band_a() + nd1 - 4, 63), su_band_a() + nd1 - 3, 63)
+                    su_st_u8(su_st_u8(arena, ba + nd1 - 4, 63), ba + nd1 - 3, 63)
                 } else { arena };
                 let rec_bc: bytes = av_tmp(100);
-                let nb2: i64 = av_compile_buf(w, su_band_a(), nd1, rec_bc);
+                let nb2: i64 = av_compile_buf(w, ba, nd1, rec_bc);
                 if_pos corrupt <=> 0 {
                     m2u_lt(nb2, 0)
                 } else {
-                    let nr1: i64 = su_read_file_into(w, orig_bc, su_band_a(), 64000);
-                    let nr2: i64 = su_read_file_into(w, rec_bc, su_band_a() + 65536, 64000);
-                    m2u_eq(nb1, nb2) * su_eq_bytes(w, su_band_a(), nr1, su_band_a() + 65536, nr2)
+                    let nr1: i64 = su_read_file_into(w, orig_bc, ba, 64000);
+                    let nr2: i64 = su_read_file_into(w, rec_bc, ba2, 64000);
+                    m2u_eq(nb1, nb2) * su_eq_bytes(w, ba, nr1, ba2, nr2)
                 }
             } else { 0 }
         }

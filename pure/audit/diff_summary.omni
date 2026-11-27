@@ -71,8 +71,9 @@ fn ad_skip_op(arena: bytes, base: i64, nwords: i64, pos: i64) -> i64 {
 #[strict]
 fn ad_imm_val(arena: bytes, base: i64, pos: i64) -> i64 {
     let t: i64 = ad_u16(arena, base, pos);
-    let v16: i64 = m2u_sext16(ad_u16(arena, base, pos + 1));
-    let v32: i64 = m2u_sext32((ad_u16(arena, base, pos + 1) << 16) | ad_u16(arena, base, pos + 2));
+    let w1: i64 = ad_u16(arena, base, pos + 1);
+    let v16: i64 = m2u_sext16(w1);
+    let v32: i64 = m2u_sext32((w1 << 16) | ad_u16(arena, base, pos + 2));
     return m2u_sel(m2u_eq(t, 32485), v16, m2u_sel(m2u_eq(t, 32486), v32, 0));
 }
 
