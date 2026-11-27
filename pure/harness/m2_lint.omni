@@ -54,8 +54,9 @@ fn ml_skip_op(w: bytes, nwords: i64, pos: i64) -> i64 {
 #[strict]
 fn ml_imm_val(w: bytes, pos: i64) -> i64 {
     let t: i64 = ml_u16(w, pos);
-    let v16: i64 = m2u_sext16(ml_u16(w, pos + 1));
-    let v32: i64 = m2u_sext32((ml_u16(w, pos + 1) << 16) | ml_u16(w, pos + 2));
+    let w1: i64 = ml_u16(w, pos + 1);
+    let v16: i64 = m2u_sext16(w1);
+    let v32: i64 = m2u_sext32((w1 << 16) | ml_u16(w, pos + 2));
     return m2u_sel(m2u_eq(t, 32485), v16, m2u_sel(m2u_eq(t, 32486), v32, 0));
 }
 
@@ -124,7 +125,7 @@ fn ml_lint_ins(arena: bytes, nwords: i64, fid: i64, ip: i64, hd: i64, dst: i64, 
     // Count ANEW (0x7F0D = 32525)
     anew_c = anew_c + m2u_eq(op, 32525);
     // L6 PACK5_OP (0x7F30=32560, 0x7F31=32561, 0x7F34=32564, 0x7F35=32565, 0x7F3F=32575)
-    let is_p5: i64 = m2u_eq(op, 32560) + m2u_eq(op, 32561) + m2u_eq(op, 32564) + m2u_eq(op, 32565) + m2u_eq(op, 32575);
+    let is_p5: i64 = m2u_in(op, 32560, 32561) + m2u_in(op, 32564, 32565) + m2u_eq(op, 32575);
     rules = rules | (m2u_lt(0, is_p5) << 4);
     // Walk operands
     let cur: i64 = cur0;
@@ -140,7 +141,7 @@ fn ml_lint_ins(arena: bytes, nwords: i64, fid: i64, ip: i64, hd: i64, dst: i64, 
         let is_b: i64 = m2u_eq(oty, 1);
         b_args = b_args + is_b;
         // L1 EAGER_SEL_BYTES (0x7F45 = 32581)
-        rules = rules | ((m2u_eq(op, 32581) * is_b) << 0);
+        rules = rules | (m2u_eq(op, 32581) * is_b);
         // L3 stale bytes handle read & L9 read-before-write on registers
         let is_r: i64 = m2u_in(t, 32256, 32447);
         let ridx: i64 = m2u_sel(is_r, t - 32256, 0);
