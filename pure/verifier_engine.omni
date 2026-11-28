@@ -220,125 +220,40 @@ fn label_bit_mask(lid: i64) -> i64 {
 }
 
 
+// Required capability mask, derived from pure/isa/table.omni cap bytes
+// (isa_op_cap), gated by the ACCEPTED bit (Addons Item 1 PR 3; spec R3).
 #[strict]
-fn op_req_cap_0(op: i64) -> i64 {
-    let acc: i64 = 0;
-    acc = acc + is_eq(op, 32562) * 16;
-    acc = acc + is_eq(op, 32563) * 16;
-    acc = acc + is_eq(op, 32565) * 16;
-    acc = acc + is_eq(op, 32566) * 16;
-    acc = acc + is_eq(op, 32567) * 16;
-    acc = acc + is_eq(op, 32568) * 16;
-    acc = acc + is_eq(op, 32569) * 16;
-    acc = acc + is_eq(op, 32601) * 16;
-    acc = acc + is_eq(op, 32608) * 2;
-    acc = acc + is_eq(op, 32609) * 2;
-    acc = acc + is_eq(op, 32610) * 2;
-    acc = acc + is_eq(op, 32611) * 2;
-    acc = acc + is_eq(op, 32612) * 1;
-    acc = acc + is_eq(op, 32613) * 1;
-    acc = acc + is_eq(op, 32614) * 2;
-    acc = acc + is_eq(op, 32615) * 2;
-    acc = acc + is_eq(op, 32616) * 1;
-    acc = acc + is_eq(op, 32617) * 2;
-    acc = acc + is_eq(op, 32618) * 1;
-    acc = acc + is_eq(op, 32619) * 2;
-    acc = acc + is_eq(op, 32620) * 4;
-    acc = acc + is_eq(op, 32621) * 4;
-    acc = acc + is_eq(op, 32622) * 4;
-    acc = acc + is_eq(op, 32623) * 4;
-    return acc;
+fn op_req_cap(ws: bytes, op: i64) -> i64 {
+    let idx: i64 = isa_op_index(op);
+    let ok: i64 = is_ge(idx, 0);
+    let safe_idx: i64 = ok * idx;
+    let known: i64 = ok * isa_op_flag(ws, 65536, safe_idx, 5);
+    let r: i64 = known * isa_op_cap(ws, 65536, safe_idx);
+    return r;
 }
 
+// Taint-sink classification, derived from pure/isa/table.omni flags bit 1
+// (isa_op_flag), gated by the ACCEPTED bit (Addons Item 1 PR 3; spec R3).
 #[strict]
-fn op_req_cap_1(op: i64) -> i64 {
-    let acc: i64 = 0;
-    acc = acc + is_eq(op, 32624) * 128;
-    acc = acc + is_eq(op, 32625) * 4;
-    acc = acc + is_eq(op, 32626) * 512;
-    acc = acc + is_eq(op, 32627) * 512;
-    acc = acc + is_eq(op, 32628) * 512;
-    acc = acc + is_eq(op, 32629) * 256;
-    acc = acc + is_eq(op, 32630) * 8;
-    acc = acc + is_eq(op, 32631) * 8;
-    acc = acc + is_eq(op, 32632) * 8;
-    acc = acc + is_eq(op, 32633) * 8;
-    acc = acc + is_eq(op, 32634) * 8;
-    acc = acc + is_eq(op, 32635) * 8;
-    acc = acc + is_eq(op, 32636) * 64;
-    acc = acc + is_eq(op, 32637) * 16;
-    acc = acc + is_eq(op, 32638) * 32;
-    acc = acc + is_eq(op, 32639) * 32;
-    return acc;
+fn op_is_sink_raw(ws: bytes, op: i64) -> i64 {
+    let idx: i64 = isa_op_index(op);
+    let ok: i64 = is_ge(idx, 0);
+    let safe_idx: i64 = ok * idx;
+    let known: i64 = ok * isa_op_flag(ws, 65536, safe_idx, 5);
+    let r: i64 = known * isa_op_flag(ws, 65536, safe_idx, 1);
+    return r;
 }
 
+// Taint-sanitizer classification, derived from pure/isa/table.omni flags
+// bit 2 (isa_op_flag), gated by the ACCEPTED bit (Addons Item 1 PR 3; spec R3).
 #[strict]
-fn op_req_cap(op: i64) -> i64 {
-    let acc: i64 = op_req_cap_0(op) + op_req_cap_1(op);
-    return acc;
-}
-
-#[strict]
-fn op_is_sink_raw_0(op: i64) -> i64 {
-    let acc: i64 = 0;
-    acc = acc + is_eq(op, 32563) * 1;
-    acc = acc + is_eq(op, 32565) * 1;
-    acc = acc + is_eq(op, 32566) * 1;
-    acc = acc + is_eq(op, 32567) * 1;
-    acc = acc + is_eq(op, 32568) * 1;
-    acc = acc + is_eq(op, 32569) * 1;
-    acc = acc + is_eq(op, 32586) * 1;
-    acc = acc + is_eq(op, 32609) * 1;
-    acc = acc + is_eq(op, 32611) * 1;
-    acc = acc + is_eq(op, 32612) * 1;
-    acc = acc + is_eq(op, 32613) * 1;
-    acc = acc + is_eq(op, 32614) * 1;
-    acc = acc + is_eq(op, 32615) * 1;
-    acc = acc + is_eq(op, 32617) * 1;
-    acc = acc + is_eq(op, 32618) * 1;
-    acc = acc + is_eq(op, 32619) * 1;
-    acc = acc + is_eq(op, 32620) * 1;
-    acc = acc + is_eq(op, 32622) * 1;
-    acc = acc + is_eq(op, 32623) * 1;
-    acc = acc + is_eq(op, 32627) * 1;
-    acc = acc + is_eq(op, 32628) * 1;
-    acc = acc + is_eq(op, 32629) * 1;
-    acc = acc + is_eq(op, 32630) * 1;
-    acc = acc + is_eq(op, 32631) * 1;
-    return acc;
-}
-
-#[strict]
-fn op_is_sink_raw_1(op: i64) -> i64 {
-    let acc: i64 = 0;
-    acc = acc + is_eq(op, 32632) * 1;
-    acc = acc + is_eq(op, 32633) * 1;
-    acc = acc + is_eq(op, 32634) * 1;
-    acc = acc + is_eq(op, 32635) * 1;
-    acc = acc + is_eq(op, 32636) * 1;
-    acc = acc + is_eq(op, 32637) * 1;
-    acc = acc + is_eq(op, 32638) * 1;
-    acc = acc + is_eq(op, 32639) * 1;
-    return acc;
-}
-
-#[strict]
-fn op_is_sink_raw(op: i64) -> i64 {
-    let acc: i64 = op_is_sink_raw_0(op) + op_is_sink_raw_1(op);
-    return acc;
-}
-
-#[strict]
-fn op_is_sanitizer(op: i64) -> i64 {
-    let acc: i64 = 0;
-    acc = acc + is_eq(op, 32599) * 1;
-    acc = acc + is_eq(op, 32600) * 1;
-    acc = acc + is_eq(op, 32601) * 1;
-    acc = acc + is_eq(op, 32602) * 1;
-    acc = acc + is_eq(op, 32603) * 1;
-    acc = acc + is_eq(op, 32604) * 1;
-    acc = acc + is_eq(op, 32624) * 1;
-    return acc;
+fn op_is_sanitizer(ws: bytes, op: i64) -> i64 {
+    let idx: i64 = isa_op_index(op);
+    let ok: i64 = is_ge(idx, 0);
+    let safe_idx: i64 = ok * idx;
+    let known: i64 = ok * isa_op_flag(ws, 65536, safe_idx, 5);
+    let r: i64 = known * isa_op_flag(ws, 65536, safe_idx, 2);
+    return r;
 }
 
 
@@ -797,7 +712,7 @@ fn handle_dest(ws: bytes, op: i64, dest: i64, tc: i64, cap: i64, off: i64) -> by
 
     let ins_untr: i64 = unpack_untrusted(tc);
     let ins_cap: i64 = unpack_cap(tc);
-    let req: i64 = op_req_cap(op);
+    let req: i64 = op_req_cap(w, op);
     let not_fn: i64 = 65535 ^ (cap & 65535);
     let missing: i64 = is_gt(((ins_cap & not_fn) | (req & not_fn)), 0);
     w = append_err_if(w, missing, 1003, off);
@@ -841,9 +756,9 @@ fn handle_dest(ws: bytes, op: i64, dest: i64, tc: i64, cap: i64, off: i64) -> by
     }
 
     let any: i64 = is_gt(any_untr, 0);
-    let sink: i64 = op_is_sink_raw(op);
+    let sink: i64 = op_is_sink_raw(w, op);
     w = append_err_if(w, sink * any, 1002, off);
-    let san: i64 = op_is_sanitizer(op);
+    let san: i64 = op_is_sanitizer(w, op);
     let upgrade: i64 = (1 - san) * any * (1 - ins_untr);
     w = append_err_if(w, upgrade, 1002, off);
 
