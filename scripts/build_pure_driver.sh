@@ -50,7 +50,7 @@ verify_pin() {
 }
 
 # 2. Verify committed bootstrap binaries against bootstrap/MANIFEST.md pins.
-verify_pin "$BOOT_M2" 125660 0x3A4A285C58CFA93E
+verify_pin "$BOOT_M2" 124248 0xAEDE11CB00E7EFDF
 verify_pin "$BOOT_M3" 207015 0x7397A5020895AEBF
 
 # 3. Rebuild m2.elf through 3 generations (S1 == S2 == S3 == bootstrap/m2.elf).
@@ -63,8 +63,8 @@ chmod +x "$OUT_DIR/m2.elf"
 cmp "$BOOT_M2" "$TMP/m2_s1.elf"
 cmp "$TMP/m2_s1.elf" "$TMP/m2_s2.elf"
 cmp "$TMP/m2_s2.elf" "$OUT_DIR/m2.elf"
-verify_pin "$OUT_DIR/m2.elf" 125660 0x3A4A285C58CFA93E
-echo "[PURE-BUILD] m2.elf fixed point S1 == S2 == S3 == bootstrap/m2.elf (125660 B, 0x3A4A285C58CFA93E)"
+verify_pin "$OUT_DIR/m2.elf" 124248 0xAEDE11CB00E7EFDF
+echo "[PURE-BUILD] m2.elf fixed point S1 == S2 == S3 == bootstrap/m2.elf (124248 B, 0xAEDE11CB00E7EFDF)"
 
 # 4. Rebuild m4.elf and verifier.elf from committed .omni_bc seeds via freshly built m2.elf.
 "$OUT_DIR/m2.elf" pure/m4/m4_standalone.omni_bc > "$OUT_DIR/m4.elf"
@@ -74,8 +74,8 @@ echo "[PURE-BUILD] m4.elf rebuilt (91576 B, 0xFBA8272337B1BAC4)"
 
 "$OUT_DIR/m2.elf" pure/verifier_standalone.omni_bc > "$OUT_DIR/verifier.elf"
 chmod +x "$OUT_DIR/verifier.elf"
-verify_pin "$OUT_DIR/verifier.elf" 77189 0xDB33F13E1082948A
-echo "[PURE-BUILD] verifier.elf rebuilt (77189 B, 0xDB33F13E1082948A)"
+verify_pin "$OUT_DIR/verifier.elf" 75340 0xEDDBB663814DFB9A
+echo "[PURE-BUILD] verifier.elf rebuilt (75340 B, 0xEDDBB663814DFB9A)"
 
 cp "$BOOT_M3" "$OUT_DIR/m3.elf"
 chmod +x "$OUT_DIR/m3.elf"

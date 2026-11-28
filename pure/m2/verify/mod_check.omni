@@ -212,18 +212,7 @@ fn m2v_ins_min_ops(w: bytes, op: i64) -> i64 {
     let in_blk: i64 = m2u_ge(idx, 0);
     let safe_idx: i64 = m2u_sel(in_blk, idx, 0);
     let known: i64 = in_blk * isa_op_flag(w, m2l_isa_tbl(), safe_idx, 5);
-    let is_4: i64 = m2u_eq(op, 32578) + m2u_eq(op, 32581);
-    let is_3: i64 = m2u_eq(op, 32556) + m2u_eq(op, 32569);
-    let is_2: i64 = m2u_in(op, 32526, 32532) + m2u_in(op, 32535, 32536) + m2u_in(op, 32542, 32544)
-        + m2u_in(op, 32546, 32551) + m2u_in(op, 32553, 32555) + m2u_in(op, 32557, 32559)
-        + m2u_eq(op, 32561) + m2u_eq(op, 32564) + m2u_in(op, 32579, 32580)
-        + m2u_eq(op, 32618) + m2u_eq(op, 32639);
-    let is_1: i64 = m2u_in(op, 32513, 32518) + m2u_in(op, 32520, 32521) + m2u_in(op, 32533, 32534)
-        + m2u_eq(op, 32545) + m2u_eq(op, 32552) + m2u_eq(op, 32560) + m2u_eq(op, 32565)
-        + m2u_in(op, 32575, 32577) + m2u_eq(op, 32584) + m2u_eq(op, 32586) + m2u_eq(op, 32592)
-        + m2u_in(op, 32598, 32601) + m2u_eq(op, 32605) + m2u_in(op, 32611, 32615)
-        + m2u_eq(op, 32617) + m2u_in(op, 32619, 32624) + m2u_eq(op, 32630) + m2u_in(op, 32637, 32638);
-    let need: i64 = is_1 * 1 + is_2 * 2 + is_3 * 3 + is_4 * 4;
+    let need: i64 = isa_op_min_ops(w, m2l_isa_tbl(), safe_idx);
     return m2u_sel(known, need, 0 - 1);
 }
 
